@@ -44,10 +44,10 @@ class AgentSpec(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     id: str
-    name: str
-    description: str
+    name: str = Field(min_length=1)
+    description: str = Field(min_length=1)
     version: str = "0.1.0"
-    skills: list[SkillSpec]
+    skills: list[SkillSpec] = Field(min_length=1)
     adapter: InboundAdapter
     provider: tuple[str, str] | None = None  # (organization, url)
     access: AgentAccess = Field(default_factory=AgentAccess)
@@ -112,7 +112,7 @@ def build_card(spec: AgentSpec, base_url: str, *, security: AuthConfig | None) -
                 id=s.id,
                 name=s.name,
                 description=s.description,
-                tags=s.tags,
+                tags=s.tags or [s.id],
                 examples=s.examples,
                 input_modes=s.input_modes or [],
                 output_modes=s.output_modes or [],

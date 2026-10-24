@@ -92,3 +92,22 @@ def test_card_json_roundtrip():
     auth = AuthConfig(jwt=JwtConfig(issuer="i", audience="a", public_key_pem="pem"))
     card = build_card(_spec(), "https://gw.example", security=auth)
     assert parse_agent_card(MessageToDict(card)) == card
+
+
+def test_card_passes_sdk_required_field_validation():
+    from a2a.utils.proto_utils import validate_proto_required_fields
+
+    card = build_card(_spec(), "https://gw.example", security=None)
+    validate_proto_required_fields(card)
+    csv = card.skills[1]
+    assert list(csv.tags) == ["csv"]
+
+
+def test_empty_skills_rejected():
+    with pytest.raises(ValidationError):
+        _spec(skills=[])
+
+
+def test_empty_name_rejected():
+    with pytest.raises(ValidationError):
+        _spec(name="")
