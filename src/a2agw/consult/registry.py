@@ -1,0 +1,253 @@
+"""Partner registry: card fetch with SSRF guard, quarantine on significant card change."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import os
+import re
+import time
+from collections.abc import Callable, Iterable
+from pathlib import Path
+from typing import Any, Literal
+from urllib.parse import urlsplit
+
+import httpx
+import yaml
+from a2a.client.card_resolver import parse_agent_card
+from a2a.types import AgentCard
+from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH
+from google.protobuf.json_format import MessageToDict
+from pydantic import BaseModel, Field
+
+from a2agw.consult.netguard import Tier, UnsafeURL, check_url
+
+MAX_CARD_BYTES = 1024 * 1024
+FETCH_TIMEOUT_S = 10.0
+_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+SIGNIFICANT_FIELDS = ("skills", "supportedInterfaces", "securitySchemes", "securityRequirements")
+
+Status = Literal["active", "quarantined", "disabled"]
+
+
+class CardFetchError(Exception):
+    """The Agent Card could not be fetched or validated."""
+
+
+def card_hash(card: dict[str, Any]) -> str:
+    blob = json.dumps(card, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+class PartnerRecord(BaseModel):
+    id: str
+    card_url: str | None = None
+    card: dict[str, Any]
+    card_hash: str
+    tier: Tier
+    status: Status = "active"
+    credential_ref: str | None = None
+    tags: list[str] = Field(default_factory=list)
+    fetched_at: float = 0.0
+    ttl_s: int = 3600
+    pending_card: dict[str, Any] | None = None
+
+    @property
+    def agent_card(self) -> AgentCard:
+        return parse_agent_card(copy.deepcopy(self.card))
+
+
+def _normalize(card: dict[str, Any]) -> tuple[dict[str, Any], AgentCard]:
+    try:
+        proto = parse_agent_card(copy.deepcopy(card))
+    except Exception as e:  # noqa: BLE001 - any parse failure is a bad card
+        raise CardFetchError(f"invalid agent card: {type(e).__name__}") from None
+    return MessageToDict(proto), proto
+
+
+def _card_urls(base: str) -> str:
+    parts = urlsplit(base)
+    if parts.path.endswith(".json"):
+        return base
+    return base.rstrip("/") + AGENT_CARD_WELL_KNOWN_PATH
+
+
+def _significant_differs(old: dict[str, Any], new: dict[str, Any]) -> bool:
+    return any(old.get(k) != new.get(k) for k in SIGNIFICANT_FIELDS)
+
+
+class PartnerRegistry:
+    def __init__(self, path: Path | None = None, *, http: httpx.AsyncClient | None = None):
+        self.path = path
+        self._http = http
+        self._records: dict[str, PartnerRecord] = {}
+        self.on_change: Callable[[PartnerRecord, str], None] | None = None
+
+    # -- fetching -------------------------------------------------------
+    async def _fetch(self, card_url: str, tier: Tier) -> dict[str, Any]:
+        url = _card_urls(card_url)
+        try:
+            await check_url(url, tier)
+        except UnsafeURL as e:
+            raise CardFetchError(f"unsafe card URL: {e}") from None
+        if self._http is not None:
+            return await self._fetch_with(self._http, url)
+        async with httpx.AsyncClient(follow_redirects=False, timeout=FETCH_TIMEOUT_S) as c:
+            return await self._fetch_with(c, url)
+
+    async def _fetch_with(self, client: httpx.AsyncClient, url: str) -> dict[str, Any]:
+        try:
+            async with client.stream(
+                "GET", url, follow_redirects=False, timeout=FETCH_TIMEOUT_S
+            ) as resp:
+                if 300 <= resp.status_code < 400:
+                    raise CardFetchError("redirects are not followed")
+                if resp.status_code != 200:
+                    raise CardFetchError(f"unexpected status {resp.status_code}")
+                buf = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    buf.extend(chunk)
+                    if len(buf) > MAX_CARD_BYTES:
+                        raise CardFetchError("agent card exceeds 1 MiB")
+        except httpx.HTTPError as e:
+            raise CardFetchError(f"card fetch failed: {type(e).__name__}") from None
+        try:
+            data = json.loads(bytes(buf))
+        except ValueError:
+            raise CardFetchError("agent card is not valid JSON") from None
+        if not isinstance(data, dict):
+            raise CardFetchError("agent card must be a JSON object")
+        return data
+
+    async def _check_endpoints(self, proto: AgentCard, tier: Tier) -> None:
+        for iface in proto.supported_interfaces:
+            try:
+                await check_url(iface.url, tier)
+            except UnsafeURL as e:
+                raise CardFetchError(f"unsafe interface URL: {e}") from None
+
+    # -- mutations ------------------------------------------------------
+    async def add_from_url(
+        self,
+        id: str,
+        url: str,
+        tier: Tier,
+        *,
+        credential_ref: str | None = None,
+        tags: Iterable[str] = (),
+    ) -> PartnerRecord:
+        self._check_new_id(id)
+        raw = await self._fetch(url, tier)
+        return await self._add(id, raw, tier, url, credential_ref, tags)
+
+    async def add_from_card(
+        self,
+        id: str,
+        card: dict[str, Any],
+        tier: Tier,
+        *,
+        credential_ref: str | None = None,
+        tags: Iterable[str] = (),
+    ) -> PartnerRecord:
+        self._check_new_id(id)
+        return await self._add(id, card, tier, None, credential_ref, tags)
+
+    def _check_new_id(self, id: str) -> None:
+        if not _ID_RE.match(id):
+            raise ValueError(f"invalid partner id: {id!r}")
+        if id in self._records:
+            raise ValueError(f"duplicate partner id: {id!r}")
+
+    async def _add(self, id, raw, tier, url, credential_ref, tags) -> PartnerRecord:
+        card, proto = _normalize(raw)
+        await self._check_endpoints(proto, tier)
+        if id in self._records:  # re-check after awaits
+            raise ValueError(f"duplicate partner id: {id!r}")
+        rec = PartnerRecord(
+            id=id,
+            card_url=url,
+            card=card,
+            card_hash=card_hash(card),
+            tier=tier,
+            credential_ref=credential_ref,
+            tags=list(tags),
+            fetched_at=time.time(),
+        )
+        self._records[id] = rec
+        self._changed(rec, "added")
+        return rec
+
+    async def refresh(self, id: str) -> Literal["unchanged", "quarantined"]:
+        rec = self.get(id)
+        if rec.status == "disabled" or not rec.card_url:
+            return "unchanged"
+        raw = await self._fetch(rec.card_url, rec.tier)
+        card, proto = _normalize(raw)
+        await self._check_endpoints(proto, rec.tier)
+        new_hash = card_hash(card)
+        rec.fetched_at = time.time()
+        if new_hash == rec.card_hash:
+            self._changed(rec, "updated")
+            return "unchanged"
+        if _significant_differs(rec.card, card):
+            rec.pending_card = card
+            rec.status = "quarantined"
+            self._changed(rec, "quarantined")
+            return "quarantined"
+        rec.card, rec.card_hash = card, new_hash
+        self._changed(rec, "updated")
+        return "unchanged"
+
+    def approve(self, id: str) -> PartnerRecord:
+        rec = self.get(id)
+        if rec.pending_card is not None:
+            rec.card = rec.pending_card
+            rec.card_hash = card_hash(rec.card)
+            rec.pending_card = None
+        rec.status = "active"
+        self._changed(rec, "approved")
+        return rec
+
+    def disable(self, id: str) -> PartnerRecord:
+        rec = self.get(id)
+        rec.status = "disabled"
+        self._changed(rec, "disabled")
+        return rec
+
+    # -- queries --------------------------------------------------------
+    def get(self, id: str) -> PartnerRecord:
+        try:
+            return self._records[id]
+        except KeyError:
+            raise KeyError(f"unknown partner: {id!r}") from None
+
+    def active(self) -> list[PartnerRecord]:
+        return [r for r in self._records.values() if r.status == "active"]
+
+    def all(self) -> list[PartnerRecord]:
+        return list(self._records.values())
+
+    # -- persistence ----------------------------------------------------
+    def _changed(self, rec: PartnerRecord, event: str) -> None:
+        if self.path is not None:
+            self.save()
+        if self.on_change is not None:
+            self.on_change(rec, event)
+
+    def save(self) -> None:
+        if self.path is None:
+            return
+        data = {"partners": [r.model_dump(mode="json") for r in self._records.values()]}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(yaml.safe_dump(data, sort_keys=False))
+        os.replace(tmp, self.path)
+
+    def load(self) -> None:
+        if self.path is None or not self.path.exists():
+            return
+        data = yaml.safe_load(self.path.read_text()) or {}
+        self._records = {
+            r["id"]: PartnerRecord.model_validate(r) for r in data.get("partners", [])
+        }
