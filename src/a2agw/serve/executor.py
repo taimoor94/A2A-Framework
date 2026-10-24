@@ -130,6 +130,7 @@ class AdapterExecutor(AgentExecutor):
         self._running: dict[str, asyncio.Task[None]] = {}
         self._closed: OrderedDict[str, None] = OrderedDict()
         self.on_cancel: Callable[[str], Awaitable[None]] | None = None
+        self.cancel_wait_s = 5.0  # how long cancel() waits for the adapter to stop
 
     # -- bookkeeping -------------------------------------------------------------------
 
@@ -186,6 +187,10 @@ class AdapterExecutor(AgentExecutor):
             raise ValueError("execute() requires a message, task_id and context_id")
         principal, owner = _caller(context)
         run = _Run(updater=TaskUpdater(event_queue, task_id, context_id), owner=owner, origin=None)
+        if task_id in self._closed:
+            # cancel() (or a terminal state) got here first, e.g. a cancel that landed while
+            # the handler was still setting up a resumed turn: never run the adapter.
+            return
         # Registered before any await, so a concurrent cancel() always finds this run.
         self._active[task_id] = run
         try:
@@ -371,7 +376,16 @@ class AdapterExecutor(AgentExecutor):
         work = self._running.pop(task_id, None)
         if work is not None and not work.done():
             work.cancel()
-            await asyncio.gather(work, return_exceptions=True)
+            _, pending = await asyncio.wait({work}, timeout=self.cancel_wait_s)
+            if pending:
+                # The adapter swallowed the cancellation. Its later changes are ignored
+                # (run.cancelled), so report CANCELED without waiting any longer.
+                logger.warning(
+                    "adapter for agent %s did not stop within %.1fs of cancel on task %s",
+                    self.spec.id,
+                    self.cancel_wait_s,
+                    task_id,
+                )
         name = TaskState.Name(TaskState.TASK_STATE_CANCELED)
         if run is not None:
             async with run.lock:  # let an in-flight index write of the run land first

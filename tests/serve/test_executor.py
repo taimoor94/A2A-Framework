@@ -557,3 +557,87 @@ async def test_cancel_parked_input_required_task(make_server):
     assert hooked == [task.id]
     assert await _index_state(h) == ST(TaskState.TASK_STATE_CANCELED)
     assert _states(h)[-1] == ST(TaskState.TASK_STATE_CANCELED)
+
+
+async def test_cancel_then_execute_resumed_task_does_not_run(make_server):
+    class Asker:
+        durable_sessions = False
+
+        def __init__(self) -> None:
+            self.runs = 0
+
+        async def run(self, ctx):
+            self.runs += 1
+            if not ctx.resumed:
+                yield NeedInput("q")
+            else:
+                yield Done("ran after cancel")
+
+    adapter = Asker()
+    h = await make_server(adapter)
+    client = h.client(streaming=False)
+    _, task = await send(client, user_msg("x"))
+    assert task.status.state == TaskState.TASK_STATE_INPUT_REQUIRED
+
+    # The cancel lands while the handler is still setting up the resumed turn.
+    resume = user_msg("y", task_id=task.id, context_id=task.context_id)
+    ctx = RequestContext(
+        ServerCallContext(),
+        SendMessageRequest(message=resume),
+        task_id=task.id,
+        context_id=task.context_id,
+        task=task,
+    )
+    queue = FakeQueue()
+    await h.executor.cancel(ctx, queue)
+    states_after_cancel = _states(h)
+    assert states_after_cancel[-1] == ST(TaskState.TASK_STATE_CANCELED)
+
+    await h.executor.execute(ctx, queue)
+
+    assert adapter.runs == 1
+    assert await _index_state(h) == ST(TaskState.TASK_STATE_CANCELED)
+    assert _states(h) == states_after_cancel  # no WORKING/COMPLETED after CANCELED
+    assert [type(e).__name__ for e in queue.events] == ["TaskStatusUpdateEvent"]
+    assert h.executor._active == {}
+
+
+async def test_cancel_is_bounded_when_adapter_ignores_it(make_server, caplog):
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    class Stubborn:
+        durable_sessions = False
+
+        async def run(self, ctx):
+            yield Status("s")
+            started.set()
+            while True:
+                try:
+                    await release.wait()
+                    break
+                except asyncio.CancelledError:
+                    continue  # swallows the cancellation
+            try:
+                yield Done("late")
+            finally:
+                finished.set()
+
+    h = await make_server(Stubborn())
+    h.executor.cancel_wait_s = 0.05
+    client = h.client(streaming=False)
+    events, _ = await send(client, user_msg("x"), return_immediately=True)
+    task_id = _task_id(events[0])
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+
+    with caplog.at_level(logging.WARNING, logger="a2agw.serve.executor"):
+        cancelled = await asyncio.wait_for(
+            client.cancel_task(CancelTaskRequest(id=task_id)), timeout=2.0
+        )
+    assert cancelled.status.state == TaskState.TASK_STATE_CANCELED
+    assert "did not stop" in caplog.text
+    release.set()  # let the stubborn adapter finish; its Done must be ignored
+    await asyncio.wait_for(finished.wait(), timeout=1.0)
+    assert await _index_state(h) == ST(TaskState.TASK_STATE_CANCELED)
+    assert ST(TaskState.TASK_STATE_COMPLETED) not in _states(h)
