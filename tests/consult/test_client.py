@@ -909,3 +909,77 @@ async def test_cancel_for_inbound_runs_concurrently_within_bound(env):
     assert await e.client.cancel_for_inbound("in-c") == 1
     assert sorted(started) == ["pa", "pb"]
     a.gate.set()
+
+
+# -- review round 2: malformed partner responses are contained ----------------------
+
+GARBAGE = [
+    (b"data: not-json\n\n", "text/event-stream"),
+    (b'data: {"jsonrpc":"2.0","id":"1"}\n\n', "text/event-stream"),
+    (b'data: ["x"]\n\n', "text/event-stream"),
+    (b'["x"]', "application/json"),
+    (b'{"jsonrpc":"2.0","id":"1","result":null}', "application/json"),
+]
+
+
+def garbage_for(inner: StreamingASGITransport, methods: set[str], body: bytes, ct: str):
+    class Garbage(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            try:
+                method = json.loads(request.content)["method"]
+            except (ValueError, KeyError, TypeError):
+                method = None
+            if method in methods:
+                headers = {"content-type": ct}
+                return httpx.Response(200, content=body, headers=headers, request=request)
+            return await inner.handle_async_request(request)
+
+    return Garbage()
+
+
+@pytest.mark.parametrize(("body", "ct"), GARBAGE)
+async def test_garbage_send_response_is_protocol_error(env, body, ct):
+    e = await env(spec("alpha", Echo()))
+    breaker = half_open_breaker(e, "alpha")
+    e.hc._transport = garbage_for(e.transport, {"SendStreamingMessage"}, body, ct)
+    res = await e.client.consult("alpha", "x", wait_seconds=3)
+    assert res.state == "failed"
+    assert res.reason == "partner protocol error"
+    assert breaker.state == "closed"  # the partner responded: success
+    assert e.client._bulkhead("alpha").in_use == 0
+
+
+@pytest.mark.parametrize(("body", "ct"), [GARBAGE[3], GARBAGE[4]])
+async def test_garbage_check_and_cancel_are_protocol_errors(env, body, ct):
+    gated = Gated()
+    e = await env(spec("slow", gated))
+    res = await e.client.consult("slow", "go", wait_seconds=0.2)
+    assert res.state == "working"
+    e.hc._transport = garbage_for(e.transport, {"GetTask", "CancelTask"}, body, ct)
+    checked = await e.client.check("slow", res.task_id)
+    assert checked.state == "failed" and checked.reason == "partner protocol error"
+    cancelled = await e.client.cancel("slow", res.task_id)
+    assert cancelled.state == "failed" and cancelled.reason == "partner protocol error"
+    assert e.client._breaker("slow").state == "closed"
+    gated.gate.set()
+
+
+async def test_wait_any_survives_one_garbage_partner(env):
+    a, b = Gated(), Gated()
+    e = await env(spec("pa", a), spec("pb", b))
+    ra = await e.client.consult("pa", "go", wait_seconds=0.2)
+    rb = await e.client.consult("pb", "go", wait_seconds=0.2)
+    b.gate.set()
+    inner = e.transport
+
+    class GarbageForPa(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            if request.url.path.startswith("/agents/pa/"):
+                return httpx.Response(200, content=b'["x"]', request=request)
+            return await inner.handle_async_request(request)
+
+    e.hc._transport = GarbageForPa()
+    results = await e.client.wait_any([("pa", ra.task_id), ("pb", rb.task_id)], 5)
+    assert results[0].state == "failed" and results[0].reason == "partner protocol error"
+    assert results[1].partner == "pb" and results[1].state in ("working", "completed")
+    a.gate.set()

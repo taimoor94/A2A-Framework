@@ -112,6 +112,10 @@ class _ConnectFailed(Exception):
     """Connection-level failure before any response (safe to retry)."""
 
 
+class _PartnerFault(Exception):
+    """An SDK call raised something unexpected (e.g. a malformed body): a partner fault."""
+
+
 ErrorKind = Literal["connect", "server", "transport", "protocol", "other"]
 
 
@@ -133,7 +137,7 @@ def _kind(exc: BaseException) -> ErrorKind:
         return "server" if root.response.status_code >= 500 else "protocol"
     if isinstance(root, httpx.TransportError):
         return "transport"
-    if isinstance(exc, (A2AError, ParseError, ProtocolViolation)):
+    if isinstance(exc, (A2AError, ParseError, ProtocolViolation, _PartnerFault)):
         return "protocol"
     return "other"
 
@@ -144,14 +148,47 @@ def _status(exc: BaseException) -> int | None:
 
 
 def _reraise_other(exc: Exception, kind: ErrorKind) -> None:
-    """Not a partner fault: an internal error must not be blamed on the partner."""
+    """Not a partner fault (SDK-call errors are wrapped first): our own bug, so re-raise."""
     if kind == "other":
         logger.exception("internal error during partner call")
         raise exc
 
 
+def _contain(exc: Exception) -> Exception:
+    """Map an exception raised by an SDK call: anything we would not otherwise classify is a
+    malformed partner response. Our own credential errors pass through unchanged."""
+    if isinstance(exc, (MissingCredential, InvalidCredential)) or _kind(exc) != "other":
+        return exc
+    logger.warning("malformed partner response (%s)", type(exc).__name__)
+    return _PartnerFault(type(exc).__name__)
+
+
+async def _sdk(call: Awaitable[Any]) -> Any:
+    """Await one SDK client call, containing partner faults (CancelledError passes through)."""
+    try:
+        return await call
+    except Exception as e:
+        mapped = _contain(e)
+        if mapped is e:
+            raise
+        raise mapped from None
+
+
+async def _next(stream: AsyncIterator[StreamResponse]) -> StreamResponse | None:
+    """Next event of an SDK stream, or None at its end; partner faults contained."""
+    try:
+        return await stream.__anext__()
+    except StopAsyncIteration:
+        return None
+    except Exception as e:
+        mapped = _contain(e)
+        if mapped is e:
+            raise
+        raise mapped from None
+
+
 def _protocol_reason(exc: BaseException) -> str:
-    if isinstance(exc, ProtocolViolation):
+    if isinstance(exc, (ProtocolViolation, _PartnerFault)):
         return PROTOCOL_ERROR
     return f"partner error: {type(exc).__name__}"
 
@@ -559,12 +596,15 @@ class PartnerClient:
         async def open_stream() -> tuple[AsyncIterator[StreamResponse], StreamResponse]:
             agen = client.send_message(request, context=self._ctx(deadline - loop.time()))
             try:
-                first = await agen.__anext__()
+                first = await _next(agen)
             except BaseException as e:
                 await _aclose(agen)
                 if isinstance(e, Exception) and _kind(e) == "connect":
                     raise _ConnectFailed from e
                 raise
+            if first is None:
+                await _aclose(agen)
+                raise StopAsyncIteration
             return agen, first
 
         async def recover(*, timed_out: bool = False) -> str | None:
@@ -611,7 +651,7 @@ class PartnerClient:
             await note()
             if streaming and not track.settled:
                 async with asyncio.timeout_at(deadline):
-                    async for ev in agen:
+                    while (ev := await _next(agen)) is not None:
                         track.apply(ev)
                         await note()
                         if track.settled:
@@ -700,7 +740,7 @@ class PartnerClient:
             )
             try:
                 async with asyncio.timeout_at(deadline):
-                    async for ev in stream:
+                    while (ev := await _next(stream)) is not None:
                         track.apply(ev)
                         if track.settled:
                             break
@@ -724,8 +764,10 @@ class PartnerClient:
                 return
             try:
                 async with asyncio.timeout(remaining):
-                    task = await client.get_task(
-                        GetTaskRequest(id=track.task_id), context=self._ctx(remaining)
+                    task = await _sdk(
+                        client.get_task(
+                            GetTaskRequest(id=track.task_id), context=self._ctx(remaining)
+                        )
                     )
                 probe.success()
                 track.set_task(task)
@@ -805,12 +847,12 @@ class PartnerClient:
     async def _fetch(self, client: Client, task_id: str, timeout: float, *, cancel: bool) -> Task:
         if cancel:
             try:
-                return await client.cancel_task(
-                    CancelTaskRequest(id=task_id), context=self._ctx(timeout)
+                return await _sdk(
+                    client.cancel_task(CancelTaskRequest(id=task_id), context=self._ctx(timeout))
                 )
             except TaskNotCancelableError:
                 pass  # already terminal: report its current state
-        return await client.get_task(GetTaskRequest(id=task_id), context=self._ctx(timeout))
+        return await _sdk(client.get_task(GetTaskRequest(id=task_id), context=self._ctx(timeout)))
 
     # -- several handles ---------------------------------------------------------------
 
