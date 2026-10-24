@@ -1,4 +1,8 @@
-"""Durable record of outbound partner tasks (handles), linked to the inbound task that made them."""
+"""Durable record of outbound partner tasks (handles), linked to the inbound task that made them.
+
+Task ids are chosen by partners, so a handle is keyed by ``(partner_id, task_id)``: one partner
+can never overwrite another partner's handle by reusing its task id.
+"""
 
 from __future__ import annotations
 
@@ -14,8 +18,8 @@ _metadata = MetaData()
 _outbound = Table(
     "a2agw_outbound",
     _metadata,
+    Column("partner_id", String, primary_key=True),
     Column("task_id", String, primary_key=True),
-    Column("partner_id", String, nullable=False),
     Column("context_id", String, nullable=True),
     Column("inbound_task_id", String, nullable=True, index=True),
     Column("origin", String, nullable=True, index=True),
@@ -56,7 +60,7 @@ class OutboundHandleStore:
         )
         ex, t = stmt.excluded, _outbound.c
         stmt = stmt.on_conflict_do_update(
-            index_elements=["task_id"],
+            index_elements=["partner_id", "task_id"],
             set_={
                 "state": ex.state,
                 "context_id": func.coalesce(ex.context_id, t.context_id),
@@ -67,10 +71,22 @@ class OutboundHandleStore:
         async with self._engine.begin() as conn:
             await conn.execute(stmt)
 
-    async def update_state(self, task_id: str, state: str) -> None:
-        stmt = update(_outbound).where(_outbound.c.task_id == task_id).values(state=state)
+    async def update_state(self, partner_id: str, task_id: str, state: str) -> None:
+        stmt = (
+            update(_outbound)
+            .where(_outbound.c.partner_id == partner_id, _outbound.c.task_id == task_id)
+            .values(state=state)
+        )
         async with self._engine.begin() as conn:
             await conn.execute(stmt)
+
+    async def get(self, partner_id: str, task_id: str) -> dict[str, Any] | None:
+        stmt = select(_outbound).where(
+            _outbound.c.partner_id == partner_id, _outbound.c.task_id == task_id
+        )
+        async with self._engine.connect() as conn:
+            row = (await conn.execute(stmt)).first()
+        return dict(row._mapping) if row is not None else None
 
     async def by_inbound(self, inbound_task_id: str) -> list[dict[str, Any]]:
         stmt = (

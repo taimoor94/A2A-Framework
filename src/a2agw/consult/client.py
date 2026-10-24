@@ -1,16 +1,24 @@
 """PartnerClient: consult registered partner agents over A2A, with resilience and task handles.
 
 Every call goes through: registry lookup (only ``active`` partners) and a full endpoint check,
-the partner's circuit breaker, then its bulkhead. The current call context is sent unchanged
+the partner's bulkhead, then its circuit breaker. The current call context is sent unchanged
 in the message metadata (R6), together with the ``A2A-Version`` and ``A2A-Extensions`` service
 parameters and the partner's credential headers.
 
 Failure handling never re-sends a message once a request may have reached the partner:
 
 - connection errors raised before any response are retried (``with_retry``);
-- a read error after the request was sent is ambiguous: the task is looked up by the
-  ``context_id`` this call generated, and followed if found ("delivery unknown" otherwise);
+- an ambiguous failure (a read error, a 502/503/504, or the deadline passing before any
+  response) triggers a lookup of the task by the ``context_id`` this call generated; the task
+  is followed if found, otherwise the result is "delivery unknown";
 - a broken stream falls back to ``subscribe``, then to polling ``get_task``.
+
+Every call that the breaker admits records an outcome (success on any protocol response,
+failure on transport errors, 5xx and timeouts) or, when it ends without one (credential
+error, cancellation, delivery unknown), gives a half-open probe back.
+
+Partner responses are untrusted: ids are validated (``results.Track``), text is capped and
+the bytes consumed per call are bounded (see ``a2agw.consult.results``).
 """
 
 from __future__ import annotations
@@ -20,7 +28,7 @@ import logging
 import math
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextvars import ContextVar
 from typing import Any, Literal
 
@@ -28,7 +36,6 @@ import httpx
 from a2a.client import Client, ClientCallContext, ClientConfig, ClientFactory
 from a2a.client.interceptors import AfterArgs, BeforeArgs, ClientCallInterceptor
 from a2a.extensions.common import HTTP_EXTENSION_HEADER
-from a2a.server.tasks.task_manager import append_artifact_to_task
 from a2a.types import (
     CancelTaskRequest,
     GetTaskRequest,
@@ -40,12 +47,10 @@ from a2a.types import (
     StreamResponse,
     SubscribeToTaskRequest,
     Task,
-    TaskState,
 )
 from a2a.utils.constants import VERSION_HEADER
 from a2a.utils.errors import A2AError, TaskNotCancelableError
-from google.protobuf.json_format import MessageToDict
-from pydantic import BaseModel, Field
+from google.protobuf.json_format import ParseError
 
 from a2agw.consult.credentials import (
     CredentialInterceptor,
@@ -56,9 +61,18 @@ from a2agw.consult.credentials import (
 from a2agw.consult.handles import OutboundHandleStore
 from a2agw.consult.registry import CardFetchError, PartnerRecord, PartnerRegistry
 from a2agw.consult.resilience import Bulkhead, Busy, CircuitBreaker, with_retry
+from a2agw.consult.results import (
+    TERMINAL_NAMES,
+    ProtocolViolation,
+    ToolResult,
+    Track,
+    build_result,
+)
 from a2agw.context.call_context import EXTENSION_URI, CallContext, current_call
 from a2agw.ops.bus import EventBus, GatewayEvent
 from a2agw.security.principal import Principal
+
+__all__ = ["PartnerClient", "ToolResult"]
 
 logger = logging.getLogger(__name__)
 
@@ -69,55 +83,15 @@ WAIT_ANY_INTERVAL_S = 0.5
 RETRY_BASE_S = 0.2
 RETRY_CAP_S = 2.0
 BULKHEAD_WAIT_S = 1.0  # how long to wait for a free slot before answering "busy"
-LOOKUP_TIMEOUT_S = 5.0  # bound on the list_tasks lookup after an ambiguous failure
+LOOKUP_FLOOR_S = 0.5  # a lookup after the deadline passed still gets this long
+ACLOSE_TIMEOUT_S = 1.0  # bound on closing a partner stream
 
 BINDINGS = ("JSONRPC", "HTTP+JSON")  # in order of preference
-
-ResultState = Literal[
-    "completed",
-    "working",
-    "input_required",
-    "auth_required",
-    "failed",
-    "canceled",
-    "rejected",
-    "unavailable",
-]
-
-_STATES: dict[int, ResultState] = {
-    TaskState.TASK_STATE_COMPLETED: "completed",
-    TaskState.TASK_STATE_WORKING: "working",
-    TaskState.TASK_STATE_SUBMITTED: "working",
-    TaskState.TASK_STATE_INPUT_REQUIRED: "input_required",
-    TaskState.TASK_STATE_AUTH_REQUIRED: "auth_required",
-    TaskState.TASK_STATE_FAILED: "failed",
-    TaskState.TASK_STATE_CANCELED: "canceled",
-    TaskState.TASK_STATE_REJECTED: "rejected",
-}
-_INTERRUPTED = {TaskState.TASK_STATE_INPUT_REQUIRED, TaskState.TASK_STATE_AUTH_REQUIRED}
-_TERMINAL = {
-    TaskState.TASK_STATE_COMPLETED,
-    TaskState.TASK_STATE_FAILED,
-    TaskState.TASK_STATE_CANCELED,
-    TaskState.TASK_STATE_REJECTED,
-}
-_TERMINAL_NAMES = {TaskState.Name(s) for s in _TERMINAL}
+_AMBIGUOUS_STATUS = {502, 503, 504}  # the partner (or a proxy) may have accepted the message
+PROTOCOL_ERROR = "partner protocol error"
 
 # The inbound caller whose credentials apply to the current outbound call.
 _caller: ContextVar[Principal | None] = ContextVar("a2agw_outbound_caller", default=None)
-
-
-class ToolResult(BaseModel):
-    partner: str
-    task_id: str | None = None
-    context_id: str | None = None
-    state: ResultState
-    text: str = ""
-    artifacts: list[dict[str, Any]] = Field(default_factory=list)
-    question: str | None = None
-    reason: str | None = None
-    truncated: bool = False
-    provenance: dict[str, Any] = Field(default_factory=dict)
 
 
 class _CallerCredentials(ClientCallInterceptor):
@@ -141,108 +115,84 @@ class _ConnectFailed(Exception):
 ErrorKind = Literal["connect", "server", "transport", "protocol", "other"]
 
 
-def _kind(exc: BaseException) -> ErrorKind:
-    """Classify an SDK/transport error by its httpx root cause."""
+def _http_root(exc: BaseException) -> httpx.HTTPError | None:
     seen: BaseException | None = exc
     for _ in range(10):
         if seen is None or isinstance(seen, httpx.HTTPError):
             break
         seen = seen.__cause__ or seen.__context__
-    if isinstance(seen, (httpx.ConnectError, httpx.ConnectTimeout)):
+    return seen if isinstance(seen, httpx.HTTPError) else None
+
+
+def _kind(exc: BaseException) -> ErrorKind:
+    """Classify an SDK/transport error by its httpx root cause."""
+    root = _http_root(exc)
+    if isinstance(root, (httpx.ConnectError, httpx.ConnectTimeout)):
         return "connect"
-    if isinstance(seen, httpx.HTTPStatusError):
-        return "server" if seen.response.status_code >= 500 else "protocol"
-    if isinstance(seen, httpx.TransportError):
+    if isinstance(root, httpx.HTTPStatusError):
+        return "server" if root.response.status_code >= 500 else "protocol"
+    if isinstance(root, httpx.TransportError):
         return "transport"
-    if isinstance(exc, A2AError):
+    if isinstance(exc, (A2AError, ParseError, ProtocolViolation)):
         return "protocol"
     return "other"
 
 
-def _record(breaker: CircuitBreaker, kind: ErrorKind) -> None:
-    if kind in ("connect", "server", "transport"):
-        breaker.record_failure()
-    elif kind == "protocol":
-        breaker.record_success()
+def _status(exc: BaseException) -> int | None:
+    root = _http_root(exc)
+    return root.response.status_code if isinstance(root, httpx.HTTPStatusError) else None
 
 
-def _texts(parts: Iterable[Part]) -> list[str]:
-    return [p.text for p in parts if p.WhichOneof("content") == "text" and p.text]
+def _reraise_other(exc: Exception, kind: ErrorKind) -> None:
+    """Not a partner fault: an internal error must not be blamed on the partner."""
+    if kind == "other":
+        logger.exception("internal error during partner call")
+        raise exc
 
 
-def _part_summary(p: Part) -> dict[str, Any]:
-    kind = p.WhichOneof("content")
-    if kind == "text":
-        return {"kind": "text", "text": p.text}
-    if kind == "data":
-        return {"kind": "data", "data": MessageToDict(p.data)}
-    out: dict[str, Any] = {"kind": "file", "media_type": p.media_type or None}
-    if p.filename:
-        out["name"] = p.filename
-    if kind == "raw":
-        out["size"] = len(p.raw)  # raw bytes are never inlined
-    elif kind == "url":
-        out["url"] = p.url
-    return out
+def _protocol_reason(exc: BaseException) -> str:
+    if isinstance(exc, ProtocolViolation):
+        return PROTOCOL_ERROR
+    return f"partner error: {type(exc).__name__}"
 
 
-class _Track:
-    """Accumulates what one call has learned about the partner task."""
+class _Probe:
+    """Breaker bookkeeping for one admitted call: every exit records or releases."""
 
-    def __init__(self, task_id: str | None, context_id: str | None) -> None:
-        self.task_id = task_id
-        self.context_id = context_id
-        self.task: Task | None = None
-        self.message: Message | None = None
-        # On a reply to an interrupted task, the old interrupted status must not end the call.
-        self.stale_status: str | None = None
+    def __init__(self, breaker: CircuitBreaker, probing: bool) -> None:
+        self.breaker = breaker
+        self.probing = probing  # this call holds the half-open probe
+        self.recorded = False
 
-    def set_task(self, task: Task) -> None:
-        self.task = task
-        self.task_id = task.id or self.task_id
-        self.context_id = task.context_id or self.context_id
+    def success(self) -> None:
+        self.breaker.record_success()
+        self.recorded = True
 
-    def apply(self, ev: StreamResponse) -> None:
-        kind = ev.WhichOneof("payload")
-        if kind == "task":
-            t = Task()
-            t.CopyFrom(ev.task)
-            self.set_task(t)
-        elif kind == "message":
-            self.message = ev.message
-        elif kind in ("status_update", "artifact_update"):
-            upd = getattr(ev, kind)
-            if self.task is None:
-                self.set_task(Task(id=upd.task_id, context_id=upd.context_id))
-            assert self.task is not None
-            if kind == "status_update":
-                self.task.status.CopyFrom(upd.status)
-            else:
-                append_artifact_to_task(self.task, upd)
+    def failure(self) -> None:
+        self.breaker.record_failure()
+        self.recorded = True
 
-    def _status_key(self) -> str | None:
-        if self.task is None:
-            return None
-        s = self.task.status
-        return f"{s.state}:{s.message.message_id}:{s.timestamp.ToJsonString()}"
+    def kind(self, kind: ErrorKind) -> None:
+        if kind in ("connect", "server", "transport"):
+            self.failure()
+        elif kind == "protocol":
+            self.success()
 
-    def mark_stale(self) -> None:
-        """Called for replies: an interrupted status seen now belongs to the previous turn."""
-        if self.task is not None and self.task.status.state in _INTERRUPTED:
-            self.stale_status = self._status_key()
+    def close(self) -> None:
+        if self.probing and not self.recorded:
+            self.breaker.release_probe()
 
-    @property
-    def settled(self) -> bool:
-        if self.message is not None and self.task is None:
-            return True
-        if self.task is None:
-            return False
-        state = self.task.status.state
-        if state in _TERMINAL:
-            return True
-        if state in _INTERRUPTED:
-            return self._status_key() != self.stale_status
-        return False
+
+async def _aclose(stream: Any) -> None:
+    """Close a partner stream without letting a stuck partner hold us."""
+    try:
+        async with asyncio.timeout(ACLOSE_TIMEOUT_S):
+            await stream.aclose()
+    except (TimeoutError, Exception):  # noqa: BLE001 - closing is best effort
+        logger.debug("partner stream did not close cleanly")
+
+
+Note = Callable[[], Awaitable[None]]
 
 
 class PartnerClient:
@@ -339,64 +289,22 @@ class PartnerClient:
             provenance=self._provenance(partner_id, rec),
         )
 
-    def _result(self, partner_id: str, rec: PartnerRecord, track: _Track) -> ToolResult:
-        prov = self._provenance(partner_id, rec)
-        if track.task is None and track.message is not None:
-            msg = track.message
-            parts = list(msg.parts)
-            arts = []
-            if any(p.WhichOneof("content") != "text" for p in parts):
-                arts = [
-                    {
-                        "artifact_id": None,
-                        "name": "message",
-                        "parts": [_part_summary(p) for p in parts],
-                    }
-                ]
-            return ToolResult(
-                partner=partner_id,
-                task_id=None,
-                context_id=msg.context_id or track.context_id,
-                state="completed",
-                text="\n".join(_texts(parts)),
-                artifacts=arts,
-                provenance=prov,
-            )
-        if track.task is None:
-            # Only the id is known (e.g. the deadline hit before any task snapshot arrived).
-            return ToolResult(
-                partner=partner_id,
-                task_id=track.task_id,
-                context_id=track.context_id,
-                state="working",
-                provenance=prov,
-            )
-        task = track.task
-        state = _STATES.get(task.status.state, "working")
-        status_text = _texts(task.status.message.parts) if task.status.HasField("message") else []
-        texts = list(status_text)
-        artifacts = []
-        for a in task.artifacts:
-            texts += _texts(a.parts)
-            artifacts.append(
-                {
-                    "artifact_id": a.artifact_id,
-                    "name": a.name or None,
-                    "parts": [_part_summary(p) for p in a.parts],
-                }
-            )
-        question = None
-        if state in ("input_required", "auth_required"):
-            question = "\n".join(status_text) or None
+    def _failed(
+        self,
+        partner_id: str,
+        rec: PartnerRecord,
+        reason: str,
+        *,
+        task_id: str | None,
+        context_id: str | None = None,
+    ) -> ToolResult:
         return ToolResult(
             partner=partner_id,
-            task_id=task.id or track.task_id,
-            context_id=task.context_id or track.context_id,
-            state=state,
-            text="\n".join(texts),
-            artifacts=artifacts,
-            question=question,
-            provenance=prov,
+            task_id=task_id,
+            context_id=context_id,
+            state="failed",
+            reason=reason,
+            provenance=self._provenance(partner_id, rec),
         )
 
     async def _prepare(
@@ -423,46 +331,53 @@ class PartnerClient:
     def _bulkhead(self, partner_id: str) -> Bulkhead:
         return self._bulkheads.setdefault(partner_id, Bulkhead())
 
+    def _admit(self, partner_id: str) -> _Probe | None:
+        breaker = self._breaker(partner_id)
+        probing = breaker.state == "half_open"
+        if not breaker.allow():
+            return None
+        return _Probe(breaker, probing)
+
     @staticmethod
     def _timeout(limit: float, cc: CallContext) -> float:
         rem = cc.remaining()
         return min(limit, rem if rem is not None else math.inf)
 
-    async def _save_handle(
+    async def _record_handle(
         self,
-        result: ToolResult,
-        *,
-        inbound_task_id: str | None = None,
-        origin: str | None = None,
-        new: bool = False,
-        state_name: str | None = None,
+        partner_id: str,
+        track: Track,
+        inbound_task_id: str | None,
+        origin: str | None,
     ) -> None:
-        if self.handles is None or result.task_id is None or result.state == "unavailable":
-            return
-        if state_name is None:
+        state = track.state_name()
+        if self.handles is None or track.task_id is None or state is None:
             return
         try:
-            if new:
-                await self.handles.record(
-                    result.task_id,
-                    result.partner,
-                    result.context_id,
-                    inbound_task_id,
-                    origin,
-                    state_name,
-                )
-            else:
-                await self.handles.update_state(result.task_id, state_name)
+            await self.handles.record(
+                track.task_id, partner_id, track.context_id, inbound_task_id, origin, state
+            )
         except Exception:
-            logger.exception("could not record outbound handle for partner %s", result.partner)
+            logger.exception("could not record outbound handle for partner %s", partner_id)
 
-    @staticmethod
-    def _state_name(track: _Track) -> str | None:
-        if track.task is not None:
-            return TaskState.Name(track.task.status.state)
-        if track.task_id is not None:
-            return TaskState.Name(TaskState.TASK_STATE_SUBMITTED)
-        return None
+    async def _update_handle(self, partner_id: str, track: Track) -> None:
+        state = track.state_name()
+        if self.handles is None or track.task_id is None or state is None:
+            return
+        try:
+            await self.handles.update_state(partner_id, track.task_id, state)
+        except Exception:
+            logger.exception("could not update outbound handle for partner %s", partner_id)
+
+    async def _stored_context(self, partner_id: str, task_id: str) -> str | None:
+        if self.handles is None:
+            return None
+        try:
+            row = await self.handles.get(partner_id, task_id)
+        except Exception:
+            logger.exception("could not read outbound handle for partner %s", partner_id)
+            return None
+        return (row or {}).get("context_id") or None
 
     def _publish(self, result: ToolResult, started: float) -> None:
         if self.bus is None:
@@ -533,21 +448,89 @@ class PartnerClient:
         timeout = self._timeout(min(wait_seconds, self.default_deadline_s), cc)
         if not timeout > 0:
             return self._unavailable(partner_id, rec, "deadline exceeded")
-        breaker = self._breaker(partner_id)
-        if not breaker.allow():
-            return self._unavailable(partner_id, rec, "circuit open")
 
-        generated_context = context_id is None
-        ctx_id = context_id or uuid.uuid4().hex
-        msg = Message(
-            message_id=uuid.uuid4().hex,  # generated once; reused by every retry
-            context_id=ctx_id,
-            role=Role.ROLE_USER,
-        )
-        if text or not files and data is None:
-            msg.parts.append(Part(text=text))
+        if task_id and context_id is None:
+            # A reply must stay in the task's context: use the one we stored, else send none.
+            context_id = await self._stored_context(partner_id, task_id)
+        generated_context = context_id is None and not task_id
+        ctx_id = uuid.uuid4().hex if generated_context else context_id
+        request = self._request(text, files, data, task_id, ctx_id, cc)
+        streaming = rec.agent_card.capabilities.streaming
+        if not streaming:
+            request.configuration.return_immediately = True  # then poll get_task
+
+        track = Track(task_id, ctx_id)
+        recorded = False
+
+        async def note() -> None:
+            nonlocal recorded
+            if not recorded and track.task_id is not None:
+                recorded = True
+                await self._record_handle(partner_id, track, inbound_task_id, cc.origin)
+
+        deadline = asyncio.get_running_loop().time() + timeout
+        try:
+            async with self._bulkhead(partner_id).acquire(min(BULKHEAD_WAIT_S, timeout)):
+                probe = self._admit(partner_id)
+                if probe is None:
+                    return self._unavailable(partner_id, rec, "circuit open")
+                try:
+                    outcome = await self._drive(
+                        client,
+                        request,
+                        track,
+                        probe,
+                        deadline,
+                        streaming=streaming,
+                        reply=bool(task_id),
+                        generated_context=generated_context,
+                        note=note,
+                    )
+                except ProtocolViolation:
+                    probe.success()  # the partner answered, wrongly
+                    outcome = PROTOCOL_ERROR
+                finally:
+                    probe.close()
+        except Busy:
+            return self._unavailable(partner_id, rec, "busy")
+
+        if outcome == PROTOCOL_ERROR:
+            return self._failed(partner_id, rec, outcome, task_id=task_id, context_id=ctx_id)
+        if outcome is not None and outcome.startswith("partner error:"):
+            if track.task is None:
+                return self._failed(
+                    partner_id, rec, outcome, task_id=track.task_id, context_id=track.context_id
+                )
+            await note()
+            res = build_result(partner_id, self._provenance(partner_id, rec), track)
+            res.state, res.reason = "failed", outcome
+            await self._update_handle(partner_id, track)
+            return res
+        if outcome is not None:
+            return self._unavailable(
+                partner_id, rec, outcome, task_id=track.task_id, context_id=track.context_id
+            )
+        await note()
+        await self._update_handle(partner_id, track)
+        return build_result(partner_id, self._provenance(partner_id, rec), track)
+
+    @staticmethod
+    def _request(
+        text: str,
+        files: Iterable[tuple[str, bytes, str]],
+        data: dict[str, Any] | None,
+        task_id: str | None,
+        context_id: str | None,
+        cc: CallContext,
+    ) -> SendMessageRequest:
+        files = list(files)
+        msg = Message(message_id=uuid.uuid4().hex, role=Role.ROLE_USER)  # reused by retries
+        if context_id:
+            msg.context_id = context_id
         if task_id:
             msg.task_id = task_id
+        if text or (not files and data is None):
+            msg.parts.append(Part(text=text))
         for name, content, media_type in files:
             msg.parts.append(Part(raw=content, filename=name, media_type=media_type))
         if data is not None:
@@ -555,95 +538,39 @@ class PartnerClient:
             part.data.struct_value.update(data)
             msg.parts.append(part)
         msg.metadata.update(cc.to_metadata())
-        request = SendMessageRequest(message=msg)
-        streaming = rec.agent_card.capabilities.streaming
-        if not streaming:
-            request.configuration.return_immediately = True  # then poll get_task
-
-        track = _Track(task_id, ctx_id)
-        recorded = False
-
-        async def note() -> None:
-            nonlocal recorded
-            if recorded or track.task_id is None or self.handles is None:
-                return
-            recorded = True
-            res = self._result(partner_id, rec, track)
-            await self._save_handle(
-                res,
-                inbound_task_id=inbound_task_id,
-                origin=cc.origin,
-                new=True,
-                state_name=self._state_name(track),
-            )
-
-        deadline = asyncio.get_running_loop().time() + timeout
-        try:
-            async with self._bulkhead(partner_id).acquire(min(BULKHEAD_WAIT_S, timeout)):
-                outcome = await self._drive(
-                    client,
-                    request,
-                    track,
-                    breaker,
-                    deadline,
-                    streaming=streaming,
-                    reply=task_id is not None,
-                    generated_context=generated_context,
-                    note=note,
-                )
-        except Busy:
-            return self._unavailable(partner_id, rec, "busy")
-        if outcome is not None:
-            if not outcome.startswith("partner error:"):
-                return self._unavailable(
-                    partner_id, rec, outcome, task_id=track.task_id, context_id=ctx_id
-                )
-            # The partner answered with a protocol error: the request itself failed.
-            if track.task is None:
-                return ToolResult(
-                    partner=partner_id,
-                    task_id=track.task_id,
-                    context_id=ctx_id,
-                    state="failed",
-                    reason=outcome,
-                    provenance=self._provenance(partner_id, rec),
-                )
-            await note()
-            res = self._result(partner_id, rec, track)
-            res.state, res.reason = "failed", outcome
-            await self._save_handle(res, state_name=self._state_name(track))
-            return res
-        await note()
-        result = self._result(partner_id, rec, track)
-        await self._save_handle(result, state_name=self._state_name(track))
-        return result
+        return SendMessageRequest(message=msg)
 
     async def _drive(
         self,
         client: Client,
         request: SendMessageRequest,
-        track: _Track,
-        breaker: CircuitBreaker,
+        track: Track,
+        probe: _Probe,
         deadline: float,
         *,
         streaming: bool,
         reply: bool,
         generated_context: bool,
-        note,
+        note: Note,
     ) -> str | None:
         """Send and follow. Returns None on success, or the failure reason."""
         loop = asyncio.get_running_loop()
 
-        async def open_stream():
+        async def open_stream() -> tuple[AsyncIterator[StreamResponse], StreamResponse]:
             agen = client.send_message(request, context=self._ctx(deadline - loop.time()))
             try:
                 first = await agen.__anext__()
             except BaseException as e:
-                await agen.aclose()
+                await _aclose(agen)
                 if isinstance(e, Exception) and _kind(e) == "connect":
                     raise _ConnectFailed from e
                 raise
             return agen, first
+
+        async def recover(*, timed_out: bool = False) -> str | None:
+            return await self._recover(
+                client, track, probe, deadline, streaming, generated_context, note, timed_out
+            )
 
         # Phase 1: send. Only connection errors before any response are retried.
         try:
@@ -655,105 +582,110 @@ class PartnerClient:
                     retry_on=(_ConnectFailed,),
                 )
         except _ConnectFailed:
-            breaker.record_failure()
+            probe.failure()
             return "partner unreachable"
         except (MissingCredential, InvalidCredential):
             return "credential error"
         except TimeoutError:
-            return await self._recover(
-                client, track, breaker, deadline, streaming, generated_context, note
-            )
+            return await recover(timed_out=True)
         except StopAsyncIteration:
-            breaker.record_success()
-            return await self._recover(
-                client, track, breaker, deadline, streaming, generated_context, note
-            )
-        except Exception as e:  # noqa: BLE001 - classified by _kind; partner faults never escape
+            probe.success()
+            return await recover()
+        except Exception as e:  # noqa: BLE001 - classified; internal errors re-raised
             kind = _kind(e)
-            _record(breaker, kind)
-            if kind == "transport":
-                return await self._recover(
-                    client, track, breaker, deadline, streaming, generated_context, note
-                )
+            _reraise_other(e, kind)
+            probe.kind(kind)
+            if kind == "transport" or _status(e) in _AMBIGUOUS_STATUS:
+                return await recover()
             if kind == "server":
                 return "partner error"
-            return f"partner error: {type(e).__name__}"
-        breaker.record_success()
-        track.apply(first)
-        if reply:
-            track.mark_stale()
-        await note()
+            return _protocol_reason(e)
+        probe.success()
 
         # Phase 2: consume the stream (streaming partners only).
         broken = False
-        if streaming and not track.settled:
-            try:
+        try:
+            track.apply(first)
+            if reply:
+                track.mark_stale()
+            await note()
+            if streaming and not track.settled:
                 async with asyncio.timeout_at(deadline):
                     async for ev in agen:
                         track.apply(ev)
                         await note()
                         if track.settled:
                             break
-            except TimeoutError:
-                return None  # still working: the caller gets a handle
-            except Exception as e:  # noqa: BLE001 - classified by _kind; partner faults never escape
-                kind = _kind(e)
-                _record(breaker, kind)
-                if kind == "protocol":
-                    return f"partner error: {type(e).__name__}"
-                broken = True
-            finally:
-                await agen.aclose()
-        else:
-            await agen.aclose()
+        except TimeoutError:
+            return None  # still working: the caller gets a handle
+        except ProtocolViolation:
+            raise
+        except Exception as e:  # noqa: BLE001 - classified; internal errors re-raised
+            kind = _kind(e)
+            _reraise_other(e, kind)
+            probe.kind(kind)
+            if kind == "protocol":
+                return _protocol_reason(e)
+            broken = True
+        finally:
+            await _aclose(agen)
 
         if track.settled or track.task_id is None:
             return None
         # Phase 3: follow the task until it settles or the deadline passes.
-        await self._follow(client, track, breaker, deadline, subscribe=streaming and broken)
+        await self._follow(client, track, probe, deadline, subscribe=streaming and broken)
         return None
 
     async def _recover(
         self,
         client: Client,
-        track: _Track,
-        breaker: CircuitBreaker,
+        track: Track,
+        probe: _Probe,
         deadline: float,
         streaming: bool,
         generated_context: bool,
-        note,
+        note: Note,
+        timed_out: bool,
     ) -> str | None:
         """Ambiguous failure: the message may have been delivered. Find the task; never re-send."""
         if track.task_id is None:
-            found = await self._lookup(client, track, generated_context)
+            found = await self._lookup(client, track, generated_context, deadline)
             if found is None:
+                if timed_out:
+                    probe.failure()  # no response to the send, none to the lookup
                 return "delivery unknown"
+            probe.success()
             track.set_task(found)
             await note()
         if not track.settled:
-            await self._follow(client, track, breaker, deadline, subscribe=streaming)
+            await self._follow(client, track, probe, deadline, subscribe=streaming)
         return None
 
-    async def _lookup(self, client: Client, track: _Track, generated_context: bool) -> Task | None:
+    async def _lookup(
+        self, client: Client, track: Track, generated_context: bool, deadline: float
+    ) -> Task | None:
         if not generated_context or track.context_id is None:
             return None  # a shared context could hold other tasks; we cannot tell which
+        bound = max(deadline - asyncio.get_running_loop().time(), LOOKUP_FLOOR_S)
         try:
-            async with asyncio.timeout(LOOKUP_TIMEOUT_S):
+            async with asyncio.timeout(bound):
                 page = await client.list_tasks(
-                    ListTasksRequest(context_id=track.context_id),
-                    context=self._ctx(LOOKUP_TIMEOUT_S),
+                    ListTasksRequest(
+                        context_id=track.context_id, include_artifacts=True, page_size=5
+                    ),
+                    context=self._ctx(bound),
                 )
-        except Exception as e:  # noqa: BLE001 - any failure leaves delivery unknown
+        except (TimeoutError, Exception) as e:  # noqa: BLE001 - failure leaves delivery unknown
             logger.warning("task lookup after ambiguous failure failed: %s", type(e).__name__)
             return None
-        tasks = [t for t in page.tasks if t.context_id == track.context_id]
+        tasks = [t for t in page.tasks if t.context_id == track.context_id and t.id]
         return tasks[0] if tasks else None
 
     async def _follow(
         self,
         client: Client,
-        track: _Track,
-        breaker: CircuitBreaker,
+        track: Track,
+        probe: _Probe,
         deadline: float,
         *,
         subscribe: bool,
@@ -762,26 +694,29 @@ class PartnerClient:
         assert track.task_id is not None
         loop = asyncio.get_running_loop()
         if subscribe:
+            stream = client.subscribe(
+                SubscribeToTaskRequest(id=track.task_id),
+                context=self._ctx(deadline - loop.time()),
+            )
             try:
                 async with asyncio.timeout_at(deadline):
-                    stream = client.subscribe(
-                        SubscribeToTaskRequest(id=track.task_id),
-                        context=self._ctx(deadline - loop.time()),
-                    )
-                    try:
-                        async for ev in stream:
-                            track.apply(ev)
-                            if track.settled:
-                                break
-                    finally:
-                        await stream.aclose()
-                breaker.record_success()
+                    async for ev in stream:
+                        track.apply(ev)
+                        if track.settled:
+                            break
+                probe.success()
                 if track.settled:
                     return
             except TimeoutError:
                 return
-            except Exception as e:  # noqa: BLE001 - classified by _kind; partner faults never escape
-                _record(breaker, _kind(e))
+            except ProtocolViolation:
+                raise
+            except Exception as e:  # noqa: BLE001 - classified; internal errors re-raised
+                kind = _kind(e)
+                _reraise_other(e, kind)
+                probe.kind(kind)
+            finally:
+                await _aclose(stream)
         delay = POLL_MIN_S
         while True:
             remaining = deadline - loop.time()
@@ -792,14 +727,18 @@ class PartnerClient:
                     task = await client.get_task(
                         GetTaskRequest(id=track.task_id), context=self._ctx(remaining)
                     )
-                breaker.record_success()
+                probe.success()
                 track.set_task(task)
                 if track.settled:
                     return
             except TimeoutError:
                 return
-            except Exception as e:  # noqa: BLE001 - classified by _kind; partner faults never escape
-                _record(breaker, _kind(e))
+            except ProtocolViolation:
+                raise
+            except Exception as e:  # noqa: BLE001 - classified; internal errors re-raised
+                kind = _kind(e)
+                _reraise_other(e, kind)
+                probe.kind(kind)
             sleep = min(delay, deadline - loop.time())
             if sleep <= 0:
                 return
@@ -829,41 +768,39 @@ class PartnerClient:
         timeout = self._timeout(self.default_deadline_s, cc)
         if not timeout > 0:
             return self._unavailable(partner_id, rec, "deadline exceeded", task_id=task_id)
-        breaker = self._breaker(partner_id)
-        if not breaker.allow():
-            return self._unavailable(partner_id, rec, "circuit open", task_id=task_id)
+        track = Track(task_id, None)
         token = _caller.set(caller)
         try:
             async with self._bulkhead(partner_id).acquire(min(BULKHEAD_WAIT_S, timeout)):
-                async with asyncio.timeout(timeout):
-                    task = await self._fetch(client, task_id, timeout, cancel=cancel)
+                probe = self._admit(partner_id)
+                if probe is None:
+                    return self._unavailable(partner_id, rec, "circuit open", task_id=task_id)
+                try:
+                    async with asyncio.timeout(timeout):
+                        task = await self._fetch(client, task_id, timeout, cancel=cancel)
+                    probe.success()
+                    track.set_task(task)
+                except TimeoutError:
+                    probe.failure()
+                    return self._unavailable(partner_id, rec, "timed out", task_id=task_id)
+                except (MissingCredential, InvalidCredential):
+                    return self._unavailable(partner_id, rec, "credential error", task_id=task_id)
+                except Exception as e:  # noqa: BLE001 - classified; internal errors re-raised
+                    kind = _kind(e)
+                    _reraise_other(e, kind)
+                    probe.kind(kind)
+                    if kind == "protocol":
+                        return self._failed(partner_id, rec, _protocol_reason(e), task_id=task_id)
+                    reason = "partner unreachable" if kind == "connect" else "partner error"
+                    return self._unavailable(partner_id, rec, reason, task_id=task_id)
+                finally:
+                    probe.close()
         except Busy:
             return self._unavailable(partner_id, rec, "busy", task_id=task_id)
-        except TimeoutError:
-            return self._unavailable(partner_id, rec, "timed out", task_id=task_id)
-        except (MissingCredential, InvalidCredential):
-            return self._unavailable(partner_id, rec, "credential error", task_id=task_id)
-        except Exception as e:  # noqa: BLE001 - classified by _kind; partner faults never escape
-            kind = _kind(e)
-            _record(breaker, kind)
-            if kind == "protocol":
-                return ToolResult(
-                    partner=partner_id,
-                    task_id=task_id,
-                    state="failed",
-                    reason=f"partner error: {type(e).__name__}",
-                    provenance=self._provenance(partner_id, rec),
-                )
-            reason = "partner unreachable" if kind == "connect" else "partner error"
-            return self._unavailable(partner_id, rec, reason, task_id=task_id)
         finally:
             _caller.reset(token)
-        breaker.record_success()
-        track = _Track(task_id, None)
-        track.set_task(task)
-        result = self._result(partner_id, rec, track)
-        await self._save_handle(result, state_name=self._state_name(track))
-        return result
+        await self._update_handle(partner_id, track)
+        return build_result(partner_id, self._provenance(partner_id, rec), track)
 
     async def _fetch(self, client: Client, task_id: str, timeout: float, *, cancel: bool) -> Task:
         if cancel:
@@ -891,25 +828,38 @@ class PartnerClient:
             await asyncio.sleep(min(WAIT_ANY_INTERVAL_S, remaining))
 
     async def cancel_for_inbound(self, inbound_task_id: str) -> int:
-        """Cancel every non-terminal partner task started for an inbound task."""
+        """Cancel every non-terminal partner task started for an inbound task, concurrently,
+        within ``default_deadline_s`` overall. Returns how many reached ``canceled``."""
         if self.handles is None:
             return 0
+        rows = [
+            r
+            for r in await self.handles.by_inbound(inbound_task_id)
+            if r["state"] not in TERMINAL_NAMES
+        ]
+        if not rows:
+            return 0
+        tasks = [asyncio.create_task(self.cancel(r["partner_id"], r["task_id"])) for r in rows]
+        try:
+            await asyncio.wait(tasks, timeout=self.default_deadline_s)
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
         cancelled = 0
-        for row in await self.handles.by_inbound(inbound_task_id):
-            if row["state"] in _TERMINAL_NAMES:
-                continue
-            try:
-                result = await self.cancel(row["partner_id"], row["task_id"])
-            except Exception:
-                logger.exception("cancel of partner task failed (partner %s)", row["partner_id"])
-                continue
-            if result.state == "canceled":
+        for row, t in zip(rows, tasks, strict=True):
+            partner = row["partner_id"]
+            if t.cancelled():
+                logger.warning("cancel of partner %s task timed out", partner)
+            elif (exc := t.exception()) is not None:
+                logger.error("cancel of partner %s task failed", partner, exc_info=exc)
+            elif t.result().state == "canceled":
                 cancelled += 1
             else:
+                res = t.result()
                 logger.warning(
-                    "partner %s task not cancelled: %s",
-                    row["partner_id"],
-                    result.reason or result.state,
+                    "partner %s task not cancelled: %s", partner, res.reason or res.state
                 )
         return cancelled
 

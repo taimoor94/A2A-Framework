@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 from typing import Any
 
 import httpx
@@ -19,6 +20,7 @@ from a2a.types import (
     AgentCapabilities,
     AgentCard,
     AgentInterface,
+    Part,
     Role,
     StreamResponse,
     Task,
@@ -28,11 +30,13 @@ from google.protobuf.json_format import MessageToDict
 from starlette.applications import Starlette
 
 from a2agw.consult import client as client_mod
+from a2agw.consult import results as results_mod
 from a2agw.consult.client import PartnerClient, ToolResult
 from a2agw.consult.handles import OutboundHandleStore
 from a2agw.consult.registry import PartnerRegistry
+from a2agw.consult.resilience import CircuitBreaker
 from a2agw.context.call_context import EXTENSION_URI, CallContext, use_call
-from a2agw.core.events import Done, NeedInput, Status
+from a2agw.core.events import ArtifactChunk, Done, NeedInput, Status
 from a2agw.ops.bus import EventBus
 from a2agw.security.principal import Principal
 from a2agw.serve.agent import AgentSpec, SkillSpec
@@ -625,7 +629,7 @@ async def test_bulkhead_full_returns_busy(env, monkeypatch):
 
 
 def test_reply_ignores_stale_interrupted_status():
-    track = client_mod._Track("t1", "c1")
+    track = results_mod.Track("t1", "c1")
     old = Task(id="t1", context_id="c1")
     old.status.state = TaskState.TASK_STATE_INPUT_REQUIRED
     old.status.message.message_id = "q1"
@@ -647,3 +651,261 @@ async def test_reply_to_unknown_task_is_failed_protocol_error(env):
     assert res.reason is not None and res.reason.startswith("partner error:")
     assert await e.handles.by_inbound("none") == []
     assert e.client._breaker("alpha").state == "closed"
+
+
+# -- review round 1 regressions -------------------------------------------------------
+
+
+class Big:
+    durable_sessions = False
+
+    async def run(self, ctx):
+        yield Done(text="x" * 200_000)
+
+
+class Firehose:
+    """Streams far more than the per-call byte budget, then completes."""
+
+    durable_sessions = False
+
+    async def run(self, ctx):
+        for i in range(40):
+            yield ArtifactChunk(
+                parts=[Part(text="y" * 65536)], artifact_id="big", append=i > 0, last=False
+            )
+        yield Done(text="end")
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def half_open_breaker(e, partner_id: str) -> CircuitBreaker:
+    clk = FakeClock()
+    breaker = CircuitBreaker(clock=clk)
+    for _ in range(5):
+        breaker.record_failure()
+    clk.t += 30
+    assert breaker.state == "half_open"
+    e.client._breakers[partner_id] = breaker
+    return breaker
+
+
+@pytest.mark.parametrize("streaming", [True, False])
+async def test_big_reply_text_is_capped(env, streaming):
+    e = await env(spec("big", Big(), streaming=streaming))
+    res = await e.client.consult("big", "go", wait_seconds=5)
+    assert res.state == "completed"
+    assert res.truncated is True
+    assert len(res.text.encode()) <= 65536
+    assert res.text == "x" * 65536
+    # The artifact copy does not fit in what is left of the shared budget.
+    assert res.artifacts[0]["parts"] == [{"kind": "text", "truncated": True, "size": 200_000}]
+
+
+def test_text_cap_cuts_on_character_boundary():
+    text, cut = results_mod.cut_utf8("é" * 40_000, 65536)  # 2 bytes each
+    assert cut and len(text.encode()) <= 65536 and text == "é" * 32768
+    text, cut = results_mod.cut_utf8("a" + "€" * 30_000, 65536)  # 3 bytes each
+    assert cut and len(text.encode()) <= 65536 and text.endswith("€")
+
+
+async def test_huge_stream_stops_at_byte_budget(env):
+    e = await env(spec("hose", Firehose()))
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    res = await e.client.consult("hose", "go", wait_seconds=5)
+    assert loop.time() - t0 < 4
+    assert res.truncated is True
+    assert res.state == "working"  # stopped before the partner's completion arrived
+    assert len(res.text.encode()) <= 65536
+
+
+@pytest.mark.parametrize("streaming", [True, False])
+async def test_reply_with_task_id_only(env, streaming):
+    e = await env(spec("asker", Asker(), streaming=streaming))
+    first = await e.client.consult("asker", "weather?", wait_seconds=5)
+    assert first.state == "input_required"
+    second = await e.client.consult("asker", "Paris", task_id=first.task_id, wait_seconds=5)
+    assert second.state == "completed", second.reason
+    assert second.task_id == first.task_id
+    assert second.context_id == first.context_id
+    assert "weather in Paris: sunny" in second.text
+
+
+async def test_reply_with_task_id_only_without_handle_sends_no_context(env):
+    e = await env(spec("asker", Asker()))
+    first = await e.client.consult("asker", "weather?", wait_seconds=5)
+    bare = PartnerClient(e.registry, http=e.hc)  # no handle store: no stored context
+    second = await bare.consult("asker", "Paris", task_id=first.task_id, wait_seconds=5)
+    assert second.state == "completed", second.reason
+    body = json.loads(e.transport.requests[-1][2])
+    assert "contextId" not in body["params"]["message"]
+    await bare.aclose()
+
+
+async def test_handles_are_partner_scoped(env):
+    e = await env()
+    await e.handles.record("same", "pa", "ca", "in-1", "o", "TASK_STATE_WORKING")
+    await e.handles.record("same", "pb", "cb", "in-2", "o", "TASK_STATE_WORKING")
+    await e.handles.update_state("pb", "same", "TASK_STATE_COMPLETED")
+    a = await e.handles.get("pa", "same")
+    b = await e.handles.get("pb", "same")
+    assert a["state"] == "TASK_STATE_WORKING" and a["context_id"] == "ca"
+    assert b["state"] == "TASK_STATE_COMPLETED" and b["context_id"] == "cb"
+    assert [r["partner_id"] for r in await e.handles.by_inbound("in-1")] == ["pa"]
+
+
+def test_track_rejects_foreign_task_id():
+    track = results_mod.Track("t1", "c1")
+    with pytest.raises(results_mod.ProtocolViolation):
+        track.apply(StreamResponse(task=Task(id="t2", context_id="c1")))
+    upd = StreamResponse()
+    upd.status_update.task_id = "t9"
+    upd.status_update.context_id = "c1"
+    with pytest.raises(results_mod.ProtocolViolation):
+        track.apply(upd)
+    with pytest.raises(results_mod.ProtocolViolation):
+        track.set_task(Task(id="t1", context_id="c2"))
+
+
+async def test_mismatched_context_from_partner_is_protocol_error(env):
+    e = await env(spec("alpha", Echo()))
+    inner = e.transport
+
+    class Forge(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            resp = await inner.handle_async_request(request)
+            original = resp.stream
+
+            class Rewritten(httpx.AsyncByteStream):
+                async def __aiter__(self):
+                    async for chunk in original:  # type: ignore[union-attr]
+                        yield re.sub(rb'"contextId":\s*"[^"]*"', b'"contextId":"forged"', chunk)
+
+                async def aclose(self):
+                    await original.aclose()  # type: ignore[union-attr]
+
+            headers = [(k, v) for k, v in resp.headers.items() if k != "content-length"]
+            return httpx.Response(
+                resp.status_code, headers=headers, stream=Rewritten(), request=request
+            )
+
+    e.hc._transport = Forge()
+    res = await e.client.consult("alpha", "x", wait_seconds=5, inbound_task_id="in-f")
+    assert res.state == "failed"
+    assert res.reason == "partner protocol error"
+    assert await e.handles.by_inbound("in-f") == []
+
+
+async def test_hung_partner_opens_breaker_after_timeouts(env, monkeypatch):
+    monkeypatch.setattr(client_mod, "LOOKUP_FLOOR_S", 0.02)
+    e = await env(spec("alpha", Echo()))
+
+    class Hang(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def handle_async_request(self, request):
+            self.calls += 1
+            await asyncio.Event().wait()
+
+    hang = Hang()
+    e.hc._transport = hang
+    for _ in range(5):
+        res = await e.client.consult("alpha", "x", wait_seconds=0.05)
+        assert res.state == "unavailable" and res.reason == "delivery unknown"
+    calls = hang.calls
+    res = await e.client.consult("alpha", "x", wait_seconds=0.05)
+    assert res.reason == "circuit open"
+    assert hang.calls == calls
+    assert e.client._bulkhead("alpha").in_use == 0
+
+
+async def test_busy_does_not_consume_half_open_probe(env, monkeypatch):
+    monkeypatch.setattr(client_mod, "BULKHEAD_WAIT_S", 0.01)
+    e = await env(spec("alpha", Echo()))
+    breaker = half_open_breaker(e, "alpha")
+    bulkhead = e.client._bulkhead("alpha")
+    async with contextlib.AsyncExitStack() as stack:
+        for _ in range(bulkhead.max_concurrent):
+            await stack.enter_async_context(bulkhead.acquire(1))
+        res = await e.client.consult("alpha", "x", wait_seconds=5)
+        assert res.reason == "busy"
+    res = await e.client.consult("alpha", "x", wait_seconds=5)
+    assert res.state == "completed"  # the probe was still available
+    assert breaker.state == "closed"
+
+
+async def test_cancelled_consult_releases_probe_and_slot(env):
+    gated = Gated()
+    e = await env(spec("slow", gated))
+    breaker = half_open_breaker(e, "slow")
+    t = asyncio.create_task(e.client.consult("slow", "go", wait_seconds=5))
+    await asyncio.wait_for(gated.started.wait(), 5)
+    t.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await t
+    assert e.client._bulkhead("slow").in_use == 0
+    assert breaker.allow()  # the abandoned probe was given back
+    gated.gate.set()
+
+
+async def test_503_before_any_event_looks_task_up(env):
+    e = await env(spec("alpha", Echo()))
+    inner = e.transport
+
+    class Proxy503(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request):
+            resp = await inner.handle_async_request(request)
+            if rpc_methods(inner)[-1] == "SendStreamingMessage":
+                await resp.aread()  # the partner accepted; the proxy answers 503
+                return httpx.Response(503, request=request)
+            return resp
+
+    e.hc._transport = Proxy503()
+    res = await e.client.consult("alpha", "x", wait_seconds=5)
+    assert res.state == "completed"
+    assert res.text == "echo: x"
+    methods = rpc_methods(inner)
+    assert methods.count("SendStreamingMessage") == 1 and "ListTasks" in methods
+
+
+async def test_internal_error_is_raised_not_blamed_on_partner(env, monkeypatch):
+    e = await env(spec("alpha", Echo()))
+    breaker = half_open_breaker(e, "alpha")
+
+    def boom(self, ev):
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(results_mod.Track, "apply", boom)
+    with pytest.raises(RuntimeError, match="bug"):
+        await e.client.consult("alpha", "x", wait_seconds=5)
+    assert breaker.state == "closed"  # the send itself got a response
+    assert e.client._bulkhead("alpha").in_use == 0
+
+
+async def test_cancel_for_inbound_runs_concurrently_within_bound(env):
+    a, b = Gated(), Gated()
+    e = await env(spec("pa", a), spec("pb", b))
+    ra = await e.client.consult("pa", "go", wait_seconds=0.2, inbound_task_id="in-c")
+    rb = await e.client.consult("pb", "go", wait_seconds=0.2, inbound_task_id="in-c")
+    assert ra.state == rb.state == "working"
+    started: list[str] = []
+    real_cancel = e.client.cancel
+
+    async def slow_cancel(partner_id, task_id, **kw):
+        started.append(partner_id)
+        if partner_id == "pa":
+            await asyncio.Event().wait()  # never finishes: cut off by the bound
+        return await real_cancel(partner_id, task_id, **kw)
+
+    e.client.cancel = slow_cancel  # type: ignore[method-assign]
+    e.client.default_deadline_s = 0.3
+    assert await e.client.cancel_for_inbound("in-c") == 1
+    assert sorted(started) == ["pa", "pb"]
+    a.gate.set()

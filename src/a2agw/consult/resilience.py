@@ -64,6 +64,11 @@ class CircuitBreaker:
             self._probe_started_at = None
         # open, or half_open without a probe: straggler from before the open; ignore
 
+    def release_probe(self) -> None:
+        """Give back a half-open probe whose call ended with no outcome (cancelled, etc.)."""
+        if self.state == "half_open":
+            self._probe_started_at = None
+
     def record_failure(self) -> None:
         s = self.state
         if s == "closed":

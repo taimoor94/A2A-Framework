@@ -161,3 +161,20 @@ async def test_retry_succeeds_and_cap():
 
     assert await with_retry(fn, attempts=4, base=1.0, cap=1.5, sleep=sleep, rand=lambda: 0.0) == "ok"
     assert delays == pytest.approx([0.5, 0.75, 0.75])
+
+
+def test_release_probe_lets_next_caller_probe():
+    clk = Clock()
+    b = CircuitBreaker(clock=clk)
+    for _ in range(5):
+        b.record_failure()
+    clk.t += 30
+    assert b.allow()
+    assert not b.allow()  # probe in flight
+    b.release_probe()
+    assert b.state == "half_open"
+    assert b.allow()  # a new probe without waiting for the stale one to expire
+    b.record_success()
+    assert b.state == "closed"
+    b.release_probe()  # no-op when closed
+    assert b.state == "closed" and b.allow()
