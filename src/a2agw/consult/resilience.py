@@ -31,7 +31,7 @@ class CircuitBreaker:
         self._clock = clock
         self._failures = 0
         self._opened_at: float | None = None
-        self._probing = False
+        self._probe_started_at: float | None = None
 
     @property
     def state(self) -> State:
@@ -45,25 +45,34 @@ class CircuitBreaker:
         s = self.state
         if s == "closed":
             return True
-        if s == "half_open" and not self._probing:
-            self._probing = True
-            return True
+        if s == "half_open":
+            now = self._clock()
+            started = self._probe_started_at
+            # A probe older than reset_after_s is abandoned (cancelled/crashed caller).
+            if started is None or now - started >= self.reset_after_s:
+                self._probe_started_at = now
+                return True
         return False
 
     def record_success(self) -> None:
-        self._failures = 0
-        self._opened_at = None
-        self._probing = False
+        s = self.state
+        if s == "closed":
+            self._failures = 0
+        elif s == "half_open" and self._probe_started_at is not None:
+            self._failures = 0
+            self._opened_at = None
+            self._probe_started_at = None
+        # open, or half_open without a probe: straggler from before the open; ignore
 
     def record_failure(self) -> None:
-        if self._opened_at is not None:  # failed probe (or late failure while open)
+        s = self.state
+        if s == "closed":
+            self._failures += 1
+            if self._failures >= self.failure_threshold:
+                self._opened_at = self._clock()
+        elif s == "half_open" and self._probe_started_at is not None:
             self._opened_at = self._clock()
-            self._probing = False
-            return
-        self._failures += 1
-        if self._failures >= self.failure_threshold:
-            self._opened_at = self._clock()
-            self._probing = False
+            self._probe_started_at = None
 
 
 class Bulkhead:

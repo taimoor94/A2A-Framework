@@ -19,6 +19,24 @@ class MissingCredential(Exception):
         self.env_var = env_var
 
 
+class InvalidCredential(Exception):
+    """A header name or value contains CR, LF or NUL. Never includes the value."""
+
+    def __init__(self, ref: str | None, header: str):
+        super().__init__(f"credential {ref!r}: header {header!r} has illegal control characters")
+        self.ref = ref
+        self.header = header
+
+
+_BAD = ("\r", "\n", "\0")
+
+
+def _check_header(ref: str | None, name: str, value: str) -> None:
+    if any(c in name or c in value for c in _BAD):
+        safe = name if not any(c in name for c in _BAD) else "<invalid name>"
+        raise InvalidCredential(ref, safe)
+
+
 class CredentialProvider(Protocol):
     async def headers(self, partner: PartnerRecord, caller: Principal | None) -> dict[str, str]: ...
 
@@ -40,6 +58,7 @@ class EnvCredentials:
         value = os.environ.get(env_var)
         if not value:
             raise MissingCredential(ref, env_var)
+        _check_header(ref, header, value)
         return {header: value}
 
 
@@ -102,9 +121,9 @@ class CredentialInterceptor(ClientCallInterceptor):
             return
         if args.context is None:
             args.context = ClientCallContext()
-        if args.context.service_parameters is None:
-            args.context.service_parameters = {}
-        args.context.service_parameters.update(headers)
+        for name, value in headers.items():
+            _check_header(self._partner.credential_ref, name, value)
+        args.context.service_parameters = {**(args.context.service_parameters or {}), **headers}
 
     async def after(self, args: AfterArgs) -> None:
         return None

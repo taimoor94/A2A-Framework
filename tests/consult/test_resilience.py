@@ -56,6 +56,41 @@ def test_half_open_single_probe():
     assert b.allow() is True
 
 
+def _open(clk):
+    b = CircuitBreaker(clock=clk)
+    for _ in range(5):
+        b.record_failure()
+    return b
+
+
+def test_abandoned_probe_is_replaced():
+    clk = Clock()
+    b = _open(clk)
+    clk.t += 31
+    assert b.allow() is True
+    assert b.allow() is False
+    clk.t += 31  # probe caller vanished
+    assert b.state == "half_open"
+    assert b.allow() is True
+    b.record_success()
+    assert b.state == "closed"
+
+
+def test_late_success_while_open_ignored():
+    b = _open(Clock())
+    b.record_success()
+    assert b.state == "open" and not b.allow()
+
+
+def test_late_failure_while_open_does_not_extend():
+    clk = Clock()
+    b = _open(clk)
+    clk.t += 20
+    b.record_failure()
+    clk.t += 11  # 31s since opening
+    assert b.state == "half_open"
+
+
 async def test_bulkhead_busy_after_timeout():
     bh = Bulkhead(max_concurrent=1)
     async with bh.acquire(0.5):
