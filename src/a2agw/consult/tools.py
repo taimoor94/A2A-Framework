@@ -10,14 +10,18 @@ skill id is not sent to the partner: ``per_skill`` only changes tool names and d
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from a2agw.consult.client import PartnerClient
+from a2agw.consult.client import WAIT_ANY_INTERVAL_S, PartnerClient
 from a2agw.consult.registry import PartnerRecord, PartnerRegistry
 from a2agw.consult.results import TEXT_CAP_BYTES, cut_utf8
+from a2agw.security.principal import Principal
 
 logger = logging.getLogger(__name__)
 
@@ -35,18 +39,28 @@ MAX_EXAMPLES = 3
 
 Kind = Literal["consult", "check", "cancel", "wait", "find", "consult_any"]
 
-_CONTROL = re.compile(r"[\x00-\x08\x0e-\x1f\x7f-\x9f\u2028\u2029]")
+_STRIP_CATEGORIES = {"Cc", "Cf", "Cs", "Co", "Zl", "Zp"}
 _HSPACE = re.compile(r"[^\S\n]+")
 _NEWLINES = re.compile(r" ?\n[ \n]*")
 _TOKEN = re.compile(r"[a-z0-9]+")
 
 
-def _clean(text: Any, limit: int) -> str:
-    """Untrusted card text -> control characters stripped, whitespace collapsed, capped."""
+def _clean(text: Any, limit: int, *, single: bool = True) -> str:
+    """Untrusted card text: invisible/control characters stripped, whitespace collapsed, capped.
+
+    ``single`` also folds newlines to spaces, so the text can never start its own line."""
     if not isinstance(text, str):
         return ""
-    s = _CONTROL.sub("", text)
-    s = _NEWLINES.sub("\n", _HSPACE.sub(" ", s)).strip()
+    s = "".join(
+        c
+        for c in text
+        if c in "\n\t"
+        or (unicodedata.category(c) not in _STRIP_CATEGORIES and not 0xE0000 <= ord(c) <= 0xE007F)
+    )
+    if single:
+        s = " ".join(s.split())
+    else:
+        s = _NEWLINES.sub("\n", _HSPACE.sub(" ", s)).strip()
     return s[:limit].rstrip()
 
 
@@ -62,10 +76,10 @@ class PartnerTool:
 # -- schemas -----------------------------------------------------------------------------
 
 _ASK_PROPS: dict[str, Any] = {
-    "message": {"type": "string", "minLength": 1, "description": "What to ask the partner."},
-    "task_id": {"type": "string", "description": "Continue an existing partner task."},
-    "context_id": {"type": "string", "description": "Continue an existing conversation."},
-    "data": {"type": "object", "description": "Optional structured data to send."},
+    "message": {"type": "string", "minLength": 1, "maxLength": 65536, "description": "What to ask the partner."},
+    "task_id": {"type": "string", "maxLength": 256, "description": "Continue an existing partner task."},
+    "context_id": {"type": "string", "maxLength": 256, "description": "Continue an existing conversation."},
+    "data": {"type": "object", "x-max-json-bytes": 32768, "description": "Optional structured data to send."},
     "wait_seconds": {
         "type": "number",
         "minimum": 0,
@@ -89,7 +103,7 @@ def _ask_schema() -> dict[str, Any]:
     return _schema({k: dict(v) for k, v in _ASK_PROPS.items()}, ["message"])
 
 
-_STR = {"type": "string"}
+_STR = {"type": "string", "maxLength": 256}
 _HANDLE = {"partner_id": dict(_STR), "task_id": dict(_STR)}
 
 
@@ -152,21 +166,21 @@ def _skill_lines(skill: dict[str, Any]) -> list[str]:
     lines = [head]
     for ex in _strs(skill.get("examples"))[:MAX_EXAMPLES]:
         if e := _clean(ex, MAX_EXAMPLE):
-            lines.append(f'  example: "{e}"')
+            lines.append(f"  example: {e}")
     tags = [t for t in (_clean(t, 40) for t in _strs(skill.get("tags"))) if t]
     if tags:
         lines.append("  tags: " + ", ".join(tags))
     return lines
 
 
-def _describe(rec: PartnerRecord, skills: list[dict[str, Any]], focus: str | None = None) -> str:
+def _describe(rec: PartnerRecord, skills: list[dict[str, Any]]) -> str:
     first = f'Consult partner agent "{rec.id}" (trust: {rec.tier}).'
     trust = f"Trust: {rec.tier}"
     body: list[str] = []
     if name := _clean(rec.card.get("name"), 100):
         body.append(f"Name: {name}")
-    if desc := _clean(rec.card.get("description"), MAX_DESCRIPTION):
-        body.append(desc)
+    if desc := _clean(rec.card.get("description"), MAX_DESCRIPTION, single=False):
+        body += desc.split("\n")
     if skills:
         body.append("Skills:")
         for s in skills:
@@ -174,7 +188,8 @@ def _describe(rec: PartnerRecord, skills: list[dict[str, Any]], focus: str | Non
     head = first + "\n" + FRAMING + "\n"
     tail = "\n" + trust + "\n" + UNTRUSTED_NOTE
     budget = MAX_DESCRIPTION - len(head) - len(tail)
-    text = "\n".join(body)
+    # Every partner line starts with "| ", so it can never forge one of our generated lines.
+    text = "\n".join("| " + line for line in body)
     if len(text) > budget:
         text = text[: max(budget - 1, 0)].rstrip() + "…"
     return head + text + tail
@@ -204,12 +219,12 @@ def partner_tools(
     taken = {"a2a_check_task", "a2a_cancel_task", "a2a_wait", "find_partners", "consult_partner"}
     tools: list[PartnerTool] = []
     if len(partners) > discovery_threshold:
-        consult_props = {"partner_id": {"type": "string"}, **_ask_schema()["properties"]}
+        consult_props = {"partner_id": dict(_STR), **_ask_schema()["properties"]}
         tools.append(
             PartnerTool(
                 "find_partners",
                 "Find partner agents suited to a need. Returns candidates with ids; "
-                "then call consult_partner with the chosen partner_id.",
+                "then call consult_partner with the chosen partner_id. " + UNTRUSTED_NOTE,
                 _schema(
                     {
                         "need": {"type": "string", "description": "What you need help with."},
@@ -264,7 +279,7 @@ def _tokens(*texts: Any) -> set[str]:
     out: set[str] = set()
     for t in texts:
         if isinstance(t, str):
-            out |= {w for w in _TOKEN.findall(t.lower()) if len(w) >= 2}
+            out |= {w for w in _TOKEN.findall(_clean(t, 10_000).lower()) if len(w) >= 2}
     return out
 
 
@@ -296,7 +311,7 @@ def rank_partners(registry: PartnerRegistry, need: str, k: int = 5) -> list[dict
                     "partner_id": rec.id,
                     "name": _clean(rec.card.get("name"), 100),
                     "description": _clean(rec.card.get("description"), MAX_SKILL_DESCRIPTION),
-                    "skills": [n for s in skills if (n := _clean(s.get("name"), 100))],
+                    "skills": [n for s in skills if (n := _clean(s.get("name"), 100))][:10],
                     "tier": rec.tier,
                     "score": score,
                 },
@@ -320,6 +335,8 @@ def _check(value: Any, schema: dict[str, Any], path: str) -> Any:
     elif t == "number":
         ok = isinstance(value, (int, float)) and not isinstance(value, bool)
     elif t == "integer":
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
         ok = isinstance(value, int) and not isinstance(value, bool)
     elif t == "object":
         ok = isinstance(value, dict)
@@ -329,8 +346,17 @@ def _check(value: Any, schema: dict[str, Any], path: str) -> Any:
         ok = True
     if not ok:
         raise _Invalid(path)
-    if t == "string" and len(value) < schema.get("minLength", 0):
+    if t == "string" and not schema.get("minLength", 0) <= len(value) <= schema.get(
+        "maxLength", len(value)
+    ):
         raise _Invalid(path)
+    if t == "object" and "x-max-json-bytes" in schema:
+        try:
+            size = len(json.dumps(value).encode())
+        except (RecursionError, ValueError, TypeError):
+            raise _Invalid(path) from None
+        if size > schema["x-max-json-bytes"]:
+            raise _Invalid(path)
     if t in ("number", "integer") and not (
         schema.get("minimum", value) <= value <= schema.get("maximum", value)  # NaN fails both
     ):
@@ -360,13 +386,51 @@ def _check_object(args: dict[str, Any], schema: dict[str, Any], path: str) -> di
     return out
 
 
-def _cap(result: Any) -> dict[str, Any]:
+def _cap(result: Any, limit: int = TEXT_CAP_BYTES) -> dict[str, Any]:
+    """Defence in depth: partner text, question and inlined artifact text fit in ``limit`` bytes."""
     d = result.model_dump()
+    cut_any = False
+    left = limit
     for field in ("text", "question"):
         if isinstance(d.get(field), str):
-            d[field], cut = cut_utf8(d[field], TEXT_CAP_BYTES)
-            d["truncated"] = d["truncated"] or cut
+            d[field], cut = cut_utf8(d[field], limit)
+            cut_any |= cut
+    left -= len(d["text"].encode())
+    for art in d.get("artifacts", []):
+        parts = art.get("parts")
+        for i, part in enumerate(parts if isinstance(parts, list) else []):
+            if part.get("truncated"):
+                continue
+            if isinstance(part.get("text"), str):
+                part["text"], cut = cut_utf8(part["text"], max(left, 0))
+                cut_any |= cut
+                left -= len(part["text"].encode())
+            elif "data" in part:
+                size = len(json.dumps(part["data"]).encode())
+                if size > left:
+                    parts[i] = {"kind": "data", "truncated": True, "size": size}
+                    cut_any = True
+                else:
+                    left -= size
+    d["truncated"] = bool(d.get("truncated")) or cut_any
     return d
+
+
+async def _wait(
+    client: PartnerClient, handles: list[tuple[str, str]], seconds: float, caller: Principal | None
+) -> list[Any]:
+    """Like ``PartnerClient.wait_any`` (which cannot carry a caller): poll until one handle is
+    no longer working or ``seconds`` pass, checking every handle as ``caller``."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + seconds
+    while True:
+        results = list(await asyncio.gather(*(client.check(p, t, caller=caller) for p, t in handles)))
+        if any(r.state != "working" for r in results):
+            return results
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return results
+        await asyncio.sleep(min(WAIT_ANY_INTERVAL_S, remaining))
 
 
 async def invoke(
@@ -374,12 +438,13 @@ async def invoke(
     args: dict[str, Any],
     client: PartnerClient,
     inbound_task_id: str | None,
+    caller: Principal | None = None,
 ) -> dict[str, Any]:
     """Run one tool call. Never raises; invalid arguments are answered with ``rejected``."""
     try:
         a = _check_object(args, tool.parameters, "") if isinstance(args, dict) else _bad("args")
     except _Invalid as e:
-        return {"state": "rejected", "reason": f"invalid arguments: {e}"}
+        return {"state": "rejected", "reason": f"invalid arguments: {str(e)[:64]}"}
     try:
         if tool.kind in ("consult", "consult_any"):
             if tool.kind == "consult":
@@ -397,16 +462,18 @@ async def invoke(
                     context_id=a.get("context_id"),
                     wait_seconds=a["wait_seconds"],
                     inbound_task_id=inbound_task_id,
+                    caller=caller,
                 )
             )
         if tool.kind == "check":
-            return _cap(await client.check(a["partner_id"], a["task_id"]))
+            return _cap(await client.check(a["partner_id"], a["task_id"], caller=caller))
         if tool.kind == "cancel":
-            return _cap(await client.cancel(a["partner_id"], a["task_id"]))
+            return _cap(await client.cancel(a["partner_id"], a["task_id"], caller=caller))
         if tool.kind == "wait":
-            handles = [(t["partner_id"], t["task_id"]) for t in a["tasks"]]
-            results = await client.wait_any(handles, a["seconds"])
-            return {"results": [_cap(r) for r in results]}
+            handles = list(dict.fromkeys((t["partner_id"], t["task_id"]) for t in a["tasks"]))
+            results = await _wait(client, handles, a["seconds"], caller)
+            share = TEXT_CAP_BYTES // len(results)
+            return {"results": [_cap(r, share) for r in results]}
         if tool.kind == "find":
             return {"partners": rank_partners(client.registry, a["need"], a["k"])}
     except Exception:
