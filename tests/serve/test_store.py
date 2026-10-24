@@ -154,3 +154,78 @@ async def test_recovery_index_only_when_task_missing(engine, index):
     assert report.failed == ["ghost"]
     rows, _ = await index.list("rec-miss", FAILED, limit=10, cursor=None)
     assert [r["task_id"] for r in rows] == ["ghost"]
+
+
+async def test_recovery_continues_when_cancel_raises(engine, index):
+    store = task_store_for(engine, "rec-cx")
+    await store.initialize()
+    await _seed(index, store, "rec-cx", "a1", W)
+    await _seed(index, store, "rec-cx", "a2", W)
+    handles = _Handles(
+        {"a1": [{"task_id": "p1", "partner_id": "px"}, {"task_id": "p2", "partner_id": "py"}]}
+    )
+    calls = []
+
+    async def cancel(h):
+        calls.append(h["task_id"])
+        if h["task_id"] == "p1":
+            raise RuntimeError("boom")
+
+    report = await recover_on_startup(index, {"rec-cx": store}, {}, handles, cancel)
+    assert sorted(report.failed) == ["a1", "a2"]
+    assert calls == ["p1", "p2"]
+    assert report.cancel_errors == ["a1:px"]
+    assert report.outbound_cancelled == 1 and report.errors == []
+    rows, _ = await index.list("rec-cx", FAILED, limit=10, cursor=None)
+    assert len(rows) == 2
+
+
+class _FlakyStore:
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def get(self, task_id, ctx):
+        if task_id == "bad":
+            raise RuntimeError("db down")
+        return await self.inner.get(task_id, ctx)
+
+    async def save(self, task, ctx):
+        await self.inner.save(task, ctx)
+
+
+async def test_recovery_continues_when_store_get_raises(engine, index):
+    inner = task_store_for(engine, "rec-sg")
+    await inner.initialize()
+    await _seed(index, inner, "rec-sg", "bad", W)
+    await _seed(index, inner, "rec-sg", "good", W)
+    report = await recover_on_startup(index, {"rec-sg": _FlakyStore(inner)}, {}, None, None)
+    assert report.errors == ["bad"] and report.failed == ["good"]
+    assert (await inner.get("good", _ctx("key:alice"))).status.state == TaskState.TASK_STATE_FAILED
+
+
+def test_task_store_for_is_idempotent(engine):
+    assert task_store_for(engine, "idem-a") is task_store_for(engine, "idem-a")
+    task_store_for(engine, "idem-b-c")
+    with pytest.raises(ValueError, match="same table"):
+        task_store_for(engine, "idem_b-c")
+    with pytest.raises(ValueError, match="invalid agent_id"):
+        task_store_for(engine, "bad name; drop")
+
+
+async def test_list_rejects_malformed_cursor(index):
+    for bad in ("!!!notbase64", "bm9zZXA="):
+        with pytest.raises(ValueError, match="invalid cursor"):
+            await index.list(None, None, limit=5, cursor=bad)
+
+
+async def test_pagination_with_equal_timestamps(index, monkeypatch):
+    monkeypatch.setattr("a2agw.serve.store.time.time", lambda: 1000.0)
+    for tid in ["d", "b", "e", "a", "c"]:
+        await index.upsert(tid, "ag", "key:x", "c", W, None)
+    seen, cur = [], None
+    while True:
+        rows, cur = await index.list("ag", None, limit=2, cursor=cur)
+        seen += [r["task_id"] for r in rows]
+        if not cur:
+            break
+    assert seen == ["a", "b", "c", "d", "e"]

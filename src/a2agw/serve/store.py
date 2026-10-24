@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import base64
+import binascii
+import logging
+import re
 import time
 import warnings
 from collections.abc import Awaitable, Callable
@@ -32,13 +35,17 @@ _index_table = Table(
     Column("origin", String, nullable=True),
 )
 
-_ACTIVE_STATES = {
-    "TASK_STATE_SUBMITTED",
-    "TASK_STATE_WORKING",
-    "TASK_STATE_INPUT_REQUIRED",
-    "TASK_STATE_AUTH_REQUIRED",
+_RESUMABLE_STATES = {
+    TaskState.Name(TaskState.TASK_STATE_INPUT_REQUIRED),
+    TaskState.Name(TaskState.TASK_STATE_AUTH_REQUIRED),
 }
-_RESUMABLE_STATES = {"TASK_STATE_INPUT_REQUIRED", "TASK_STATE_AUTH_REQUIRED"}
+_ACTIVE_STATES = {
+    TaskState.Name(TaskState.TASK_STATE_SUBMITTED),
+    TaskState.Name(TaskState.TASK_STATE_WORKING),
+} | _RESUMABLE_STATES
+_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_STORES: dict[tuple[int, str], tuple[str, DatabaseTaskStore]] = {}
+logger = logging.getLogger(__name__)
 
 
 async def create_engine(url: str = "sqlite+aiosqlite:///a2agw.db") -> AsyncEngine:
@@ -46,14 +53,29 @@ async def create_engine(url: str = "sqlite+aiosqlite:///a2agw.db") -> AsyncEngin
 
 
 def task_store_for(engine: AsyncEngine, agent_id: str) -> DatabaseTaskStore:
-    """One table per agent; call once per agent_id per process."""
+    """One table per agent. Idempotent per (engine, agent): repeat calls return the same store.
+
+    The SDK registers tables on a process-global MetaData, so a store cannot be built twice
+    for the same table name.
+    """
+    if not _AGENT_ID_RE.fullmatch(agent_id):
+        raise ValueError(f"invalid agent_id for table name: {agent_id!r}")
+    table_name = f"tasks_{agent_id.replace('-', '_')}"
+    key = (id(engine), table_name)
+    cached = _STORES.get(key)
+    if cached is not None:
+        if cached[0] != agent_id:
+            raise ValueError(
+                f"agent ids {cached[0]!r} and {agent_id!r} map to the same table {table_name!r}"
+            )
+        return cached[1]
     # The SDK names every generated model class "TaskModel", which makes SQLAlchemy warn
     # once per extra table. The tables are distinct, so the warning is noise.
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="This declarative base already contains a class")
-        return DatabaseTaskStore(
-            engine, create_table=True, table_name=f"tasks_{agent_id.replace('-', '_')}"
-        )
+        store = DatabaseTaskStore(engine, create_table=True, table_name=table_name)
+    _STORES[key] = (agent_id, store)
+    return store
 
 
 def _encode_cursor(updated_at: float, task_id: str) -> str:
@@ -61,9 +83,14 @@ def _encode_cursor(updated_at: float, task_id: str) -> str:
 
 
 def _decode_cursor(cursor: str) -> tuple[float, str]:
-    raw = base64.urlsafe_b64decode(cursor.encode()).decode()
-    ts, _, task_id = raw.partition(":")
-    return float(ts), task_id
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode()).decode()
+        ts, sep, task_id = raw.partition(":")
+        if not sep:
+            raise ValueError("missing separator")
+        return float(ts), task_id
+    except (binascii.Error, ValueError, UnicodeError) as exc:
+        raise ValueError("invalid cursor") from exc
 
 
 class TaskIndex:
@@ -158,6 +185,8 @@ class RecoveryReport:
     failed: list[str] = field(default_factory=list)
     kept: list[str] = field(default_factory=list)
     outbound_cancelled: int = 0
+    cancel_errors: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
 
 def _context_for(owner: str) -> ServerCallContext:
@@ -185,24 +214,32 @@ async def recover_on_startup(
         if row["state"] in _RESUMABLE_STATES and durable.get(agent_id, False):
             report.kept.append(task_id)
             continue
-        store = stores.get(agent_id)
-        if store is not None:
-            ctx = _context_for(owner)
-            task = await store.get(task_id, ctx)
-            if task is not None:
-                task.status.state = TaskState.TASK_STATE_FAILED
-                task.status.message.CopyFrom(
-                    Message(
-                        message_id=f"recovery-{task_id}",
-                        role=Role.ROLE_AGENT,
-                        parts=[Part(text="gateway restarted")],
+        try:
+            store = stores.get(agent_id)
+            if store is not None:
+                ctx = _context_for(owner)
+                task = await store.get(task_id, ctx)
+                if task is not None:
+                    task.status.state = TaskState.TASK_STATE_FAILED
+                    task.status.message.CopyFrom(
+                        Message(
+                            message_id=f"recovery-{task_id}",
+                            role=Role.ROLE_AGENT,
+                            parts=[Part(text="gateway restarted")],
+                        )
                     )
-                )
-                await store.save(task, ctx)
-        await index.set_state(task_id, failed_state)
-        report.failed.append(task_id)
-        if handles is not None and cancel_outbound is not None:
-            for handle in await handles.by_inbound(task_id):
-                await cancel_outbound(handle)
-                report.outbound_cancelled += 1
+                    await store.save(task, ctx)
+            if handles is not None and cancel_outbound is not None:
+                for handle in await handles.by_inbound(task_id):
+                    try:
+                        await cancel_outbound(handle)
+                        report.outbound_cancelled += 1
+                    except Exception:
+                        logger.exception("outbound cancel failed during recovery")
+                        report.cancel_errors.append(f"{task_id}:{handle.get('partner_id')}")
+            await index.set_state(task_id, failed_state)
+            report.failed.append(task_id)
+        except Exception:
+            logger.exception("recovery failed for task %s", task_id)
+            report.errors.append(task_id)
     return report
