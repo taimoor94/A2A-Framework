@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "a2a-gateway"
+version = "0.1.0"
+description = "Framework-agnostic A2A (Agent2Agent protocol) gateway: serve agents inbound and expose partner agents outbound as tools."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = [
+    "a2a-sdk[http-server,sqlite,telemetry]>=1.2.3,<2",
+    "starlette",
+    "uvicorn",
+    "httpx",
+    "pydantic>=2",
+    "pyjwt[crypto]",
+    "pyyaml",
+    "typer",
+    "opentelemetry-sdk",
+]
+
+[project.optional-dependencies]
+langchain = ["langchain-core>=1.7"]
+langgraph = ["langgraph>=1.2", "langchain-core>=1.7"]
+all = ["langchain-core>=1.7", "langgraph>=1.2"]
+
+[project.scripts]
+a2agw = "a2agw.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "respx",
+    "ruff",
+    "mypy",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/a2agw"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
