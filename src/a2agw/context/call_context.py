@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 import uuid
 from collections.abc import Iterator, Mapping
@@ -12,6 +13,10 @@ from typing import Any
 
 EXTENSION_URI = "https://a2agw.dev/ext/call-context/v1"
 METADATA_KEY = EXTENSION_URI
+
+
+MAX_STR = 256
+MAX_PATH = 64
 
 
 class CallContextViolation(Exception):
@@ -40,8 +45,8 @@ def _str(d: Mapping, key: str, *, required: bool = False) -> str | None:
         if required:
             raise ValueError(f"call-context: missing required field {key!r}")
         return None
-    if not isinstance(v, str) or (required and not v):
-        raise ValueError(f"call-context: {key!r} must be a string")
+    if not isinstance(v, str) or (required and not v) or len(v) > MAX_STR:
+        raise ValueError(f"call-context: {key!r} must be a string of at most {MAX_STR} chars")
     return v
 
 
@@ -84,32 +89,45 @@ class CallContext:
 
     @classmethod
     def from_metadata(cls, md: Mapping) -> CallContext | None:
+        if not isinstance(md, Mapping):
+            raise ValueError("call-context: metadata must be a mapping")  # noqa: TRY004
         raw = md.get(METADATA_KEY)
         if raw is None:
             return None
         if not isinstance(raw, Mapping):
             raise ValueError("call-context: metadata value must be an object")  # noqa: TRY004
         path = raw.get("path", [])
-        if isinstance(path, str) or not hasattr(path, "__iter__"):
-            raise ValueError("call-context: 'path' must be a list of strings")
-        path = list(path)
-        if not all(isinstance(p, str) for p in path):
-            raise ValueError("call-context: 'path' must be a list of strings")
-        deadline = raw.get("deadline")
-        if deadline is not None and (
-            isinstance(deadline, bool) or not isinstance(deadline, (int, float))
+        if (
+            not isinstance(path, (list, tuple))
+            or len(path) > MAX_PATH
+            or not all(isinstance(p, str) and len(p) <= MAX_STR for p in path)
         ):
-            raise ValueError("call-context: 'deadline' must be a number")
+            raise ValueError(
+                f"call-context: 'path' must be a list of at most {MAX_PATH} short strings"
+            )
+        deadline = raw.get("deadline")
+        if deadline is not None:
+            if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+                raise ValueError("call-context: 'deadline' must be a number")
+            try:
+                deadline = float(deadline)
+            except OverflowError:
+                raise ValueError("call-context: 'deadline' out of range") from None
+            if not math.isfinite(deadline):
+                raise ValueError("call-context: 'deadline' must be finite")
+        max_calls = _int(raw, "max_calls", None)
+        if max_calls is not None and max_calls < 0:
+            raise ValueError("call-context: 'max_calls' must be non-negative")
         return cls(
             origin=_str(raw, "origin", required=True),  # type: ignore[arg-type]
             root_agent=_str(raw, "root_agent", required=True),  # type: ignore[arg-type]
             hop=_int(raw, "hop", 0),  # type: ignore[arg-type]
             max_hops=_int(raw, "max_hops", 8),  # type: ignore[arg-type]
             path=tuple(path),
-            deadline=float(deadline) if deadline is not None else None,
+            deadline=deadline,
             traceparent=_str(raw, "traceparent"),
             on_behalf_of=_str(raw, "on_behalf_of"),
-            max_calls=_int(raw, "max_calls", None),
+            max_calls=max_calls,
             calls_used=_int(raw, "calls_used", 0),  # type: ignore[arg-type]
         )
 
@@ -130,15 +148,29 @@ class CallContext:
         }
 
     def clamp(
-        self, *, local_max_hops: int, local_max_deadline_s: float, now: float
+        self,
+        *,
+        local_max_hops: int,
+        local_max_deadline_s: float,
+        now: float,
+        local_max_calls: int | None = None,
     ) -> CallContext:
-        """Cap untrusted inbound values to local policy."""
+        """Cap untrusted inbound values to local policy (fails closed on non-finite deadlines)."""
         limit = now + local_max_deadline_s
+        if self.deadline is None or not math.isfinite(self.deadline):
+            deadline = limit
+        else:
+            deadline = min(self.deadline, limit)
+        max_calls = self.max_calls
+        if local_max_calls is not None:
+            max_calls = min(max_calls if max_calls is not None else local_max_calls, local_max_calls)
         return replace(
             self,
             hop=max(self.hop, 0),
             max_hops=min(self.max_hops, local_max_hops),
-            deadline=min(self.deadline, limit) if self.deadline is not None else limit,
+            deadline=deadline,
+            max_calls=max_calls,
+            calls_used=max(self.calls_used, 0),
         )
 
     def child(self, next_agent: str) -> CallContext:
@@ -162,7 +194,7 @@ class CallContext:
         if agent_id in self.path and not allow_reentry:
             raise CycleDetected(f"agent {agent_id!r} already in path {list(self.path)}")
         rem = self.remaining(now)
-        if rem is not None and rem <= 0:
+        if rem is not None and not rem > 0:  # also rejects NaN
             raise DeadlineExceeded("call deadline exceeded")
         if self.max_calls is not None and self.calls_used > self.max_calls:
             raise BudgetExceeded(f"calls_used {self.calls_used} exceeds max_calls {self.max_calls}")
