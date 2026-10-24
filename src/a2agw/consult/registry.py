@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -19,14 +20,15 @@ from a2a.client.card_resolver import parse_agent_card
 from a2a.types import AgentCard
 from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH
 from google.protobuf.json_format import MessageToDict
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from a2agw.consult.netguard import Tier, UnsafeURL, check_url
+from a2agw.consult.netguard import Tier, UnsafeURL, check_url, check_url_syntax
 
 MAX_CARD_BYTES = 1024 * 1024
 FETCH_TIMEOUT_S = 10.0
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
-SIGNIFICANT_FIELDS = ("skills", "supportedInterfaces", "securitySchemes", "securityRequirements")
+# Everything except these top-level fields is significant (name/description reach LLM tool text).
+COSMETIC_FIELDS = frozenset({"version", "documentationUrl", "iconUrl", "provider"})
 
 Status = Literal["active", "quarantined", "disabled"]
 
@@ -41,6 +43,8 @@ def card_hash(card: dict[str, Any]) -> str:
 
 
 class PartnerRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     id: str
     card_url: str | None = None
     card: dict[str, Any]
@@ -52,6 +56,13 @@ class PartnerRecord(BaseModel):
     fetched_at: float = 0.0
     ttl_s: int = 3600
     pending_card: dict[str, Any] | None = None
+
+    @field_validator("id")
+    @classmethod
+    def _valid_id(cls, v: str) -> str:
+        if not _ID_RE.match(v):
+            raise ValueError(f"invalid partner id: {v!r}")
+        return v
 
     @property
     def agent_card(self) -> AgentCard:
@@ -74,7 +85,8 @@ def _card_urls(base: str) -> str:
 
 
 def _significant_differs(old: dict[str, Any], new: dict[str, Any]) -> bool:
-    return any(old.get(k) != new.get(k) for k in SIGNIFICANT_FIELDS)
+    keys = (set(old) | set(new)) - COSMETIC_FIELDS
+    return any(old.get(k) != new.get(k) for k in keys)
 
 
 class PartnerRegistry:
@@ -98,7 +110,7 @@ class PartnerRegistry:
 
     async def _fetch_with(self, client: httpx.AsyncClient, url: str) -> dict[str, Any]:
         try:
-            async with client.stream(
+            async with asyncio.timeout(FETCH_TIMEOUT_S), client.stream(
                 "GET", url, follow_redirects=False, timeout=FETCH_TIMEOUT_S
             ) as resp:
                 if 300 <= resp.status_code < 400:
@@ -110,6 +122,8 @@ class PartnerRegistry:
                     buf.extend(chunk)
                     if len(buf) > MAX_CARD_BYTES:
                         raise CardFetchError("agent card exceeds 1 MiB")
+        except TimeoutError:
+            raise CardFetchError("card fetch timed out") from None
         except httpx.HTTPError as e:
             raise CardFetchError(f"card fetch failed: {type(e).__name__}") from None
         try:
@@ -178,6 +192,11 @@ class PartnerRegistry:
         self._changed(rec, "added")
         return rec
 
+    async def verify_endpoints(self, id: str) -> None:
+        """Run the full SSRF check on a stored card's interface URLs (call before use)."""
+        rec = self.get(id)
+        await self._check_endpoints(rec.agent_card, rec.tier)
+
     async def refresh(self, id: str) -> Literal["unchanged", "quarantined"]:
         rec = self.get(id)
         if rec.status == "disabled" or not rec.card_url:
@@ -185,26 +204,38 @@ class PartnerRegistry:
         raw = await self._fetch(rec.card_url, rec.tier)
         card, proto = _normalize(raw)
         await self._check_endpoints(proto, rec.tier)
+        if self._records.get(id) is not rec or rec.status == "disabled":
+            return "unchanged"  # changed while we awaited
         new_hash = card_hash(card)
         rec.fetched_at = time.time()
-        if new_hash == rec.card_hash:
-            self._changed(rec, "updated")
-            return "unchanged"
         if _significant_differs(rec.card, card):
             rec.pending_card = card
             rec.status = "quarantined"
             self._changed(rec, "quarantined")
             return "quarantined"
+        # Same significant content as the approved card: apply cosmetics, lift quarantine.
+        changed = new_hash != rec.card_hash or rec.status == "quarantined"
         rec.card, rec.card_hash = card, new_hash
-        self._changed(rec, "updated")
+        rec.pending_card = None
+        rec.status = "active"
+        if changed:
+            self._changed(rec, "updated")
+        elif self.path is not None:
+            self.save()
         return "unchanged"
 
-    def approve(self, id: str) -> PartnerRecord:
+    def approve(self, id: str, expected_hash: str | None = None) -> PartnerRecord:
         rec = self.get(id)
+        if rec.status == "disabled":
+            raise ValueError("partner is disabled; re-enable explicitly before approving")
         if rec.pending_card is not None:
+            if expected_hash is not None and expected_hash != card_hash(rec.pending_card):
+                raise ValueError("pending card changed since it was reviewed")
             rec.card = rec.pending_card
             rec.card_hash = card_hash(rec.card)
             rec.pending_card = None
+        elif expected_hash is not None and expected_hash != rec.card_hash:
+            raise ValueError("card changed since it was reviewed")
         rec.status = "active"
         self._changed(rec, "approved")
         return rec
@@ -247,7 +278,33 @@ class PartnerRegistry:
     def load(self) -> None:
         if self.path is None or not self.path.exists():
             return
-        data = yaml.safe_load(self.path.read_text()) or {}
-        self._records = {
-            r["id"]: PartnerRecord.model_validate(r) for r in data.get("partners", [])
-        }
+        data = yaml.safe_load(self.path.read_text())
+        if not isinstance(data, dict) or not isinstance(data.get("partners"), list):
+            raise ValueError("partner file must be a mapping with a 'partners' list")  # noqa: TRY004
+        records: dict[str, PartnerRecord] = {}
+        for item in data["partners"]:
+            rec = self._validate_loaded(item)
+            if rec.id in records:
+                raise ValueError(f"duplicate partner id in file: {rec.id!r}")
+            records[rec.id] = rec
+        self._records = records
+
+    @staticmethod
+    def _validate_loaded(item: Any) -> PartnerRecord:
+        if not isinstance(item, dict):
+            raise ValueError("partner entry must be a mapping")  # noqa: TRY004
+        rec = PartnerRecord.model_validate(item)
+        if card_hash(rec.card) != rec.card_hash:
+            raise ValueError(f"card hash mismatch for partner {rec.id!r}")
+        try:
+            rec.card, proto = _normalize(rec.card)
+            if rec.pending_card is not None:
+                rec.pending_card, _ = _normalize(rec.pending_card)
+            if rec.card_url is not None:
+                check_url_syntax(rec.card_url)
+            for iface in proto.supported_interfaces:
+                check_url_syntax(iface.url)
+        except (CardFetchError, UnsafeURL) as e:
+            raise ValueError(f"invalid partner {rec.id!r}: {e}") from None
+        rec.card_hash = card_hash(rec.card)
+        return rec

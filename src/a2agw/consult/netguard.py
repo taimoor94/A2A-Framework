@@ -7,7 +7,8 @@ import ipaddress
 import os
 import socket
 from typing import Literal
-from urllib.parse import urlsplit
+
+import httpx
 
 Tier = Literal["internal", "partner", "public"]
 
@@ -47,23 +48,29 @@ def _is_public(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     )
 
 
-async def check_url(url: str, tier: Tier) -> None:
-    """Raise UnsafeURL if `url` must not be fetched/called for `tier`."""
+def check_url_syntax(url: str) -> tuple[str, str]:
+    """Synchronous checks (scheme, userinfo, host). Returns (scheme, host-as-httpx-connects)."""
     try:
-        parts = urlsplit(url)
-        host = parts.hostname
-        parts.port  # noqa: B018 - validates the port
-    except ValueError:
+        parsed = httpx.URL(url)
+        host = parsed.raw_host.decode("ascii")  # IDNA2008, exactly what httpx connects to
+        userinfo = parsed.userinfo
+    except (httpx.InvalidURL, UnicodeError, ValueError):
         raise UnsafeURL("malformed URL") from None
-    if parts.scheme not in ("http", "https"):
+    if parsed.scheme not in ("http", "https"):
         raise UnsafeURL("scheme must be http or https")
-    if parts.username is not None or parts.password is not None or "@" in parts.netloc:
+    if userinfo or "@" in parsed.netloc.decode("ascii", "replace"):
         raise UnsafeURL("userinfo in URL is not allowed")
     if not host:
         raise UnsafeURL("URL has no host")
+    return parsed.scheme, host
+
+
+async def check_url(url: str, tier: Tier) -> None:
+    """Raise UnsafeURL if `url` must not be fetched/called for `tier`."""
+    scheme, host = check_url_syntax(url)
     if tier == "internal":
         return  # R2: no IP checks, unresolvable hosts allowed
-    if parts.scheme != "https" and os.environ.get("A2AGW_DEV") != "1":
+    if scheme != "https" and os.environ.get("A2AGW_DEV") != "1":
         raise UnsafeURL("https is required")
 
     try:
