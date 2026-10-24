@@ -1,0 +1,249 @@
+"""AgentHost end to end: routing, auth, limits and restart recovery."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import uuid
+
+import httpx
+import pytest
+from a2a.client import ClientConfig, ClientFactory
+from a2a.types import (
+    GetTaskRequest,
+    Message,
+    Part,
+    Role,
+    SendMessageConfiguration,
+    SendMessageRequest,
+    TaskState,
+)
+from a2a.utils.errors import InvalidParamsError, TaskNotFoundError
+
+from a2agw.core.events import Done
+from a2agw.security.auth import AgentAccess, ApiKeyEntry, AuthConfig
+from a2agw.serve.agent import AgentSpec, SkillSpec
+from a2agw.serve.host import AgentHost
+
+
+class Echo:
+    durable_sessions = False
+
+    async def run(self, ctx):
+        yield Done(text=f"echo: {ctx.text}")
+
+
+class Blocker:
+    durable_sessions = False
+
+    def __init__(self) -> None:
+        self.started = asyncio.Event()
+
+    async def run(self, ctx):
+        self.started.set()
+        await asyncio.Event().wait()
+        yield Done(text="never")
+
+
+def spec(agent_id: str, adapter=None, **kw) -> AgentSpec:
+    return AgentSpec(
+        id=agent_id,
+        name=agent_id.title(),
+        description="Test agent",
+        skills=[SkillSpec(id="s", name="S", description="d")],
+        adapter=adapter or Echo(),
+        **kw,
+    )
+
+
+def msg(text: str = "hi", parts: int = 1) -> Message:
+    return Message(
+        message_id=uuid.uuid4().hex,
+        role=Role.ROLE_USER,
+        parts=[Part(text=text) for _ in range(parts)],
+    )
+
+
+def key_auth(**keys: str) -> AuthConfig:
+    return AuthConfig(
+        api_keys={
+            hashlib.sha256(secret.encode()).hexdigest(): ApiKeyEntry(principal_id=pid)
+            for pid, secret in keys.items()
+        }
+    )
+
+
+class Env:
+    def __init__(self, tmp_path, **host_kwargs) -> None:
+        self.host = AgentHost(
+            "http://t", db_url=f"sqlite+aiosqlite:///{tmp_path / 'host.db'}", **host_kwargs
+        )
+        self._clients: list[httpx.AsyncClient] = []
+
+    async def start(self) -> None:
+        await self.host.startup()
+
+    def http(self, **headers: str) -> httpx.AsyncClient:
+        hc = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=self.host.app()),
+            base_url="http://t",
+            headers=headers,
+        )
+        self._clients.append(hc)
+        return hc
+
+    def client(self, agent_id: str, *, streaming: bool = False, **headers: str):
+        hc = self.http(**headers)
+        card = self.host.cards[agent_id]
+        return ClientFactory(ClientConfig(httpx_client=hc, streaming=streaming)).create(card)
+
+    async def stop(self) -> None:
+        for hc in self._clients:
+            await hc.aclose()
+        await self.host.shutdown()
+
+
+@pytest.fixture
+async def env(tmp_path):
+    made: list[Env] = []
+
+    async def _make(*specs: AgentSpec, **host_kwargs) -> Env:
+        e = Env(tmp_path, **host_kwargs)
+        for s in specs:
+            e.host.add(s)
+        await e.start()
+        made.append(e)
+        return e
+
+    yield _make
+    for e in made:
+        await e.stop()
+
+
+async def send_one(client, message: Message, **config):
+    req = SendMessageRequest(message=message)
+    if config:
+        req.configuration.CopyFrom(SendMessageConfiguration(**config))
+    return [ev async for ev in client.send_message(req)]
+
+
+def task_id_of(events) -> str:
+    return events[0].task.id
+
+
+async def test_two_agents_isolated_cards_and_rpc(env):
+    e = await env(spec("alpha"), spec("beta"))
+    hc = e.http()
+    for aid in ("alpha", "beta"):
+        r = await hc.get(f"/agents/{aid}/.well-known/agent-card.json")
+        assert r.status_code == 200 and r.json()["name"] == aid.title()
+    events = await send_one(e.client("alpha"), msg("yo"))
+    assert events[0].task.status.state == TaskState.TASK_STATE_COMPLETED
+    assert events[0].task.artifacts[0].parts[0].text == "echo: yo"
+    assert (await hc.get("/.well-known/agent-card.json")).status_code == 404
+    assert (await hc.post("/agents/nope/", json={})).status_code == 404
+
+
+async def test_duplicate_and_late_add_rejected(env):
+    e = await env(spec("alpha"))
+    with pytest.raises(ValueError):
+        e.host.add(spec("alpha"))
+    e.host.app()
+    with pytest.raises(RuntimeError):
+        e.host.add(spec("beta"))
+
+
+async def test_single_agent_root_card(env):
+    e = await env(spec("solo"))
+    r = await e.http().get("/.well-known/agent-card.json")
+    assert r.status_code == 200 and r.json()["name"] == "Solo"
+
+
+async def test_task_from_agent_a_not_visible_via_agent_b(env):
+    e = await env(spec("alpha"), spec("beta"))
+    tid = task_id_of(await send_one(e.client("alpha"), msg()))
+    with pytest.raises(TaskNotFoundError):
+        await e.client("beta").get_task(GetTaskRequest(id=tid))
+    assert (await e.client("alpha").get_task(GetTaskRequest(id=tid))).id == tid
+
+
+async def test_other_principal_cannot_get_task(env):
+    e = await env(spec("alpha"), auth=key_auth(a="secret-a", b="secret-b"))
+    tid = task_id_of(await send_one(e.client("alpha", **{"X-API-Key": "secret-a"}), msg()))
+    got = await e.client("alpha", **{"X-API-Key": "secret-a"}).get_task(GetTaskRequest(id=tid))
+    assert got.id == tid
+    with pytest.raises(TaskNotFoundError):
+        await e.client("alpha", **{"X-API-Key": "secret-b"}).get_task(GetTaskRequest(id=tid))
+
+
+async def test_unauthenticated_401_and_public_paths(env):
+    e = await env(spec("alpha"), auth=key_auth(a="secret-a"))
+    hc = e.http()
+    assert (await hc.post("/agents/alpha/", json={})).status_code == 401
+    assert (await hc.get("/agents/alpha/.well-known/agent-card.json")).status_code == 200
+    assert (await hc.get("/.well-known/agent-card.json")).status_code == 200
+
+
+async def test_forbidden_principal_403(env):
+    e = await env(
+        spec("alpha", access=AgentAccess(allowed_principals=frozenset({"key:a"}))),
+        auth=key_auth(a="secret-a", b="secret-b"),
+    )
+    r = await e.http(**{"X-API-Key": "secret-b"}).post("/agents/alpha/", json={})
+    assert r.status_code == 403 and r.json() == {"error": "forbidden"}
+    events = await send_one(e.client("alpha", **{"X-API-Key": "secret-a"}), msg())
+    assert events[0].task.status.state == TaskState.TASK_STATE_COMPLETED
+    # An unknown agent is 404 even when authenticated.
+    r = await e.http(**{"X-API-Key": "secret-a"}).post("/agents/zzz/", json={})
+    assert r.status_code == 404 and r.json() == {"error": "not found"}
+
+
+async def test_body_too_large_413(env):
+    e = await env(spec("alpha"), max_body_bytes=1000)
+    hc = e.http()
+    r = await hc.post("/agents/alpha/", content=b"x" * 2000)
+    assert r.status_code == 413 and r.json() == {"error": "payload too large"}
+
+    async def chunks():
+        for _ in range(4):
+            yield b"x" * 500
+
+    r = await hc.post("/agents/alpha/", content=chunks())  # no Content-Length
+    assert r.status_code == 413 and r.json() == {"error": "payload too large"}
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_too_many_parts_invalid_params(env, streaming):
+    e = await env(spec("alpha"), max_parts=3)
+    client = e.client("alpha", streaming=streaming)
+    with pytest.raises(InvalidParamsError, match="too many parts"):
+        await send_one(client, msg(parts=4))
+    events = await send_one(client, msg(parts=3))
+    assert events
+
+
+async def test_restart_recovers(tmp_path):
+    blocker = Blocker()
+    e1 = Env(tmp_path)
+    e1.host.add(spec("alpha", blocker))
+    await e1.start()
+    events = await send_one(e1.client("alpha"), msg(), return_immediately=True)
+    tid = task_id_of(events)
+    await asyncio.wait_for(blocker.started.wait(), 5)
+    working = TaskState.Name(TaskState.TASK_STATE_WORKING)
+    rows, _ = await e1.host.index.list(agent_id="alpha")
+    assert [(r["task_id"], r["state"]) for r in rows] == [(tid, working)]
+    await e1.stop()
+
+    e2 = Env(tmp_path)
+    e2.host.add(spec("alpha"))
+    await e2.start()
+    try:
+        assert e2.host.last_recovery.failed == [tid]
+        # Same principal as the original (anonymous, no auth configured).
+        got = await e2.client("alpha").get_task(GetTaskRequest(id=tid))
+        assert got.status.state == TaskState.TASK_STATE_FAILED
+        rows, _ = await e2.host.index.list(agent_id="alpha")
+        assert rows[0]["state"] == TaskState.Name(TaskState.TASK_STATE_FAILED)
+    finally:
+        await e2.stop()
