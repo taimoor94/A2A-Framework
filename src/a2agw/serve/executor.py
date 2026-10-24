@@ -6,6 +6,7 @@ import asyncio
 import dataclasses
 import logging
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -45,11 +46,18 @@ _REASONS: dict[type[CallContextViolation], str] = {
 }
 _INVALID = "invalid call context"
 _RESUMABLE = {TaskState.TASK_STATE_INPUT_REQUIRED, TaskState.TASK_STATE_AUTH_REQUIRED}
+_TERMINAL = {
+    TaskState.TASK_STATE_COMPLETED,
+    TaskState.TASK_STATE_FAILED,
+    TaskState.TASK_STATE_CANCELED,
+    TaskState.TASK_STATE_REJECTED,
+}
+_CLOSED_MAX = 10_000  # remembered terminal/cancelled task ids (makes cancel() idempotent)
 
 
 @dataclass
 class _Run:
-    """Per-execute state: where to record state changes, and the usage totals so far."""
+    """State of one execute() call: where to record changes, terminal flags, usage totals."""
 
     updater: TaskUpdater
     owner: str
@@ -59,6 +67,11 @@ class _Run:
     cost: float = 0.0
     usage_seen: bool = False
     last_state: int | None = None
+    terminal: bool = False  # this run emitted a terminal state; later changes are ignored
+    cancelled: bool = False  # cancel() claimed the task; only cancel() writes from now on
+    # Serializes this run's index writes with cancel()'s, so an in-flight write never lands
+    # after CANCELED.
+    lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
 
     def usage_metadata(self) -> dict[str, Any] | None:
         if not self.usage_seen:
@@ -84,6 +97,17 @@ class AdapterExecutor(AgentExecutor):
 
     Enforces call-context limits on admission, maps adapter events to A2A task updates, and
     records every state change in the task index and on the event bus.
+
+    Each task reaches at most one terminal state. Once a run emits one, or cancel() claims
+    the task, later state changes from that run are ignored, and cancel() on a terminal or
+    already-cancelled task is a no-op (so ``on_cancel`` runs at most once per task).
+
+    Known limits (Phase 1):
+    - An ``ArtifactChunk`` with ``append=True`` for an unknown ``artifact_id`` is rejected by
+      the SDK's event consumer, after the executor has enqueued it; the executor cannot
+      observe that failure.
+    - The call-context deadline is checked on admission only; it is not enforced while the
+      adapter runs.
     """
 
     def __init__(
@@ -102,19 +126,30 @@ class AdapterExecutor(AgentExecutor):
         self.local_max_hops = local_max_hops
         self.local_max_deadline_s = local_max_deadline_s
         self._now = now
+        self._active: dict[str, _Run] = {}
         self._running: dict[str, asyncio.Task[None]] = {}
+        self._closed: OrderedDict[str, None] = OrderedDict()
         self.on_cancel: Callable[[str], Awaitable[None]] | None = None
 
     # -- bookkeeping -------------------------------------------------------------------
 
+    def _close(self, task_id: str) -> None:
+        self._closed[task_id] = None
+        self._closed.move_to_end(task_id)
+        while len(self._closed) > _CLOSED_MAX:
+            self._closed.popitem(last=False)
+
     async def _record(self, run: _Run, state: int) -> None:
-        if state == run.last_state:
-            return
-        run.last_state = state
-        name = TaskState.Name(state)
-        u = run.updater
-        await self.index.upsert(u.task_id, self.spec.id, run.owner, u.context_id, name, run.origin)
-        self._publish(u.task_id, u.context_id, name)
+        async with run.lock:
+            if run.cancelled or state == run.last_state:
+                return
+            run.last_state = state
+            name = TaskState.Name(state)
+            u = run.updater
+            await self.index.upsert(
+                u.task_id, self.spec.id, run.owner, u.context_id, name, run.origin
+            )
+            self._publish(u.task_id, u.context_id, name)
 
     def _publish(self, task_id: str, context_id: str, state: str) -> None:
         self.bus.publish(
@@ -126,9 +161,16 @@ class AdapterExecutor(AgentExecutor):
         )
 
     async def _status(self, run: _Run, state: int, text: str | None = None) -> None:
+        if run.terminal or run.cancelled:
+            return
+        if state in _TERMINAL:
+            run.terminal = True
+            self._close(run.updater.task_id)
         message = self._agent_message(run.updater, text) if text is not None else None
         # Index first: a blocking caller may read the index as soon as the event is consumed.
         await self._record(run, state)
+        if run.cancelled:  # cancel() claimed the task meanwhile and reports CANCELED
+            return
         await run.updater.update_status(state, message=message, metadata=run.usage_metadata())
 
     @staticmethod
@@ -139,31 +181,47 @@ class AdapterExecutor(AgentExecutor):
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         message = context.message
-        if message is None:  # pragma: no cover - the handler always supplies one
-            raise ValueError("execute() requires a message")
+        task_id, context_id = context.task_id, context.context_id
+        if message is None or not task_id or not context_id:  # pragma: no cover
+            raise ValueError("execute() requires a message, task_id and context_id")
         principal, owner = _caller(context)
+        run = _Run(updater=TaskUpdater(event_queue, task_id, context_id), owner=owner, origin=None)
+        # Registered before any await, so a concurrent cancel() always finds this run.
+        self._active[task_id] = run
+        try:
+            await self._execute(run, context, message, principal)
+        finally:
+            if self._active.get(task_id) is run:
+                del self._active[task_id]
+
+    async def _execute(
+        self,
+        run: _Run,
+        context: RequestContext,
+        message: Message,
+        principal: Principal | None,
+    ) -> None:
+        updater = run.updater
         current = context.current_task
         resumed = current is not None and current.status.state in _RESUMABLE
         if current is None:
-            current = new_task_from_user_message(message)
-            await event_queue.enqueue_event(current)
-        updater = TaskUpdater(event_queue, current.id, current.context_id)
-        run = _Run(updater=updater, owner=owner, origin=None)
-        if resumed:
+            await updater.event_queue.enqueue_event(new_task_from_user_message(message))
+            await self._record(run, TaskState.TASK_STATE_SUBMITTED)
+        elif resumed:
             prior = MessageToDict(current.metadata).get(USAGE_KEY)
             if isinstance(prior, dict):
                 run.tokens_in = int(prior.get("tokens_in", 0))
                 run.tokens_out = int(prior.get("tokens_out", 0))
                 run.cost = float(prior.get("cost", 0.0))
-        else:
-            await self._record(run, current.status.state)
+        if run.cancelled:
+            return
 
         cc, reason = self._admit(message)
         if cc is None:
-            await self._record(run, TaskState.TASK_STATE_REJECTED)
-            await updater.reject(message=self._agent_message(updater, reason))
+            await self._status(run, TaskState.TASK_STATE_REJECTED, reason)
             return
-        run.origin = cc.origin
+        # A resumed turn keeps the origin recorded by the turn that created the task.
+        run.origin = None if resumed else cc.origin
 
         inbound = InboundContext.from_message(
             self.spec.id,
@@ -175,6 +233,9 @@ class AdapterExecutor(AgentExecutor):
             metadata=MessageToDict(message.metadata),
             resumed=resumed,
         )
+        if run.cancelled:
+            return
+        # No await between the check above and registration: cancel() sees one or the other.
         work = asyncio.create_task(self._drive(run, inbound), name=f"a2agw:{updater.task_id}")
         self._running[updater.task_id] = work
         try:
@@ -183,7 +244,15 @@ class AdapterExecutor(AgentExecutor):
             this = asyncio.current_task()
             if this is not None and this.cancelling():
                 raise  # the framework is cancelling execute() itself
-            # Otherwise cancel() stopped the work and reports CANCELED itself.
+            if run.cancelled:
+                return  # cancel() stopped the work and reports CANCELED itself
+            # The adapter raised CancelledError on its own: that is an adapter failure.
+            logger.error(
+                "adapter for agent %s raised CancelledError on task %s",
+                self.spec.id,
+                updater.task_id,
+            )
+            await self._status(run, TaskState.TASK_STATE_FAILED, "internal error")
         finally:
             if self._running.get(updater.task_id) is work:
                 del self._running[updater.task_id]
@@ -210,26 +279,41 @@ class AdapterExecutor(AgentExecutor):
         return cc, ""
 
     async def _drive(self, run: _Run, inbound: InboundContext) -> None:
-        updater = run.updater
-        try:
-            with use_call(inbound.call):
-                await self._status(run, TaskState.TASK_STATE_WORKING)
-                events = self.spec.adapter.run(inbound)
+        events: Any = None
+        with use_call(inbound.call):
+            try:
                 try:
+                    await self._status(run, TaskState.TASK_STATE_WORKING)
+                    events = self.spec.adapter.run(inbound)
                     async for ev in events:
                         if await self._apply(run, ev):
-                            return
-                finally:
-                    # Close the adapter's generator now (it may be left mid-iteration).
-                    aclose = getattr(events, "aclose", None)
-                    if aclose is not None:
-                        await aclose()
-            await self._status(run, TaskState.TASK_STATE_COMPLETED)
-        except Exception:  # CancelledError is a BaseException and propagates
+                            break
+                    else:
+                        await self._status(run, TaskState.TASK_STATE_COMPLETED)
+                except Exception:  # CancelledError is a BaseException and propagates
+                    logger.exception(
+                        "adapter for agent %s failed on task %s",
+                        self.spec.id,
+                        run.updater.task_id,
+                    )
+                    await self._status(run, TaskState.TASK_STATE_FAILED, "internal error")
+            finally:
+                if events is not None:
+                    await self._close_events(run, events)
+
+    async def _close_events(self, run: _Run, events: Any) -> None:
+        """Close the adapter's generator (it may be left mid-iteration). Never changes state."""
+        aclose = getattr(events, "aclose", None)
+        if aclose is None:
+            return
+        try:
+            await aclose()
+        except Exception:
             logger.exception(
-                "adapter for agent %s failed on task %s", self.spec.id, updater.task_id
+                "adapter cleanup failed for agent %s on task %s",
+                self.spec.id,
+                run.updater.task_id,
             )
-            await self._status(run, TaskState.TASK_STATE_FAILED, "internal error")
 
     async def _apply(self, run: _Run, ev: object) -> bool:
         """Map one adapter event onto the task. Returns True when the run should stop."""
@@ -273,17 +357,32 @@ class AdapterExecutor(AgentExecutor):
         task_id = context.task_id
         if not task_id:  # pragma: no cover - the handler always supplies one
             return
-        context_id = context.context_id or (
-            context.current_task.context_id if context.current_task is not None else ""
-        )
+        current = context.current_task
+        if task_id in self._closed or (current is not None and current.status.state in _TERMINAL):
+            return  # already terminal or already cancelled: nothing to do
+        # Claim the task synchronously, before any await, so execute() and a second
+        # cancel() both see it.
+        self._close(task_id)
+        run = self._active.get(task_id)
+        if run is not None:
+            run.cancelled = True
+        context_id = context.context_id or (current.context_id if current is not None else "")
+
         work = self._running.pop(task_id, None)
         if work is not None and not work.done():
             work.cancel()
             await asyncio.gather(work, return_exceptions=True)
         name = TaskState.Name(TaskState.TASK_STATE_CANCELED)
-        await self.index.set_state(task_id, name)
+        if run is not None:
+            async with run.lock:  # let an in-flight index write of the run land first
+                await self.index.set_state(task_id, name)
+        else:
+            await self.index.set_state(task_id, name)
         self._publish(task_id, context_id, name)
-        await TaskUpdater(event_queue, task_id, context_id).cancel()
+        await TaskUpdater(event_queue, task_id, context_id).update_status(
+            TaskState.TASK_STATE_CANCELED,
+            metadata=run.usage_metadata() if run is not None else None,
+        )
         if self.on_cancel is not None:
             try:
                 await self.on_cancel(task_id)

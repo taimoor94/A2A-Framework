@@ -6,6 +6,8 @@ import asyncio
 import logging
 import uuid
 
+from a2a.server.agent_execution import RequestContext
+from a2a.server.context import ServerCallContext
 from a2a.server.routes import DefaultServerCallContextBuilder
 from a2a.types import (
     CancelTaskRequest,
@@ -154,12 +156,17 @@ async def test_need_input_then_resume_completes(make_server):
     _, first = await send(client, user_msg("start"))
     assert first.status.state == TaskState.TASK_STATE_INPUT_REQUIRED
     assert status_text(first) == "what is your name?"
+    [row] = (await h.index.list(agent_id="echo"))[0]
+    origin = row["origin"]
+    assert origin
 
     _, second = await send(client, user_msg("ada", task_id=first.id, context_id=first.context_id))
     assert second.id == first.id
     assert second.status.state == TaskState.TASK_STATE_COMPLETED
     assert [p.text for p in second.artifacts[0].parts] == ["hi ada"]
     assert adapter.resumed == [False, True]
+    [row] = (await h.index.list(agent_id="echo"))[0]
+    assert row["origin"] == origin  # the resumed turn kept the task's origin
 
 
 async def test_adapter_exception_fails_without_leaking(make_server, caplog):
@@ -238,6 +245,7 @@ async def test_cancel_running_task(make_server, caplog):
 
         async def run(self, ctx):
             yield Status("working")
+            yield Usage(tokens_in=4, tokens_out=2, cost=0.125)  # only persisted by CANCELED
             started.set()
             try:
                 await asyncio.Event().wait()
@@ -267,6 +275,11 @@ async def test_cancel_running_task(make_server, caplog):
 
     task = await client.get_task(GetTaskRequest(id=task_id))
     assert task.status.state == TaskState.TASK_STATE_CANCELED
+    assert MessageToDict(task.metadata)["a2agw.usage"] == {
+        "tokens_in": 4,
+        "tokens_out": 2,
+        "cost": 0.125,
+    }
     assert h.executor._running == {}
     rows, _ = await h.index.list(agent_id="echo")
     assert rows[0]["state"] == ST(TaskState.TASK_STATE_CANCELED)
@@ -363,3 +376,184 @@ async def test_usage_totals_survive_resume(make_server):
         "tokens_out": 2,
         "cost": 1.0,
     }
+
+
+# -- terminal-state and cancellation hardening -------------------------------------------
+
+
+class FakeQueue:
+    def __init__(self) -> None:
+        self.events: list = []
+
+    async def enqueue_event(self, event) -> None:
+        self.events.append(event)
+
+
+def _states(h) -> list[str]:
+    return [ev.data["state"] for ev in h.bus.recent()]
+
+
+async def _index_state(h) -> str:
+    [row] = (await h.index.list(agent_id=h.spec.id))[0]
+    return row["state"]
+
+
+async def test_adapter_raises_cancelled_fails_task(make_server):
+    class SelfCancel:
+        durable_sessions = False
+
+        async def run(self, ctx):
+            yield Status("s")
+            raise asyncio.CancelledError  # not requested by anyone
+
+    h = await make_server(SelfCancel())
+    client = h.client(streaming=False)
+    _, task = await asyncio.wait_for(send(client, user_msg("x")), timeout=2.0)
+    assert task.status.state == TaskState.TASK_STATE_FAILED
+    assert status_text(task) == "internal error"
+    assert await _index_state(h) == ST(TaskState.TASK_STATE_FAILED)
+    assert h.executor._running == {}
+
+
+async def test_aclose_raises_after_done_stays_completed(make_server, caplog):
+    class BadCleanup:
+        durable_sessions = False
+
+        async def run(self, ctx):
+            try:
+                yield Done("ok")
+            finally:
+                raise RuntimeError("cleanup boom")
+
+    h = await make_server(BadCleanup())
+    client = h.client(streaming=False)
+    with caplog.at_level(logging.ERROR, logger="a2agw.serve.executor"):
+        _, task = await send(client, user_msg("x"))
+    completed = ST(TaskState.TASK_STATE_COMPLETED)
+    assert task.status.state == TaskState.TASK_STATE_COMPLETED
+    assert await _index_state(h) == completed
+    assert _states(h)[-1] == completed
+    assert ST(TaskState.TASK_STATE_FAILED) not in _states(h)
+    assert "adapter cleanup failed" in caplog.text
+
+
+async def test_double_cancel_hook_once(make_server):
+    started = asyncio.Event()
+
+    class Hanger:
+        durable_sessions = False
+
+        async def run(self, ctx):
+            yield Status("s")
+            started.set()
+            await asyncio.Event().wait()
+
+    h = await make_server(Hanger())
+    hooked: list[str] = []
+
+    async def on_cancel(task_id: str) -> None:
+        hooked.append(task_id)
+
+    h.executor.on_cancel = on_cancel
+    client = h.client(streaming=False)
+    events, _ = await send(client, user_msg("x"), return_immediately=True)
+    task_id = _task_id(events[0])
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+
+    await asyncio.gather(
+        client.cancel_task(CancelTaskRequest(id=task_id)),
+        client.cancel_task(CancelTaskRequest(id=task_id)),
+        return_exceptions=True,
+    )
+    # A late direct call (as the SDK makes while its consumer lags) is a no-op too.
+    queue = FakeQueue()
+    ctx = RequestContext(ServerCallContext(), task_id=task_id, context_id="c")
+    await h.executor.cancel(ctx, queue)
+
+    assert queue.events == []
+    assert hooked == [task_id]
+    assert _states(h).count(ST(TaskState.TASK_STATE_CANCELED)) == 1
+    task = await client.get_task(GetTaskRequest(id=task_id))
+    assert task.status.state == TaskState.TASK_STATE_CANCELED
+
+
+async def test_cancel_after_complete_is_noop(make_server):
+    h = await make_server(EchoAdapter())
+    hooked: list[str] = []
+
+    async def on_cancel(task_id: str) -> None:
+        hooked.append(task_id)
+
+    h.executor.on_cancel = on_cancel
+    client = h.client(streaming=False)
+    _, task = await send(client, user_msg("x"))
+    # The store has not caught up yet (task=None): the executor's own record decides.
+    queue = FakeQueue()
+    ctx = RequestContext(ServerCallContext(), task_id=task.id, context_id=task.context_id)
+    await h.executor.cancel(ctx, queue)
+
+    assert queue.events == []
+    assert hooked == []
+    assert await _index_state(h) == ST(TaskState.TASK_STATE_COMPLETED)
+    assert _states(h)[-1] == ST(TaskState.TASK_STATE_COMPLETED)
+
+
+async def test_cancel_before_adapter_starts(make_server):
+    adapter = EchoAdapter()
+    h = await make_server(adapter)
+    hooked: list[str] = []
+
+    async def on_cancel(task_id: str) -> None:
+        hooked.append(task_id)
+
+    h.executor.on_cancel = on_cancel
+    real_upsert = h.index.upsert
+    reached, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_upsert(*args, **kwargs):
+        if args[4] == ST(TaskState.TASK_STATE_SUBMITTED):
+            reached.set()
+            await release.wait()  # hold execute() inside admission
+        await real_upsert(*args, **kwargs)
+
+    h.index.upsert = slow_upsert
+    queue = FakeQueue()
+    ctx = RequestContext(ServerCallContext(), SendMessageRequest(message=user_msg("x")))
+    executing = asyncio.create_task(h.executor.execute(ctx, queue))
+    await asyncio.wait_for(reached.wait(), timeout=1.0)
+    cancelling = asyncio.create_task(h.executor.cancel(ctx, queue))
+    release.set()
+    await asyncio.wait_for(asyncio.gather(executing, cancelling), timeout=2.0)
+
+    assert adapter.seen == []
+    assert hooked == [ctx.task_id]
+    assert await _index_state(h) == ST(TaskState.TASK_STATE_CANCELED)
+    assert _states(h) == [ST(TaskState.TASK_STATE_SUBMITTED), ST(TaskState.TASK_STATE_CANCELED)]
+    kinds = [type(e).__name__ for e in queue.events]
+    assert kinds == ["Task", "TaskStatusUpdateEvent"]
+    assert queue.events[-1].status.state == TaskState.TASK_STATE_CANCELED
+
+
+async def test_cancel_parked_input_required_task(make_server):
+    class Asker:
+        durable_sessions = False
+
+        async def run(self, ctx):
+            yield NeedInput("q")
+
+    h = await make_server(Asker())
+    hooked: list[str] = []
+
+    async def on_cancel(task_id: str) -> None:
+        hooked.append(task_id)
+
+    h.executor.on_cancel = on_cancel
+    client = h.client(streaming=False)
+    _, task = await send(client, user_msg("x"))
+    assert task.status.state == TaskState.TASK_STATE_INPUT_REQUIRED
+
+    cancelled = await client.cancel_task(CancelTaskRequest(id=task.id))
+    assert cancelled.status.state == TaskState.TASK_STATE_CANCELED
+    assert hooked == [task.id]
+    assert await _index_state(h) == ST(TaskState.TASK_STATE_CANCELED)
+    assert _states(h)[-1] == ST(TaskState.TASK_STATE_CANCELED)

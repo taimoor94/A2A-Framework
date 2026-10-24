@@ -16,7 +16,7 @@ from a2a.server.context import ServerCallContext
 from a2a.server.models import create_task_model
 from a2a.server.tasks import DatabaseTaskStore, TaskStore
 from a2a.types import Message, Part, Role, TaskState
-from sqlalchemy import Column, Float, MetaData, String, Table, and_, or_, select, update
+from sqlalchemy import Column, Float, MetaData, String, Table, and_, func, or_, select, update
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects import sqlite as sqlite_dialect
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -117,6 +117,7 @@ class TaskIndex:
         state: str,
         origin: str | None,
     ) -> None:
+        """Insert or update a row. ``origin=None`` keeps the row's existing origin."""
         insert = (
             sqlite_dialect.insert if self._engine.dialect.name == "sqlite" else postgresql.insert
         )
@@ -130,10 +131,10 @@ class TaskIndex:
             "origin": origin,
         }
         stmt = insert(_index_table).values(**values)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["task_id"],
-            set_={k: v for k, v in values.items() if k != "task_id"},
-        )
+        set_: dict[str, Any] = {k: v for k, v in values.items() if k != "task_id"}
+        # origin=None never erases a known origin (e.g. a resumed turn has none of its own).
+        set_["origin"] = func.coalesce(stmt.excluded.origin, _index_table.c.origin)
+        stmt = stmt.on_conflict_do_update(index_elements=["task_id"], set_=set_)
         async with self._engine.begin() as conn:
             await conn.execute(stmt)
 

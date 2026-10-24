@@ -256,3 +256,13 @@ async def test_pagination_with_equal_timestamps(index, monkeypatch):
         if not cur:
             break
     assert seen == ["a", "b", "c", "d", "e"]
+
+
+async def test_upsert_none_origin_keeps_existing(index):
+    await index.upsert("t1", "a1", "key:x", "c", S, "orig-1")
+    await index.upsert("t1", "a1", "key:x", "c", W, None)
+    [row] = await index.by_state({W})
+    assert row["origin"] == "orig-1"
+    await index.upsert("t1", "a1", "key:x", "c", W, "orig-2")
+    [row] = await index.by_state({W})
+    assert row["origin"] == "orig-2"
