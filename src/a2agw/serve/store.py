@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from a2a.server.context import ServerCallContext
+from a2a.server.models import create_task_model
 from a2a.server.tasks import DatabaseTaskStore, TaskStore
 from a2a.types import Message, Part, Role, TaskState
 from sqlalchemy import Column, Float, MetaData, String, Table, and_, or_, select, update
@@ -44,7 +45,7 @@ _ACTIVE_STATES = {
     TaskState.Name(TaskState.TASK_STATE_WORKING),
 } | _RESUMABLE_STATES
 _AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-_STORES: dict[tuple[int, str], tuple[str, DatabaseTaskStore]] = {}
+_MODELS: dict[str, tuple[str, type]] = {}
 logger = logging.getLogger(__name__)
 
 
@@ -53,28 +54,32 @@ async def create_engine(url: str = "sqlite+aiosqlite:///a2agw.db") -> AsyncEngin
 
 
 def task_store_for(engine: AsyncEngine, agent_id: str) -> DatabaseTaskStore:
-    """One table per agent. Idempotent per (engine, agent): repeat calls return the same store.
+    """A task store backed by this agent's own table.
 
-    The SDK registers tables on a process-global MetaData, so a store cannot be built twice
-    for the same table name.
+    The SDK registers generated models on a process-global MetaData, so each per-agent model
+    is built once per process (cached by table name) and reused by every store, on any engine.
+    Each call returns a new store.
     """
     if not _AGENT_ID_RE.fullmatch(agent_id):
         raise ValueError(f"invalid agent_id for table name: {agent_id!r}")
     table_name = f"tasks_{agent_id.replace('-', '_')}"
-    key = (id(engine), table_name)
-    cached = _STORES.get(key)
-    if cached is not None:
-        if cached[0] != agent_id:
-            raise ValueError(
-                f"agent ids {cached[0]!r} and {agent_id!r} map to the same table {table_name!r}"
+    cached = _MODELS.get(table_name)
+    if cached is not None and cached[0] != agent_id:
+        raise ValueError(
+            f"agent ids {cached[0]!r} and {agent_id!r} map to the same table {table_name!r}"
+        )
+    if cached is None:
+        # The SDK names every generated model class "TaskModel", which makes SQLAlchemy warn
+        # once per extra table. The tables are distinct, so the warning is noise.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", message="This declarative base already contains a class"
             )
-        return cached[1]
-    # The SDK names every generated model class "TaskModel", which makes SQLAlchemy warn
-    # once per extra table. The tables are distinct, so the warning is noise.
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="This declarative base already contains a class")
-        store = DatabaseTaskStore(engine, create_table=True, table_name=table_name)
-    _STORES[key] = (agent_id, store)
+            model = create_task_model(table_name)
+        cached = _MODELS[table_name] = (agent_id, model)
+    # Default table name makes the SDK reuse its built-in model; we then swap in ours.
+    store = DatabaseTaskStore(engine, create_table=True, table_name="tasks")
+    store.task_model = cached[1]
     return store
 
 

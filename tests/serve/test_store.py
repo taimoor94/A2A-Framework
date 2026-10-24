@@ -203,13 +203,40 @@ async def test_recovery_continues_when_store_get_raises(engine, index):
     assert (await inner.get("good", _ctx("key:alice"))).status.state == TaskState.TASK_STATE_FAILED
 
 
-def test_task_store_for_is_idempotent(engine):
-    assert task_store_for(engine, "idem-a") is task_store_for(engine, "idem-a")
+async def test_task_store_for_is_idempotent(engine):
+    s1 = task_store_for(engine, "idem-a")
+    s2 = task_store_for(engine, "idem-a")
+    await s1.initialize()
+    await s2.initialize()
+    await s1.save(
+        Task(id="x", context_id="c", status=TaskStatus(state=TaskState.TASK_STATE_WORKING)),
+        _ctx("key:a"),
+    )
+    assert await s2.get("x", _ctx("key:a")) is not None
     task_store_for(engine, "idem-b-c")
     with pytest.raises(ValueError, match="same table"):
         task_store_for(engine, "idem_b-c")
     with pytest.raises(ValueError, match="invalid agent_id"):
         task_store_for(engine, "bad name; drop")
+
+
+async def test_two_engines_same_agent_id(tmp_path):
+    e1 = await create_engine(f"sqlite+aiosqlite:///{tmp_path / 'one.db'}")
+    e2 = await create_engine(f"sqlite+aiosqlite:///{tmp_path / 'two.db'}")
+    try:
+        s1, s2 = task_store_for(e1, "a"), task_store_for(e2, "a")
+        await s1.initialize()
+        await s2.initialize()
+        working = TaskStatus(state=TaskState.TASK_STATE_WORKING)
+        await s1.save(Task(id="t1", context_id="c", status=working), _ctx("key:a"))
+        await s2.save(Task(id="t2", context_id="c", status=working), _ctx("key:a"))
+        assert (await s1.get("t1", _ctx("key:a"))).id == "t1"
+        assert await s1.get("t2", _ctx("key:a")) is None
+        assert (await s2.get("t2", _ctx("key:a"))).id == "t2"
+        assert await s2.get("t1", _ctx("key:a")) is None
+    finally:
+        await e1.dispose()
+        await e2.dispose()
 
 
 async def test_list_rejects_malformed_cursor(index):
