@@ -43,6 +43,7 @@ packages = ["src/a2agw"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+addopts = "--import-mode=importlib"
 testpaths = ["tests"]
 
 [tool.ruff]
