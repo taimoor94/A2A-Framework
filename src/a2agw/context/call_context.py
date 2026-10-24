@@ -163,7 +163,9 @@ class CallContext:
             deadline = min(self.deadline, limit)
         max_calls = self.max_calls
         if local_max_calls is not None:
-            max_calls = min(max_calls if max_calls is not None else local_max_calls, local_max_calls)
+            max_calls = min(
+                max_calls if max_calls is not None else local_max_calls, local_max_calls
+            )
         return replace(
             self,
             hop=max(self.hop, 0),

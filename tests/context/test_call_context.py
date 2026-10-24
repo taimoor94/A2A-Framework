@@ -25,8 +25,16 @@ def test_new_defaults():
 
 def test_round_trip():
     cc = CallContext(
-        origin="o", root_agent="a", hop=2, max_hops=5, path=("a", "b"), deadline=NOW + 5,
-        traceparent="00-x-y-01", on_behalf_of="u", max_calls=10, calls_used=3,
+        origin="o",
+        root_agent="a",
+        hop=2,
+        max_hops=5,
+        path=("a", "b"),
+        deadline=NOW + 5,
+        traceparent="00-x-y-01",
+        on_behalf_of="u",
+        max_calls=10,
+        calls_used=3,
     )
     md = cc.to_metadata()
     assert md[METADATA_KEY]["path"] == ["a", "b"]
@@ -36,8 +44,15 @@ def test_round_trip():
 def test_from_metadata_absent_and_float_ints():
     assert CallContext.from_metadata({}) is None
     cc = CallContext.from_metadata(
-        {METADATA_KEY: {"origin": "o", "root_agent": "a", "hop": 1.0, "max_hops": 8.0,
-                        "path": ["a"]}}
+        {
+            METADATA_KEY: {
+                "origin": "o",
+                "root_agent": "a",
+                "hop": 1.0,
+                "max_hops": 8.0,
+                "path": ["a"],
+            }
+        }
     )
     assert cc is not None and cc.hop == 1 and isinstance(cc.hop, int)
 
@@ -166,7 +181,8 @@ def test_clamp_floors_calls_used_and_caps_max_calls():
     out = cc.clamp(local_max_hops=8, local_max_deadline_s=60, now=NOW, local_max_calls=20)
     assert out.calls_used == 0 and out.max_calls == 20
     none = CallContext(origin="o", root_agent="a")
-    assert none.clamp(
-        local_max_hops=8, local_max_deadline_s=60, now=NOW, local_max_calls=20
-    ).max_calls == 20
+    assert (
+        none.clamp(local_max_hops=8, local_max_deadline_s=60, now=NOW, local_max_calls=20).max_calls
+        == 20
+    )
     assert none.clamp(local_max_hops=8, local_max_deadline_s=60, now=NOW).max_calls is None

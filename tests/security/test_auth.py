@@ -1,5 +1,12 @@
+import base64
 import hashlib
+import hmac
+import json
+import logging
+import socket
+import threading
 import time
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 import jwt
 import pytest
@@ -13,6 +20,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from a2agw.security import auth as auth_mod
 from a2agw.security.auth import (
     AgentAccess,
     ApiKeyEntry,
@@ -115,15 +123,15 @@ async def test_api_key_header_authenticates():
         r = await c.get("/", headers={"X-API-Key": "s3cret"})
     assert r.status_code == 200
     body = r.json()
-    assert body["id"] == "svc" and body["scopes"] == ["a", "b"] and body["kind"] == "api_key"
+    assert body["id"] == "key:svc" and body["scopes"] == ["a", "b"] and body["kind"] == "api_key"
     assert body["auth"] == ["a", "b"]
-    assert body["ctx_user"] == "svc" and body["authenticated"] is True
+    assert body["ctx_user"] == "key:svc" and body["authenticated"] is True
 
 
 async def test_bearer_without_dots_is_api_key():
     async with make_client(KEYS) as c:
         r = await c.get("/", headers={"Authorization": "Bearer s3cret"})
-    assert r.status_code == 200 and r.json()["id"] == "svc"
+    assert r.status_code == 200 and r.json()["id"] == "key:svc"
 
 
 async def test_unknown_key_is_401():
@@ -137,7 +145,7 @@ async def test_jwt_rs256_valid(pub_pem, priv_pem):
         r = await c.get("/", headers={"Authorization": f"Bearer {token(priv_pem)}"})
     assert r.status_code == 200
     body = r.json()
-    assert body["id"] == "alice" and body["kind"] == "jwt"
+    assert body["id"] == "jwt:alice" and body["kind"] == "jwt"
     assert body["scopes"] == ["read", "write"]
 
 
@@ -183,8 +191,19 @@ async def test_jwt_missing_required_claim_401(pub_pem, priv_pem, missing):
 async def test_alg_none_and_hs256_rejected(pub_pem):
     claims = {"sub": "alice", "iss": ISS, "aud": AUD, "exp": int(time.time()) + 300}
     none_tok = jwt.encode(claims, key=None, algorithm="none")
-    # classic confusion attack: HMAC-sign with the public key bytes as the secret
-    hs_tok = jwt.encode(claims, "x" * 40, algorithm="HS256")
+
+    # true confusion attack: HS256 token HMAC-signed with the PEM public key bytes,
+    # assembled by hand because PyJWT refuses to sign with a PEM key.
+    def b64(b: bytes) -> str:
+        return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+    signing_input = (
+        b64(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+        + "."
+        + b64(json.dumps(claims).encode())
+    )
+    sig = hmac.new(pub_pem.encode(), signing_input.encode(), hashlib.sha256).digest()
+    hs_tok = f"{signing_input}.{b64(sig)}"
     async with make_client(jwt_config(pub_pem)) as c:
         for t in (none_tok, hs_tok):
             await assert_401(await c.get("/", headers={"Authorization": f"Bearer {t}"}))
@@ -211,9 +230,9 @@ async def test_anonymous_allowed_when_configured():
 
 
 def test_principal_user():
-    p = Principal("svc", "api_key", frozenset({"a"}))
+    p = Principal("key:svc", "api_key", frozenset({"a"}))
     u = PrincipalUser(p)
-    assert u.principal is p and u.user_name == "svc" and u.is_authenticated
+    assert u.principal is p and u.user_name == "key:svc" and u.is_authenticated
 
 
 def test_authorize_scope_missing_raises():
@@ -234,3 +253,168 @@ def test_authorize_principal_allowlist_and_anonymous():
     anon = Principal("anonymous", "anonymous", frozenset())
     with pytest.raises(PermissionDenied):
         authorize(anon, AgentAccess())
+
+
+# ---- JWKS ----
+
+
+@pytest.fixture
+def jwks_url(tmp_path, rsa_key):
+    # PyJWT refuses file:// JWKS URIs, so serve the JWKS from a loopback HTTP server.
+    jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(rsa_key.public_key()))
+    jwk.update(kid="k1", use="sig", alg="RS256")
+    (tmp_path / "jwks.json").write_text(json.dumps({"keys": [jwk]}))
+
+    class Quiet(SimpleHTTPRequestHandler):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, directory=str(tmp_path), **kw)
+
+        def log_message(self, *a):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Quiet)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{srv.server_port}/jwks.json"
+    srv.shutdown()
+    srv.server_close()
+
+
+def jwks_config(url):
+    return AuthConfig(jwt=JwtConfig(issuer=ISS, audience=AUD, jwks_url=url))
+
+
+def kid_token(priv_pem, kid):
+    claims = {"sub": "alice", "iss": ISS, "aud": AUD, "exp": int(time.time()) + 300}
+    return jwt.encode(claims, priv_pem, algorithm="RS256", headers={"kid": kid})
+
+
+async def test_jwks_valid_token_resolved_by_kid(jwks_url, priv_pem):
+    async with make_client(jwks_config(jwks_url)) as c:
+        r = await c.get("/", headers={"Authorization": f"Bearer {kid_token(priv_pem, 'k1')}"})
+    assert r.status_code == 200 and r.json()["id"] == "jwt:alice"
+
+
+async def test_jwks_unknown_kid_401(jwks_url, priv_pem):
+    async with make_client(jwks_config(jwks_url)) as c:
+        t = kid_token(priv_pem, "nope")
+        await assert_401(await c.get("/", headers={"Authorization": f"Bearer {t}"}))
+
+
+async def test_jwks_unreachable_401_and_logged(priv_pem, caplog):
+    with socket.socket() as sk:  # grab a port that nothing listens on
+        sk.bind(("127.0.0.1", 0))
+        url = f"http://127.0.0.1:{sk.getsockname()[1]}/jwks.json"
+    t = kid_token(priv_pem, "k1")
+    with caplog.at_level(logging.DEBUG, logger="a2agw.security.auth"):
+        async with make_client(jwks_config(url)) as c:
+            await assert_401(await c.get("/", headers={"Authorization": f"Bearer {t}"}))
+    assert "jwks unreachable" in caplog.text
+    assert t not in caplog.text
+
+
+async def test_jwks_client_created_once(jwks_url, priv_pem, monkeypatch):
+    created = []
+    real = jwt.PyJWKClient
+
+    def spy(*a, **kw):
+        created.append(kw)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(auth_mod.jwt, "PyJWKClient", spy)
+    async with make_client(jwks_config(jwks_url)) as c:
+        h = {"Authorization": f"Bearer {kid_token(priv_pem, 'k1')}"}
+        assert (await c.get("/", headers=h)).status_code == 200
+        assert (await c.get("/", headers=h)).status_code == 200
+    assert len(created) == 1 and created[0]["timeout"] == 5
+
+
+# ---- logging ----
+
+
+async def test_jwt_rejection_logs_class_not_token(pub_pem, priv_pem, caplog):
+    t = token(priv_pem, aud="other")
+    with caplog.at_level(logging.DEBUG, logger="a2agw.security.auth"):
+        async with make_client(jwt_config(pub_pem)) as c:
+            await assert_401(await c.get("/", headers={"Authorization": f"Bearer {t}"}))
+    assert "jwt rejected: InvalidAudienceError" in caplog.text
+    assert t not in caplog.text and t.split(".")[1] not in caplog.text
+
+
+# ---- namespacing, validation, overlaps ----
+
+
+async def test_same_name_key_and_jwt_have_distinct_user_names(pub_pem, priv_pem):
+    cfg = AuthConfig(
+        api_keys={_sha("k"): ApiKeyEntry(principal_id="svc")},
+        jwt=JwtConfig(issuer=ISS, audience=AUD, public_key_pem=pub_pem),
+    )
+    async with make_client(cfg) as c:
+        a = await c.get("/", headers={"X-API-Key": "k"})
+        b = await c.get("/", headers={"Authorization": f"Bearer {token(priv_pem, sub='svc')}"})
+    assert a.json()["ctx_user"] == "key:svc" and b.json()["ctx_user"] == "jwt:svc"
+
+
+@pytest.mark.parametrize("sub", ["", "   "])
+async def test_blank_sub_401(pub_pem, priv_pem, sub):
+    async with make_client(jwt_config(pub_pem)) as c:
+        t = token(priv_pem, sub=sub)
+        await assert_401(await c.get("/", headers={"Authorization": f"Bearer {t}"}))
+
+
+async def test_empty_credential_headers_401_even_if_anonymous_allowed():
+    async with make_client(AuthConfig(allow_anonymous=True)) as c:
+        await assert_401(await c.get("/", headers={"X-API-Key": ""}))
+        await assert_401(await c.get("/", headers={"Authorization": ""}))
+        await assert_401(await c.get("/", headers={"Authorization": "Bearer "}))
+
+
+async def test_jwt_in_api_key_header_401(pub_pem, priv_pem):
+    async with make_client(jwt_config(pub_pem)) as c:
+        await assert_401(await c.get("/", headers={"X-API-Key": token(priv_pem)}))
+
+
+async def test_api_key_header_wins_over_authorization(pub_pem, priv_pem):
+    cfg = AuthConfig(
+        api_keys={_sha("k"): ApiKeyEntry(principal_id="svc")},
+        jwt=JwtConfig(issuer=ISS, audience=AUD, public_key_pem=pub_pem),
+    )
+    async with make_client(cfg) as c:
+        h = {"X-API-Key": "k", "Authorization": f"Bearer {token(priv_pem)}"}
+        r = await c.get("/", headers=h)
+    assert r.json()["id"] == "key:svc"
+
+
+async def test_non_bearer_scheme_401():
+    async with make_client(KEYS) as c:
+        await assert_401(await c.get("/", headers={"Authorization": "Basic czNjcmV0"}))
+        await assert_401(await c.get("/", headers={"Authorization": "Token s3cret"}))
+
+
+async def test_stored_hash_case_insensitive():
+    cfg = AuthConfig(api_keys={_sha("s3cret").upper(): ApiKeyEntry(principal_id="svc")})
+    async with make_client(cfg) as c:
+        r = await c.get("/", headers={"X-API-Key": "s3cret"})
+    assert r.status_code == 200
+
+
+async def test_non_string_non_list_scopes_claim_is_empty(pub_pem, priv_pem):
+    async with make_client(jwt_config(pub_pem)) as c:
+        r = await c.get("/", headers={"Authorization": f"Bearer {token(priv_pem, scope=5)}"})
+    assert r.status_code == 200 and r.json()["scopes"] == []
+
+
+def test_config_validation(pub_pem):
+    with pytest.raises(ValueError):
+        JwtConfig(issuer=ISS, audience=AUD)
+    with pytest.raises(ValueError):
+        JwtConfig(issuer=ISS, audience=AUD, jwks_url="https://x", public_key_pem=pub_pem)
+    with pytest.raises(ValueError):
+        JwtConfig(issuer=ISS, audience=AUD, jwks_url="file:///etc/passwd")
+    with pytest.raises(ValueError):
+        AuthConfig(api_keys={"abc": ApiKeyEntry(principal_id="a")})
+    h = _sha("k")
+    with pytest.raises(ValueError):
+        AuthConfig(
+            api_keys={h: ApiKeyEntry(principal_id="a"), h.upper(): ApiKeyEntry(principal_id="b")}
+        )
+    assert list(AuthConfig(api_keys={h.upper(): ApiKeyEntry(principal_id="a")}).api_keys) == [h]

@@ -5,13 +5,15 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
 import jwt
 from a2a.auth.user import UnauthenticatedUser, User
 from a2a.server.routes.common import DefaultServerCallContextBuilder
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.authentication import (
     AuthCredentials,
     AuthenticationBackend,
@@ -21,6 +23,8 @@ from starlette.requests import HTTPConnection, Request
 from starlette.responses import JSONResponse
 
 from a2agw.security.principal import Principal, PrincipalUser
+
+logger = logging.getLogger(__name__)
 
 ALLOWED_JWT_ALGORITHMS = ["RS256", "ES256", "EdDSA"]
 JWT_LEEWAY_SECONDS = 30
@@ -42,11 +46,33 @@ class JwtConfig(BaseModel):
     public_key_pem: str | None = None
     scopes_claim: str = "scope"
 
+    @model_validator(mode="after")
+    def _exactly_one_key_source(self) -> JwtConfig:
+        if bool(self.jwks_url) == bool(self.public_key_pem):
+            raise ValueError("exactly one of jwks_url or public_key_pem is required")
+        if self.jwks_url and not self.jwks_url.lower().startswith(("http://", "https://")):
+            raise ValueError("jwks_url must be http(s)")  # PyJWT also refuses other schemes
+        return self
+
 
 class AuthConfig(BaseModel):
     api_keys: dict[str, ApiKeyEntry] = Field(default_factory=dict)  # sha256 hex -> entry
     jwt: JwtConfig | None = None
     allow_anonymous: bool = False
+
+    @field_validator("api_keys", mode="before")
+    @classmethod
+    def _normalise_key_hashes(cls, v: Any) -> Any:
+        if not isinstance(v, dict):
+            return v
+        out: dict[str, Any] = {}
+        for k, entry in v.items():
+            if not isinstance(k, str) or not _SHA256_HEX.fullmatch(k):
+                raise ValueError("api_keys keys must be 64-char sha256 hex digests")
+            if k.lower() in out:
+                raise ValueError("duplicate api key hash")
+            out[k.lower()] = entry
+        return out
 
 
 @dataclass(frozen=True)
@@ -55,6 +81,7 @@ class AgentAccess:
     required_scopes: frozenset[str] = frozenset()
 
 
+_SHA256_HEX = re.compile(r"[0-9a-fA-F]{64}")
 _ANONYMOUS = Principal(id="anonymous", kind="anonymous", scopes=frozenset())
 
 
@@ -64,6 +91,13 @@ def _fail() -> AuthenticationError:
 
 
 class GatewayAuthBackend(AuthenticationBackend):
+    """Reads X-API-Key or Authorization: Bearer.
+
+    A bearer token with exactly two dots is treated as a JWT, so API keys sent as
+    Bearer must not contain two dots. X-API-Key takes precedence over Authorization.
+    Any presented credential (even an empty one) disables the anonymous fallback.
+    """
+
     def __init__(self, config: AuthConfig) -> None:
         self._config = config
         self._jwks_client: jwt.PyJWKClient | None = None
@@ -72,13 +106,15 @@ class GatewayAuthBackend(AuthenticationBackend):
         api_key = conn.headers.get("x-api-key")
         bearer: str | None = None
         authz = conn.headers.get("authorization")
-        if authz:
+        if api_key is not None and not api_key.strip():
+            raise _fail()
+        if authz is not None:
             scheme, _, value = authz.partition(" ")
             if scheme.lower() != "bearer" or not value.strip():
                 raise _fail()
             bearer = value.strip()
 
-        if api_key:
+        if api_key is not None:
             principal = self._check_api_key(api_key)
         elif bearer is not None:
             if bearer.count(".") == 2:
@@ -95,11 +131,11 @@ class GatewayAuthBackend(AuthenticationBackend):
         digest = hashlib.sha256(key.encode()).hexdigest()
         match: ApiKeyEntry | None = None
         for stored, entry in self._config.api_keys.items():  # scan all: no early exit
-            if hmac.compare_digest(stored.lower().encode(), digest.encode()):
+            if hmac.compare_digest(stored.encode(), digest.encode()):
                 match = entry
         if match is None:
             raise _fail()
-        return Principal(match.principal_id, "api_key", frozenset(match.scopes))
+        return Principal(f"key:{match.principal_id}", "api_key", frozenset(match.scopes))
 
     async def _check_jwt(self, token: str) -> Principal:
         cfg = self._config.jwt
@@ -110,9 +146,9 @@ class GatewayAuthBackend(AuthenticationBackend):
                 key: Any = cfg.public_key_pem
             elif cfg.jwks_url:
                 if self._jwks_client is None:
-                    self._jwks_client = jwt.PyJWKClient(cfg.jwks_url, cache_keys=True)
+                    self._jwks_client = jwt.PyJWKClient(cfg.jwks_url, cache_keys=True, timeout=5)
                 signing = await asyncio.to_thread(self._jwks_client.get_signing_key_from_jwt, token)
-                key = signing.key
+                key = signing
             else:
                 raise _fail()
             claims = jwt.decode(
@@ -126,8 +162,16 @@ class GatewayAuthBackend(AuthenticationBackend):
             )
         except AuthenticationError:
             raise
-        except Exception:  # noqa: BLE001 - any failure is a plain 401
+        except jwt.PyJWKClientConnectionError:
+            logger.error("jwks unreachable")
             raise _fail() from None
+        except Exception as e:  # noqa: BLE001 - any failure is a plain 401
+            logger.warning("jwt rejected: %s", type(e).__name__)
+            raise _fail() from None
+        sub = claims.get("sub")
+        if not isinstance(sub, str) or not sub.strip():
+            logger.warning("jwt rejected: %s", "InvalidSubject")
+            raise _fail()
         raw = claims.get(cfg.scopes_claim, [])
         if isinstance(raw, str):
             scopes = frozenset(raw.split())
@@ -135,7 +179,7 @@ class GatewayAuthBackend(AuthenticationBackend):
             scopes = frozenset(str(s) for s in raw)
         else:
             scopes = frozenset()
-        return Principal(str(claims["sub"]), "jwt", scopes)
+        return Principal(f"jwt:{sub}", "jwt", scopes)
 
 
 def on_auth_error(conn: HTTPConnection, exc: Exception) -> JSONResponse:
