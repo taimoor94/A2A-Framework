@@ -83,9 +83,9 @@ class Env:
     async def start(self) -> None:
         await self.host.startup()
 
-    def http(self, **headers: str) -> httpx.AsyncClient:
+    def http(self, *, root_path: str = "", **headers: str) -> httpx.AsyncClient:
         hc = httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=self.host.app()),
+            transport=httpx.ASGITransport(app=self.host.app(), root_path=root_path),
             base_url="http://t",
             headers=headers,
         )
@@ -247,3 +247,90 @@ async def test_restart_recovers(tmp_path):
         assert rows[0]["state"] == TaskState.Name(TaskState.TASK_STATE_FAILED)
     finally:
         await e2.stop()
+
+
+def _restricted(**kw):
+    return dict(
+        specs=(spec("alpha", access=AgentAccess(allowed_principals=frozenset({"key:a"}))),),
+        auth=key_auth(a="secret-a", b="secret-b"),
+        **kw,
+    )
+
+
+async def test_root_path_does_not_bypass_authz(env):
+    kw = _restricted()
+    e = await env(*kw.pop("specs"), **kw)
+    bad = e.http(root_path="/api", **{"X-API-Key": "secret-b"})
+    assert (await bad.post("/api/agents/alpha/", json={})).status_code == 403
+    assert (await bad.get("/api/agents/alpha/rest/tasks")).status_code == 403
+    good = e.http(root_path="/api", **{"X-API-Key": "secret-a"})
+    assert (
+        await good.get("/api/agents/alpha/rest/tasks", headers={"A2A-Version": "1.0"})
+    ).status_code == 200
+    # The card stays public under a root_path too.
+    anon = e.http(root_path="/api")
+    assert (await anon.get("/api/agents/alpha/.well-known/agent-card.json")).status_code == 200
+
+
+async def test_rest_binding_forbidden(env):
+    kw = _restricted()
+    e = await env(*kw.pop("specs"), **kw)
+    r = await e.http(**{"X-API-Key": "secret-b"}).get("/agents/alpha/rest/tasks")
+    assert r.status_code == 403 and r.json() == {"error": "forbidden"}
+
+
+async def test_healthz_path_exempt_from_auth(tmp_path):
+    from starlette.responses import PlainTextResponse
+    from starlette.routing import Route
+
+    async def health(request):
+        return PlainTextResponse("ok")
+
+    e = Env(tmp_path, auth=key_auth(a="secret-a"))
+    e.host.add(spec("alpha"))
+    e.host.extra_routes.append(Route("/a2agw/admin/healthz", health))
+    e.host.extra_routes.append(Route("/a2agw/admin/other", health))
+    await e.start()
+    try:
+        hc = e.http()
+        assert (await hc.get("/a2agw/admin/healthz")).text == "ok"
+        assert (await hc.get("/a2agw/admin/other")).status_code == 401
+    finally:
+        await e.stop()
+
+
+async def test_post_to_card_path_not_exempt(env):
+    kw = _restricted()
+    e = await env(*kw.pop("specs"), **kw)
+    hc = e.http()
+    for path in ("/agents/alpha/.well-known/agent-card.json", "/.well-known/agent-card.json"):
+        assert (await hc.post(path, json={})).status_code in (401, 404, 405)
+
+
+async def test_unknown_agent_404_json(env):
+    kw = _restricted()
+    e = await env(*kw.pop("specs"), **kw)
+    r = await e.http(**{"X-API-Key": "secret-a"}).post("/agents/zzz/", json={})
+    assert r.status_code == 404 and r.json() == {"error": "not found"}
+
+
+async def test_lying_content_length_413(env):
+    e = await env(spec("alpha"), max_body_bytes=1000)
+
+    async def chunks():
+        for _ in range(4):
+            yield b"x" * 500
+
+    r = await e.http().post("/agents/alpha/", content=chunks(), headers={"Content-Length": "10"})
+    assert r.status_code == 413
+
+
+async def test_add_after_startup_rejected(env):
+    e = await env(spec("alpha"))
+    with pytest.raises(RuntimeError):
+        e.host.add(spec("beta"))
+
+
+async def test_app_is_cached(env):
+    e = await env(spec("alpha"))
+    assert e.host.app() is e.host.app()

@@ -21,7 +21,7 @@ from starlette.applications import Starlette
 from starlette.authentication import AuthCredentials, AuthenticationError
 from starlette.requests import HTTPConnection
 from starlette.responses import JSONResponse
-from starlette.routing import BaseRoute, Mount
+from starlette.routing import BaseRoute, Mount, get_route_path
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from a2agw.ops.bus import EventBus
@@ -95,10 +95,12 @@ class _BodyLimitMiddleware:
 
         async def limited_receive() -> Message:
             nonlocal seen, rejected, responded
+            if rejected:
+                raise _TooLarge
             message = await receive()
             if message["type"] == "http.request":
                 seen += len(message.get("body", b""))
-                if seen > self.max_bytes and not rejected:
+                if seen > self.max_bytes:
                     # Downstream code may swallow exceptions, so answer right here.
                     rejected = True
                     if not responded:
@@ -142,7 +144,13 @@ class _AnonymousMiddleware:
         await self.app(scope, receive, send)
 
 
-def _card_path(path: str) -> bool:
+def _is_public(scope: Scope) -> bool:
+    """Public paths (cards, health), matched on the route path so root_path cannot confuse it."""
+    path = get_route_path(scope)
+    if path == HEALTH_PATH:
+        return True
+    if scope["type"] != "http" or scope["method"] not in ("GET", "HEAD"):
+        return False
     if path == CARD_PATH:
         return True
     parts = path.split("/")
@@ -165,8 +173,7 @@ class _AuthMiddleware:
         if scope["type"] not in ("http", "websocket"):
             await self.app(scope, receive, send)
             return
-        path = scope["path"]
-        if path == HEALTH_PATH or _card_path(path):
+        if _is_public(scope):
             scope["user"] = _anonymous_user()
             scope["auth"] = AuthCredentials()
             await self.app(scope, receive, send)
@@ -182,36 +189,38 @@ class _AuthMiddleware:
         await self.app(scope, receive, send)
 
 
-class _AuthorizeMiddleware:
-    """Maps /agents/{id}/... to an agent and enforces its AgentAccess."""
+class _AgentAuthorizer:
+    """Wraps one agent's sub-app: enforces that agent's AgentAccess on everything but its card.
 
-    def __init__(self, app: ASGIApp, specs: dict[str, AgentSpec], enforce: bool) -> None:
+    Bound to the agent at mount time, so no path parsing decides *which* agent is checked.
+    """
+
+    def __init__(self, app: ASGIApp, spec: AgentSpec, enforce: bool) -> None:
         self.app = app
-        self.specs = specs
+        self.spec = spec
         self.enforce = enforce
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
-            await self.app(scope, receive, send)
+            if scope["type"] == "websocket":
+                await receive()
+                await send({"type": "websocket.close", "code": 1008})
             return
-        path = scope["path"]
-        if path.startswith("/agents/") and not _card_path(path):
-            agent_id = path.split("/")[2]
-            spec = self.specs.get(agent_id)
-            if spec is None:
-                await JSONResponse({"error": "not found"}, status_code=404)(scope, receive, send)
+        is_card = scope["method"] in ("GET", "HEAD") and get_route_path(scope) == CARD_PATH
+        if self.enforce and not is_card:
+            user = scope.get("user")
+            principal = user.principal if isinstance(user, PrincipalUser) else None
+            try:
+                authorize(principal, self.spec.access)
+            except PermissionDenied:
+                await JSONResponse({"error": "forbidden"}, status_code=403)(scope, receive, send)
                 return
-            if self.enforce:
-                user = scope.get("user")
-                principal = user.principal if isinstance(user, PrincipalUser) else None
-                try:
-                    authorize(principal, spec.access)
-                except PermissionDenied:
-                    await JSONResponse({"error": "forbidden"}, status_code=403)(
-                        scope, receive, send
-                    )
-                    return
         await self.app(scope, receive, send)
+
+
+async def _agent_not_found(scope: Scope, receive: Receive, send: Send) -> None:
+    if scope["type"] == "http":
+        await JSONResponse({"error": "not found"}, status_code=404)(scope, receive, send)
 
 
 class AgentHost:
@@ -240,12 +249,13 @@ class AgentHost:
         self.last_recovery: RecoveryReport | None = None
         self._inner: Starlette | None = None
         self._app_built = False
+        self._app: Starlette | None = None
 
     def add(self, spec: AgentSpec) -> None:
-        if self._app_built:
-            raise RuntimeError("cannot add agents after app() has been called")
         if spec.id in self.specs:
             raise ValueError(f"duplicate agent id: {spec.id}")
+        if self._app_built or self._inner is not None:
+            raise RuntimeError("cannot add agents after app() or startup()")
         self.specs[spec.id] = spec
 
     async def startup(self) -> None:
@@ -279,7 +289,15 @@ class AgentHost:
             sub_routes += create_rest_routes(
                 handler, context_builder=builder, enable_v0_3_compat=True, path_prefix="/rest"
             )
-            routes.append(Mount(f"/agents/{agent_id}", app=Starlette(routes=sub_routes)))
+            routes.append(
+                Mount(
+                    f"/agents/{agent_id}",
+                    app=_AgentAuthorizer(
+                        Starlette(routes=sub_routes), spec, enforce=self.auth is not None
+                    ),
+                )
+            )
+        routes.append(Mount("/agents", app=_agent_not_found))
         if len(self.cards) == 1:
             routes += create_agent_card_routes(next(iter(self.cards.values())))
         self._inner = Starlette(routes=routes)
@@ -305,6 +323,8 @@ class AgentHost:
         await self._inner(scope, receive, send)
 
     def app(self) -> Starlette:
+        if self._app is not None:
+            return self._app
         self._app_built = True
 
         @asynccontextmanager
@@ -319,12 +339,12 @@ class AgentHost:
             routes=[*self.extra_routes, Mount("/", app=self._delegate)], lifespan=lifespan
         )
         # add_middleware prepends, so the last one added is outermost.
-        app.add_middleware(_AuthorizeMiddleware, specs=self.specs, enforce=self.auth is not None)
         if self.auth is not None:
             app.add_middleware(_AuthMiddleware, config=self.auth)
         else:
             app.add_middleware(_AnonymousMiddleware)
         app.add_middleware(_BodyLimitMiddleware, max_bytes=self.max_body_bytes)
+        self._app = app
         return app
 
     def run(self, host: str = "0.0.0.0", port: int = 8000) -> None:
