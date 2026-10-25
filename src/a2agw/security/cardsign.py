@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Literal, get_args
 
 import httpx
+import jwt
 from a2a.types import AgentCard, AgentCardSignature
 from a2a.utils.signing import (
     ProtectedHeader,
@@ -113,6 +114,7 @@ class CardSigner:
             header["jku"] = jku
         self.kid = kid
         self.alg = alg
+        self._key = key
         self._sign = create_agent_card_signer(key, ProtectedHeader(**header))  # type: ignore[typeddict-item]
 
     def sign(self, card: AgentCard) -> AgentCard:
@@ -120,6 +122,12 @@ class CardSigner:
         out = AgentCard()
         out.CopyFrom(card)
         return self._sign(out)
+
+    def sign_jwt(self, claims: dict[str, Any]) -> str:
+        """A compact JWT over `claims`, signed with this signer's key (header `kid`, `alg`).
+
+        The claims are signed as given; the caller sets `iss`, `aud`, `exp` and the rest."""
+        return jwt.encode(claims, self._key.key, algorithm=self.alg, headers={"kid": self.kid})
 
 
 def _protected_header(sig: AgentCardSignature) -> dict[str, Any] | None:

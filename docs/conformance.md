@@ -11,7 +11,7 @@ a2agw's inbound side is checked with the official A2A Technology Compatibility K
 | a2a-sdk | 1.2.3 |
 | Date | 2026-10-25 |
 | Transports | JSON-RPC, HTTP+JSON (a2agw does not serve gRPC) |
-| SUT | `examples/tck_sut/sut_agent.py`: one `AgentSpec` + `CallableAdapter` on `AgentHost`, port 9999, no auth |
+| SUT | `examples/tck_sut/sut_agent.py`: one `AgentSpec` + `CallableAdapter` on `AgentHost`, port 9999, no auth, push notifications on (`PushSettings(allow_private=True)`) |
 
 ## Results
 
@@ -19,23 +19,25 @@ a2agw's inbound side is checked with the official A2A Technology Compatibility K
 
 | | passed | failed | skipped |
 |---|---|---|---|
-| tests | 139 | 0 | 96 |
-| requirements | 73 | 0 | 20 skipped, 21 not tested |
+| tests | 155 | 0 | 80 |
+| requirements | 82 | 0 | 11 skipped, 21 not tested |
+
+All ten push requirements (`PUSH-CREATE-001/002`, `PUSH-GET-001/002`, `PUSH-LIST-001`, `PUSH-DEL-001/002`, `PUSH-DELIVER-001/002/003`) now run and pass on JSON-RPC and HTTP+JSON. The SUT turns push on with `allow_private=True` because the TCK's webhook receiver listens on `http://localhost`; the `AgentHost` default (`allow_private=False`) accepts only public https webhooks.
 
 Why tests are skipped. All of these are TCK skips, not failures:
 
-- 52: the gRPC transport is not offered.
-- 30: push notifications are not supported. The card declares `pushNotifications: false`.
+- 61: the gRPC transport is not offered (this now includes the gRPC variants of the push tests).
 - 6: the card does not declare an extended agent card.
-- 2: the card declares no required extension.
+- 5: tests that only apply when push notifications are unsupported (`PushNotificationNotSupportedError`, -32003).
 - 4: tests that only apply when streaming is unsupported.
+- 2: the card declares no required extension.
 - 2: wrong-`Content-Type` probes, including `HTTP_JSON-STATUS-001` (415). The SDK accepts the request, and the TCK skips rather than fails in that case.
 
 "Not tested" means requirements this TCK has no automated test for: card signing, auth, TLS, versioning and binding equivalence.
 
 ### SHOULD (for information)
 
-13 passed, 0 failed, 7 skipped.
+13 passed, 0 failed, 7 skipped (unchanged with push on: the TCK has no SHOULD-level push tests).
 
 - `CARD-CACHE-001` passes now. `AgentHost(card_cache_control=...)` defaults to `public, max-age=300` on every card route; pass `None` to omit the header.
 - Skips: 4 are for gRPC, which is not offered, and 3 are "No requirements at this level".
@@ -55,9 +57,10 @@ Why tests are skipped. All of these are TCK skips, not failures:
 | `CARD-CACHE-001` (SHOULD) | The agent card had no `Cache-Control` header. | `AgentHost(card_cache_control="public, max-age=300")`, passed to both card routes. |
 | `CORE-CANCEL-002` on HTTP+JSON (MUST) | The SDK returns 400 for `TaskNotCancelableError`, but spec §5.4 requires 409. | `AgentHost` wraps each agent's routes in `_RestConformance`, which remaps REST error statuses by `ErrorInfo.reason` to match §5.4: `TASK_NOT_CANCELABLE` to 409, `CONTENT_TYPE_NOT_SUPPORTED` to 415, `INVALID_AGENT_RESPONSE` to 502. The body's `code` is updated too. SDK clients map errors by reason, so they are unaffected. |
 | `HTTP_JSON-SVC-001` (MUST) | The SDK labels REST responses `application/a2a+json`, but spec §11.1 and the TCK require `application/json`. | The same wrapper rewrites the header to `application/json`. |
+| `PUSH-*` (MUST; they were skipped) | Push notifications were not offered. | `AgentHost(push=PushSettings(...))` (`a2agw.serve.push`): per-agent config stores, owner-scoped CRUD through the SDK handler, and a sender that re-checks the webhook URL with netguard on every delivery, never follows redirects, retries 5xx and connect errors with jittered backoff, and delivers in the background in order per task. The config's `authentication` is sent as `Authorization` (`PUSH-DELIVER-001`) and its `token` as `X-A2A-Notification-Token`. |
 | History tests (`CORE-HIST-*`, SHOULD; they were skipped) | A follow-up that sends only `taskId` gets a fresh `contextId` from the SDK, so the task's events failed with "Context in event doesn't match TaskManager". | `AdapterExecutor` uses the existing task's `context_id`. |
 
-Each fix has a regression test, in `tests/serve/test_executor.py` and `tests/serve/test_host.py`.
+Each fix has a regression test, in `tests/serve/test_executor.py`, `tests/serve/test_host.py` and `tests/serve/test_push.py`.
 
 The TCK reads the root card at `/.well-known/agent-card.json` and then calls the interface URLs that card advertises (`/agents/tck/` and `/agents/tck/rest`). No root-path mount was needed.
 

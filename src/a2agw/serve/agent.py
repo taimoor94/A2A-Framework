@@ -75,7 +75,11 @@ class AgentSpec(BaseModel):
         return v
 
 
-def build_card(spec: AgentSpec, base_url: str, *, security: AuthConfig | None) -> AgentCard:
+def build_card(
+    spec: AgentSpec, base_url: str, *, security: AuthConfig | None, push: bool = False
+) -> AgentCard:
+    """The agent's card. ``push`` declares push-notification support (set by ``AgentHost``
+    only when it is configured with ``PushSettings``)."""
     base = base_url.rstrip("/")
     root = f"{base}/agents/{spec.id}"
 
@@ -112,7 +116,7 @@ def build_card(spec: AgentSpec, base_url: str, *, security: AuthConfig | None) -
         ],
         capabilities=AgentCapabilities(
             streaming=spec.streaming,
-            push_notifications=False,
+            push_notifications=push,
             extensions=[AgentExtension(uri=EXTENSION_URI, required=False)],
         ),
         default_input_modes=spec.input_modes,

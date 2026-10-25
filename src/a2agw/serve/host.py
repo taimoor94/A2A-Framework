@@ -20,7 +20,7 @@ from a2a.server.routes import (
     create_jsonrpc_routes,
     create_rest_routes,
 )
-from a2a.server.tasks import TaskStore
+from a2a.server.tasks import DatabasePushNotificationConfigStore, TaskStore
 from a2a.types import AgentCard, SendMessageRequest
 from a2a.utils.errors import InvalidParamsError
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -53,6 +53,13 @@ from a2agw.security.policy import PolicyEngine
 from a2agw.security.principal import Principal, PrincipalUser
 from a2agw.serve.agent import AgentSpec, build_card
 from a2agw.serve.executor import AdapterExecutor
+from a2agw.serve.push import (
+    DRAIN_TIMEOUT_S,
+    GuardedPushSender,
+    PushSettings,
+    make_push_url_validator,
+    push_config_store_for,
+)
 from a2agw.serve.store import (
     RecoveryReport,
     TaskIndex,
@@ -451,8 +458,14 @@ class AgentHost:
         card_signer: CardSigner | None = None,
         policy: PolicyEngine | None = None,
         audit: bool = True,
+        push: PushSettings | None = None,
     ) -> None:
         self.base_url = base_url
+        # Push notifications (A2A webhooks). None: not offered, and the card says so.
+        self.push = push
+        self.push_http: httpx.AsyncClient | None = None  # created at startup when push is set
+        self.push_senders: dict[str, GuardedPushSender] = {}
+        self.push_stores: dict[str, DatabasePushNotificationConfigStore] = {}
         # Authz (authorizer and executor), egress (partner client) and routing (tools).
         self.policy = policy
         # audit=False disables the audit log entirely (no table, no events).
@@ -507,6 +520,9 @@ class AgentHost:
         try:
             await self._startup()
         except BaseException:
+            if self.push_http is not None:
+                await self.push_http.aclose()
+                self.push_http = None
             if self.client is not None:
                 await self.client.aclose()
                 self.client = None
@@ -516,6 +532,8 @@ class AgentHost:
             raise
 
     async def _startup(self) -> None:
+        push = self.push
+        push_key = push.encryption_key() if push is not None else None  # fail before opening
         self.bus.reopen()
         engine = self.engine = await create_engine(self.db_url)
         index = self.index = TaskIndex(engine)
@@ -542,6 +560,10 @@ class AgentHost:
         )
         stores: dict[str, TaskStore] = {}
         routes: list[BaseRoute] = []
+        push_validator = None
+        if push is not None:
+            push_validator = make_push_url_validator(push.allow_private)
+            self.push_http = httpx.AsyncClient(follow_redirects=False, timeout=push.timeout_s)
         for agent_id, spec in self.specs.items():
             store = task_store_for(engine, agent_id)
             await store.initialize()
@@ -549,14 +571,37 @@ class AgentHost:
             executor = AdapterExecutor(spec, index, self.bus, policy=self.policy, audit=audit)
             # Cancelling an inbound task cancels the partner tasks it started.
             executor.on_cancel = client.cancel_for_inbound
-            card = build_card(spec, self.base_url, security=self.auth)
+            card = build_card(spec, self.base_url, security=self.auth, push=push is not None)
             if self.card_signer is not None:
                 card = self.card_signer.sign(card)
+            push_kwargs: dict[str, Any] = {}
+            if push is not None:
+                assert self.push_http is not None
+                push_store = push_config_store_for(engine, agent_id, encryption_key=push_key)
+                await push_store.initialize()
+                sender = GuardedPushSender(
+                    self.push_http,
+                    push_store,
+                    settings=push,
+                    agent_id=agent_id,
+                    base_url=self.base_url,
+                    validator=push_validator,
+                )
+                self.push_stores[agent_id] = push_store
+                self.push_senders[agent_id] = sender
+                # The handler checks the URL when a config is created; the sender again at
+                # every delivery. Config CRUD is owner-scoped by the store's owner resolver.
+                push_kwargs = {
+                    "push_config_store": push_store,
+                    "push_sender": sender,
+                    "push_url_validator": push_validator,
+                }
             handler = LimitedRequestHandler(
                 agent_executor=executor,
                 task_store=store,
                 agent_card=card,
                 max_parts=self.max_parts,
+                **push_kwargs,
             )
             self.executors[agent_id] = executor
             self.handlers[agent_id] = handler
@@ -651,12 +696,22 @@ class AgentHost:
         if result.state != "canceled":
             raise RuntimeError("not canceled")
 
+    def push_stats(self, agent_id: str) -> dict[str, int]:
+        """Delivery counters of one agent's push sender (delivered, failed, retries, ...)."""
+        return dict(self.push_senders[agent_id].stats)
+
     async def shutdown(self) -> None:
-        # Order matters: end event streams, stop the executors, let the partner client
-        # drain its cancellation cleanups (they need the engine), then dispose the engine.
+        # Order matters: end event streams, stop the executors, flush pending push
+        # deliveries (bounded), let the partner client drain its cancellation cleanups (they
+        # need the engine), then dispose the engine.
         self.bus.close_all()
         for handler in self.handlers.values():
             await handler.aclose()
+        if self.push_senders:
+            await asyncio.gather(*(s.aclose(DRAIN_TIMEOUT_S) for s in self.push_senders.values()))
+        if self.push_http is not None:
+            await self.push_http.aclose()
+            self.push_http = None
         if self.client is not None:
             await self.client.aclose()
         if self.audit is not None:

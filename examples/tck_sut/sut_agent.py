@@ -24,6 +24,7 @@ from a2agw.core.events import AgentEvent, ArtifactChunk, Done, Failed, NeedInput
 from a2agw.core.spi import InboundContext
 from a2agw.serve.agent import AgentSpec, SkillSpec
 from a2agw.serve.host import AgentHost
+from a2agw.serve.push import PushSettings
 
 BASE_URL = "http://localhost:9999"
 STREAMING_TIMEOUT_S = 2.0  # the TCK's streaming timeout; the resubscribe task waits 2x this
@@ -138,7 +139,9 @@ def build_host(base_url: str = BASE_URL, *, db_url: str | None = None) -> AgentH
         tmp = tempfile.TemporaryDirectory(prefix="a2agw-tck-")
         atexit.register(tmp.cleanup)
         db_url = f"sqlite+aiosqlite:///{os.path.join(tmp.name, 'tck.db')}"
-    host = AgentHost(base_url, db_url=db_url)
+    # Push is on so the TCK's PUSH-* tests run. Its webhook receiver listens on localhost over
+    # plain http, so the SUT opts in to private webhooks; the default is public https only.
+    host = AgentHost(base_url, db_url=db_url, push=PushSettings(allow_private=True))
     host.add(sut_spec())
     if tmp is not None:
         # uvicorn re-raises SIGTERM after a graceful shutdown, which skips atexit, so the

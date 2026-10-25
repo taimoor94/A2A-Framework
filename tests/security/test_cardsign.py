@@ -425,3 +425,35 @@ def test_trusted_keys_checked_like_jwks_keys(tmp_path):
     mislabeled = PyJWK(ECAlgorithm.to_jwk(p384, as_dict=True), algorithm="ES256")
     with pytest.raises(ValueError):
         CardVerifier({"k1": mislabeled})
+
+
+@pytest.mark.parametrize("name", ["ec", "ed", "rsa"])
+def test_sign_jwt_uses_card_key_kid_and_alg(keys, name):
+    import jwt as pyjwt
+
+    s = signer(keys, name, kid="gw-1")
+    token = s.sign_jwt({"iss": "https://gw", "aud": "https://hook", "iat": 1, "exp": 301})
+    header = pyjwt.get_unverified_header(token)
+    assert header["kid"] == "gw-1" and header["alg"] == keys[name][2]
+    claims = pyjwt.decode(
+        token,
+        load_public_key(keys[name][1]).key,
+        algorithms=[keys[name][2]],
+        audience="https://hook",
+        options={"verify_exp": False},
+    )
+    assert claims["iss"] == "https://gw"
+    # Another key of the same type does not verify it.
+    fresh = {
+        "ec": lambda: ec.generate_private_key(ec.SECP256R1()),
+        "ed": ed25519.Ed25519PrivateKey.generate,
+        "rsa": lambda: rsa.generate_private_key(public_exponent=65537, key_size=2048),
+    }[name]()
+    with pytest.raises(pyjwt.InvalidSignatureError):
+        pyjwt.decode(
+            token,
+            fresh.public_key(),
+            algorithms=[keys[name][2]],
+            audience="https://hook",
+            options={"verify_exp": False},
+        )
