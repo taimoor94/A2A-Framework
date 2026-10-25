@@ -75,8 +75,8 @@ AUTHZ_RULES = [
         (ALICE, "billing", None, True, None, "alice-all"),
         # wildcard principal allows any authenticated caller for skill "read"
         (BOB, "billing", "read", True, None, "authz[1]"),
-        # skill_id None matches only skills="*" rules
-        (BOB, "billing", None, False, "no matching allow rule", None),
+        # skill_id None: allow rules need skills="*", deny rules match whatever their skills
+        (BOB, "billing", None, False, "denied by rule", "no-bob-refund"),
         # deny overrides allow
         (BOB, "billing", "refund", False, None, "no-bob-refund"),
         # rules exist for the agent, none match: default deny
@@ -91,8 +91,9 @@ AUTHZ_RULES = [
         (BOB, "status", "x", False, "no matching allow rule", None),
         # wildcard deny
         (ALICE, "ops", None, False, None, "authz[4]"),
-        # anonymous is not matched by the "*" deny either, but rules mention ops: default deny
-        (ANON, "ops", None, False, "no matching allow rule", None),
+        # a "*" deny matches anonymous and None principals too
+        (ANON, "ops", None, False, "denied by rule", "authz[4]"),
+        (None, "ops", "x", False, "denied by rule", "authz[4]"),
     ],
 )
 def test_authorize_table(principal, agent, skill, allowed, reason, rule):
@@ -114,6 +115,38 @@ def test_authorize_without_rules_for_agent_allows():
 
 def test_authorize_empty_policy_allows():
     assert PolicyEngine(_policy()).authorize(None, "a", None).allowed
+
+
+def test_skill_scoped_deny_applies_when_skill_unknown():
+    rules = [
+        {"principal": "*", "agents": ["billing"], "effect": "allow"},
+        {"principal": "key:alice", "agents": ["billing"], "skills": ["transfer"], "effect": "deny"},
+    ]
+    engine = PolicyEngine(_policy(authz=rules))
+    assert not engine.authorize(ALICE, "billing", None).allowed
+    assert not engine.authorize(ALICE, "billing", "transfer").allowed
+    assert engine.authorize(ALICE, "billing", "read").allowed
+    assert engine.authorize(BOB, "billing", None).allowed
+
+
+def test_wildcard_deny_locks_out_anonymous():
+    rules = [
+        {"principal": "anonymous", "agents": ["pub"], "effect": "allow"},
+        {"id": "lockdown", "principal": "*", "agents": ["pub"], "effect": "deny"},
+    ]
+    engine = PolicyEngine(_policy(authz=rules))
+    for who in (ANON, None, ALICE):
+        d = engine.authorize(who, "pub", None)
+        assert not d.allowed and d.rule == "lockdown"
+
+
+def test_lone_deny_rule_denies_everyone_on_that_agent():
+    engine = PolicyEngine(
+        _policy(authz=[{"principal": "key:mallory", "agents": ["billing"], "effect": "deny"}])
+    )
+    assert engine.authorize(BOB, "billing", None).reason == "no matching allow rule"
+    assert not engine.authorize(BOB, "billing", None).allowed
+    assert engine.authorize(BOB, "hr", None).allowed
 
 
 def test_authz_skills_default_to_wildcard():
@@ -193,6 +226,25 @@ def test_unknown_classification_used_when_nothing_classifies():
     # an explicit value counts as classifying the data
     d = engine.egress("a", _partner("pub", tier="public"), C.PUBLIC, "", None)
     assert d.classification is C.PUBLIC and d.allowed
+
+
+def test_classifier_cannot_lower_unknown_classification():
+    pol = _policy(defaults={"unknown_classification": "internal"})
+    pub = _partner("pub", tier="public")
+    for clf in (None, RegexPiiClassifier()):
+        d = PolicyEngine(pol, classifier=clf).egress("a", pub, None, "hello", None)
+        assert not d.allowed and d.classification is C.INTERNAL
+    # the classifier still raises it
+    d = PolicyEngine(pol, classifier=RegexPiiClassifier()).egress(
+        "a", _partner("p"), None, "x@example.com", None
+    )
+    assert d.classification is C.CONFIDENTIAL
+
+
+def test_classifier_raises_explicit_label():
+    engine = PolicyEngine(_policy(), classifier=RegexPiiClassifier())
+    d = engine.egress("a", _partner("pub", tier="public"), C.PUBLIC, "x@example.com", None)
+    assert d.classification is C.CONFIDENTIAL and not d.allowed
 
 
 def test_egress_defaults_public_with_no_classifier():
@@ -370,6 +422,38 @@ def test_validation_errors_name_path(tmp_path, yaml_text, path):
     with pytest.raises(PolicyError) as ei:
         load_policy(f)
     assert path in str(ei.value)
+
+
+@pytest.mark.parametrize(
+    "principal", ["alice", " key:alice", "key:alice ", "key:", "jwt:", "user:bob", "Anonymous", ""]
+)
+def test_bad_principal_rejected(tmp_path, principal):
+    f = tmp_path / "p.yaml"
+    f.write_text(
+        f"version: 1\nauthz:\n  - {{principal: '{principal}', agents: [a], effect: deny}}\n"
+    )
+    with pytest.raises(PolicyError) as ei:
+        load_policy(f)
+    assert "authz.0.principal" in str(ei.value)
+
+
+@pytest.mark.parametrize("principal", ["*", "anonymous", "key:alice", "jwt:auth0|abc def"])
+def test_good_principal_accepted(principal):
+    _policy(authz=[{"principal": principal, "agents": ["a"], "effect": "allow"}])
+
+
+@pytest.mark.parametrize("section", ["authz", "routing"])
+def test_duplicate_rule_ids_rejected(tmp_path, section):
+    rule = (
+        "{id: r, principal: '*', agents: [a], effect: allow}"
+        if section == "authz"
+        else "{id: r, agent: a, partners: [p], mode: forbid}"
+    )
+    f = tmp_path / "p.yaml"
+    f.write_text(f"version: 1\n{section}:\n  - {rule}\n  - {rule}\n")
+    with pytest.raises(PolicyError) as ei:
+        load_policy(f)
+    assert f"duplicate rule id at {section}[1]" in str(ei.value)
 
 
 def test_error_message_omits_values(tmp_path):

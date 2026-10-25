@@ -19,18 +19,30 @@ startup with an error naming the field path (``load_policy`` -> ``PolicyError``)
 
 authorize(principal, agent_id, skill_id)
     A rule matches when its principal matches, the agent is listed (or ``agents: "*"``) and
-    the skill is listed (or ``skills: "*"``); a ``skill_id`` of None matches only
-    ``skills: "*"``. ``principal: "*"`` matches any authenticated caller but never an
-    anonymous or None principal; those match only an exact ``"anonymous"`` rule.
+    the skill is listed (or ``skills: "*"``). Matching is conservative in the deny
+    direction:
+
+    - ``skill_id`` None (skill unknown): an allow rule matches only if ``skills: "*"``; a
+      deny rule matches whatever its ``skills`` list says.
+    - ``principal: "*"``: on an allow rule it matches any authenticated caller but never
+      an anonymous or None principal (those match only an exact ``"anonymous"`` rule); on
+      a deny rule it matches every caller, anonymous and None included.
+
+    Principals in rules are ``"*"``, ``"anonymous"``, ``key:<id>`` or ``jwt:<sub>``.
     Any matching deny -> deny. Else any matching allow -> allow. Else, if any rule mentions
-    the agent (listed or ``"*"``, whatever its principal/skills) -> deny ("no matching
-    allow rule"). Else allow ("no authz rules for agent"): Phase 1 ``AgentAccess`` applies.
-    ``Decision.rule`` is the rule's ``id`` or ``authz[i]``.
+    the agent (listed or ``"*"``, whatever its principal/skills/effect) -> deny ("no
+    matching allow rule"). Else allow ("no authz rules for agent"): Phase 1
+    ``AgentAccess`` applies. Note the consequence: a lone deny rule is a lockdown, not a
+    blocklist. ``{principal: "key:mallory", agents: [billing], effect: deny}`` with no
+    allow rule for ``billing`` denies every caller on ``billing``; add an allow rule
+    (e.g. ``principal: "*"``) to deny only mallory.
+    ``Decision.rule`` is the rule's ``id`` or ``authz[i]``; ids must be unique.
 
 egress(agent_id, partner, classification, text, data)
-    effective = max(explicit classification, ``defaults.agent_classification[agent]``,
-    classifier result if a classifier is configured); ``defaults.unknown_classification``
-    when none of those exists. ceiling = ``egress.partner_ceilings[partner.id]`` if set,
+    label = max(explicit classification, ``defaults.agent_classification[agent]``), or
+    ``defaults.unknown_classification`` when neither is given; effective = max(label,
+    classifier result if a classifier is configured), so a classifier can raise but never
+    lower the level. ceiling = ``egress.partner_ceilings[partner.id]`` if set,
     else ``egress.tier_ceilings[partner.tier]`` (missing tiers keep their defaults).
     Allowed iff effective <= ceiling. ``Decision.classification`` is the effective value.
 
@@ -41,7 +53,8 @@ route(agent_id, partners)
     (either hit suffices; no/empty match means every partner). ``forbid`` removes partners
     from ``visible``; ``force`` lists them in ``forced``; ``prefer`` moves them to the front
     of ``visible`` in rule order and lists them in ``preferred``. Forbid wins: a partner
-    both forced and forbidden is in neither list and is reported in ``conflicts``.
+    both forced and forbidden is in neither list and is reported in ``conflicts``. Rule
+    ids must be unique.
 
 Fail closed: an exception during evaluation yields ``Decision(False, "policy evaluation
 error", None, None)`` (or an empty ``RoutePlan``) and is logged by exception class only.
@@ -50,6 +63,7 @@ error", None, None)`` (or an empty ``RoutePlan``) and is logged by exception cla
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal
@@ -106,12 +120,35 @@ class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+_PRINCIPAL = re.compile(r"\*|anonymous|(?:key|jwt):\S(?:.*\S)?", re.DOTALL)
+
+
 class AuthzRule(_Strict):
     id: str | None = None
     principal: str
     agents: list[str] | Literal["*"]
     skills: list[str] | Literal["*"] = "*"
     effect: Literal["allow", "deny"]
+
+    @field_validator("principal")
+    @classmethod
+    def _check_principal(cls, v: str) -> str:
+        if not _PRINCIPAL.fullmatch(v):
+            raise ValueError(
+                'principal must be "*", "anonymous", "key:<id>" or "jwt:<sub>" '
+                "with no surrounding whitespace"
+            )
+        return v
+
+
+def _unique_ids(rules: list[Any], section: str) -> None:
+    seen: set[str] = set()
+    for i, rule in enumerate(rules):
+        if rule.id is None:
+            continue
+        if rule.id in seen:
+            raise ValueError(f"duplicate rule id at {section}[{i}]")
+        seen.add(rule.id)
 
 
 class Egress(_Strict):
@@ -150,6 +187,18 @@ class Policy(_Strict):
     egress: Egress = Field(default_factory=Egress)
     routing: list[RoutingRule] = Field(default_factory=list)
     defaults: Defaults = Field(default_factory=Defaults)
+
+    @field_validator("authz")
+    @classmethod
+    def _unique_authz(cls, v: list[AuthzRule]) -> list[AuthzRule]:
+        _unique_ids(v, "authz")
+        return v
+
+    @field_validator("routing")
+    @classmethod
+    def _unique_routing(cls, v: list[RoutingRule]) -> list[RoutingRule]:
+        _unique_ids(v, "routing")
+        return v
 
 
 @dataclass(frozen=True)
@@ -205,18 +254,19 @@ class PolicyEngine:
             if not _mentions(rule.agents, agent_id):
                 continue
             mentioned = True
+            deny = rule.effect == "deny"
             if rule.principal == "*":
-                if anonymous:
+                if anonymous and not deny:
                     continue
             elif rule.principal != pid:
                 continue
             if skill_id is None:
-                if rule.skills != "*":
+                if rule.skills != "*" and not deny:
                     continue
             elif not _mentions(rule.skills, skill_id):
                 continue
             name = rule.id or f"authz[{i}]"
-            if rule.effect == "deny":
+            if deny:
                 return Decision(False, "denied by rule", name, None)
             if allow is None:
                 allow = name
@@ -249,15 +299,15 @@ class PolicyEngine:
         text: str,
         data: dict[str, Any] | None,
     ) -> Decision:
-        levels: list[Classification] = []
+        labels: list[Classification] = []
         if classification is not None:
-            levels.append(Classification(classification))
+            labels.append(Classification(classification))
         default = self.policy.defaults.agent_classification.get(agent_id)
         if default is not None:
-            levels.append(default)
+            labels.append(default)
+        eff = max(labels) if labels else self.policy.defaults.unknown_classification
         if self.classifier is not None:
-            levels.append(Classification(self.classifier.classify(text, data)))
-        eff = max(levels) if levels else self.policy.defaults.unknown_classification
+            eff = max(eff, Classification(self.classifier.classify(text, data)))
 
         egress = self.policy.egress
         if partner.id in egress.partner_ceilings:
@@ -343,10 +393,16 @@ def _route_match(match: RouteMatch | None, rec: PartnerRecord) -> bool:
 
 def _describe_errors(exc: ValidationError) -> str:
     # Dotted field path and error type only; never the offending input values.
-    return "; ".join(
-        f"{'.'.join(str(p) for p in err['loc']) or '<root>'} ({err['type']})"
-        for err in exc.errors(include_input=False, include_url=False)
-    )
+    # Our own validators' messages (type value_error) never include the input, so they
+    # are shown too.
+    parts = []
+    for err in exc.errors(include_input=False, include_url=False):
+        loc = ".".join(str(p) for p in err["loc"]) or "<root>"
+        detail = err["type"]
+        if detail == "value_error":
+            detail = err["msg"].removeprefix("Value error, ")
+        parts.append(f"{loc} ({detail})")
+    return "; ".join(parts)
 
 
 def load_policy(path: Path) -> Policy:

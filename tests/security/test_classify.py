@@ -96,11 +96,78 @@ def test_unserialisable_data_does_not_raise():
     assert clf.classify("hi", {"obj": object()}) is C.PUBLIC
 
 
-def test_input_is_bounded():
+def test_over_bound_input_fails_closed():
     clf = RegexPiiClassifier()
     pad = "x" * (256 * 1024)
-    assert clf.classify(pad + " jane@example.com", None) is C.PUBLIC
-    assert clf.classify("", {"pad": pad, "email": "jane@example.com"}) is C.PUBLIC
+    assert clf.classify(pad, None) is C.PUBLIC  # exactly at the bound is scanned
+    assert clf.classify(pad + " jane@example.com", None) is C.CONFIDENTIAL
+    assert clf.classify(pad + "x", None) is C.CONFIDENTIAL
+    assert clf.classify("", {"pad": pad, "email": "jane@example.com"}) is C.CONFIDENTIAL
+    assert clf.classify("", {"pad": pad}) is C.CONFIDENTIAL
+
+
+def test_huge_data_stops_serialising_early():
+    clf = RegexPiiClassifier()
+    big = {"items": ["x" * 1024] * 50_000}  # ~50 MB if fully serialised
+    start = time.perf_counter()
+    assert clf.classify("", big) is C.CONFIDENTIAL
+    assert time.perf_counter() - start < 0.5
+
+
+def test_circular_data_raises():
+    loop: dict = {}
+    loop["self"] = loop
+    with pytest.raises(ValueError):
+        RegexPiiClassifier().classify("", loop)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "pay DE89 3704 0044 0532 0130 00 now",
+        "pay de89370400440532013000 now",
+        "pay gb82 west 1234 5698 7654 32",
+        "acct BE68 5390 0754 7034 then done",  # 16-char IBAN followed by a 4-letter word
+    ],
+)
+def test_iban_spaced_and_lowercase(text):
+    assert RegexPiiClassifier().classify(text, None) is C.CONFIDENTIAL
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "\uff14" + "\uff11" * 15,  # fullwidth 4111111111111111
+        "\u0664" + "\u0661" * 15,  # Arabic-Indic 4111111111111111
+        "jane\uff20example.com",  # fullwidth at sign
+        "\u0968\u0968 \u0967\u0968\u0969 \u0967\u0968\u0969",  # Devanagari digits, too short
+    ],
+)
+def test_unicode_digits_normalised(text):
+    expected = C.PUBLIC if "\u0968" in text else C.CONFIDENTIAL
+    assert RegexPiiClassifier().classify(text, None) is expected
+
+
+def test_card_requires_issuer_prefix():
+    clf = RegexPiiClassifier()
+    # Luhn-valid but no real IIN prefix (starts with 1 / 9) or wrong length for the brand.
+    assert clf.classify("id 1234567812345670", None) is C.PUBLIC
+    assert clf.classify("id 9111111111111111", None) is C.PUBLIC
+    assert clf.classify("id 411111111111111113", None) is C.PUBLIC  # 18-digit "Visa"
+
+
+def test_timestamps_and_snowflakes_not_flagged():
+    import random
+
+    rng = random.Random(1234)
+    clf = RegexPiiClassifier()
+    for _ in range(2000):
+        epoch_ms = str(1_600_000_000_000 + rng.randrange(10**12))
+        # Snowflake-style ids: 18-19 digits with a leading 1.
+        snow18 = str(rng.randrange(10**17, 2 * 10**17))
+        snow19 = str(rng.randrange(10**18, 2 * 10**18))
+        assert clf.classify(f"ts {epoch_ms}", None) is C.PUBLIC
+        assert clf.classify(f"id {snow18} {snow19}", None) is C.PUBLIC
 
 
 @pytest.mark.parametrize(
@@ -120,6 +187,9 @@ def test_input_is_bounded():
         "GB8",
         "A1",
         "1111 ",
+        "AB12 CCCC ",
+        "ab12cccc",
+        "\u0664",
         "a.b@",
         "@a.",
     ],
@@ -128,5 +198,5 @@ def test_adversarial_input_is_fast(unit):
     text = (unit * (256 * 1024 // len(unit) + 1))[: 256 * 1024]
     clf = RegexPiiClassifier()
     start = time.perf_counter()
-    clf.classify(text, {"t": text})
+    clf.classify(text, {"t": text[: 200 * 1024]})
     assert time.perf_counter() - start < 0.5
