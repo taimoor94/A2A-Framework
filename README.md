@@ -1,6 +1,6 @@
 # a2a-gateway
 
-A framework-agnostic gateway for the [A2A (Agent2Agent) protocol](https://a2a-protocol.org). It works in both directions. **Inbound**, it serves any agent (a plain function, a LangChain runnable, a LangGraph graph) as a standards-compliant A2A server. **Outbound**, it keeps a registry of partner agents, each registered from its Agent Card, and exposes them to your agent as tools, so the agent's own reasoning decides which partner to consult. It is built on the official `a2a-sdk` and treats every remote party as untrusted by default.
+A framework-agnostic gateway for the [A2A (Agent2Agent) protocol](https://a2a-protocol.org). It works in both directions. **Inbound**, it serves any agent (a plain function, a LangChain runnable, a LangGraph graph) as a standards-compliant A2A server. **Outbound**, it keeps a registry of partner agents, each registered from its Agent Card, and makes them available to your agent as tools (when the agent's code uses `partner_tools`), so the agent's own reasoning decides which partner to consult. It is built on the official `a2a-sdk` and treats every remote party as untrusted by default.
 
 ## Features
 
@@ -45,12 +45,15 @@ wrote myagent/.env.example
 Start the gateway:
 
 ```bash
-cd myagent && a2agw serve          # http://localhost:8000
+cd myagent && a2agw serve          # binds 127.0.0.1:8000 by default
 ```
 
-The echo agent is now served at `http://localhost:8000/agents/echo/`, and its card is at `/agents/echo/.well-known/agent-card.json`. In another terminal, call it. `call` takes the agent's base URL (the one in its card, with the trailing slash). It treats the target as a `partner` by default, which requires https, so for a local `http://` agent pass `--tier internal`:
+The scaffold sets `admin_without_auth: true` so you can try the admin API locally. That leaves the admin API open to anyone who can reach the port, so keep the default `--host 127.0.0.1` and configure `auth` (see Configuration) before you bind to `0.0.0.0` with `--host 0.0.0.0`.
+
+The echo agent is now served at `http://localhost:8000/agents/echo/`, and its card is at `/agents/echo/.well-known/agent-card.json`. In another terminal (the `partners` commands read `a2agw.yaml`, so stay in `myagent`, or pass `-c myagent/a2agw.yaml`), call it. `call` takes the agent's base URL (the one in its card, with the trailing slash). It treats the target as a `partner` by default, which requires https, so for a local `http://` agent pass `--tier internal`:
 
 ```bash
+cd myagent
 a2agw call http://localhost:8000/agents/echo/ "hello" --tier internal
 ```
 
@@ -72,7 +75,7 @@ ID    TIER      STATUS  HASH          PENDING
 echo  internal  active  da7686314f77
 ```
 
-Restart `a2agw serve` to load new partners. Agents running in the gateway then see them as tools. Open `agent.py` and edit the function: it is a normal Python function.
+Restart `a2agw serve` to load new partners. Partners are registered gateway-wide, but an agent only gets them as tools if its code builds them with `partner_tools` / `as_langchain_tools` (see below); the echo agent does not. Open `agent.py` and edit the function: it is a normal Python function.
 
 ```python
 from a2agw.adapters.callable import agent
@@ -150,10 +153,12 @@ host.add(deployer)
 `partner_tools(host.partners)` projects the active partners as tools. `as_langchain_tools(tools, host.client)` turns them into LangChain `StructuredTool`s, and each tool returns a JSON string. `host.client` exists once the host has started, so build the tools inside the agent run, as the demo does.
 
 ```python
+from pathlib import Path
+
 from a2agw import AgentHost, partner_tools
 from a2agw.adapters.langchain import as_langchain_tools
 
-host = AgentHost("http://localhost:8000", partners_path="partners.yaml")
+host = AgentHost("http://localhost:8000", partners_path=Path("partners.yaml"))
 
 
 def tools_for_this_run():
@@ -176,12 +181,14 @@ Give those tools to a tool-calling model, a LangGraph `ToolNode`, or call them d
   a2agw partners list                   # shows the PENDING flag and the hash
   a2agw partners approve acme --hash <hash-from-list>
   ```
-- **Principals are prefixed.** `AgentAccess(allowed_principals=...)` takes `key:<principal_id>` for API keys and `jwt:<sub>` for JWTs. An unprefixed id matches nothing. Anonymous callers are always denied by `authorize`.
-- **Untrusted partner text.** Text from partners is capped at 64 KiB and returned with `UNTRUSTED_NOTE` in the tool result, so the model treats it as data. Binary artifacts are never inlined.
-- **Call-context limits.** Every call carries a call context: at most 8 hops by default, an absolute deadline (the default inbound ceiling is 1 hour), an optional call budget (`max_calls`), and the path of agents already involved. A call that comes back to an agent already on its path is rejected unless that agent sets `allow_reentry`. Limits only ever tighten as the context travels. Cancelling an inbound task cancels the partner tasks it started.
+- **Access control needs `auth`.** Without an `auth` section every caller is anonymous and `AgentAccess` is not enforced, so that setup is for local development only. Once `auth` is set, anonymous callers are always denied on agent endpoints; `allow_anonymous: true` only opens the public card and healthz endpoints.
+- **Principals are prefixed.** `AgentAccess(allowed_principals=...)` takes `key:<principal_id>` for API keys and `jwt:<sub>` for JWTs. An unprefixed id matches nothing.
+- **Untrusted partner text.** Text from partners is capped at 64 KiB, and results carry `provenance.untrusted = true`. `UNTRUSTED_NOTE` is appended to the partner tools' descriptions so the model treats partner output as data, not instructions. Binary artifacts are never inlined.
+- **Call-context limits.** Every call carries a call context: at most 8 hops by default, an absolute deadline (the default inbound ceiling is 1 hour; it is checked when a call is admitted, not enforced mid-run), an optional call budget (`max_calls`), and the path of agents already involved. A call that comes back to an agent already on its path is rejected unless that agent sets `allow_reentry`. Limits only ever tighten as the context travels. Cancelling an inbound task cancels the partner tasks it started.
 - **Inbound limits.** Request bodies up to 10 MiB and 64 parts per message.
 - **Admin.** The admin API needs a principal with the `a2agw:admin` scope. With no `auth` configured it is closed, unless you set `admin_without_auth: true` (development only).
-- **Secrets** never appear in logs, traces, the admin API, or error messages. Credentials are read from the environment at call time.
+- **Secrets.** By design, secrets are kept out of logs, traces, the admin API, and error messages, and credentials are read from the environment at call time. Treat that as the intent, not a guarantee, and review your own agent code and exporters.
+- **Development switch.** `A2AGW_DEV=1` allows plain `http://` for the `partner` and `public` tiers. It is for local development only; never set it in production.
 
 ```python
 from a2agw import AgentAccess, AuthConfig
@@ -225,7 +232,7 @@ partners_file: partners.yaml                         # partner registry, relativ
 admin_without_auth: false                            # true = open admin API (development only)
 
 auth:                                                # omit for no authentication
-  allow_anonymous: false
+  allow_anonymous: false                             # true only opens card + healthz
   api_keys:                                          # key: sha256 hex of the API key
     "<64-char sha256 hex>":
       principal_id: ci-bot                           # becomes key:ci-bot
@@ -256,7 +263,7 @@ telemetry:
   otlp_endpoint: ${OTLP_ENDPOINT:-}                  # optional
 ```
 
-Generate an API-key hash with `printf %s "$KEY" | shasum -a 256`.
+Generate an API-key hash with `printf %s "$KEY" | shasum -a 256 | cut -d' ' -f1`.
 
 ## Architecture
 

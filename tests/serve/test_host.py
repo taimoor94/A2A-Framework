@@ -439,3 +439,13 @@ async def test_card_cache_control_default_and_override(env):
     e2 = await env(spec("beta"), card_cache_control=None)
     r = await e2.http().get("/agents/beta/.well-known/agent-card.json")
     assert "cache-control" not in r.headers
+
+
+async def test_partners_path_accepts_str(tmp_path):
+    path = tmp_path / "partners.yaml"
+    path.write_text("partners: []\n")
+    host = AgentHost(
+        "http://t", partners_path=str(path), db_url=f"sqlite+aiosqlite:///{tmp_path}/a.db"
+    )
+    host.partners.load()  # raised AttributeError when the str was passed through
+    assert host.partners.all() == []

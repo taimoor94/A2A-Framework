@@ -344,7 +344,7 @@ class AgentHost:
         max_parts: int = 64,
         admin: bool = True,
         admin_without_auth: bool = False,
-        partners_path: Path | None = None,
+        partners_path: str | Path | None = None,
         credentials: CredentialProvider | None = None,
         partner_http: httpx.AsyncClient | None = None,
         default_deadline_s: float = 60.0,
@@ -370,7 +370,9 @@ class AgentHost:
         self.last_recovery: RecoveryReport | None = None
         # Outbound side. The registry exists from construction so operators can register
         # partners before startup; the handle store and client are created at startup.
-        self.partners = PartnerRegistry(partners_path, http=partner_http)
+        self.partners = PartnerRegistry(
+            Path(partners_path) if partners_path is not None else None, http=partner_http
+        )
         self.credentials = credentials
         self.partner_http = partner_http
         self.default_deadline_s = default_deadline_s

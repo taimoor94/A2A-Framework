@@ -207,7 +207,7 @@ def test_serve_registers_and_runs(tmp_path, monkeypatch):
     monkeypatch.setattr(uvicorn, "run", lambda app, **kw: calls.update(kw, app=app))
     r = run("serve", "-c", str(tmp_path / "a2agw.yaml"), "--port", "9123")
     assert r.exit_code == 0, r.output
-    assert calls["port"] == 9123 and calls["host"] == "0.0.0.0"
+    assert calls["port"] == 9123 and calls["host"] == "127.0.0.1"
     import sys
 
     sys.modules.pop("t20_serve_agent", None)

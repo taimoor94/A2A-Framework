@@ -140,7 +140,7 @@ def init(
 @guarded
 def serve(
     config: ConfigOpt = Path("a2agw.yaml"),
-    host: Annotated[str, typer.Option("--host")] = "0.0.0.0",
+    host: Annotated[str, typer.Option("--host")] = "127.0.0.1",
     port: Annotated[int, typer.Option("--port")] = 8000,
 ) -> None:
     """Run the gateway."""
