@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from a2agw.context.call_context import (
@@ -9,8 +11,12 @@ from a2agw.context.call_context import (
     DeadlineExceeded,
     HopLimitExceeded,
     current_call,
+    current_inbound_task,
+    current_principal,
     use_call,
+    use_inbound,
 )
+from a2agw.security.principal import Principal
 
 NOW = 1_000_000.0
 
@@ -186,3 +192,26 @@ def test_clamp_floors_calls_used_and_caps_max_calls():
         == 20
     )
     assert none.clamp(local_max_hops=8, local_max_deadline_s=60, now=NOW).max_calls is None
+
+
+async def test_use_inbound_scoped_to_block_and_its_tasks():
+    p = Principal(id="key:x", kind="api_key", scopes=frozenset())
+    gate = asyncio.Event()
+    seen: dict[str, object] = {}
+
+    async def unrelated():  # started outside the block, runs while it is active
+        await gate.wait()
+        seen["unrelated"] = (current_inbound_task.get(), current_principal.get())
+
+    async def child():
+        seen["child"] = (current_inbound_task.get(), current_principal.get())
+
+    other = asyncio.create_task(unrelated())
+    with use_inbound("t1", p):
+        assert (current_inbound_task.get(), current_principal.get()) == ("t1", p)
+        await asyncio.create_task(child())
+        gate.set()
+        await other
+    assert seen["child"] == ("t1", p)
+    assert seen["unrelated"] == (None, None)
+    assert current_inbound_task.get() is None and current_principal.get() is None

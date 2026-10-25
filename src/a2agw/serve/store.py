@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import logging
@@ -246,10 +247,18 @@ async def recover_on_startup(
     stores: dict[str, TaskStore],
     durable: dict[str, bool],
     handles: OutboundHandleStore | None,
-    cancel_outbound: Callable[[dict[str, Any]], Awaitable[None]] | None,
+    cancel_outbound: Callable[..., Awaitable[object]] | None,
+    *,
+    cancel_timeout_s: float = 60.0,
 ) -> RecoveryReport:
-    """Spec 11a item 5: fail orphaned in-flight tasks, keep durable input-required ones."""
+    """Spec 11a item 5: fail orphaned in-flight tasks, keep durable input-required ones.
+
+    The non-terminal outbound handles of every failed task are then cancelled concurrently,
+    within ``cancel_timeout_s`` overall. A cancel that raises or times out is reported in
+    ``cancel_errors``; every other one counts in ``outbound_cancelled``.
+    """
     report = RecoveryReport()
+    to_cancel: list[tuple[str, dict[str, Any]]] = []
     failed_state = TaskState.Name(TaskState.TASK_STATE_FAILED)
     for row in await index.by_state(_ACTIVE_STATES):
         task_id, agent_id, owner = row["task_id"], row["agent_id"], row["owner"]
@@ -273,15 +282,41 @@ async def recover_on_startup(
                     await store.save(task, ctx)
             if handles is not None and cancel_outbound is not None:
                 for handle in await handles.by_inbound(task_id):
-                    try:
-                        await cancel_outbound(handle)
-                        report.outbound_cancelled += 1
-                    except Exception:
-                        logger.exception("outbound cancel failed during recovery")
-                        report.cancel_errors.append(f"{task_id}:{handle.get('partner_id')}")
+                    if handle.get("state") not in _TERMINAL_STATES:
+                        to_cancel.append((task_id, handle))
             await index.set_state(task_id, failed_state)
             report.failed.append(task_id)
         except Exception:
             logger.exception("recovery failed for task %s", task_id)
             report.errors.append(task_id)
+    if to_cancel and cancel_outbound is not None:
+        await _cancel_all(to_cancel, cancel_outbound, cancel_timeout_s, report)
     return report
+
+
+async def _cancel_all(
+    to_cancel: list[tuple[str, dict[str, Any]]],
+    cancel_outbound: Callable[..., Awaitable[object]],
+    timeout_s: float,
+    report: RecoveryReport,
+) -> None:
+    async def one(handle: dict[str, Any]) -> None:
+        await cancel_outbound(handle)
+
+    tasks = [asyncio.create_task(one(h)) for _, h in to_cancel]
+    try:
+        await asyncio.wait(tasks, timeout=timeout_s)
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+    for (task_id, handle), t in zip(to_cancel, tasks, strict=True):
+        if t.cancelled() or t.exception() is not None:
+            if not t.cancelled():
+                logger.error("outbound cancel failed during recovery", exc_info=t.exception())
+            else:
+                logger.warning("outbound cancel timed out during recovery")
+            report.cancel_errors.append(f"{task_id}:{handle.get('partner_id')}")
+        else:
+            report.outbound_cancelled += 1

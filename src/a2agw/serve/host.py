@@ -343,8 +343,16 @@ class AgentHost:
             stores,
             durable={i: s.adapter.durable_sessions for i, s in self.specs.items()},
             handles=handles,
-            cancel_outbound=lambda h: client.cancel(h["partner_id"], h["task_id"]),
+            cancel_outbound=self._cancel_outbound,
+            cancel_timeout_s=self.default_deadline_s,
         )
+
+    async def _cancel_outbound(self, handle: dict[str, Any]) -> None:
+        """Recovery: cancel one partner task; raise unless the partner reports it canceled."""
+        assert self.client is not None
+        result = await self.client.cancel(handle["partner_id"], handle["task_id"])
+        if result.state != "canceled":
+            raise RuntimeError("not canceled")
 
     async def shutdown(self) -> None:
         for handler in self.handlers.values():

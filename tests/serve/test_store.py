@@ -1,7 +1,10 @@
+import asyncio
+
 import pytest
 from a2a.server.context import ServerCallContext
 from a2a.types import Role, Task, TaskState, TaskStatus
 
+from a2agw.consult.handles import OutboundHandleStore
 from a2agw.security.principal import Principal, PrincipalUser
 from a2agw.serve.store import (
     TaskIndex,
@@ -268,10 +271,7 @@ async def test_upsert_none_origin_keeps_existing(index):
     assert row["origin"] == "orig-2"
 
 
-
 async def test_blocked_downstream_needs_other_live_task_with_live_outbound_handle(engine, index):
-    from a2agw.consult.handles import OutboundHandleStore
-
     handles = OutboundHandleStore(engine)
     await handles.initialize()
     done = "TASK_STATE_COMPLETED"
@@ -293,3 +293,53 @@ async def test_blocked_downstream_needs_other_live_task_with_live_outbound_handl
     assert not await index.blocked_downstream("a2", "o1", "t9")  # other agent
     assert await index.blocked_downstream("a2", "o5", "t9")
     assert not await index.blocked_downstream("a1", "nope", "t9")
+
+
+async def test_recovery_skips_terminal_handles(engine, index):
+    store = task_store_for(engine, "rec-term")
+    await store.initialize()
+    await _seed(index, store, "rec-term", "w1", W)
+    handles = _Handles(
+        {
+            "w1": [
+                {"task_id": "p1", "partner_id": "px", "state": "TASK_STATE_COMPLETED"},
+                {"task_id": "p2", "partner_id": "py", "state": W},
+            ]
+        }
+    )
+    calls = []
+
+    async def cancel(h):
+        calls.append(h["task_id"])
+
+    report = await recover_on_startup(index, {"rec-term": store}, {}, handles, cancel)
+    assert calls == ["p2"]
+    assert report.outbound_cancelled == 1 and report.cancel_errors == []
+
+
+async def test_recovery_cancels_run_concurrently_within_bound(engine, index):
+    store = task_store_for(engine, "rec-slow")
+    await store.initialize()
+    await _seed(index, store, "rec-slow", "w1", W)
+    await _seed(index, store, "rec-slow", "w2", W)
+    handles = _Handles(
+        {
+            "w1": [{"task_id": "p1", "partner_id": "hang"}],
+            "w2": [{"task_id": "p2", "partner_id": "ok"}],
+        }
+    )
+    started = []
+
+    async def cancel(h):
+        started.append(h["task_id"])
+        if h["partner_id"] == "hang":
+            await asyncio.Event().wait()
+
+    async with asyncio.timeout(2):
+        report = await recover_on_startup(
+            index, {"rec-slow": store}, {}, handles, cancel, cancel_timeout_s=0.1
+        )
+    assert sorted(started) == ["p1", "p2"]
+    assert report.outbound_cancelled == 1
+    assert report.cancel_errors == ["w1:hang"]
+    assert sorted(report.failed) == ["w1", "w2"]

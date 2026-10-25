@@ -111,7 +111,11 @@ class AdapterExecutor(AgentExecutor):
     admitting parallel fan-out and diamond calls (PM -> arch -> sec, PM -> rev -> sec) to the
     same agent. Residual false positive: a shared agent that is itself waiting downstream
     (e.g. sec consulting a partner while the second diamond branch reaches it) rejects the
-    second call. ``AgentSpec.allow_reentry`` disables the check.
+    second call. ``AgentSpec.allow_reentry`` disables the check. Two false-negative windows
+    remain: admission is not atomic (two entries arriving at the same instant are both
+    checked before either is recorded), and a partner that calls back before the caller has
+    recorded its outbound handle (written when the partner's first response arrives) does
+    not yet see the caller as blocked downstream.
 
     Known limits (Phase 1):
     - An ``ArtifactChunk`` with ``append=True`` for an unknown ``artifact_id`` is rejected by
@@ -140,7 +144,7 @@ class AdapterExecutor(AgentExecutor):
         self._active: dict[str, _Run] = {}
         self._running: dict[str, asyncio.Task[None]] = {}
         self._closed: OrderedDict[str, None] = OrderedDict()
-        self.on_cancel: Callable[[str], Awaitable[None]] | None = None
+        self.on_cancel: Callable[..., Awaitable[object]] | None = None
         self.cancel_wait_s = 5.0  # how long cancel() waits for the adapter to stop
 
     # -- bookkeeping -------------------------------------------------------------------

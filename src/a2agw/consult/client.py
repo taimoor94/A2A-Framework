@@ -47,6 +47,7 @@ from a2a.types import (
     StreamResponse,
     SubscribeToTaskRequest,
     Task,
+    TaskState,
 )
 from a2a.utils.constants import VERSION_HEADER
 from a2a.utils.errors import A2AError, TaskNotCancelableError
@@ -62,6 +63,7 @@ from a2agw.consult.handles import OutboundHandleStore
 from a2agw.consult.registry import CardFetchError, PartnerRecord, PartnerRegistry
 from a2agw.consult.resilience import Bulkhead, Busy, CircuitBreaker, with_retry
 from a2agw.consult.results import (
+    TERMINAL,
     TERMINAL_NAMES,
     ProtocolViolation,
     ToolResult,
@@ -91,6 +93,7 @@ RETRY_CAP_S = 2.0
 BULKHEAD_WAIT_S = 1.0  # how long to wait for a free slot before answering "busy"
 LOOKUP_FLOOR_S = 0.5  # a lookup after the deadline passed still gets this long
 ACLOSE_TIMEOUT_S = 1.0  # bound on closing a partner stream
+CANCEL_CLEANUP_S = 3.0  # bound on cancelling partner work when a consult itself is cancelled
 
 BINDINGS = ("JSONRPC", "HTTP+JSON")  # in order of preference
 _AMBIGUOUS_STATUS = {502, 503, 504}  # the partner (or a proxy) may have accepted the message
@@ -261,6 +264,7 @@ class PartnerClient:
         self._clients: dict[tuple[str, str], Client] = {}
         self._breakers: dict[str, CircuitBreaker] = {}
         self._bulkheads: dict[str, Bulkhead] = {}
+        self._cleanups: set[asyncio.Task[None]] = set()  # keeps cleanup tasks referenced
 
     # -- plumbing ----------------------------------------------------------------------
 
@@ -526,6 +530,47 @@ class PartnerClient:
 
         deadline = asyncio.get_running_loop().time() + timeout
         try:
+            outcome = await self._send_admitted(
+                partner_id,
+                rec,
+                client,
+                request,
+                track,
+                timeout,
+                deadline,
+                streaming,
+                reply=bool(task_id),
+                generated_context=generated_context,
+                note=note,
+            )
+            if isinstance(outcome, ToolResult):
+                return outcome
+            return await self._finish(partner_id, rec, track, outcome, task_id, ctx_id, note)
+        except asyncio.CancelledError:
+            # The inbound task was cancelled mid-call, possibly before the partner task's
+            # handle was recorded: cancel_for_inbound could not find it, so clean up here.
+            await self._cleanup_cancelled(
+                partner_id, client, track, generated_context, inbound_task_id, cc.origin
+            )
+            raise
+
+    async def _send_admitted(
+        self,
+        partner_id: str,
+        rec: PartnerRecord,
+        client: Client,
+        request: SendMessageRequest,
+        track: Track,
+        timeout: float,
+        deadline: float,
+        streaming: bool,
+        *,
+        reply: bool,
+        generated_context: bool,
+        note: Note,
+    ) -> str | None | ToolResult:
+        """Bulkhead, breaker and drive. Returns the drive outcome, or an early result."""
+        try:
             async with self._bulkhead(partner_id).acquire(min(BULKHEAD_WAIT_S, timeout)):
                 probe = self._admit(partner_id)
                 if probe is None:
@@ -538,7 +583,7 @@ class PartnerClient:
                         probe,
                         deadline,
                         streaming=streaming,
-                        reply=bool(task_id),
+                        reply=reply,
                         generated_context=generated_context,
                         note=note,
                     )
@@ -549,7 +594,18 @@ class PartnerClient:
                     probe.close()
         except Busy:
             return self._unavailable(partner_id, rec, "busy")
+        return outcome
 
+    async def _finish(
+        self,
+        partner_id: str,
+        rec: PartnerRecord,
+        track: Track,
+        outcome: str | None,
+        task_id: str | None,
+        ctx_id: str | None,
+        note: Note,
+    ) -> ToolResult:
         if outcome == PROTOCOL_ERROR:
             return self._failed(partner_id, rec, outcome, task_id=task_id, context_id=ctx_id)
         if outcome is not None and outcome.startswith("partner error:"):
@@ -569,6 +625,73 @@ class PartnerClient:
         await note()
         await self._update_handle(partner_id, track)
         return build_result(partner_id, self._provenance(partner_id, rec), track)
+
+    async def _cleanup_cancelled(
+        self,
+        partner_id: str,
+        client: Client,
+        track: Track,
+        generated_context: bool,
+        inbound_task_id: str | None,
+        origin: str | None,
+    ) -> None:
+        """Cancel partner work started by a consult that is itself being cancelled.
+
+        Runs in its own task, bounded by ``CANCEL_CLEANUP_S``, so the caller's cancellation
+        cannot interrupt it; never raises (the caller re-raises its CancelledError)."""
+        work = asyncio.create_task(
+            self._cancel_orphans(partner_id, client, track, generated_context, inbound_task_id, origin)
+        )
+        self._cleanups.add(work)
+        work.add_done_callback(self._cleanups.discard)
+        try:
+            _, pending = await asyncio.wait({work}, timeout=CANCEL_CLEANUP_S)
+        except asyncio.CancelledError:
+            return  # cancelled again while waiting: the cleanup carries on in the background
+        if pending:
+            logger.warning("cleanup of cancelled call to partner %s timed out", partner_id)
+            work.cancel()
+
+    async def _cancel_orphans(
+        self,
+        partner_id: str,
+        client: Client,
+        track: Track,
+        generated_context: bool,
+        inbound_task_id: str | None,
+        origin: str | None,
+    ) -> None:
+        try:
+            if track.task_id is not None:
+                ids = [track.task_id]
+            elif generated_context and track.context_id is not None:
+                # Only a context this call generated: a shared one may hold unrelated tasks.
+                page = await _sdk(
+                    client.list_tasks(
+                        ListTasksRequest(context_id=track.context_id, page_size=20),
+                        context=self._ctx(CANCEL_CLEANUP_S),
+                    )
+                )
+                ids = [
+                    t.id
+                    for t in page.tasks
+                    if t.id and t.context_id == track.context_id and t.status.state not in TERMINAL
+                ]
+            else:
+                ids = []
+            for tid in ids:
+                try:
+                    task = await self._fetch(client, tid, CANCEL_CLEANUP_S, cancel=True)
+                    state = TaskState.Name(task.status.state)
+                except Exception:  # noqa: BLE001 - best effort; the handle stays non-terminal
+                    logger.warning("cancel of partner %s task after cancelled call failed", partner_id)
+                    state = TaskState.Name(TaskState.TASK_STATE_WORKING)
+                if self.handles is not None:
+                    await self.handles.record(
+                        tid, partner_id, track.context_id, inbound_task_id, origin, state
+                    )
+        except Exception:  # cleanup must never raise
+            logger.exception("cleanup of cancelled call to partner %s failed", partner_id)
 
     @staticmethod
     def _request(

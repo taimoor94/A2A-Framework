@@ -23,7 +23,7 @@ from streaming_asgi import StreamingASGITransport
 
 from a2agw.consult import client as client_mod
 from a2agw.consult.tools import invoke, partner_tools
-from a2agw.context.call_context import EXTENSION_URI
+from a2agw.context.call_context import EXTENSION_URI, current_inbound_task, current_principal
 from a2agw.core.events import Done
 from a2agw.serve.agent import AgentSpec, SkillSpec
 from a2agw.serve.host import AgentHost
@@ -181,6 +181,54 @@ async def test_cancel_inbound_cancels_partner_task(env):
     await until(b_canceled)
     check = await host.client.check("b", b_task)
     assert check.state == "canceled"
+    [handle] = await host.handles.by_inbound(a_task)
+    assert handle["state"] == CANCELED
+
+
+def delay_first_response(app, agent_id: str, delay: float):
+    """Holds the start of every POST response from ``agent_id`` for ``delay`` seconds."""
+
+    async def wrapped(scope, receive, send):
+        async def send_later(message):
+            if (
+                message["type"] == "http.response.start"
+                and scope["method"] == "POST"
+                and scope["path"].startswith(f"/agents/{agent_id}")
+            ):
+                await asyncio.sleep(delay)
+            await send(message)
+
+        await app(scope, receive, send_later)
+
+    return wrapped
+
+
+async def test_cancel_before_first_event_cancels_partner_task(env):
+    """A is cancelled after B's task exists but before A has seen any response from B, so
+    no handle is recorded yet: the cancelled consult itself must cancel B's task."""
+    b = Blocker()
+
+    async def a_run(ctx):
+        await host.client.consult("b", "go", wait_seconds=5)
+        await asyncio.Event().wait()
+        yield Done(text="never")
+
+    e = await env(spec("a", Fn(a_run)), spec("b", b))
+    host = e.host
+    e.partner_hc._transport.apps["t"] = delay_first_response(host.app(), "b", 0.5)
+    await e.register("b")
+
+    events = await e.send("a", "start", return_immediately=True)
+    a_task = events[0].task.id
+    await asyncio.wait_for(b.started.wait(), 5)
+    assert await host.handles.by_inbound(a_task) == []  # still inside the window
+    await e.client("a").cancel_task(CancelTaskRequest(id=a_task))
+
+    async def b_canceled() -> bool:
+        rows, _ = await host.index.list(agent_id="b")
+        return [r["state"] for r in rows] == [CANCELED]
+
+    await until(b_canceled)
     [handle] = await host.handles.by_inbound(a_task)
     assert handle["state"] == CANCELED
 
@@ -438,6 +486,33 @@ async def test_contextvars_supply_inbound_and_caller(env):
     assert handle["partner_id"] == "b"
     assert seen["principal"] is not None
     assert seen["caller"] == seen["principal"]
+
+
+async def test_inbound_contextvars_not_leaked(env):
+    inside = asyncio.Event()
+    release = asyncio.Event()
+    seen: dict[str, Any] = {}
+
+    async def a_run(ctx):
+        seen["a"] = (current_inbound_task.get(), ctx.task_id)
+        inside.set()
+        await release.wait()
+        yield Done(text="a done")
+
+    async def b_run(ctx):  # an unrelated request running while A is inside its adapter
+        seen["b"] = (current_inbound_task.get(), ctx.task_id)
+        yield Done(text="b done")
+
+    e = await env(spec("a", Fn(a_run)), spec("b", Fn(b_run)))
+    a_send = asyncio.create_task(e.send("a", "start"))
+    await asyncio.wait_for(inside.wait(), 5)
+    assert current_inbound_task.get() is None and current_principal.get() is None
+    await e.send("b", "other")
+    release.set()
+    await a_send
+    assert seen["a"][0] == seen["a"][1]
+    assert seen["b"][0] == seen["b"][1] != seen["a"][1]
+    assert current_inbound_task.get() is None and current_principal.get() is None
 
 
 # -- admin -----------------------------------------------------------------------------
