@@ -5,6 +5,10 @@ Authentication happens in the host middleware; here we only read ``scope["user"]
 With no auth configured there are no principals, so admin fails closed unless the
 host was created with ``admin_without_auth=True`` (development only).
 Secrets (credential refs, headers) are never part of any response.
+
+Audit: every admitted admin request appends one ``admin.read`` event (the path category in
+``detail.reason``); a request refused for lack of the admin scope appends ``authz.deny``.
+``/audit`` lists audit events (newest first) and ``/audit/verify`` checks the hash chain.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+from a2agw.ops.audit import ACTIONS, AuditEvent, parse_since
 from a2agw.security.principal import PrincipalUser
 
 if TYPE_CHECKING:
@@ -27,6 +32,9 @@ if TYPE_CHECKING:
 ADMIN_PREFIX = "/a2agw/admin"
 HEALTH_PATH = f"{ADMIN_PREFIX}/healthz"
 ADMIN_SCOPE = "a2agw:admin"
+AUDIT_MAX_LIMIT = 500
+AUDIT_DEFAULT_LIMIT = 100
+MAX_FILTER_CHARS = 256
 KEEPALIVE_S = 15.0  # module constant so tests can shorten it
 REPLAY = 50
 MAX_EVENTS = 1000
@@ -65,11 +73,35 @@ def _allowed(host: AgentHost, request: Request) -> bool:
     return ADMIN_SCOPE in user.principal.scopes
 
 
+def _str_param(request: Request, name: str) -> str | None:
+    raw = request.query_params.get(name)
+    if raw is not None and (not raw or len(raw) > MAX_FILTER_CHARS):
+        raise _BadRequest(name)
+    return raw
+
+
 def admin_routes(host: AgentHost) -> list[Route]:
-    def guarded(fn: Handler) -> Handler:
+    async def audit(request: Request, action: Any, outcome: str, reason: str) -> None:
+        log = getattr(host, "audit", None)
+        if log is None:
+            return
+        user = request.scope.get("user")
+        principal = user.principal if isinstance(user, PrincipalUser) else None
+        await log.emit(
+            AuditEvent(
+                actor=principal.id if principal is not None else "anonymous",
+                action=action,
+                outcome=outcome,
+                detail={"reason": reason},
+            )
+        )
+
+    def guarded(category: str, fn: Handler) -> Handler:
         async def wrapper(request: Request) -> Response:
             if not _allowed(host, request):
+                await audit(request, "authz.deny", "forbidden", f"admin {category}")
                 return JSONResponse({"error": "forbidden"}, status_code=403)
+            await audit(request, "admin.read", "ok", category)
             try:
                 return await fn(request)
             except _BadRequest as exc:
@@ -78,7 +110,11 @@ def admin_routes(host: AgentHost) -> list[Route]:
         return wrapper
 
     async def healthz(_: Request) -> Response:
-        return JSONResponse({"status": "ok"})
+        body: dict[str, Any] = {"status": "ok"}
+        log = getattr(host, "audit", None)
+        if log is not None:
+            body["audit_errors"] = log.audit_errors
+        return JSONResponse(body)
 
     async def agents(_: Request) -> Response:
         out = [
@@ -163,8 +199,43 @@ def admin_routes(host: AgentHost) -> list[Route]:
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
+    async def audit_list(request: Request) -> Response:
+        limit = _int_param(request, "limit", lo=1, hi=AUDIT_MAX_LIMIT, default=AUDIT_DEFAULT_LIMIT)
+        action = _str_param(request, "action")
+        if action is not None and action not in ACTIONS:
+            raise _BadRequest("action")
+        filters: dict[str, Any] = {
+            "action": action,
+            "agent": _str_param(request, "agent"),
+            "partner": _str_param(request, "partner"),
+        }
+        since = _str_param(request, "since")
+        if since is not None:
+            try:
+                filters["since"] = parse_since(since)
+            except ValueError:
+                raise _BadRequest("since") from None
+        cursor = _str_param(request, "cursor")
+        log = host.audit
+        if log is None:
+            return JSONResponse({"error": "audit unavailable"}, status_code=503)
+        try:
+            rows, next_cursor = await log.query(filters, limit or AUDIT_DEFAULT_LIMIT, cursor)
+        except ValueError:
+            raise _BadRequest("cursor") from None
+        return JSONResponse({"events": rows, "next_cursor": next_cursor})
+
+    async def audit_verify(_: Request) -> Response:
+        log = host.audit
+        if log is None:
+            return JSONResponse({"error": "audit unavailable"}, status_code=503)
+        bad = await log.verify_chain()
+        if bad is None:
+            return JSONResponse({"ok": True})
+        return JSONResponse({"ok": False, "first_bad_seq": bad})
+
     def route(name: str, fn: Handler) -> Route:
-        return Route(f"{ADMIN_PREFIX}/{name}", guarded(fn), methods=["GET"])
+        return Route(f"{ADMIN_PREFIX}/{name}", guarded(name.replace("/", "."), fn), methods=["GET"])
 
     return [
         Route(HEALTH_PATH, healthz, methods=["GET"]),
@@ -172,6 +243,8 @@ def admin_routes(host: AgentHost) -> list[Route]:
         route("partners", partners),
         route("tasks", tasks),
         route("events", events),
+        route("audit", audit_list),
+        route("audit/verify", audit_verify),
     ]
 
 

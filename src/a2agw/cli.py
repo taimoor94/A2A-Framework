@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import unicodedata
 from collections.abc import Callable
 from pathlib import Path
@@ -26,12 +27,15 @@ from a2agw.config import (
 )
 from a2agw.consult.netguard import UnsafeURL, check_url
 from a2agw.consult.registry import MAX_CARD_BYTES, CardFetchError, PartnerRegistry
+from a2agw.ops.audit import ACTIONS, AuditLog, parse_since
 
 app = typer.Typer(help="A2A gateway: serve agents and manage partner agents.", no_args_is_help=True)
 partners_app = typer.Typer(help="Manage the partner registry.", no_args_is_help=True)
 card_app = typer.Typer(help="Agent Card tools.", no_args_is_help=True)
+audit_app = typer.Typer(help="Export and verify the audit log (read only).", no_args_is_help=True)
 app.add_typer(partners_app, name="partners")
 app.add_typer(card_app, name="card")
+app.add_typer(audit_app, name="audit")
 
 KNOWN_ERRORS = (ConfigError, CardFetchError, UnsafeURL, KeyError, ValueError, OSError)
 OUTPUT_CAP = 64 * 1024
@@ -383,3 +387,69 @@ def call(
 ) -> None:
     """Send one message to an A2A agent and print the final state and text."""
     typer.echo(asyncio.run(_call(url, message, api_key, _tier(tier), timeout)))
+
+
+# -- audit -----------------------------------------------------------------------------------
+async def _with_audit(config: Path, fn: Callable[[AuditLog], Any]) -> Any:
+    """Open the configured database read only (no table creation, no pragmas) and run fn."""
+    from sqlalchemy import inspect as sa_inspect
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    cfg = load_config(config)
+    url = make_url(cfg.db_url)
+    if url.get_backend_name() == "sqlite":
+        db = url.database or ""
+        if db in ("", ":memory:") or not Path(db).is_file():
+            raise ConfigError(f"database {db or ':memory:'} not found")
+    engine = create_async_engine(cfg.db_url)
+    try:
+        async with engine.connect() as conn:
+            exists = await conn.run_sync(lambda sync: sa_inspect(sync).has_table("a2agw_audit"))
+        if not exists:
+            raise ConfigError("no audit log in the configured database")
+        return await fn(AuditLog(engine))
+    finally:
+        await engine.dispose()
+
+
+@audit_app.command("export")
+@guarded
+def audit_export(
+    config: ConfigOpt = Path("a2agw.yaml"),
+    since: Annotated[str | None, typer.Option("--since", help="ISO 8601 timestamp.")] = None,
+    action: Annotated[str | None, typer.Option("--action", help="Only this action.")] = None,
+) -> None:
+    """Write audit events as JSON lines (oldest first) to stdout."""
+    filters: dict[str, Any] = {}
+    if since is not None:
+        try:
+            filters["since"] = parse_since(since)
+        except ValueError:
+            raise ValueError("--since must be an ISO 8601 timestamp") from None
+    if action is not None:
+        if action not in ACTIONS:
+            raise ValueError(f"--action must be one of {', '.join(sorted(ACTIONS))}")
+        filters["action"] = action
+
+    async def export(log: AuditLog) -> None:
+        cursor: str | None = None
+        while True:
+            rows, cursor = await log.query(filters, 500, cursor, ascending=True)
+            for row in rows:
+                typer.echo(json.dumps(row, ensure_ascii=False, sort_keys=True))
+            if cursor is None:
+                return
+
+    asyncio.run(_with_audit(config, export))
+
+
+@audit_app.command("verify")
+@guarded
+def audit_verify(config: ConfigOpt = Path("a2agw.yaml")) -> None:
+    """Check the audit hash chain; exit 1 and name the first bad seq if it is broken."""
+    bad = asyncio.run(_with_audit(config, lambda log: log.verify_chain()))
+    if bad is not None:
+        typer.echo(f"audit chain broken at seq {bad}", err=True)
+        raise typer.Exit(1)
+    typer.echo("audit chain ok")

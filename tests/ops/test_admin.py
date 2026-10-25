@@ -300,7 +300,8 @@ async def test_healthz_public(make):
     _, hc = await make(spec(), auth=auth())
     assert HEALTH_PATH == "/a2agw/admin/healthz"
     r = await hc.get(HEALTH_PATH)
-    assert r.status_code == 200 and r.json() == {"status": "ok"}
+    # audit_errors counts failed audit appends (the audit log is fail-open).
+    assert r.status_code == 200 and r.json() == {"status": "ok", "audit_errors": 0}
 
 
 def _events_scope() -> dict:

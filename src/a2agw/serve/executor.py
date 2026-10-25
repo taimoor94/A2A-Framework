@@ -29,6 +29,7 @@ from a2agw.context.call_context import (
     CycleDetected,
     DeadlineExceeded,
     HopLimitExceeded,
+    use_agent,
     use_call,
     use_inbound,
     use_inbound_token,
@@ -44,9 +45,11 @@ from a2agw.core.events import (
     Usage,
 )
 from a2agw.core.spi import InboundContext
+from a2agw.ops.audit import AuditEvent, AuditLog
 from a2agw.ops.bus import EventBus, GatewayEvent
 from a2agw.ops.telemetry import extract_parent, get_tracer
 from a2agw.security.auth import BEARER_STATE_KEY
+from a2agw.security.policy import PolicyEngine
 from a2agw.security.principal import Principal, PrincipalUser
 from a2agw.serve.agent import AgentSpec
 from a2agw.serve.store import TaskIndex
@@ -64,6 +67,7 @@ _REASONS: dict[type[CallContextViolation], str] = {
 }
 _INVALID = "invalid call context"
 _REENTRY = "re-entry"
+_FORBIDDEN = "forbidden"  # the client-facing reason; the policy reason is audited only
 _RESUMABLE = {TaskState.TASK_STATE_INPUT_REQUIRED, TaskState.TASK_STATE_AUTH_REQUIRED}
 _TERMINAL = {
     TaskState.TASK_STATE_COMPLETED,
@@ -170,8 +174,14 @@ class AdapterExecutor(AgentExecutor):
         local_max_hops: int = 8,
         local_max_deadline_s: float = 3600.0,
         now: Callable[[], float] = time.time,
+        policy: PolicyEngine | None = None,
+        audit: AuditLog | None = None,
     ) -> None:
         self.spec = spec
+        # Skill-level authz runs here once the skill is known; Phase 1 has no skill routing,
+        # so it is evaluated with skill_id=None (deny rules then match conservatively).
+        self.policy = policy
+        self.audit = audit
         self.index = index
         self.bus = bus
         self.local_max_hops = local_max_hops
@@ -297,7 +307,23 @@ class AdapterExecutor(AgentExecutor):
         cc, reason = self._admit(message)
         if cc is None:
             await self._status(run, TaskState.TASK_STATE_REJECTED, reason)
+            await self._audit("inbound.reject", run, principal, "rejected", reason=reason)
             return
+        if self.policy is not None:
+            decision = self.policy.authorize(principal, self.spec.id, None)
+            if not decision.allowed:
+                await self._status(run, TaskState.TASK_STATE_REJECTED, _FORBIDDEN)
+                await self._audit(
+                    "inbound.reject",
+                    run,
+                    principal,
+                    "rejected",
+                    reason=f"policy: {decision.reason}",
+                    rule=decision.rule,
+                )
+                return
+            if run.cancelled:
+                return
         # A resumed turn keeps the origin recorded by the turn that created the task.
         run.origin = None if resumed else cc.origin
         if run.pending is not None:
@@ -311,9 +337,20 @@ class AdapterExecutor(AgentExecutor):
             # path: see "Re-entry" in the class docstring.
             if await self.index.blocked_downstream(self.spec.id, cc.origin, updater.task_id):
                 await self._status(run, TaskState.TASK_STATE_REJECTED, _REENTRY)
+                await self._audit("inbound.reject", run, principal, "rejected", reason=_REENTRY)
                 return
             if run.cancelled:
                 return
+        await self._audit(
+            "inbound.admit",
+            run,
+            principal,
+            "admitted",
+            state="resumed" if resumed else "new",
+            principal_kind=principal.kind if principal is not None else "anonymous",
+        )
+        if run.cancelled:
+            return
 
         inbound = InboundContext.from_message(
             self.spec.id,
@@ -350,6 +387,27 @@ class AdapterExecutor(AgentExecutor):
         finally:
             if self._running.get(updater.task_id) is work:
                 del self._running[updater.task_id]
+
+    async def _audit(
+        self,
+        action: Any,
+        run: _Run,
+        principal: Principal | None,
+        outcome: str,
+        **detail: Any,
+    ) -> None:
+        if self.audit is None:
+            return
+        await self.audit.emit(
+            AuditEvent(
+                actor=principal.id if principal is not None else "anonymous",
+                action=action,
+                agent_id=self.spec.id,
+                task_id=run.updater.task_id,
+                outcome=outcome,
+                detail=detail,
+            )
+        )
 
     def _admit(self, message: Message) -> tuple[CallContext | None, str]:
         """Parse, clamp and admit the caller's call context. Returns (cc, "") or (None, reason)."""
@@ -393,6 +451,7 @@ class AdapterExecutor(AgentExecutor):
             use_call(inbound.call),
             use_inbound(inbound.task_id, inbound.principal),
             use_inbound_token(inbound_token),
+            use_agent(self.spec.id),
         ):
             try:
                 try:

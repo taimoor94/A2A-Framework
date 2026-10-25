@@ -274,3 +274,17 @@ def use_maintenance() -> Iterator[None]:
         yield
     finally:
         maintenance_call.reset(reset)
+
+
+# The id of the agent whose adapter is running, set by the inbound executor for the run, so
+# outbound calls made by that adapter are evaluated by the egress policy for that agent.
+current_agent: ContextVar[str | None] = ContextVar("a2agw_current_agent", default=None)
+
+
+@contextmanager
+def use_agent(agent_id: str | None) -> Iterator[None]:
+    reset = current_agent.set(agent_id)
+    try:
+        yield
+    finally:
+        current_agent.reset(reset)

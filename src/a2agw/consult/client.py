@@ -80,14 +80,18 @@ from a2agw.consult.tls import TlsClientConfig, build_async_client
 from a2agw.context.call_context import (
     EXTENSION_URI,
     CallContext,
+    current_agent,
     current_call,
     current_inbound_task,
     current_principal,
     maintenance_call,
     use_maintenance,
 )
+from a2agw.ops.audit import AuditEvent, AuditLog
 from a2agw.ops.bus import EventBus, GatewayEvent
 from a2agw.ops.telemetry import get_tracer, with_current_traceparent
+from a2agw.security.classify import Classification
+from a2agw.security.policy import Decision, PolicyEngine
 from a2agw.security.principal import Principal
 
 __all__ = ["PartnerClient", "ToolResult"]
@@ -356,8 +360,12 @@ class PartnerClient:
         default_deadline_s: float = 60.0,
         agent_id: str = "client",
         tls: Mapping[str, TlsClientConfig] | None = None,
+        policy: PolicyEngine | None = None,
+        audit: AuditLog | None = None,
     ) -> None:
         self.registry = registry
+        self.policy = policy  # egress checks in consult(), before any network activity
+        self.audit = audit
         self.tls: dict[str, TlsClientConfig] = dict(tls or {})
         for cfg in self.tls.values():  # load certificates now, not on the event loop later
             cfg.ssl_context()
@@ -619,13 +627,21 @@ class PartnerClient:
         wait_seconds: float = 30.0,
         inbound_task_id: str | None = None,
         caller: Principal | None = None,
+        classification: Classification | str | None = None,
     ) -> ToolResult:
         """Consult a partner. ``inbound_task_id`` and ``caller`` default to the inbound task
-        and principal the executor is currently running an adapter for."""
+        and principal the executor is currently running an adapter for.
+
+        With a policy, the egress check runs first, for the agent whose adapter is running
+        (else this client's ``agent_id``), with ``classification`` as the caller's label. A
+        denial returns ``rejected`` ("egress policy: <reason>") and sends nothing."""
         if inbound_task_id is None:
             inbound_task_id = current_inbound_task.get()
         started = time.monotonic()
-        token = _caller.set(caller if caller is not None else current_principal.get())
+        principal = caller if caller is not None else current_principal.get()
+        agent_id = current_agent.get() or self.agent_id
+        token = _caller.set(principal)
+        decision: Decision | None = None
         try:
             with get_tracer().start_as_current_span(
                 "a2agw.partner_call", record_exception=False, set_status_on_exception=False
@@ -633,6 +649,14 @@ class PartnerClient:
                 span.set_attribute("a2agw.partner_id", partner_id)
                 if task_id:
                     span.set_attribute("a2a.task_id", task_id)
+                denied, decision = self._egress(partner_id, agent_id, message, data, classification)
+                if denied is not None:
+                    span.set_attribute("a2agw.result_state", denied.state)
+                    await self._audit_egress_deny(
+                        denied, decision, principal, agent_id, inbound_task_id
+                    )
+                    self._publish(denied, started)
+                    return denied
                 try:
                     result = await self._consult(
                         partner_id,
@@ -655,7 +679,95 @@ class PartnerClient:
         finally:
             _caller.reset(token)
         self._publish(result, started)
+        if self.audit is not None:
+            label = decision.classification if decision is not None else classification
+            await self.audit.emit(
+                AuditEvent(
+                    actor=principal.id if principal is not None else "system",
+                    action="partner.call",
+                    agent_id=agent_id,
+                    partner_id=partner_id,
+                    task_id=inbound_task_id,
+                    classification=label if isinstance(label, Classification) else None,
+                    outcome=result.state,
+                    detail={
+                        "state": result.state,
+                        "tier": (result.provenance or {}).get("tier"),
+                    },
+                )
+            )
         return result
+
+    def _egress(
+        self,
+        partner_id: str,
+        agent_id: str,
+        text: str,
+        data: dict[str, Any] | None,
+        classification: Classification | str | None,
+    ) -> tuple[ToolResult | None, Decision | None]:
+        """(rejected result, decision) on a denial; (None, decision or None) otherwise."""
+        label: Classification | None
+        if classification is None or isinstance(classification, Classification):
+            label = classification
+        else:
+            try:
+                label = Classification.parse(str(classification))
+            except (ValueError, AttributeError):
+                rec = self._record_or_none(partner_id)
+                return ToolResult(
+                    partner=partner_id,
+                    state="rejected",
+                    reason="egress policy: invalid classification",
+                    provenance=self._provenance(partner_id, rec),
+                ), None
+        if self.policy is None:
+            return None, Decision(True, "no policy", None, label) if label is not None else None
+        rec = self._record_or_none(partner_id)
+        if rec is None:
+            return None, None  # _consult answers "unknown partner"
+        decision = self.policy.egress(agent_id, rec, label, text, data)
+        if decision.allowed:
+            return None, decision
+        return ToolResult(
+            partner=partner_id,
+            state="rejected",
+            reason=f"egress policy: {decision.reason}",
+            provenance=self._provenance(partner_id, rec),
+        ), decision
+
+    def _record_or_none(self, partner_id: str) -> PartnerRecord | None:
+        try:
+            return self.registry.get(partner_id)
+        except KeyError:
+            return None
+
+    async def _audit_egress_deny(
+        self,
+        result: ToolResult,
+        decision: Decision | None,
+        principal: Principal | None,
+        agent_id: str,
+        inbound_task_id: str | None,
+    ) -> None:
+        if self.audit is None:
+            return
+        await self.audit.emit(
+            AuditEvent(
+                actor=principal.id if principal is not None else "system",
+                action="egress.deny",
+                agent_id=agent_id,
+                partner_id=result.partner,
+                task_id=inbound_task_id,
+                classification=decision.classification if decision is not None else None,
+                outcome="rejected",
+                detail={
+                    "reason": decision.reason if decision is not None else result.reason,
+                    "rule": decision.rule if decision is not None else None,
+                    "tier": (result.provenance or {}).get("tier"),
+                },
+            )
+        )
 
     async def _consult(
         self,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import signal
 import threading
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator
@@ -33,9 +34,11 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from a2agw.consult.client import PartnerClient
 from a2agw.consult.credentials import CredentialProvider
 from a2agw.consult.handles import OutboundHandleStore
-from a2agw.consult.registry import PartnerRegistry
+from a2agw.consult.registry import PartnerRecord, PartnerRegistry
+from a2agw.consult.tools import PartnerTool, partner_tools
 from a2agw.context.call_context import use_maintenance
 from a2agw.ops.admin import ADMIN_PREFIX, HEALTH_PATH, admin_routes
+from a2agw.ops.audit import AuditEvent, AuditLog
 from a2agw.ops.bus import EventBus
 from a2agw.security.auth import (
     AuthConfig,
@@ -46,6 +49,7 @@ from a2agw.security.auth import (
     on_auth_error,
 )
 from a2agw.security.cardsign import CardSigner
+from a2agw.security.policy import PolicyEngine
 from a2agw.security.principal import Principal, PrincipalUser
 from a2agw.serve.agent import AgentSpec, build_card
 from a2agw.serve.executor import AdapterExecutor
@@ -58,6 +62,16 @@ from a2agw.serve.store import (
 )
 
 CARD_PATH = "/.well-known/agent-card.json"
+logger = logging.getLogger(__name__)
+# Registry on_change events -> audit actions.
+_REGISTRY_ACTIONS = {
+    "added": "partner.add",
+    "quarantined": "partner.quarantine",
+    "approved": "partner.approve",
+    "disabled": "partner.disable",
+    "enabled": "partner.enable",
+    "updated": "partner.update",
+}
 _EXIT_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
 
@@ -343,15 +357,46 @@ class _AuthMiddleware:
 
 
 class _AgentAuthorizer:
-    """Wraps one agent's sub-app: enforces that agent's AgentAccess on everything but its card.
+    """Wraps one agent's sub-app: enforces that agent's AgentAccess (when auth is configured)
+    and then the policy's authz rules (whenever a policy is set) on everything but its card.
+    Both must allow. A denial is a bare 403 ``{"error": "forbidden"}``; the reason is only
+    audited (``authz.deny``).
 
     Bound to the agent at mount time, so no path parsing decides *which* agent is checked.
     """
 
-    def __init__(self, app: ASGIApp, spec: AgentSpec, enforce: bool) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        spec: AgentSpec,
+        enforce: bool,
+        *,
+        policy: PolicyEngine | None = None,
+        audit: AuditLog | None = None,
+    ) -> None:
         self.app = app
         self.spec = spec
         self.enforce = enforce
+        self.policy = policy
+        self.audit = audit
+
+    async def _deny(
+        self, scope: Scope, receive: Receive, send: Send, principal: Principal | None, **detail: Any
+    ) -> None:
+        if self.audit is not None:
+            await self.audit.emit(
+                AuditEvent(
+                    actor=principal.id if principal is not None else "anonymous",
+                    action="authz.deny",
+                    agent_id=self.spec.id,
+                    outcome="forbidden",
+                    detail={
+                        "principal_kind": principal.kind if principal is not None else "anonymous",
+                        **detail,
+                    },
+                )
+            )
+        await JSONResponse({"error": "forbidden"}, status_code=403)(scope, receive, send)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -360,14 +405,22 @@ class _AgentAuthorizer:
                 await send({"type": "websocket.close", "code": 1008})
             return
         is_card = scope["method"] in ("GET", "HEAD") and get_route_path(scope) == CARD_PATH
-        if self.enforce and not is_card:
+        if not is_card and (self.enforce or self.policy is not None):
             user = scope.get("user")
             principal = user.principal if isinstance(user, PrincipalUser) else None
-            try:
-                authorize(principal, self.spec.access)
-            except PermissionDenied:
-                await JSONResponse({"error": "forbidden"}, status_code=403)(scope, receive, send)
-                return
+            if self.enforce:
+                try:
+                    authorize(principal, self.spec.access)
+                except PermissionDenied as exc:
+                    await self._deny(scope, receive, send, principal, reason=f"agent access: {exc}")
+                    return
+            if self.policy is not None:
+                decision = self.policy.authorize(principal, self.spec.id, None)
+                if not decision.allowed:
+                    await self._deny(
+                        scope, receive, send, principal, reason=decision.reason, rule=decision.rule
+                    )
+                    return
         await self.app(scope, receive, send)
 
 
@@ -393,8 +446,15 @@ class AgentHost:
         default_deadline_s: float = 60.0,
         card_cache_control: str | None = "public, max-age=300",
         card_signer: CardSigner | None = None,
+        policy: PolicyEngine | None = None,
+        audit: bool = True,
     ) -> None:
         self.base_url = base_url
+        # Authz (authorizer and executor), egress (partner client) and routing (tools).
+        self.policy = policy
+        # audit=False disables the audit log entirely (no table, no events).
+        self.audit_enabled = audit
+        self.audit: AuditLog | None = None  # created at startup
         # Signs every card built at startup (per-agent and the single-agent root card).
         self.card_signer = card_signer
         # Cache-Control on every agent card response (A2A 1.0 section 8.6.1); None omits it.
@@ -425,6 +485,7 @@ class AgentHost:
         self.handles: OutboundHandleStore | None = None
         self.client: PartnerClient | None = None
         self._inner: Starlette | None = None
+        self._audit_hooked = False
         self._app_built = False
         self._app: Starlette | None = None
 
@@ -456,7 +517,13 @@ class AgentHost:
         engine = self.engine = await create_engine(self.db_url)
         index = self.index = TaskIndex(engine)
         await index.initialize()
+        audit: AuditLog | None = None
+        if self.audit_enabled:
+            audit = self.audit = AuditLog(engine)
+            await audit.initialize()
+            self._hook_registry_audit()
         self.partners.load()
+        self._warn_unknown_routing_partners()
         handles = self.handles = OutboundHandleStore(engine)
         await handles.initialize()
         client = self.client = PartnerClient(
@@ -467,6 +534,8 @@ class AgentHost:
             http=self.partner_http,
             default_deadline_s=self.default_deadline_s,
             agent_id="host",
+            policy=self.policy,
+            audit=audit,
         )
         stores: dict[str, TaskStore] = {}
         routes: list[BaseRoute] = []
@@ -474,7 +543,7 @@ class AgentHost:
             store = task_store_for(engine, agent_id)
             await store.initialize()
             stores[agent_id] = store
-            executor = AdapterExecutor(spec, index, self.bus)
+            executor = AdapterExecutor(spec, index, self.bus, policy=self.policy, audit=audit)
             # Cancelling an inbound task cancels the partner tasks it started.
             executor.on_cancel = client.cancel_for_inbound
             card = build_card(spec, self.base_url, security=self.auth)
@@ -508,6 +577,8 @@ class AgentHost:
                         _RestConformance(Starlette(routes=sub_routes)),
                         spec,
                         enforce=self.auth is not None,
+                        policy=self.policy,
+                        audit=audit,
                     ),
                 )
             )
@@ -525,6 +596,44 @@ class AgentHost:
             cancel_outbound=self._cancel_outbound,
             cancel_timeout_s=self.default_deadline_s,
         )
+
+    def _hook_registry_audit(self) -> None:
+        """Chain an audit callback onto the registry's ``on_change`` (once per host)."""
+        if self._audit_hooked:
+            return
+        self._audit_hooked = True
+        previous = self.partners.on_change
+
+        def on_change(rec: PartnerRecord, event: str) -> None:
+            if previous is not None:
+                previous(rec, event)
+            action = _REGISTRY_ACTIONS.get(event)
+            if self.audit is None or action is None:
+                return
+            self.audit.submit(
+                AuditEvent(
+                    actor="system",
+                    action=action,  # type: ignore[arg-type]
+                    partner_id=rec.id,
+                    outcome=rec.status,
+                    detail={"tier": rec.tier, "state": rec.status, "key_id": rec.signed_key_id},
+                )
+            )
+
+        self.partners.on_change = on_change
+
+    def _warn_unknown_routing_partners(self) -> None:
+        if self.policy is None:
+            return
+        known = {r.id for r in self.partners.all()}
+        named = {p for rule in self.policy.policy.routing for p in rule.partners}
+        unknown = sorted(named - known)
+        if unknown:
+            logger.warning("policy routing rules name unknown partner ids: %s", ", ".join(unknown))
+
+    def partner_tools(self, agent_id: str, **kwargs: Any) -> list[PartnerTool]:
+        """``partner_tools`` for one of this host's agents, filtered by the host's policy."""
+        return partner_tools(self.partners, policy=self.policy, agent_id=agent_id, **kwargs)
 
     async def _cancel_outbound(self, handle: dict[str, Any]) -> None:
         """Recovery: cancel one partner task, as the caller it was started for; raise unless
@@ -547,6 +656,8 @@ class AgentHost:
             await handler.aclose()
         if self.client is not None:
             await self.client.aclose()
+        if self.audit is not None:
+            await self.audit.drain()  # registry events still being written
         if self.engine is not None:
             await self.engine.dispose()
             self.engine = None

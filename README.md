@@ -212,6 +212,29 @@ Certificates are loaded at startup; rotating them requires a restart.
 
 Troubleshooting: when a partner rejects our client certificate under TLS 1.3, the result can show "delivery unknown" instead of "partner unreachable", because the platform reports a plain connection reset. The gateway deliberately never resends in that case.
 
+### Policy and audit
+
+Pass `AgentHost(..., policy=PolicyEngine(load_policy(path)))` to enforce a declarative policy (see `a2agw.security.policy` for the file format). It applies in three places:
+
+- **Authz.** Every agent request except the card is checked after `AgentAccess`; both must allow. A denial is a bare `403 {"error": "forbidden"}`; the reason goes only to the audit log. The policy also applies when no `auth` is configured (every caller is then `anonymous`, which a `principal: "*"` allow rule never matches).
+  - *A lone deny rule is a lockdown, not a blocklist.* As soon as any rule mentions an agent, callers without a matching allow rule are denied ("default deny"). `{principal: "key:mallory", agents: [billing], effect: deny}` on its own denies everyone on `billing`; add `{principal: "*", agents: [billing], effect: allow}` to deny only mallory.
+  - *Deny rules match conservatively when the skill is unknown.* Requests are checked with no skill id (there is no skill routing yet), so a deny rule matches whatever its `skills` list says, while an allow rule matches only with `skills: "*"`.
+- **Egress.** `PartnerClient.consult(..., classification=...)` (and the `classification` argument of the `ask_*` tools) labels outbound data `public`, `internal`, `confidential` or `restricted`. The effective level is the highest of that label, the calling agent's `defaults.agent_classification` and the optional classifier; with none of them it is `defaults.unknown_classification`. It must not exceed the partner's ceiling: `egress.partner_ceilings[id]`, else `egress.tier_ceilings[tier]` (defaults: internal=restricted, partner=confidential, public=public). A call above the ceiling returns `rejected` ("egress policy: ...") and sends nothing. The calling agent is the one whose adapter is running.
+- **Routing.** `host.partner_tools(agent_id)` (or `partner_tools(registry, policy=..., agent_id=...)`) hides `forbid`den partners, lists `prefer`red ones first and marks forced and preferred ones "Required for this agent." / "Preferred.". A routing evaluation error offers no partner tools at all (fail closed). Routing rules that name unknown partner ids are logged once at startup.
+
+Any policy evaluation error denies.
+
+**Audit log.** By default (`AgentHost(audit=True)`) the gateway appends to a hash-chained table `a2agw_audit` in its database: inbound admissions and rejections, authz denials, partner calls (outcome = result state), egress denials, partner registry changes and admin reads. Each row holds ids, the action, the outcome, a classification and a short allowlisted `detail` (reason, rule, state, tier, ...). It never stores message text, data, artifact contents or secrets. Each row's hash covers the previous row's hash, so editing or deleting a row breaks the chain (removing the newest rows is only detectable against an exported copy).
+
+```bash
+curl -H "X-API-Key: $ADMIN_KEY" "localhost:8000/a2agw/admin/audit?action=egress.deny&limit=50"
+curl -H "X-API-Key: $ADMIN_KEY" localhost:8000/a2agw/admin/audit/verify   # {"ok": true}
+a2agw audit export -c a2agw.yaml --since 2026-10-01T00:00:00Z > audit.jsonl
+a2agw audit verify -c a2agw.yaml                                          # exit 1 if broken
+```
+
+The audit log is fail-open for availability: a failed append is logged and counted in `audit_errors` (shown by `/a2agw/admin/healthz`), and the request goes on. Phase 2 assumes a single gateway process writes to a given database. `AgentHost(audit=False)` turns the audit log off.
+
 ## Observability
 
 ```python
