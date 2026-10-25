@@ -24,6 +24,7 @@ the bytes consumed per call are bounded (see ``a2agw.consult.results``).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import math
 import time
@@ -56,10 +57,10 @@ from opentelemetry.trace import Status as SpanStatus
 from opentelemetry.trace import StatusCode
 
 from a2agw.consult.credentials import (
+    ChainCredentials,
+    CredentialError,
     CredentialInterceptor,
     CredentialProvider,
-    InvalidCredential,
-    MissingCredential,
 )
 from a2agw.consult.handles import OutboundHandleStore
 from a2agw.consult.registry import CardFetchError, PartnerRecord, PartnerRegistry
@@ -101,6 +102,7 @@ CANCEL_CLEANUP_S = 3.0  # bound on cancelling partner work when a consult itself
 BINDINGS = ("JSONRPC", "HTTP+JSON")  # in order of preference
 _AMBIGUOUS_STATUS = {502, 503, 504}  # the partner (or a proxy) may have accepted the message
 PROTOCOL_ERROR = "partner protocol error"
+AUTH_REJECTED = "partner rejected credentials"  # HTTP 401 to the send, after any resend
 
 # The inbound caller whose credentials apply to the current outbound call.
 _caller: ContextVar[Principal | None] = ContextVar("a2agw_outbound_caller", default=None)
@@ -120,6 +122,21 @@ class _CallerCredentials(ClientCallInterceptor):
         return None
 
 
+Reauth = Callable[[], Awaitable[bool]]
+
+
+def _invalidators(provider: CredentialProvider | None) -> list[Callable[..., Any]]:
+    """The ``invalidate(partner)`` methods of a provider, or of the providers in a chain."""
+    if provider is None:
+        return []
+    inv = getattr(provider, "invalidate", None)
+    if callable(inv):
+        return [inv]
+    if isinstance(provider, ChainCredentials):
+        return [i for p in provider.providers for i in _invalidators(p)]
+    return []
+
+
 class _ConnectFailed(Exception):
     """Connection-level failure before any response (safe to retry)."""
 
@@ -129,6 +146,11 @@ class _PartnerFault(Exception):
 
 
 ErrorKind = Literal["connect", "server", "transport", "protocol", "other"]
+
+
+def _caller_id() -> str | None:
+    caller = _caller.get()
+    return caller.id if caller is not None else None
 
 
 def _http_root(exc: BaseException) -> httpx.HTTPError | None:
@@ -169,7 +191,7 @@ def _reraise_other(exc: Exception, kind: ErrorKind) -> None:
 def _contain(exc: Exception) -> Exception:
     """Map an exception raised by an SDK call: anything we would not otherwise classify is a
     malformed partner response. Our own credential errors pass through unchanged."""
-    if isinstance(exc, (MissingCredential, InvalidCredential)) or _kind(exc) != "other":
+    if isinstance(exc, CredentialError) or _kind(exc) != "other":
         return exc
     logger.warning("malformed partner response (%s)", type(exc).__name__)
     return _PartnerFault(type(exc).__name__)
@@ -398,6 +420,25 @@ class PartnerClient:
             return rec, None, self._unavailable(partner_id, rec, "no supported binding")
         return rec, client, None
 
+    def _reauth(self, rec: PartnerRecord) -> Reauth | None:
+        """A callback dropping ``rec``'s cached credentials, or None if no provider caches."""
+        invalidators = _invalidators(self.credentials)
+        if not invalidators:
+            return None
+
+        async def reauth() -> bool:
+            try:
+                for inv in invalidators:
+                    res = inv(rec)
+                    if inspect.isawaitable(res):
+                        await res
+            except Exception:  # no fresh credentials: do not resend
+                logger.exception("credential invalidation for partner %s failed", rec.id)
+                return False
+            return True
+
+        return reauth
+
     def _breaker(self, partner_id: str) -> CircuitBreaker:
         return self._breakers.setdefault(partner_id, CircuitBreaker())
 
@@ -437,7 +478,13 @@ class PartnerClient:
             return
         try:
             await self.handles.record(
-                track.task_id, partner_id, track.context_id, inbound_task_id, origin, state
+                track.task_id,
+                partner_id,
+                track.context_id,
+                inbound_task_id,
+                origin,
+                state,
+                caller_id=_caller_id(),
             )
         except Exception:
             logger.exception("could not record outbound handle for partner %s", partner_id)
@@ -585,6 +632,7 @@ class PartnerClient:
                 generated_context=generated_context,
                 note=note,
                 inflight=inflight,
+                reauth=self._reauth(rec),
             )
             if isinstance(outcome, ToolResult):
                 return outcome
@@ -612,6 +660,7 @@ class PartnerClient:
         generated_context: bool,
         note: Note,
         inflight: InFlight,
+        reauth: Reauth | None = None,
     ) -> str | None | ToolResult:
         """Bulkhead, breaker and drive. Returns the drive outcome, or an early result."""
         try:
@@ -631,6 +680,7 @@ class PartnerClient:
                         generated_context=generated_context,
                         note=note,
                         inflight=inflight,
+                        reauth=reauth,
                     )
                 except ProtocolViolation:
                     probe.success()  # the partner answered, wrongly
@@ -653,6 +703,15 @@ class PartnerClient:
     ) -> ToolResult:
         if outcome == PROTOCOL_ERROR:
             return self._failed(partner_id, rec, outcome, task_id=task_id, context_id=ctx_id)
+        if outcome == AUTH_REJECTED:
+            return ToolResult(
+                partner=partner_id,
+                task_id=task_id,
+                context_id=ctx_id,
+                state="auth_required",
+                reason=outcome,
+                provenance=self._provenance(partner_id, rec),
+            )
         if outcome is not None and outcome.startswith("partner error:"):
             if track.task is None:
                 return self._failed(
@@ -745,7 +804,13 @@ class PartnerClient:
                         state = TaskState.Name(TaskState.TASK_STATE_WORKING)
                     if self.handles is not None:
                         await self.handles.record(
-                            tid, partner_id, track.context_id, inbound_task_id, origin, state
+                            tid,
+                            partner_id,
+                            track.context_id,
+                            inbound_task_id,
+                            origin,
+                            state,
+                            caller_id=_caller_id(),
                         )
         except TimeoutError:
             logger.warning("cleanup of cancelled call to partner %s timed out", partner_id)
@@ -791,7 +856,7 @@ class PartnerClient:
                 tasks = [t for t in page.tasks if t.id and t.context_id == context_id]
                 if tasks:
                     return [t.id for t in tasks if t.status.state not in TERMINAL]
-            except (MissingCredential, InvalidCredential):
+            except CredentialError:
                 raise
             except Exception as e:  # noqa: BLE001 - retried until the deadline
                 logger.debug("orphan lookup failed: %s", type(e).__name__)
@@ -837,8 +902,13 @@ class PartnerClient:
         generated_context: bool,
         note: Note,
         inflight: InFlight,
+        reauth: Reauth | None = None,
     ) -> str | None:
-        """Send and follow. Returns None on success, or the failure reason."""
+        """Send and follow. Returns None on success, or the failure reason.
+
+        An HTTP 401 to the send (so no event arrived and the partner did not accept the
+        message) is answered once: ``reauth`` drops the cached credential and the same
+        request, with the same message id, is sent again with fresh credentials."""
         loop = asyncio.get_running_loop()
 
         async def open_stream() -> tuple[AsyncIterator[StreamResponse], StreamResponse]:
@@ -870,35 +940,45 @@ class PartnerClient:
                 client, track, probe, deadline, streaming, generated_context, note, timed_out
             )
 
-        # Phase 1: send. Only connection errors before any response are retried.
-        try:
-            async with asyncio.timeout_at(deadline):
-                agen, first = await with_retry(
-                    open_stream,
-                    base=RETRY_BASE_S,
-                    cap=RETRY_CAP_S,
-                    retry_on=(_ConnectFailed,),
-                )
-        except _ConnectFailed:
-            probe.failure()
-            return "partner unreachable"
-        except (MissingCredential, InvalidCredential):
-            return "credential error"
-        except TimeoutError:
-            await _drop_inflight(inflight)
-            return await recover(timed_out=True)
-        except StopAsyncIteration:
-            probe.success()
-            return await recover()
-        except Exception as e:  # noqa: BLE001 - classified; internal errors re-raised
-            kind = _kind(e)
-            _reraise_other(e, kind)
-            probe.kind(kind)
-            if kind == "transport" or _status(e) in _AMBIGUOUS_STATUS:
+        # Phase 1: send. Only connection errors before any response are retried, plus one
+        # resend after a 401 (the partner refused the request, so it was not accepted).
+        resent = False
+        while True:
+            try:
+                async with asyncio.timeout_at(deadline):
+                    agen, first = await with_retry(
+                        open_stream,
+                        base=RETRY_BASE_S,
+                        cap=RETRY_CAP_S,
+                        retry_on=(_ConnectFailed,),
+                    )
+            except _ConnectFailed:
+                probe.failure()
+                return "partner unreachable"
+            except CredentialError:
+                return "credential error"
+            except TimeoutError:
+                await _drop_inflight(inflight)
+                return await recover(timed_out=True)
+            except StopAsyncIteration:
+                probe.success()
                 return await recover()
-            if kind == "server":
-                return "partner error"
-            return _protocol_reason(e)
+            except Exception as e:  # noqa: BLE001 - classified; internal errors re-raised
+                kind = _kind(e)
+                _reraise_other(e, kind)
+                if _status(e) == 401:
+                    if not resent and reauth is not None and await reauth():
+                        resent = True
+                        continue
+                    probe.success()  # the partner answered: it is up
+                    return AUTH_REJECTED
+                probe.kind(kind)
+                if kind == "transport" or _status(e) in _AMBIGUOUS_STATUS:
+                    return await recover()
+                if kind == "server":
+                    return "partner error"
+                return _protocol_reason(e)
+            break
         probe.success()
 
         # Phase 2: consume the stream (streaming partners only).
@@ -1084,7 +1164,7 @@ class PartnerClient:
                 except TimeoutError:
                     probe.failure()
                     return self._unavailable(partner_id, rec, "timed out", task_id=task_id)
-                except (MissingCredential, InvalidCredential):
+                except CredentialError:
                     return self._unavailable(partner_id, rec, "credential error", task_id=task_id)
                 except Exception as e:  # noqa: BLE001 - classified; internal errors re-raised
                     kind = _kind(e)
@@ -1140,7 +1220,18 @@ class PartnerClient:
         ]
         if not rows:
             return 0
-        tasks = [asyncio.create_task(self.cancel(r["partner_id"], r["task_id"])) for r in rows]
+        # Each partner task is cancelled as the caller it was started for (rows written
+        # before the caller was recorded fall back to the current principal).
+        tasks = [
+            asyncio.create_task(
+                self.cancel(
+                    r["partner_id"],
+                    r["task_id"],
+                    caller=Principal.from_id(r["caller_id"]) if r.get("caller_id") else None,
+                )
+            )
+            for r in rows
+        ]
         try:
             await asyncio.wait(tasks, timeout=self.default_deadline_s)
         finally:

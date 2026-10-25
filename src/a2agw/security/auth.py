@@ -12,6 +12,7 @@ from typing import Any
 
 import jwt
 from a2a.auth.user import UnauthenticatedUser, User
+from a2a.server.context import ServerCallContext
 from a2a.server.routes.common import DefaultServerCallContextBuilder
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.authentication import (
@@ -27,6 +28,9 @@ from a2agw.security.principal import Principal, PrincipalUser
 logger = logging.getLogger(__name__)
 
 ALLOWED_JWT_ALGORITHMS = ["RS256", "ES256", "EdDSA"]
+# Key, in the ASGI scope state and the SDK's ServerCallContext.state, of the raw bearer JWT of
+# a JWT-authenticated caller (never an API key). It is a secret: never log it.
+BEARER_STATE_KEY = "a2agw_bearer"
 JWT_LEEWAY_SECONDS = 30
 
 
@@ -119,6 +123,11 @@ class GatewayAuthBackend(AuthenticationBackend):
         elif bearer is not None:
             if bearer.count(".") == 2:
                 principal = await self._check_jwt(bearer)
+                # Kept for an outbound token exchange on this caller's behalf. A copy, so a
+                # state dict shared with other requests is never written to.
+                state = dict(conn.scope.get("state") or {})
+                state[BEARER_STATE_KEY] = bearer
+                conn.scope["state"] = state
             else:
                 principal = self._check_api_key(bearer)
         elif self._config.allow_anonymous:
@@ -191,6 +200,13 @@ def on_auth_error(conn: HTTPConnection, exc: Exception) -> JSONResponse:
 
 
 class GatewayCallContextBuilder(DefaultServerCallContextBuilder):
+    def build(self, request: Request) -> ServerCallContext:
+        ctx = super().build(request)
+        token = (request.scope.get("state") or {}).get(BEARER_STATE_KEY)
+        if isinstance(token, str) and token:
+            ctx.state[BEARER_STATE_KEY] = token
+        return ctx
+
     def build_user(self, request: Request) -> User:
         user = request.scope.get("user")
         if isinstance(user, PrincipalUser):

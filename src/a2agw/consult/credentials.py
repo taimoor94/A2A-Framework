@@ -12,14 +12,19 @@ from a2agw.consult.registry import PartnerRecord
 from a2agw.security.principal import Principal
 
 
-class MissingCredential(Exception):
-    def __init__(self, ref: str, env_var: str):
-        super().__init__(f"credential {ref!r}: environment variable {env_var} is unset or empty")
+class CredentialError(Exception):
+    """Base of every outbound credential failure. Messages never contain secret values."""
+
+
+class MissingCredential(CredentialError):
+    def __init__(self, ref: str | None, env_var: str | None = None, *, reason: str | None = None):
+        detail = reason or f"environment variable {env_var} is unset or empty"
+        super().__init__(f"credential {ref!r}: {detail}")
         self.ref = ref
         self.env_var = env_var
 
 
-class InvalidCredential(Exception):
+class InvalidCredential(CredentialError):
     """A header name or value contains CR, LF or NUL. Never includes the value."""
 
     def __init__(self, ref: str | None, header: str):
@@ -86,6 +91,10 @@ class ChainCredentials:
 
     def __repr__(self) -> str:
         return f"ChainCredentials({', '.join(repr(p) for p in self._providers)})"
+
+    @property
+    def providers(self) -> tuple[CredentialProvider, ...]:
+        return self._providers
 
     async def headers(self, partner: PartnerRecord, caller: Principal | None) -> dict[str, str]:
         for p in self._providers:

@@ -15,6 +15,18 @@ class Principal:
     scopes: frozenset[str]
     tenant: str = ""
 
+    @classmethod
+    def from_id(cls, principal_id: str) -> Principal:
+        """Rebuild a stored caller from its prefixed id, without scopes (``key:`` is an API
+        key, ``jwt:`` a JWT subject, anything else anonymous)."""
+        if principal_id.startswith("key:"):
+            kind: Literal["api_key", "jwt", "anonymous"] = "api_key"
+        elif principal_id.startswith("jwt:"):
+            kind = "jwt"
+        else:
+            kind = "anonymous"
+        return cls(id=principal_id, kind=kind, scopes=frozenset())
+
 
 class PrincipalUser(User):
     """Adapts a Principal to the A2A SDK User (used for task ownership scoping)."""

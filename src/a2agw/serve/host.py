@@ -526,9 +526,12 @@ class AgentHost:
         )
 
     async def _cancel_outbound(self, handle: dict[str, Any]) -> None:
-        """Recovery: cancel one partner task; raise unless the partner reports it canceled."""
+        """Recovery: cancel one partner task, as the caller it was started for; raise unless
+        the partner reports it canceled."""
         assert self.client is not None
-        result = await self.client.cancel(handle["partner_id"], handle["task_id"])
+        caller_id = handle.get("caller_id")
+        caller = Principal.from_id(caller_id) if caller_id else None
+        result = await self.client.cancel(handle["partner_id"], handle["task_id"], caller=caller)
         if result.state != "canceled":
             raise RuntimeError("not canceled")
 

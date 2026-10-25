@@ -236,3 +236,20 @@ def use_inbound(task_id: str | None, principal: Principal | None) -> Iterator[No
     finally:
         current_principal.reset(principal_token)
         current_inbound_task.reset(task_token)
+
+
+# The inbound caller's raw bearer JWT, set by the executor while an adapter runs so that an
+# RFC 8693 token exchange (a2agw.consult.oauth.OAuthTokenExchange) can act on the caller's
+# behalf. Only JWT callers have one. A secret: never log it or put it in a repr or a span.
+current_inbound_token: ContextVar[str | None] = ContextVar(
+    "a2agw_current_inbound_token", default=None
+)
+
+
+@contextmanager
+def use_inbound_token(token: str | None) -> Iterator[None]:
+    reset = current_inbound_token.set(token)
+    try:
+        yield
+    finally:
+        current_inbound_token.reset(reset)

@@ -9,7 +9,18 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from sqlalchemy import Column, Float, MetaData, String, Table, func, select, update
+from sqlalchemy import (
+    Column,
+    Float,
+    MetaData,
+    String,
+    Table,
+    func,
+    inspect,
+    select,
+    text,
+    update,
+)
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects import sqlite as sqlite_dialect
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -25,6 +36,9 @@ _outbound = Table(
     Column("origin", String, nullable=True, index=True),
     Column("state", String, nullable=False),  # TaskState NAME, e.g. "TASK_STATE_WORKING"
     Column("created_at", Float, nullable=False),
+    # The prefixed id of the inbound caller the partner task was started for (``key:...``,
+    # ``jwt:...``), so cascade and recovery cancels are made with that caller's credentials.
+    Column("caller_id", String, nullable=True),
 )
 OUTBOUND_TABLE = _outbound  # read by the inbound side's re-entry check (serve.store)
 
@@ -36,6 +50,16 @@ class OutboundHandleStore:
     async def initialize(self) -> None:
         async with self._engine.begin() as conn:
             await conn.run_sync(_metadata.create_all)
+            # Phase 1 tables lack caller_id: add it (works on sqlite and postgres alike).
+            columns = await conn.run_sync(
+                lambda sync: {c["name"] for c in inspect(sync).get_columns(_outbound.name)}
+            )
+            if "caller_id" not in columns:
+                # postgres: IF NOT EXISTS tolerates a concurrent startup doing the same.
+                guard = "IF NOT EXISTS " if conn.dialect.name == "postgresql" else ""
+                await conn.execute(
+                    text(f"ALTER TABLE a2agw_outbound ADD COLUMN {guard}caller_id VARCHAR")
+                )
 
     async def record(
         self,
@@ -45,8 +69,11 @@ class OutboundHandleStore:
         inbound_task_id: str | None,
         origin: str | None,
         state: str,
+        *,
+        caller_id: str | None = None,
     ) -> None:
-        """Insert a handle, or update its state. Known links (inbound task, origin) are kept."""
+        """Insert a handle, or update its state. Known links (inbound task, origin, caller)
+        are kept."""
         insert = (
             sqlite_dialect.insert if self._engine.dialect.name == "sqlite" else postgresql.insert
         )
@@ -58,6 +85,7 @@ class OutboundHandleStore:
             origin=origin,
             state=state,
             created_at=time.time(),
+            caller_id=caller_id,
         )
         ex, t = stmt.excluded, _outbound.c
         stmt = stmt.on_conflict_do_update(
@@ -67,6 +95,7 @@ class OutboundHandleStore:
                 "context_id": func.coalesce(ex.context_id, t.context_id),
                 "inbound_task_id": func.coalesce(t.inbound_task_id, ex.inbound_task_id),
                 "origin": func.coalesce(t.origin, ex.origin),
+                "caller_id": func.coalesce(t.caller_id, ex.caller_id),
             },
         )
         async with self._engine.begin() as conn:

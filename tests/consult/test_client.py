@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import re
 
 import httpx
 import pytest
+import respx
 from a2a.helpers import new_text_message
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
@@ -30,14 +32,18 @@ from starlette.applications import Starlette
 from streaming_asgi import StreamingASGITransport
 
 from a2agw.consult import client as client_mod
+from a2agw.consult import netguard
 from a2agw.consult import results as results_mod
 from a2agw.consult.client import PartnerClient, ToolResult
+from a2agw.consult.credentials import ChainCredentials, StaticCredentials
 from a2agw.consult.handles import OutboundHandleStore
+from a2agw.consult.oauth import OAuthClientCredentials
 from a2agw.consult.registry import PartnerRegistry
 from a2agw.consult.resilience import CircuitBreaker
-from a2agw.context.call_context import EXTENSION_URI, CallContext, use_call
+from a2agw.context.call_context import EXTENSION_URI, CallContext, use_call, use_inbound
 from a2agw.core.events import ArtifactChunk, Done, NeedInput, Status
 from a2agw.ops.bus import EventBus
+from a2agw.security.auth import ApiKeyEntry, AuthConfig
 from a2agw.security.principal import Principal
 from a2agw.serve.agent import AgentSpec, SkillSpec
 from a2agw.serve.host import AgentHost
@@ -167,8 +173,12 @@ async def env(tmp_path, monkeypatch):
     monkeypatch.setattr(client_mod, "RETRY_CAP_S", 0.002)
     made: list[Env] = []
 
-    async def _make(*specs: AgentSpec, register: bool = True, apps: dict | None = None) -> Env:
-        host = AgentHost("http://t", db_url=f"sqlite+aiosqlite:///{tmp_path / 'host.db'}")
+    async def _make(
+        *specs: AgentSpec, register: bool = True, apps: dict | None = None, auth=None
+    ) -> Env:
+        host = AgentHost(
+            "http://t", db_url=f"sqlite+aiosqlite:///{tmp_path / 'host.db'}", auth=auth
+        )
         for s in specs:
             host.add(s)
         await host.startup()
@@ -999,3 +1009,185 @@ async def test_wait_any_survives_one_garbage_partner(env):
     assert results[0].state == "failed" and results[0].reason == "partner protocol error"
     assert results[1].partner == "pb" and results[1].state in ("working", "completed")
     a.gate.set()
+
+
+# -- Phase 2: OAuth 401 resend and caller-scoped cascades ----------------------------
+
+TOKEN_URL = "https://auth.example.com/token"
+
+
+def _sha(k: str) -> str:
+    return hashlib.sha256(k.encode()).hexdigest()
+
+
+@pytest.fixture
+def oauth_env(monkeypatch):
+    async def fake(host: str) -> list[str]:
+        return ["93.184.216.34"]
+
+    monkeypatch.setattr(netguard, "_resolve", fake)
+    monkeypatch.setenv("OAUTH_SECRET", "client-secret")
+
+
+def _token(tok: str) -> httpx.Response:
+    return httpx.Response(
+        200, json={"access_token": tok, "token_type": "Bearer", "expires_in": 600}
+    )
+
+
+class SendLog(httpx.AsyncBaseTransport):
+    """Records (messageId, Authorization) of every send that reaches the partner host."""
+
+    def __init__(self, inner: StreamingASGITransport) -> None:
+        self.inner = inner
+        self.sends: list[tuple[str, str]] = []
+
+    async def handle_async_request(self, request):
+        try:
+            body = json.loads(request.content)
+        except ValueError:
+            body = {}
+        if body.get("method") in ("SendMessage", "SendStreamingMessage"):
+            mid = body["params"]["message"]["messageId"]
+            self.sends.append((mid, request.headers.get("authorization", "")))
+        return await self.inner.handle_async_request(request)
+
+
+async def test_401_before_accept_refreshes_and_resends_once(env, oauth_env):
+    partner_auth = AuthConfig(api_keys={_sha("tok-good"): ApiKeyEntry(principal_id="gw")})
+    e = await env(spec("alpha", Echo()), register=False, auth=partner_auth)
+    await e.registry.add_from_card("alpha", e.card("alpha"), "internal", credential_ref="o")
+    log = SendLog(e.transport)
+    e.hc._transport = log
+    creds = OAuthClientCredentials(TOKEN_URL, "gw", "OAUTH_SECRET", refs={"o"})
+    client = PartnerClient(e.registry, credentials=creds, handles=e.handles, http=e.hc)
+    breaker = half_open_breaker(e, "alpha")
+    client._breakers["alpha"] = breaker
+    try:
+        with respx.mock as rx:
+            route = rx.post(TOKEN_URL).mock(side_effect=[_token("tok-stale"), _token("tok-good")])
+            res = await client.consult("alpha", "x", wait_seconds=5)
+        assert res.state == "completed", res
+        assert res.text == "echo: x"
+        assert route.call_count == 2
+        assert len(log.sends) == 2
+        (mid1, auth1), (mid2, auth2) = log.sends
+        assert mid1 == mid2
+        assert auth1 == "Bearer tok-stale" and auth2 == "Bearer tok-good"
+        assert breaker.state == "closed"
+    finally:
+        await client.aclose()
+
+
+async def test_401_twice_gives_auth_required_result(env, oauth_env):
+    partner_auth = AuthConfig(api_keys={_sha("tok-good"): ApiKeyEntry(principal_id="gw")})
+    e = await env(spec("alpha", Echo()), register=False, auth=partner_auth)
+    await e.registry.add_from_card("alpha", e.card("alpha"), "internal", credential_ref="o")
+    log = SendLog(e.transport)
+    e.hc._transport = log
+    creds = OAuthClientCredentials(TOKEN_URL, "gw", "OAUTH_SECRET")
+    client = PartnerClient(e.registry, credentials=creds, http=e.hc)
+    breaker = half_open_breaker(e, "alpha")
+    client._breakers["alpha"] = breaker
+    try:
+        with respx.mock as rx:
+            route = rx.post(TOKEN_URL).mock(side_effect=[_token("bad-1"), _token("bad-2")])
+            res = await client.consult("alpha", "x", wait_seconds=5)
+        assert res.state == "auth_required"
+        assert res.reason == "partner rejected credentials"
+        assert route.call_count == 2
+        assert len(log.sends) == 2  # one resend, never more
+        assert breaker.state == "closed"  # the partner did answer
+    finally:
+        await client.aclose()
+
+
+async def test_401_without_invalidate_is_not_resent(env):
+    partner_auth = AuthConfig(api_keys={_sha("tok-good"): ApiKeyEntry(principal_id="gw")})
+    e = await env(spec("alpha", Echo()), register=False, auth=partner_auth)
+    await e.registry.add_from_card("alpha", e.card("alpha"), "internal", credential_ref="o")
+    log = SendLog(e.transport)
+    e.hc._transport = log
+    creds = StaticCredentials({"o": {"Authorization": "Bearer nope"}})
+    client = PartnerClient(e.registry, credentials=ChainCredentials(creds), http=e.hc)
+    try:
+        res = await client.consult("alpha", "x", wait_seconds=5)
+        assert res.state == "auth_required"
+        assert len(log.sends) == 1
+    finally:
+        await client.aclose()
+
+
+async def test_cascade_cancel_uses_original_caller(env):
+    gated = Gated()
+    e = await env(spec("slow", gated), register=False)
+    await e.registry.add_from_card("slow", e.card("slow"), "internal", credential_ref="r")
+    callers: list[Principal | None] = []
+
+    class Creds:
+        async def headers(self, partner, caller):
+            callers.append(caller)
+            return {"X-Partner-Key": "k"}
+
+    client = PartnerClient(e.registry, credentials=Creds(), handles=e.handles, http=e.hc)
+    alice = Principal(id="jwt:alice", kind="jwt", scopes=frozenset({"a"}))
+    try:
+        res = await client.consult(
+            "slow", "go", wait_seconds=0.2, inbound_task_id="in-a", caller=alice
+        )
+        assert res.state == "working"
+        [row] = await e.handles.by_inbound("in-a")
+        assert row["caller_id"] == "jwt:alice"
+        callers.clear()
+        other = Principal(id="key:mallory", kind="api_key", scopes=frozenset())
+        with use_inbound("in-other", other):
+            assert await client.cancel_for_inbound("in-a") == 1
+        assert callers and all(
+            c is not None and (c.id, c.kind, c.scopes) == ("jwt:alice", "jwt", frozenset())
+            for c in callers
+        )
+
+        # Restart recovery rebuilds the caller the same way.
+        seen: list = []
+
+        async def spy(partner_id, task_id, *, caller=None):
+            seen.append(caller)
+            return ToolResult(partner=partner_id, task_id=task_id, state="canceled")
+
+        e.host.client.cancel = spy  # type: ignore[method-assign]
+        await e.host._cancel_outbound(
+            {"partner_id": "slow", "task_id": "t1", "caller_id": "key:bob"}
+        )
+        await e.host._cancel_outbound({"partner_id": "slow", "task_id": "t2", "caller_id": None})
+        assert seen[0] == Principal(id="key:bob", kind="api_key", scopes=frozenset())
+        assert seen[1] is None
+    finally:
+        gated.gate.set()
+        await client.aclose()
+
+
+async def test_handles_migration_adds_caller_id(tmp_path):
+    engine = await create_engine(f"sqlite+aiosqlite:///{tmp_path / 'old.db'}")
+    try:
+        async with engine.begin() as conn:  # the Phase 1 schema, with one row
+            await conn.exec_driver_sql(
+                "CREATE TABLE a2agw_outbound (partner_id VARCHAR NOT NULL, task_id VARCHAR NOT "
+                "NULL, context_id VARCHAR, inbound_task_id VARCHAR, origin VARCHAR, state "
+                "VARCHAR NOT NULL, created_at FLOAT NOT NULL, PRIMARY KEY (partner_id, task_id))"
+            )
+            await conn.exec_driver_sql(
+                "INSERT INTO a2agw_outbound VALUES ('p', 't', NULL, 'in-1', NULL, "
+                "'TASK_STATE_WORKING', 1.0)"
+            )
+        store = OutboundHandleStore(engine)
+        await store.initialize()
+        await store.initialize()  # idempotent
+        [old] = await store.by_inbound("in-1")
+        assert old["caller_id"] is None
+        await store.record("t2", "p", None, "in-1", None, "TASK_STATE_WORKING", caller_id="jwt:x")
+        await store.record("t2", "p", None, "in-1", None, "TASK_STATE_COMPLETED", caller_id="jwt:y")
+        row = await store.get("p", "t2")
+        assert row is not None and row["caller_id"] == "jwt:x"  # the first caller is kept
+        assert row["state"] == "TASK_STATE_COMPLETED"
+    finally:
+        await engine.dispose()

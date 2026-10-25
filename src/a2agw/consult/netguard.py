@@ -6,7 +6,7 @@ import asyncio
 import ipaddress
 import os
 import socket
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 
@@ -108,20 +108,60 @@ async def safe_get(
 
     The deadline covers the DNS check, the connection and the whole body. Raises UnsafeURL
     when the URL is refused and FetchError for every other failure."""
+    return await _guarded("GET", url, tier, max_bytes, deadline_s, http, {})
+
+
+async def safe_post(
+    url: str,
+    tier: Tier,
+    *,
+    data: dict[str, str],
+    headers: dict[str, str] | None = None,
+    max_bytes: int,
+    deadline_s: float,
+    http: httpx.AsyncClient | None = None,
+) -> bytes:
+    """POST a form to `url` with the same protections as ``safe_get``.
+
+    Only a 200 response body is returned; any other status is a FetchError that names the
+    status but never includes the body."""
+    return await _guarded(
+        "POST", url, tier, max_bytes, deadline_s, http, {"data": data, "headers": headers or {}}
+    )
+
+
+async def _guarded(
+    method: str,
+    url: str,
+    tier: Tier,
+    max_bytes: int,
+    deadline_s: float,
+    http: httpx.AsyncClient | None,
+    kwargs: dict[str, Any],
+) -> bytes:
     try:
         async with asyncio.timeout(deadline_s):
             await check_url(url, tier)
             if http is not None:
-                return await _get_capped(http, url, max_bytes, deadline_s)
+                return await _capped(http, method, url, max_bytes, deadline_s, kwargs)
             async with httpx.AsyncClient(follow_redirects=False, timeout=deadline_s) as c:
-                return await _get_capped(c, url, max_bytes, deadline_s)
+                return await _capped(c, method, url, max_bytes, deadline_s, kwargs)
     except TimeoutError:
         raise FetchError("timed out") from None
 
 
-async def _get_capped(client: httpx.AsyncClient, url: str, max_bytes: int, timeout: float) -> bytes:
+async def _capped(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    max_bytes: int,
+    timeout: float,
+    kwargs: dict[str, Any],
+) -> bytes:
     try:
-        async with client.stream("GET", url, follow_redirects=False, timeout=timeout) as resp:
+        async with client.stream(
+            method, url, follow_redirects=False, timeout=timeout, **kwargs
+        ) as resp:
             if 300 <= resp.status_code < 400:
                 raise FetchError("redirects are not followed")
             if resp.status_code != 200:

@@ -31,6 +31,7 @@ from a2agw.context.call_context import (
     HopLimitExceeded,
     use_call,
     use_inbound,
+    use_inbound_token,
 )
 from a2agw.core.events import (
     ArtifactChunk,
@@ -45,6 +46,7 @@ from a2agw.core.events import (
 from a2agw.core.spi import InboundContext
 from a2agw.ops.bus import EventBus, GatewayEvent
 from a2agw.ops.telemetry import extract_parent, get_tracer
+from a2agw.security.auth import BEARER_STATE_KEY
 from a2agw.security.principal import Principal, PrincipalUser
 from a2agw.serve.agent import AgentSpec
 from a2agw.serve.store import TaskIndex
@@ -104,6 +106,13 @@ class _Run:
                 "cost": self.cost,
             }
         }
+
+
+def _inbound_token(context: RequestContext) -> str | None:
+    """The caller's raw bearer JWT (JWT callers only), for an outbound token exchange."""
+    state = context.call_context.state if context.call_context is not None else None
+    token = (state or {}).get(BEARER_STATE_KEY)
+    return token if isinstance(token, str) and token else None
 
 
 def _caller(context: RequestContext) -> tuple[Principal | None, str]:
@@ -319,7 +328,9 @@ class AdapterExecutor(AgentExecutor):
         if run.cancelled:
             return
         # No await between the check above and registration: cancel() sees one or the other.
-        work = asyncio.create_task(self._drive(run, inbound), name=f"a2agw:{updater.task_id}")
+        work = asyncio.create_task(
+            self._drive(run, inbound, _inbound_token(context)), name=f"a2agw:{updater.task_id}"
+        )
         self._running[updater.task_id] = work
         try:
             await work
@@ -361,7 +372,9 @@ class AdapterExecutor(AgentExecutor):
             return None, _REASONS.get(type(exc), _INVALID)
         return cc, ""
 
-    async def _drive(self, run: _Run, inbound: InboundContext) -> None:
+    async def _drive(
+        self, run: _Run, inbound: InboundContext, inbound_token: str | None = None
+    ) -> None:
         events: Any = None
         span_attrs = {
             "a2agw.agent_id": self.spec.id,
@@ -379,6 +392,7 @@ class AdapterExecutor(AgentExecutor):
             ) as span,
             use_call(inbound.call),
             use_inbound(inbound.task_id, inbound.principal),
+            use_inbound_token(inbound_token),
         ):
             try:
                 try:
