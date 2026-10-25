@@ -749,3 +749,60 @@ async def test_follow_up_without_context_id_resumes_in_task_context(make_server)
     assert task2.status.state == TaskState.TASK_STATE_COMPLETED
     assert task2.context_id == task.context_id
     assert [c.context_id for c in seen] == [task.context_id, task.context_id]
+
+
+async def test_pending_direct_replies_turn_is_indexed(make_server):
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    class Waiter:
+        durable_sessions = False
+
+        async def run(self, ctx: InboundContext):
+            started.set()
+            await release.wait()
+            yield Reply("done")
+
+    h = await make_server(Waiter(), direct_replies=True)
+    sub = h.bus.subscribe()
+    async with sub:
+        req = SendMessageRequest(message=user_msg("hi"))
+        sending = asyncio.create_task(anext(aiter(h.client(streaming=False).send_message(req))))
+        await asyncio.wait_for(started.wait(), 5)
+        [row] = (await h.index.list(agent_id="echo"))[0]
+        assert row["state"] == "TASK_STATE_SUBMITTED"
+        assert row["origin"] and row["context_id"] and row["owner"] == "anonymous"
+        release.set()
+        ev = await asyncio.wait_for(sending, 5)
+        assert ev.WhichOneof("payload") == "message"
+        rows, _ = await h.index.list(agent_id="echo")
+        assert rows == []  # a direct reply leaves no task behind
+        states = []
+        while len(states) < 2:
+            got = await asyncio.wait_for(anext(sub), 5)
+            states.append(got.data["state"])
+        assert states == ["TASK_STATE_SUBMITTED", "DIRECT_REPLY"]
+
+
+async def test_direct_reply_runs_cascade_hook_and_marks_span(make_server, spans):
+    cancelled: list[str] = []
+
+    async def hook(task_id: str) -> None:
+        cancelled.append(task_id)
+
+    h = await make_server(ScriptAdapter(Reply("hello")), direct_replies=True)
+    h.executor.on_cancel = hook
+    [ev] = [
+        ev
+        async for ev in h.client(streaming=False).send_message(
+            SendMessageRequest(message=user_msg("hi"))
+        )
+    ]
+    assert ev.WhichOneof("payload") == "message"
+    async with asyncio.timeout(5):  # the hook runs after the reply has been sent
+        while not cancelled or not spans.get_finished_spans():
+            await asyncio.sleep(0.01)
+    assert len(cancelled) == 1 and cancelled[0]
+    [span] = [s for s in spans.get_finished_spans() if s.name == "a2agw.inbound"]
+    assert span.attributes["a2agw.direct_reply"] is True
+    assert span.attributes["a2a.task_id"] == cancelled[0]

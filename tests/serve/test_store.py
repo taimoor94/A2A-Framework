@@ -343,3 +343,12 @@ async def test_recovery_cancels_run_concurrently_within_bound(engine, index):
     assert report.outbound_cancelled == 1
     assert report.cancel_errors == ["w1:hang"]
     assert sorted(report.failed) == ["w1", "w2"]
+
+
+async def test_delete_removes_only_that_row(index):
+    await index.upsert("t1", "a1", "key:x", "c", S, "o1")
+    await index.upsert("t2", "a1", "key:x", "c", S, "o1")
+    await index.delete("t1")
+    await index.delete("missing")  # deleting an unknown id is a no-op
+    rows, _ = await index.list(agent_id="a1")
+    assert [r["task_id"] for r in rows] == ["t2"]

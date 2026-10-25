@@ -39,3 +39,14 @@ async def test_sut_completes_and_replies_in_process(tmp_path):
     finally:
         await hc.aclose()
         await host.shutdown()
+
+
+async def test_default_temp_database_is_removed_on_shutdown():
+    import os
+
+    host = build_host("http://t")
+    path = host.db_url.removeprefix("sqlite+aiosqlite:///")
+    await host.startup()
+    assert os.path.exists(path)
+    await host.shutdown()
+    assert not os.path.exists(os.path.dirname(path))

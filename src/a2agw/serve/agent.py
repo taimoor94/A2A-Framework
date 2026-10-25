@@ -58,7 +58,9 @@ class AgentSpec(BaseModel):
     allow_reentry: bool = False
     # Lets the adapter answer a new turn with a bare A2A Message (a ``Reply`` first event).
     # The task is then created lazily, on the adapter's first other event: until then it is
-    # not visible to GetTask/CancelTask and no WORKING status is sent.
+    # not visible to GetTask/CancelTask and no WORKING status is sent. The turn is still
+    # indexed (SUBMITTED) from admission, so re-entry detection and the cancellation cascade
+    # cover it; a direct Reply deletes that row and cancels any partner tasks the turn started.
     direct_replies: bool = False
 
     @field_validator("id")

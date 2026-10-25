@@ -52,6 +52,7 @@ from a2agw.serve.store import TaskIndex
 logger = logging.getLogger(__name__)
 
 USAGE_KEY = "a2agw.usage"
+DIRECT_REPLY = "DIRECT_REPLY"  # bus "task.state" value for a turn answered with a bare Message
 
 _REASONS: dict[type[CallContextViolation], str] = {
     HopLimitExceeded: "hop limit exceeded",
@@ -134,6 +135,14 @@ class AdapterExecutor(AgentExecutor):
     checked before either is recorded), and a partner that calls back before the caller has
     recorded its outbound handle (written when the partner's first response arrives) does
     not yet see the caller as blocked downstream.
+
+    Direct replies (``AgentSpec.direct_replies``): a new turn's A2A Task is created lazily, on
+    the adapter's first event other than ``Reply``/``Usage``. The turn is indexed as SUBMITTED
+    at admission regardless, so the re-entry check and the cancellation cascade see it while
+    it is pending. If the first event is ``Reply``, the executor answers with a bare Message,
+    deletes the index row, publishes ``task.state`` = ``DIRECT_REPLY``, marks the span
+    ``a2agw.direct_reply=true`` and runs ``on_cancel`` so partner tasks the turn started are
+    cancelled.
 
     Known limits (Phase 1):
     - An ``ArtifactChunk`` with ``append=True`` for an unknown ``artifact_id`` is rejected by
@@ -282,6 +291,12 @@ class AdapterExecutor(AgentExecutor):
             return
         # A resumed turn keeps the origin recorded by the turn that created the task.
         run.origin = None if resumed else cc.origin
+        if run.pending is not None:
+            # direct_replies: no A2A task exists yet, but the turn is indexed now so the
+            # re-entry check and the cancellation cascade can see it while it is pending.
+            await self._record(run, TaskState.TASK_STATE_SUBMITTED)
+            if run.cancelled:
+                return
         if not resumed and not self.spec.allow_reentry:
             # The path check above misses a partner that forwards our origin but rewrites the
             # path: see "Re-entry" in the class docstring.
@@ -444,17 +459,7 @@ class AdapterExecutor(AgentExecutor):
                 if run.pending is None:  # a task exists: the reply completes it
                     await self._status(run, TaskState.TASK_STATE_COMPLETED, text)
                     return True
-                run.pending = None
-                run.terminal = True
-                self._close(updater.task_id)
-                await updater.event_queue.enqueue_event(
-                    Message(
-                        message_id=uuid.uuid4().hex,
-                        role=Role.ROLE_AGENT,
-                        context_id=updater.context_id,
-                        parts=[new_text_part(text)],
-                    )
-                )
+                await self._direct_reply(run, text)
                 return True
             case Failed(error=error):
                 otel_trace.get_current_span().set_status(SpanStatus(StatusCode.ERROR))
@@ -463,6 +468,32 @@ class AdapterExecutor(AgentExecutor):
             case _:
                 raise TypeError(f"unknown adapter event {type(ev).__name__}")
         return False
+
+    async def _direct_reply(self, run: _Run, text: str) -> None:
+        """End a pending direct_replies turn with a bare Message: no task is ever created."""
+        updater = run.updater
+        task_id = updater.task_id
+        run.pending = None
+        run.terminal = True
+        self._close(task_id)
+        async with run.lock:  # the admission row goes; nothing records after terminal
+            await self.index.delete(task_id)
+        otel_trace.get_current_span().set_attribute("a2agw.direct_reply", True)
+        await updater.event_queue.enqueue_event(
+            Message(
+                message_id=uuid.uuid4().hex,
+                role=Role.ROLE_AGENT,
+                context_id=updater.context_id,
+                parts=[new_text_part(text)],
+            )
+        )
+        self._publish(task_id, updater.context_id, DIRECT_REPLY)
+        # The reply ends the turn: partner work it started would otherwise be orphaned.
+        if self.on_cancel is not None:
+            try:
+                await self.on_cancel(task_id)
+            except Exception:
+                logger.exception("on_cancel hook failed after direct reply on task %s", task_id)
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         task_id = context.task_id

@@ -170,8 +170,12 @@ class _RestConformance:
       and ``InvalidAgentResponseError`` 502 (the SDK sends 400, 400 and 500). The error body's
       ``code`` field is updated to match.
 
-    Only error responses (status >= 400) with a small, non-streaming body are buffered.
-    JSON-RPC answers errors with HTTP 200 and is therefore untouched.
+    It wraps the agent's whole sub-app (card, JSON-RPC and REST routes), but only acts on
+    responses labelled ``application/a2a+json`` (header rewrite) and on JSON error responses
+    with status >= 400 and a body of at most 64 KiB (status remap). JSON-RPC errors travel
+    with HTTP 200, so in practice only REST errors are remapped. The body's gRPC-style
+    ``error.status`` string (e.g. ``FAILED_PRECONDITION``) is kept on purpose: section 5.4
+    pairs these errors with exactly those gRPC statuses.
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -344,8 +348,11 @@ class AgentHost:
         credentials: CredentialProvider | None = None,
         partner_http: httpx.AsyncClient | None = None,
         default_deadline_s: float = 60.0,
+        card_cache_control: str | None = "public, max-age=300",
     ) -> None:
         self.base_url = base_url
+        # Cache-Control on every agent card response (A2A 1.0 section 8.6.1); None omits it.
+        self.card_cache_control = card_cache_control
         self.auth = auth
         self.db_url = db_url
         self.max_body_bytes = max_body_bytes
@@ -418,7 +425,9 @@ class AgentHost:
             builder = GatewayCallContextBuilder()
             # Each agent gets its own sub-app: the SDK's REST routes include a catch-all
             # "/{tenant}" mount that would otherwise swallow every other agent's paths.
-            sub_routes: list[BaseRoute] = [*create_agent_card_routes(card)]
+            sub_routes: list[BaseRoute] = [
+                *create_agent_card_routes(card, cache_control=self.card_cache_control)
+            ]
             sub_routes += create_jsonrpc_routes(
                 handler, rpc_url="/", context_builder=builder, enable_v0_3_compat=True
             )
@@ -437,7 +446,9 @@ class AgentHost:
             )
         routes.append(Mount("/agents", app=_agent_not_found))
         if len(self.cards) == 1:
-            routes += create_agent_card_routes(next(iter(self.cards.values())))
+            routes += create_agent_card_routes(
+                next(iter(self.cards.values())), cache_control=self.card_cache_control
+            )
         self._inner = Starlette(routes=routes)
         self.last_recovery = await recover_on_startup(
             index,

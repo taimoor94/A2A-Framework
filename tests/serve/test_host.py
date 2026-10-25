@@ -428,3 +428,14 @@ async def test_rest_conformance_leaves_non_json_errors_alone():
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as hc:
         r = await hc.get("/")
     assert r.status_code == 400 and r.text == "nope"
+
+
+async def test_card_cache_control_default_and_override(env):
+    e = await env(spec("alpha"))
+    hc = e.http()
+    for path in ("/.well-known/agent-card.json", "/agents/alpha/.well-known/agent-card.json"):
+        r = await hc.get(path)
+        assert r.headers["cache-control"] == "public, max-age=300"
+    e2 = await env(spec("beta"), card_cache_control=None)
+    r = await e2.http().get("/agents/beta/.well-known/agent-card.json")
+    assert "cache-control" not in r.headers

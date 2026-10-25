@@ -11,6 +11,7 @@ Run: ``uv run python -m examples.tck_sut.sut_agent`` (HTTP on :9999, no auth). S
 from __future__ import annotations
 
 import asyncio
+import atexit
 import os
 import tempfile
 from collections.abc import AsyncIterator
@@ -130,11 +131,27 @@ def sut_spec() -> AgentSpec:
 
 
 def build_host(base_url: str = BASE_URL, *, db_url: str | None = None) -> AgentHost:
-    """A single-agent host with no auth. Without ``db_url`` it uses a fresh temp database."""
+    """A single-agent host with no auth. Without ``db_url`` it uses a fresh temp database,
+    removed when the host shuts down (the app lifespan) or, failing that, at exit."""
+    tmp = None
     if db_url is None:
-        db_url = f"sqlite+aiosqlite:///{os.path.join(tempfile.mkdtemp(), 'tck.db')}"
+        tmp = tempfile.TemporaryDirectory(prefix="a2agw-tck-")
+        atexit.register(tmp.cleanup)
+        db_url = f"sqlite+aiosqlite:///{os.path.join(tmp.name, 'tck.db')}"
     host = AgentHost(base_url, db_url=db_url)
     host.add(sut_spec())
+    if tmp is not None:
+        # uvicorn re-raises SIGTERM after a graceful shutdown, which skips atexit, so the
+        # directory goes with the lifespan's shutdown.
+        shutdown = host.shutdown
+
+        async def shutdown_and_clean() -> None:
+            try:
+                await shutdown()
+            finally:
+                tmp.cleanup()
+
+        host.shutdown = shutdown_and_clean  # type: ignore[method-assign]
     return host
 
 

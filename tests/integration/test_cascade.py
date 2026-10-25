@@ -16,7 +16,7 @@ from google.protobuf.json_format import MessageToDict
 
 from a2agw.consult.tools import invoke, partner_tools
 from a2agw.context.call_context import EXTENSION_URI, current_inbound_task, current_principal
-from a2agw.core.events import Done
+from a2agw.core.events import Done, Reply
 
 CANCELED = TaskState.Name(TaskState.TASK_STATE_CANCELED)
 REJECTED = TaskState.Name(TaskState.TASK_STATE_REJECTED)
@@ -423,3 +423,74 @@ async def test_admin_partners_through_real_wiring(env):
     assert row["status"] == "active"
     assert row["breaker_state"] == "closed"
     assert row["in_flight"] == 0
+
+
+# -- direct replies ---------------------------------------------------------------------
+
+
+async def test_reentry_detected_for_direct_replies_agent(env):
+    """As test_reentry_via_origin_preserving_partner, for an agent whose outer turn is still
+    pending a direct reply (no A2A task yet): the index row written at admission still shows
+    it blocked downstream."""
+    results: dict[str, Any] = {}
+
+    async def a_run(ctx):
+        if ctx.text == "start":
+            results["a"] = await host.client.consult("p", "help", wait_seconds=5)
+            yield Reply("outer done")
+        else:
+            yield Reply("nested ok")
+
+    async def p_run(ctx):
+        async def recorded() -> bool:
+            return await host.handles.get("p", ctx.task_id) is not None
+
+        await until(recorded)
+        cc = dict(ctx.metadata[EXTENSION_URI])
+        cc["path"] = [x for x in cc["path"] if x != "a"]
+        back = msg("nested")
+        back.metadata.update({EXTENSION_URI: cc})
+        [ev] = [ev async for ev in e.client("a").send_message(SendMessageRequest(message=back))]
+        results["nested"] = ev
+        yield Done(text="p done")
+
+    e = await env(spec("a", Fn(a_run), direct_replies=True), spec("p", Fn(p_run)))
+    host = e.host
+    await e.register("p")
+
+    [outer] = await e.send("a", "start")
+    assert outer.WhichOneof("payload") == "message"
+    assert results["a"].state == "completed"
+    nested = results["nested"]
+    assert nested.WhichOneof("payload") == "task"
+    assert nested.task.status.state == TaskState.TASK_STATE_REJECTED
+    assert nested.task.status.message.parts[0].text == "re-entry"
+
+
+async def test_direct_reply_drops_index_row_and_cancels_partner_work(env):
+    b = Blocker()
+    seen: dict[str, Any] = {}
+
+    async def a_run(ctx):
+        seen["a_task"] = ctx.task_id
+        seen["result"] = await host.client.consult("b", "go", wait_seconds=0.2)
+        yield Reply("answered without waiting for b")
+
+    e = await env(spec("a", Fn(a_run), direct_replies=True), spec("b", b))
+    host = e.host
+    await e.register("b")
+
+    [ev] = await e.send("a", "start")
+    assert ev.WhichOneof("payload") == "message"
+    assert seen["result"].state == "working"
+    b_task = seen["result"].task_id
+
+    async def b_canceled() -> bool:
+        rows, _ = await host.index.list(agent_id="b")
+        return [r["state"] for r in rows if r["task_id"] == b_task] == [CANCELED]
+
+    await until(b_canceled)
+    rows, _ = await host.index.list(agent_id="a")
+    assert rows == []
+    [handle] = await host.handles.by_inbound(seen["a_task"])
+    assert handle["state"] == CANCELED

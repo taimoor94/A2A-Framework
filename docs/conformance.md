@@ -35,9 +35,9 @@ Why tests are skipped. All of these are TCK skips, not failures:
 
 ### SHOULD (for information)
 
-11 passed, 2 failed, 7 skipped.
+13 passed, 0 failed, 7 skipped.
 
-- `CARD-CACHE-001`, `test_cache_control_present` and `test_cache_control_has_max_age`: the agent card response has no `Cache-Control` header. The SDK's card route sets none, and a2agw adds none.
+- `CARD-CACHE-001` passes now. `AgentHost(card_cache_control=...)` defaults to `public, max-age=300` on every card route; pass `None` to omit the header.
 - Skips: 4 are for gRPC, which is not offered, and 3 are "No requirements at this level".
 
 ### MAY (for information)
@@ -51,7 +51,8 @@ Why tests are skipped. All of these are TCK skips, not failures:
 
 | TCK requirement | Gap | Fix |
 |---|---|---|
-| `DM-MSG-001` (MUST) | An adapter could not answer with a bare `Message`; every turn created a Task. | New adapter event `a2agw.core.events.Reply(text)` and opt-in `AgentSpec.direct_replies`. When the flag is on, the Task is created lazily, at the adapter's first non-`Reply` event, and a first `Reply` returns a Message with no task. Without the flag, a `Reply` completes the task with the text as its status message. |
+| `DM-MSG-001` (MUST) | An adapter could not answer with a bare `Message`; every turn created a Task. | New adapter event `a2agw.core.events.Reply(text)` and opt-in `AgentSpec.direct_replies`. When the flag is on, the Task is created lazily, at the adapter's first non-`Reply` event, and a first `Reply` returns a Message with no task. Without the flag, a `Reply` completes the task with the text as its status message. A pending direct-reply turn is indexed as SUBMITTED from admission, so re-entry detection and the cancellation cascade cover it. A direct `Reply` deletes that index row, cancels any partner tasks the turn started, and publishes `task.state` = `DIRECT_REPLY` on the bus. |
+| `CARD-CACHE-001` (SHOULD) | The agent card had no `Cache-Control` header. | `AgentHost(card_cache_control="public, max-age=300")`, passed to both card routes. |
 | `CORE-CANCEL-002` on HTTP+JSON (MUST) | The SDK returns 400 for `TaskNotCancelableError`, but spec §5.4 requires 409. | `AgentHost` wraps each agent's routes in `_RestConformance`, which remaps REST error statuses by `ErrorInfo.reason` to match §5.4: `TASK_NOT_CANCELABLE` to 409, `CONTENT_TYPE_NOT_SUPPORTED` to 415, `INVALID_AGENT_RESPONSE` to 502. The body's `code` is updated too. SDK clients map errors by reason, so they are unaffected. |
 | `HTTP_JSON-SVC-001` (MUST) | The SDK labels REST responses `application/a2a+json`, but spec §11.1 and the TCK require `application/json`. | The same wrapper rewrites the header to `application/json`. |
 | History tests (`CORE-HIST-*`, SHOULD; they were skipped) | A follow-up that sends only `taskId` gets a fresh `contextId` from the SDK, so the task's events failed with "Context in event doesn't match TaskManager". | `AdapterExecutor` uses the existing task's `context_id`. |
@@ -76,10 +77,10 @@ scripts/run_tck.sh -- -k cancel -v     # extra pytest arguments are passed to th
 The script does the following:
 
 1. Clones the TCK into `.tck/a2a-tck`, which is git-ignored, and checks out the pinned commit.
-2. Creates the TCK's own virtualenv there. None of its dependencies enter this project.
+2. Creates the TCK's own virtualenv there, and reinstalls the TCK into it whenever the pinned commit changes. None of its dependencies enter this project.
 3. Starts the SUT in the background, logging to `.tck/sut.log`, and waits for `/.well-known/agent-card.json`.
 4. Runs `run_tck.py --sut-host http://localhost:9999 --level <level>`.
-5. Stops the SUT on exit.
+5. Stops the SUT on exit: SIGTERM, then SIGKILL after 10 s. Ctrl-C exits with status 130.
 
 Reports are written to `.tck/a2a-tck/reports/`: `compatibility.json`, `compatibility.html`, `tck_report.html` and `junitreport.xml`.
 

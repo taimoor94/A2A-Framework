@@ -17,7 +17,19 @@ from a2a.server.context import ServerCallContext
 from a2a.server.models import create_task_model
 from a2a.server.tasks import DatabaseTaskStore, TaskStore
 from a2a.types import Message, Part, Role, TaskState
-from sqlalchemy import Column, Float, MetaData, String, Table, and_, func, or_, select, update
+from sqlalchemy import (
+    Column,
+    Float,
+    MetaData,
+    String,
+    Table,
+    and_,
+    delete,
+    func,
+    or_,
+    select,
+    update,
+)
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects import sqlite as sqlite_dialect
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -215,6 +227,11 @@ class TaskIndex:
         )
         async with self._engine.begin() as conn:
             await conn.execute(stmt)
+
+    async def delete(self, task_id: str) -> None:
+        """Remove a row (a direct-reply turn that ended without creating a task)."""
+        async with self._engine.begin() as conn:
+            await conn.execute(delete(_index_table).where(_index_table.c.task_id == task_id))
 
 
 class OutboundHandleStore(Protocol):

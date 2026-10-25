@@ -28,8 +28,14 @@ if [ "$(git -C "${TCK_DIR}" rev-parse HEAD)" != "${TCK_SHA}" ]; then
   git -C "${TCK_DIR}" fetch --quiet origin
   git -C "${TCK_DIR}" checkout --quiet --detach "${TCK_SHA}"
 fi
+# Reinstall the TCK into its venv whenever the pinned commit changes.
+INSTALLED_MARKER="${TCK_DIR}/.venv/.a2agw-installed-sha"
 if [ ! -x "${TCK_DIR}/.venv/bin/python" ]; then
-  (cd "${TCK_DIR}" && uv venv --quiet && uv pip install --quiet -e .)
+  (cd "${TCK_DIR}" && uv venv --quiet)
+fi
+if [ "$(cat "${INSTALLED_MARKER}" 2>/dev/null || true)" != "${TCK_SHA}" ]; then
+  (cd "${TCK_DIR}" && uv pip install --quiet -e .)
+  echo "${TCK_SHA}" >"${INSTALLED_MARKER}"
 fi
 
 if curl -fsS -o /dev/null "${SUT_URL}/.well-known/agent-card.json" 2>/dev/null; then
@@ -41,10 +47,19 @@ cd "${ROOT}"
 uv run python -m examples.tck_sut.sut_agent >"${SUT_LOG}" 2>&1 &
 SUT_PID=$!
 cleanup() {
-  kill "${SUT_PID}" 2>/dev/null || true
+  kill -TERM "${SUT_PID}" 2>/dev/null || return 0
+  for _ in $(seq 1 20); do  # up to 10 s for a graceful stop
+    kill -0 "${SUT_PID}" 2>/dev/null || break
+    sleep 0.5
+  done
+  if kill -0 "${SUT_PID}" 2>/dev/null; then
+    kill -KILL "${SUT_PID}" 2>/dev/null || true
+  fi
   wait "${SUT_PID}" 2>/dev/null || true
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT   # the EXIT trap then stops the SUT
+trap 'exit 143' TERM
 
 for _ in $(seq 1 60); do
   if curl -fsS -o /dev/null "${SUT_URL}/.well-known/agent-card.json" 2>/dev/null; then
