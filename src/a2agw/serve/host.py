@@ -40,7 +40,6 @@ from a2agw.consult.credentials import CredentialProvider
 from a2agw.consult.handles import OutboundHandleStore
 from a2agw.consult.registry import PartnerRecord, PartnerRegistry
 from a2agw.consult.tools import PartnerTool, partner_tools
-from a2agw.context.call_context import use_maintenance
 from a2agw.ops.admin import ADMIN_PREFIX, HEALTH_PATH, admin_routes
 from a2agw.ops.audit import AuditEvent, AuditLog
 from a2agw.ops.bus import EventBus
@@ -65,11 +64,17 @@ from a2agw.serve.push import (
     make_push_url_validator,
     push_config_store_for,
 )
+from a2agw.serve.reap import (
+    AgentServedError,
+    ReapResult,
+    RecentActivityError,
+    make_cancel_outbound,
+    reap_agent,
+)
 from a2agw.serve.store import (
     RecoveryReport,
     TaskIndex,
     create_engine,
-    reap_tasks,
     recover_on_startup,
     task_store_for,
 )
@@ -123,11 +128,7 @@ def _on_exit_signal(callback: Callable[[], None]) -> Iterator[None]:
                 signal.signal(sig, prev)
 
 
-__all__ = ["ADMIN_PREFIX", "HEALTH_PATH", "AgentHost"]
-
-
-class AgentServedError(ValueError):
-    """The agent is served by this gateway, so its tasks must not be reaped."""
+__all__ = ["ADMIN_PREFIX", "HEALTH_PATH", "AgentHost", "AgentServedError", "RecentActivityError"]
 
 
 def _strings(value: Any) -> Iterator[str]:
@@ -144,7 +145,13 @@ def _strings(value: Any) -> Iterator[str]:
 
 def _reject_nul(arg: Any) -> None:
     """NUL cannot be stored by PostgreSQL text/JSON columns: refuse it at the boundary."""
-    if isinstance(arg, ProtoMessage) and any("\x00" in s for s in _strings(MessageToDict(arg))):
+    if isinstance(arg, str):
+        found = "\x00" in arg
+    elif isinstance(arg, ProtoMessage):
+        found = any("\x00" in s for s in _strings(MessageToDict(arg)))
+    else:
+        found = False
+    if found:
         raise InvalidParamsError(message="invalid characters")
 
 
@@ -158,9 +165,9 @@ def _guard_handler_method(fn: Callable[..., Any]) -> Callable[..., Any]:
         return InternalError(message="internal error")
 
     def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        for arg in args:
-            _reject_nul(arg)
         try:
+            for arg in (*args, *kwargs.values()):
+                _reject_nul(arg)
             result = fn(self, *args, **kwargs)
         except A2AError:
             raise
@@ -746,18 +753,25 @@ class AgentHost:
                 foreign,
             )
 
-    async def reap(self, agent_id: str) -> RecoveryReport:
-        """Fail the non-terminal tasks of an agent nobody serves and cancel their outbound
-        partner tasks (as maintenance calls). ``AgentServedError`` for an agent of this host."""
-        if agent_id in self.specs:
-            raise AgentServedError(f"agent {agent_id!r} is served by this gateway")
+    async def reap(
+        self, agent_id: str, *, confirm: bool = False, force: bool = False, actor: str = "system"
+    ) -> ReapResult:
+        """Fail the open tasks of an agent nobody serves and cancel their outbound partner
+        tasks (see ``a2agw.serve.reap``). Without ``confirm`` it only counts what would be
+        reaped. Raises ``AgentServedError`` for an agent of this host and
+        ``RecentActivityError`` for tasks touched recently (unless ``force``). Audited."""
         if self.index is None:
             raise RuntimeError("host not started")
-        return await reap_tasks(
+        return await reap_agent(
             self.index,
             self.handles,
             self._cancel_outbound,
+            self.audit,
             agent_id,
+            served=set(self.specs),
+            confirm=confirm,
+            force=force,
+            actor=actor,
             cancel_timeout_s=self.default_deadline_s,
         )
 
@@ -803,14 +817,7 @@ class AgentHost:
         """Recovery: cancel one partner task, as the caller it was started for; raise unless
         the partner reports it canceled."""
         assert self.client is not None
-        caller_id = handle.get("caller_id")
-        caller = Principal.from_id(caller_id) if caller_id else None
-        with use_maintenance():
-            result = await self.client.cancel(
-                handle["partner_id"], handle["task_id"], caller=caller
-            )
-        if result.state != "canceled":
-            raise RuntimeError("not canceled")
+        await make_cancel_outbound(self.client)(handle)
 
     def push_stats(self, agent_id: str) -> dict[str, int]:
         """Delivery counters of one agent's push sender (delivered, failed, retries,

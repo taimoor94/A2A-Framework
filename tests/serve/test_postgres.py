@@ -484,34 +484,108 @@ async def test_reap_tasks_fails_open_tasks_and_cancels_handles(db_url):
         await eng.dispose()
 
 
-async def test_host_warns_about_foreign_open_tasks_and_reaps_via_admin(tmp_path, db_url, caplog):
+async def _age(eng, seconds: float = 3600.0) -> None:
+    async with eng.begin() as conn:
+        await conn.execute(
+            text("UPDATE a2agw_task_index SET updated_at = updated_at - :s"), {"s": seconds}
+        )
+
+
+async def _states(eng) -> dict[str, str]:
+    return {r["task_id"]: r["state"] for r in (await TaskIndex(eng).list())[0]}
+
+
+async def _reap_audit(host):
+    await host.audit.drain()
+    rows, _ = await host.audit.query({"action": "task.reap"}, 50, None, ascending=True)
+    return [
+        (r["agent_id"], r["outcome"], r["detail"].get("reason"), r["detail"]["count"]) for r in rows
+    ]
+
+
+async def test_host_warns_about_foreign_open_tasks(tmp_path, db_url, caplog):
     eng = await create_engine(db_url)
     await _seed_orphans(eng)
     await eng.dispose()
-    e = Env(tmp_path, db_url=db_url, audit=True, admin_without_auth=True)
+    e = Env(tmp_path, db_url=db_url)
     e.host.add(spec("alpha"))
     with caplog.at_level("WARNING"):
         await e.start()
     try:
         assert "2 non-terminal task(s)" in caplog.text and "a2agw tasks reap" in caplog.text
         assert await e.host.index.count_active_outside({"alpha"}) == 2  # recovery skipped them
+    finally:
+        await e.stop()
+
+
+async def test_admin_reap_is_dry_run_idle_guarded_confirmed_and_audited(tmp_path, db_url):
+    eng = await create_engine(db_url)
+    await _seed_orphans(eng)
+    e = Env(tmp_path, db_url=db_url, audit=True, admin_without_auth=True)
+    e.host.add(spec("alpha"))
+    await e.start()
+    try:
         hc = httpx.AsyncClient(transport=httpx.ASGITransport(app=e.host.app()), base_url="http://t")
+        url = "/a2agw/admin/tasks/reap"
         async with hc:
-            url = "/a2agw/admin/tasks/reap"
             assert (await hc.post(url)).status_code == 400  # agent is required
-            assert (await hc.post(url, params={"agent": "alpha"})).status_code == 409
+            assert (
+                await hc.post(url, params={"agent": "gone", "confirm": "yes"})
+            ).status_code == 400
+            assert (
+                await hc.post(url, params={"agent": "alpha", "confirm": "true"})
+            ).status_code == 409
             assert (await hc.get(url, params={"agent": "gone"})).status_code != 200
+            # No confirm: a dry run that changes nothing.
             r = await hc.post(url, params={"agent": "gone"})
+            assert r.status_code == 200
+            assert r.json() == {"dry_run": True, "tasks": 1, "handles": 1, "recent": 1}
+            assert (await _states(eng))["gone-1"] == W
+            # Confirmed but the rows are recent: refused with the count.
+            r = await hc.post(url, params={"agent": "gone", "confirm": "true"})
+            assert r.status_code == 409 and r.json()["recent"] == 1
+            assert (await _states(eng))["gone-1"] == W
+            # force reaps recent rows; idle rows need no force.
+            r = await hc.post(url, params={"agent": "gone", "confirm": "true", "force": "true"})
             assert r.status_code == 200 and r.json()["reaped"] == 1
-            assert (await hc.post(url, params={"agent": "gone"})).json()["reaped"] == 0
-        states = {r["task_id"]: r["state"] for r in (await e.host.index.list())[0]}
+            await eng.dispose()
+        eng = await create_engine(db_url)
+        states = await _states(eng)
         assert states["gone-1"] == FAILED and states["other-1"] == W
-        await e.host.audit.drain()
-        rows, _ = await e.host.audit.query({"action": "task.reap"}, 10)
-        assert [(r["agent_id"], r["outcome"]) for r in rows[::-1]] == [
-            ("gone", "reaped"),
-            ("gone", "reaped"),
+        await _age(eng)
+        await TaskIndex(eng).upsert("gone-3", "gone", "key:a", "c", W, None)
+        await _age(eng)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=e.host.app()), base_url="http://t"
+        ) as hc:
+            r = await hc.post(url, params={"agent": "gone", "confirm": "true"})
+            assert r.status_code == 200 and r.json()["reaped"] == 1
+        # Exactly one audit row per attempt, none from the route itself.
+        assert await _reap_audit(e.host) == [
+            ("alpha", "refused", "served", 0),
+            ("gone", "refused", "not_confirmed", 1),
+            ("gone", "refused", "recent", 1),
+            ("gone", "reaped", None, 1),
+            ("gone", "reaped", None, 1),
         ]
+    finally:
+        await eng.dispose()
+        await e.stop()
+
+
+async def test_failed_reap_is_audited(tmp_path, db_url, monkeypatch):
+    e = Env(tmp_path, db_url=db_url, audit=True)
+    e.host.add(spec("alpha"))
+    await e.start()
+    try:
+
+        async def boom(*args, **kwargs):
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr("a2agw.serve.reap.reap_tasks", boom)
+        with pytest.raises(RuntimeError):
+            await e.host.reap("gone", confirm=True, force=True)
+        assert await _reap_audit(e.host) == [("gone", "failed", None, 0)]
     finally:
         await e.stop()
 
@@ -523,38 +597,128 @@ async def test_admin_reap_needs_the_admin_scope(tmp_path, db_url):
     try:
         hc = httpx.AsyncClient(transport=httpx.ASGITransport(app=e.host.app()), base_url="http://t")
         async with hc:
-            r = await hc.post("/a2agw/admin/tasks/reap", params={"agent": "gone"})
+            r = await hc.post(
+                "/a2agw/admin/tasks/reap", params={"agent": "gone", "confirm": "true"}
+            )
         assert r.status_code == 403
     finally:
         await e.stop()
 
 
-def test_cli_tasks_reap(tmp_path):
+def _cli(tmp_path, url, *args, agents="[]"):
     from typer.testing import CliRunner
 
     from a2agw import cli
 
-    db = tmp_path / "gw.db"
-    url = f"sqlite+aiosqlite:///{db}"
+    cfg = tmp_path / "a2agw.yaml"
+    cfg.write_text(f"base_url: http://localhost\ndb_url: {url}\nagents: {agents}\n")
+    return CliRunner().invoke(cli.app, ["tasks", "reap", "-c", str(cfg), *args])
 
-    async def seed():
-        eng = await create_engine(url)
-        await _seed_orphans(eng)
+
+async def test_cli_tasks_reap(tmp_path, db_url, caplog):
+    eng = await create_engine(db_url)
+    await _seed_orphans(eng)
+    try:
+        loop = asyncio.get_running_loop()
+
+        async def run(*args, **kw):  # the CLI runs its own event loop: use a thread
+            return await loop.run_in_executor(None, lambda: _cli(tmp_path, db_url, *args, **kw))
+
+        r = await run("--agent", "gone")
+        assert r.exit_code == 0 and "dry run: 1 open task(s), 1 partner task(s)" in r.output
+        assert (await _states(eng))["gone-1"] == W
+        r = await run("--agent", "gone", "--yes")  # recent
+        assert r.exit_code == 1 and "1 task(s) changed in the last 10 minutes" in r.output
+        assert (await _states(eng))["gone-1"] == W
+        await _age(eng)
+        with caplog.at_level("WARNING"):
+            r = await run("--agent", "gone", "--yes")
+        assert r.exit_code == 0 and "reaped 1 task(s)" in r.output
+        assert "non-terminal" not in caplog.text  # no host, no foreign-task warning
+        states = await _states(eng)
+        assert states["gone-1"] == FAILED and states["other-1"] == W
+        r = await run("--agent", "other", "--yes", "--force")
+        assert r.exit_code == 0 and (await _states(eng))["other-1"] == FAILED
+        log = AuditLog(eng)
+        rows, _ = await log.query({"action": "task.reap"}, 20, None, ascending=True)
+        assert [(r["agent_id"], r["outcome"], r["detail"].get("reason")) for r in rows] == [
+            ("gone", "refused", "not_confirmed"),
+            ("gone", "refused", "recent"),
+            ("gone", "reaped", None),
+            ("other", "reaped", None),
+        ]
+    finally:
         await eng.dispose()
 
-    asyncio.run(seed())
-    cfg = tmp_path / "a2agw.yaml"
-    cfg.write_text(f"base_url: http://localhost\ndb_url: {url}\nagents: []\n")
-    r = CliRunner().invoke(cli.app, ["tasks", "reap", "--agent", "gone", "-c", str(cfg)])
-    assert r.exit_code == 0, r.output
-    assert "reaped 1 task(s)" in r.output
 
-    async def states():
-        eng = await create_engine(url)
-        try:
-            return {r["task_id"]: r["state"] for r in (await TaskIndex(eng).list())[0]}
-        finally:
-            await eng.dispose()
+async def test_cli_refuses_to_reap_a_served_agent(tmp_path, monkeypatch):
+    import sys
+    import textwrap
 
-    assert asyncio.run(states())["gone-1"] == FAILED
-    assert asyncio.run(states())["other-1"] == W  # other agents' tasks untouched
+    (tmp_path / "served_agent.py").write_text(
+        textwrap.dedent(
+            """
+            from a2agw.core.events import Done
+            from a2agw.serve.agent import AgentSpec, SkillSpec
+
+            class A:
+                durable_sessions = False
+                async def run(self, ctx):
+                    yield Done(text="x")
+
+            spec = AgentSpec(id="mine", name="M", description="d",
+                             skills=[SkillSpec(id="s", name="S", description="d")], adapter=A())
+            """
+        )
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    url = f"sqlite+aiosqlite:///{tmp_path / 'gw.db'}"
+    loop = asyncio.get_running_loop()
+    r = await loop.run_in_executor(
+        None,
+        lambda: _cli(
+            tmp_path,
+            url,
+            "--agent",
+            "mine",
+            "--yes",
+            "--force",
+            agents="[{spec: 'served_agent:spec'}]",
+        ),
+    )
+    sys.modules.pop("served_agent", None)
+    assert r.exit_code == 1 and "served by this gateway" in r.output
+
+
+# -- agent output with NUL ---------------------------------------------------------------
+
+
+async def test_agent_output_with_nul_is_stored(tmp_path, db_url):
+    from a2agw.core.events import ArtifactChunk, Status
+
+    class Nul:
+        durable_sessions = False
+
+        async def run(self, ctx):
+            yield Status("work\x00ing")
+            yield ArtifactChunk(
+                artifact_id="a\x00", parts=[Part(text="par\x00t", filename="f\x00")], name="n\x00"
+            )
+            yield Done(text="done\x00!")
+
+    sp = spec("alpha")
+    sp.adapter = Nul()
+    e = Env(tmp_path, db_url=db_url)
+    e.host.add(sp)
+    await e.start()
+    try:
+        events = await send_one(e.client("alpha"), _msg())
+        task = events[-1].task
+        assert task.status.state == TaskState.TASK_STATE_COMPLETED
+        texts = [p.text for a in task.artifacts for p in a.parts]
+        assert "par\ufffdt" in texts and "done\ufffd!" in texts
+        assert {a.name for a in task.artifacts} == {"n\ufffd", "result"}
+        [row] = (await e.host.index.list("alpha"))[0]
+        assert row["state"] == "TASK_STATE_COMPLETED"
+    finally:
+        await e.stop()

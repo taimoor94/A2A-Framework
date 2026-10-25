@@ -9,8 +9,9 @@ Secrets (credential refs, headers) are never part of any response.
 Audit: every admitted admin request appends one ``admin.read`` event (the path category in
 ``detail.reason``); a request refused for lack of the admin scope appends ``authz.deny``.
 ``/audit`` lists audit events (newest first) and ``/audit/verify`` checks the hash chain.
-``POST /tasks/reap?agent=<id>`` fails the open tasks of an agent no gateway serves (409 for
-one this host serves) and appends a ``task.reap`` event.
+``POST /tasks/reap?agent=<id>`` fails the open tasks of an agent no gateway serves. Without
+``confirm=true`` it is a dry run (counts only); 409 for an agent this host serves or tasks
+changed within 10 minutes (unless ``force=true``). Every attempt is audited as ``task.reap``.
 ``/push`` reports per-agent push delivery counters (no URLs, task ids or config contents).
 """
 
@@ -250,31 +251,44 @@ def admin_routes(host: AgentHost) -> list[Route]:
         )
 
     async def tasks_reap(request: Request) -> Response:
+        from a2agw.serve.reap import AgentServedError, RecentActivityError
+
         agent_id = _str_param(request, "agent")
         if agent_id is None:
             raise _BadRequest("agent")
+        flags = {}
+        for name in ("confirm", "force"):
+            raw = request.query_params.get(name, "false")
+            if raw not in ("true", "false"):
+                raise _BadRequest(name)
+            flags[name] = raw == "true"
         if host.index is None:
             return JSONResponse({"error": "not started"}, status_code=503)
-        from a2agw.serve.host import AgentServedError
-
+        user = request.scope.get("user")
+        actor = user.principal.id if isinstance(user, PrincipalUser) else "anonymous"
         try:
-            report = await host.reap(agent_id)
+            result = await host.reap(agent_id, actor=actor, **flags)
         except AgentServedError:
             return JSONResponse({"error": "agent is served by this gateway"}, status_code=409)
-        user = request.scope.get("user")
-        log = getattr(host, "audit", None)
-        if log is not None:
-            await log.emit(
-                AuditEvent(
-                    actor=user.principal.id if isinstance(user, PrincipalUser) else "anonymous",
-                    action="task.reap",
-                    agent_id=agent_id,
-                    outcome="reaped",
-                    detail={"count": len(report.failed)},
-                )
+        except RecentActivityError as exc:
+            return JSONResponse(
+                {"error": "tasks changed recently; use force=true", "recent": exc.count},
+                status_code=409,
             )
+        if result.dry_run:
+            return JSONResponse(
+                {
+                    "dry_run": True,
+                    "tasks": result.tasks,
+                    "handles": result.handles,
+                    "recent": result.recent,
+                }
+            )
+        report = result.report
+        assert report is not None
         return JSONResponse(
             {
+                "dry_run": False,
                 "reaped": len(report.failed),
                 "outbound_cancelled": report.outbound_cancelled,
                 "cancel_errors": len(report.cancel_errors),

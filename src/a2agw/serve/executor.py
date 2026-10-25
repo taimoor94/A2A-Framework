@@ -112,6 +112,22 @@ class _Run:
         }
 
 
+def _clean(value: str) -> str:
+    """NUL cannot be stored by PostgreSQL text/JSON columns: agent output gets U+FFFD."""
+    return value.replace("\x00", "\ufffd")
+
+
+def _clean_part(part: Part) -> Part:
+    if "\x00" not in part.text and "\x00" not in part.filename:
+        return part
+    out = Part()
+    out.CopyFrom(part)
+    if "\x00" in part.text:
+        out.text = _clean(part.text)
+    out.filename = _clean(part.filename)
+    return out
+
+
 def _inbound_token(context: RequestContext) -> str | None:
     """The caller's raw bearer JWT (JWT callers only), for an outbound token exchange."""
     state = context.call_context.state if context.call_context is not None else None
@@ -252,7 +268,7 @@ class AdapterExecutor(AgentExecutor):
 
     @staticmethod
     def _agent_message(updater: TaskUpdater, text: str) -> Message:
-        return updater.new_agent_message([new_text_part(text)])
+        return updater.new_agent_message([new_text_part(_clean(text))])
 
     # -- AgentExecutor -----------------------------------------------------------------
 
@@ -505,9 +521,9 @@ class AdapterExecutor(AgentExecutor):
                 await self._status(run, TaskState.TASK_STATE_WORKING, text)
             case ArtifactChunk():
                 await updater.add_artifact(
-                    list(ev.parts),
-                    artifact_id=ev.artifact_id,
-                    name=ev.name,
+                    [_clean_part(p) for p in ev.parts],
+                    artifact_id=_clean(ev.artifact_id) if ev.artifact_id is not None else None,
+                    name=_clean(ev.name) if ev.name is not None else None,
                     append=ev.append,
                     last_chunk=ev.last,
                 )
@@ -525,7 +541,7 @@ class AdapterExecutor(AgentExecutor):
                 return True
             case Done(text=text):
                 if text is not None:
-                    await updater.add_artifact([Part(text=text)], name="result")
+                    await updater.add_artifact([Part(text=_clean(text))], name="result")
                 await self._status(run, TaskState.TASK_STATE_COMPLETED)
                 return True
             case Reply(text=text):
@@ -557,7 +573,7 @@ class AdapterExecutor(AgentExecutor):
                 message_id=uuid.uuid4().hex,
                 role=Role.ROLE_AGENT,
                 context_id=updater.context_id,
-                parts=[new_text_part(text)],
+                parts=[new_text_part(_clean(text))],
             )
         )
         self._publish(task_id, updater.context_id, DIRECT_REPLY)

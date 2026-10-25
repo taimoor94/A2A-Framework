@@ -463,25 +463,85 @@ def audit_verify(config: ConfigOpt = Path("a2agw.yaml")) -> None:
 def tasks_reap(
     agent: Annotated[str, typer.Option("--agent", help="Agent id nobody serves any more.")],
     config: ConfigOpt = Path("a2agw.yaml"),
+    yes: Annotated[bool, typer.Option("--yes", help="Do it. Without it: a dry run.")] = False,
+    force: Annotated[
+        bool, typer.Option("--force", help="Also reap tasks changed in the last 10 minutes.")
+    ] = False,
 ) -> None:
     """Fail the open tasks of an agent that no gateway serves, and cancel their partner tasks.
 
-    Refused for an agent the configured gateway serves."""
+    Prints what would be reaped unless --yes is given. Refused for an agent the configured
+    gateway serves and, without --force, for tasks changed within the last 10 minutes (a live
+    gateway may own them). Every attempt is audited."""
+    from a2agw.serve.reap import ReapRefused
 
-    async def run() -> None:
-        cfg = load_config(config)
-        host = build_host(cfg, config_dir=config.resolve().parent)
-        if agent in host.specs:
-            raise ConfigError(f"agent {agent!r} is served by this gateway; refusing to reap it")
-        host.specs.clear()  # recovery must not touch the served agents' tasks from here
-        await host.startup()
-        try:
-            report = await host.reap(agent)
-        finally:
-            await host.shutdown()
+    try:
+        result = asyncio.run(_reap(config, agent, yes, force))
+    except ReapRefused as exc:
+        raise ValueError(
+            "refused: agent is served by this gateway"
+            if exc.reason == "served"
+            else f"refused: {exc.count} task(s) changed in the last 10 minutes; use --force"
+        ) from None
+    if result.dry_run:
         typer.echo(
-            f"reaped {len(report.failed)} task(s); cancelled {report.outbound_cancelled} "
-            f"partner task(s); {len(report.cancel_errors)} cancel error(s)"
+            f"dry run: {result.tasks} open task(s), {result.handles} partner task(s) would be "
+            f"cancelled, {result.recent} changed recently; re-run with --yes"
         )
+        return
+    report = result.report
+    assert report is not None
+    typer.echo(
+        f"reaped {len(report.failed)} task(s); cancelled {report.outbound_cancelled} "
+        f"partner task(s); {len(report.cancel_errors)} cancel error(s)"
+    )
 
-    asyncio.run(run())
+
+async def _reap(config: Path, agent: str, confirm: bool, force: bool) -> Any:
+    """Open the database, index, handles and registry directly: no host, no agent adapters
+    are started, and no recovery runs."""
+    from a2agw.config import _load_agent
+    from a2agw.consult.client import PartnerClient
+    from a2agw.consult.credentials import EnvCredentials
+    from a2agw.consult.handles import OutboundHandleStore
+    from a2agw.consult.registry import PartnerRegistry
+    from a2agw.ops.bus import EventBus
+    from a2agw.serve.reap import make_cancel_outbound, reap_agent
+    from a2agw.serve.store import TaskIndex, create_engine
+
+    cfg = load_config(config)
+    config_dir = config.resolve().parent
+    # Only the specs are imported (their ids tell which agents this config serves).
+    served = {_load_agent(ref.spec, config_dir).id for ref in cfg.agents}
+    registry = PartnerRegistry(partners_path(cfg, config_dir))
+    registry.load()
+    engine = await create_engine(cfg.db_url)
+    client = None
+    try:
+        index, handles = TaskIndex(engine), OutboundHandleStore(engine)
+        await index.initialize()
+        await handles.initialize()
+        audit = AuditLog(engine)
+        await audit.initialize()
+        client = PartnerClient(
+            registry,
+            credentials=EnvCredentials({k: (v.header, v.env) for k, v in cfg.credentials.items()}),
+            handles=handles,
+            bus=EventBus(),
+            agent_id="host",
+        )
+        return await reap_agent(
+            index,
+            handles,
+            make_cancel_outbound(client),
+            audit,
+            agent,
+            served=served,
+            confirm=confirm,
+            force=force,
+            actor="system",
+        )
+    finally:
+        if client is not None:
+            await client.aclose()
+        await engine.dispose()
