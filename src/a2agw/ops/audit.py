@@ -84,6 +84,7 @@ DETAIL_KEYS = frozenset(
         "classification",
         "key_id",
         "count",
+        "context",  # call-context signature: "signed" or "bad signature" (never the token)
     }
 )
 DETAIL_MAX_CHARS = 256

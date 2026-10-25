@@ -3,7 +3,9 @@
 Every call goes through: registry lookup (only ``active`` partners) and a full endpoint check,
 the partner's bulkhead, then its circuit breaker. The current call context is sent unchanged
 in the message metadata (R6), together with the ``A2A-Version`` and ``A2A-Extensions`` service
-parameters and the partner's credential headers.
+parameters and the partner's credential headers. With a ``context_signer``, a JWS over that
+same context is attached next to it (``a2agw.context.signing``), signed once per consult:
+the request message, and so the token, is reused by every retry of that consult.
 
 Failure handling never re-sends a message once a request may have reached the partner:
 
@@ -89,6 +91,7 @@ from a2agw.context.call_context import (
     maintenance_call,
     use_maintenance,
 )
+from a2agw.context.signing import JWS_METADATA_KEY, CallContextSigner
 from a2agw.ops.audit import AuditEvent, AuditLog
 from a2agw.ops.bus import EventBus, GatewayEvent
 from a2agw.ops.telemetry import get_tracer, with_current_traceparent
@@ -366,8 +369,10 @@ class PartnerClient:
         tls: Mapping[str, TlsClientConfig] | None = None,
         policy: PolicyEngine | None = None,
         audit: AuditLog | None = None,
+        context_signer: CallContextSigner | None = None,
     ) -> None:
         self.registry = registry
+        self.context_signer = context_signer  # signs the call context of every consult
         self.policy = policy  # egress checks in consult(), before any network activity
         self.audit = audit
         self.tls: dict[str, TlsClientConfig] = dict(tls or {})
@@ -859,7 +864,16 @@ class PartnerClient:
             context_id = await self._stored_context(partner_id, task_id)
         generated_context = context_id is None and not task_id
         ctx_id = uuid.uuid4().hex if generated_context else context_id
-        request = self._request(text, files, data, task_id, ctx_id, cc)
+        jws: str | None = None
+        if self.context_signer is not None:
+            try:
+                jws = self.context_signer.sign(cc)  # cc exactly as sent, traceparent included
+            except Exception as e:  # noqa: BLE001 - fail closed: never send unsigned
+                logger.error(  # no traceback: keep key handling out of the logs
+                    "call context signing failed for partner %s: %s", partner_id, type(e).__name__
+                )
+                return self._unavailable(partner_id, rec, "signing failed")
+        request = self._request(text, files, data, task_id, ctx_id, cc, jws)
         streaming = rec.agent_card.capabilities.streaming
         if not streaming:
             request.configuration.return_immediately = True  # then poll get_task
@@ -1132,6 +1146,7 @@ class PartnerClient:
         task_id: str | None,
         context_id: str | None,
         cc: CallContext,
+        jws: str | None = None,
     ) -> SendMessageRequest:
         files = list(files)
         msg = Message(message_id=uuid.uuid4().hex, role=Role.ROLE_USER)  # reused by retries
@@ -1148,6 +1163,8 @@ class PartnerClient:
             part.data.struct_value.update(data)
             msg.parts.append(part)
         msg.metadata.update(cc.to_metadata())
+        if jws is not None:
+            msg.metadata.update({JWS_METADATA_KEY: jws})
         return SendMessageRequest(message=msg)
 
     async def _drive(

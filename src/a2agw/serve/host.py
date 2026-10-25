@@ -40,6 +40,7 @@ from a2agw.consult.credentials import CredentialProvider
 from a2agw.consult.handles import OutboundHandleStore
 from a2agw.consult.registry import PartnerRecord, PartnerRegistry
 from a2agw.consult.tools import PartnerTool, partner_tools
+from a2agw.context.signing import CallContextSigner, CallContextVerifier
 from a2agw.ops.admin import ADMIN_PREFIX, HEALTH_PATH, admin_routes
 from a2agw.ops.audit import AuditEvent, AuditLog
 from a2agw.ops.bus import EventBus
@@ -549,8 +550,14 @@ class AgentHost:
         policy: PolicyEngine | None = None,
         audit: bool = True,
         push: PushSettings | None = None,
+        context_signer: CallContextSigner | None = None,
+        context_verifier: CallContextVerifier | None = None,
     ) -> None:
         self.base_url = base_url
+        # Signed call contexts between gateways (a2agw.context.signing): the signer signs the
+        # call context of every outbound consult; the verifier lets agents trust a signed one.
+        self.context_signer = context_signer
+        self.context_verifier = context_verifier
         # Push notifications (A2A webhooks). None: not offered, and the card says so.
         self.push = push
         self.push_http: httpx.AsyncClient | None = None  # created at startup when push is set
@@ -648,6 +655,7 @@ class AgentHost:
             agent_id="host",
             policy=self.policy,
             audit=audit,
+            context_signer=self.context_signer,
         )
         stores: dict[str, TaskStore] = {}
         routes: list[BaseRoute] = []
@@ -662,7 +670,14 @@ class AgentHost:
             store = task_store_for(engine, agent_id)
             await retry_ddl(store.initialize)
             stores[agent_id] = store
-            executor = AdapterExecutor(spec, index, self.bus, policy=self.policy, audit=audit)
+            executor = AdapterExecutor(
+                spec,
+                index,
+                self.bus,
+                policy=self.policy,
+                audit=audit,
+                context_verifier=self.context_verifier,
+            )
             # Cancelling an inbound task cancels the partner tasks it started.
             executor.on_cancel = client.cancel_for_inbound
             card = build_card(spec, self.base_url, security=self.auth, push=push is not None)

@@ -34,6 +34,7 @@ from a2agw.context.call_context import (
     use_inbound,
     use_inbound_token,
 )
+from a2agw.context.signing import JWS_METADATA_KEY, CallContextVerifier
 from a2agw.core.events import (
     ArtifactChunk,
     Done,
@@ -173,6 +174,12 @@ class AdapterExecutor(AgentExecutor):
     ``a2agw.direct_reply=true`` and runs ``on_cancel`` so partner tasks the turn started are
     cancelled.
 
+    Signed call contexts (``context_verifier``): when the message carries a call-context JWS
+    (``a2agw.context.signing.JWS_METADATA_KEY``) and a verifier is configured, the call is
+    admitted under the verified context instead of the unsigned one (then clamped and
+    checked as usual), or rejected with "invalid call context" if the JWS does not verify.
+    Without a verifier the JWS is ignored. See ``a2agw.context.signing``.
+
     Known limits (Phase 1):
     - An ``ArtifactChunk`` with ``append=True`` for an unknown ``artifact_id`` is rejected by
       the SDK's event consumer, after the executor has enqueued it; the executor cannot
@@ -192,8 +199,10 @@ class AdapterExecutor(AgentExecutor):
         now: Callable[[], float] = time.time,
         policy: PolicyEngine | None = None,
         audit: AuditLog | None = None,
+        context_verifier: CallContextVerifier | None = None,
     ) -> None:
         self.spec = spec
+        self.context_verifier = context_verifier
         # Skill-level authz runs here once the skill is known; Phase 1 has no skill routing,
         # so it is evaluated with skill_id=None (deny rules then match conservatively).
         self.policy = policy
@@ -320,10 +329,12 @@ class AdapterExecutor(AgentExecutor):
         if run.cancelled:
             return
 
-        cc, reason = self._admit(message)
+        cc, reason, admit_detail = self._admit_detail(message)
         if cc is None:
             await self._status(run, TaskState.TASK_STATE_REJECTED, reason)
-            await self._audit("inbound.reject", run, principal, "rejected", reason=reason)
+            await self._audit(
+                "inbound.reject", run, principal, "rejected", reason=reason, **admit_detail
+            )
             return
         if self.policy is not None:
             decision = self.policy.authorize(principal, self.spec.id, None)
@@ -364,6 +375,7 @@ class AdapterExecutor(AgentExecutor):
             "admitted",
             state="resumed" if resumed else "new",
             principal_kind=principal.kind if principal is not None else "anonymous",
+            **admit_detail,
         )
         if run.cancelled:
             return
@@ -427,10 +439,27 @@ class AdapterExecutor(AgentExecutor):
 
     def _admit(self, message: Message) -> tuple[CallContext | None, str]:
         """Parse, clamp and admit the caller's call context. Returns (cc, "") or (None, reason)."""
-        try:
-            cc = CallContext.from_metadata(MessageToDict(message.metadata))
-        except ValueError:
-            return None, _INVALID
+        cc, reason, _ = self._admit_detail(message)
+        return cc, reason
+
+    def _admit_detail(self, message: Message) -> tuple[CallContext | None, str, dict[str, Any]]:
+        """``_admit`` plus audit detail: whether the context was signed, or why the JWS was
+        refused (the reason category only, never token contents)."""
+        md = MessageToDict(message.metadata)
+        detail: dict[str, Any] = {}
+        token = md.get(JWS_METADATA_KEY)
+        if token is not None and self.context_verifier is not None:
+            try:
+                cc: CallContext | None = self.context_verifier.verify(token)
+            except Exception:  # noqa: BLE001 - fail closed: present but unverifiable
+                logger.warning("call context signature rejected for agent %s", self.spec.id)
+                return None, _INVALID, {"context": "bad signature"}
+            detail["context"] = "signed"
+        else:
+            try:
+                cc = CallContext.from_metadata(md)
+            except ValueError:
+                return None, _INVALID, detail
         if cc is None:
             # No caller context: this agent is the root. Start from an empty path so the
             # cycle check does not trip on the agent itself; child() below adds it.
@@ -443,8 +472,8 @@ class AdapterExecutor(AgentExecutor):
         try:
             cc.check_admit(self.spec.id, allow_reentry=self.spec.allow_reentry, now=self._now())
         except CallContextViolation as exc:
-            return None, _REASONS.get(type(exc), _INVALID)
-        return cc, ""
+            return None, _REASONS.get(type(exc), _INVALID), detail
+        return cc, "", detail
 
     async def _drive(
         self, run: _Run, inbound: InboundContext, inbound_token: str | None = None
