@@ -26,6 +26,7 @@ _outbound = Table(
     Column("state", String, nullable=False),  # TaskState NAME, e.g. "TASK_STATE_WORKING"
     Column("created_at", Float, nullable=False),
 )
+OUTBOUND_TABLE = _outbound  # read by the inbound side's re-entry check (serve.store)
 
 
 class OutboundHandleStore:

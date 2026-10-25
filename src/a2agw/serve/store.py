@@ -21,6 +21,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects import sqlite as sqlite_dialect
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from a2agw.consult.handles import OUTBOUND_TABLE
 from a2agw.security.principal import Principal, PrincipalUser
 
 _metadata = MetaData()
@@ -44,6 +45,15 @@ _ACTIVE_STATES = {
     TaskState.Name(TaskState.TASK_STATE_SUBMITTED),
     TaskState.Name(TaskState.TASK_STATE_WORKING),
 } | _RESUMABLE_STATES
+_TERMINAL_STATES = {
+    TaskState.Name(s)
+    for s in (
+        TaskState.TASK_STATE_COMPLETED,
+        TaskState.TASK_STATE_FAILED,
+        TaskState.TASK_STATE_CANCELED,
+        TaskState.TASK_STATE_REJECTED,
+    )
+}
 _AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _MODELS: dict[str, tuple[str, type]] = {}
 logger = logging.getLogger(__name__)
@@ -107,6 +117,8 @@ class TaskIndex:
     async def initialize(self) -> None:
         async with self._engine.begin() as conn:
             await conn.run_sync(_metadata.create_all)
+            # The re-entry query joins the outbound handles, so make sure that table exists.
+            await conn.run_sync(OUTBOUND_TABLE.create, checkfirst=True)
 
     async def upsert(
         self,
@@ -172,17 +184,24 @@ class TaskIndex:
         async with self._engine.connect() as conn:
             return [dict(r._mapping) for r in (await conn.execute(stmt)).all()]
 
-    async def has_active(self, agent_id: str, origin: str, exclude_task_id: str) -> bool:
-        """Whether ``agent_id`` has a non-terminal task with ``origin`` other than
-        ``exclude_task_id`` (used to detect an agent re-entered within its own call chain)."""
-        t = _index_table
+    async def blocked_downstream(
+        self, agent_id: str, origin: str, exclude_task_id: str
+    ) -> bool:
+        """Whether ``agent_id`` has a non-terminal task in ``origin``, other than
+        ``exclude_task_id``, that is waiting on at least one non-terminal outbound partner task.
+
+        Such an agent is being re-entered from inside its own call chain."""
+        t, o = _index_table, OUTBOUND_TABLE
+        terminal = sorted(_TERMINAL_STATES)
         stmt = (
             select(t.c.task_id)
+            .join(o, o.c.inbound_task_id == t.c.task_id)
             .where(
                 t.c.agent_id == agent_id,
                 t.c.origin == origin,
                 t.c.task_id != exclude_task_id,
-                t.c.state.in_(sorted(_ACTIVE_STATES)),
+                t.c.state.not_in(terminal),
+                o.c.state.not_in(terminal),
             )
             .limit(1)
         )

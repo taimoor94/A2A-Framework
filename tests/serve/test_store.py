@@ -268,13 +268,28 @@ async def test_upsert_none_origin_keeps_existing(index):
     assert row["origin"] == "orig-2"
 
 
-async def test_has_active_matches_other_non_terminal_task_of_same_agent_and_origin(index):
-    await index.upsert("t1", "a1", "key:x", "c", W, "o1")
-    await index.upsert("t2", "a1", "key:x", "c", "TASK_STATE_COMPLETED", "o2")
-    await index.upsert("t3", "a2", "key:x", "c", IR, "o3")
-    assert await index.has_active("a1", "o1", "t9")
-    assert not await index.has_active("a1", "o1", "t1")  # the task itself never counts
-    assert not await index.has_active("a1", "o2", "t9")  # terminal
-    assert not await index.has_active("a2", "o1", "t9")  # other agent
-    assert await index.has_active("a2", "o3", "t9")  # input-required is still active
-    assert not await index.has_active("a1", "nope", "t9")
+
+async def test_blocked_downstream_needs_other_live_task_with_live_outbound_handle(engine, index):
+    from a2agw.consult.handles import OutboundHandleStore
+
+    handles = OutboundHandleStore(engine)
+    await handles.initialize()
+    done = "TASK_STATE_COMPLETED"
+    await index.upsert("t1", "a1", "key:x", "c", W, "o1")  # waiting on a live partner task
+    await handles.record("p1", "px", "pc", "t1", "o1", W)
+    await index.upsert("t2", "a1", "key:x", "c", W, "o2")  # live, but no outbound handle
+    await index.upsert("t3", "a1", "key:x", "c", W, "o3")  # its partner task has finished
+    await handles.record("p3", "px", "pc", "t3", "o3", done)
+    await index.upsert("t4", "a1", "key:x", "c", done, "o4")  # finished itself
+    await handles.record("p4", "px", "pc", "t4", "o4", W)
+    await index.upsert("t5", "a2", "key:x", "c", IR, "o5")  # input-required counts as live
+    await handles.record("p5", "px", "pc", "t5", "o5", IR)
+
+    assert await index.blocked_downstream("a1", "o1", "t9")
+    assert not await index.blocked_downstream("a1", "o1", "t1")  # the task itself never counts
+    assert not await index.blocked_downstream("a1", "o2", "t9")
+    assert not await index.blocked_downstream("a1", "o3", "t9")
+    assert not await index.blocked_downstream("a1", "o4", "t9")
+    assert not await index.blocked_downstream("a2", "o1", "t9")  # other agent
+    assert await index.blocked_downstream("a2", "o5", "t9")
+    assert not await index.blocked_downstream("a1", "nope", "t9")

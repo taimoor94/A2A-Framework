@@ -104,6 +104,15 @@ class AdapterExecutor(AgentExecutor):
     the task, later state changes from that run are ignored, and cancel() on a terminal or
     already-cancelled task is a no-op (so ``on_cancel`` runs at most once per task).
 
+    Re-entry: after the path-based cycle check, a new (not resumed) task for this agent with
+    call-context origin O is rejected with "re-entry" when this agent already has another
+    non-terminal task in O that is blocked downstream, i.e. has at least one non-terminal
+    outbound partner task. This catches A -> P -> A even when P rewrites the path, while
+    admitting parallel fan-out and diamond calls (PM -> arch -> sec, PM -> rev -> sec) to the
+    same agent. Residual false positive: a shared agent that is itself waiting downstream
+    (e.g. sec consulting a partner while the second diamond branch reaches it) rejects the
+    second call. ``AgentSpec.allow_reentry`` disables the check.
+
     Known limits (Phase 1):
     - An ``ArtifactChunk`` with ``append=True`` for an unknown ``artifact_id`` is rejected by
       the SDK's event consumer, after the executor has enqueued it; the executor cannot
@@ -231,8 +240,8 @@ class AdapterExecutor(AgentExecutor):
         run.origin = None if resumed else cc.origin
         if not resumed and not self.spec.allow_reentry:
             # The path check above misses a partner that forwards our origin but rewrites the
-            # path; another live task of this agent in the same chain still shows re-entry.
-            if await self.index.has_active(self.spec.id, cc.origin, updater.task_id):
+            # path: see "Re-entry" in the class docstring.
+            if await self.index.blocked_downstream(self.spec.id, cc.origin, updater.task_id):
                 await self._status(run, TaskState.TASK_STATE_REJECTED, _REENTRY)
                 return
             if run.cancelled:

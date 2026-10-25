@@ -280,6 +280,12 @@ async def test_reentry_via_origin_preserving_partner(env, allow):
             yield Done(text="nested ok")
 
     async def p_run(ctx):
+        # A real call back takes a network round trip; here, wait until A has recorded its
+        # handle for this task so A is visibly blocked downstream.
+        async def recorded() -> bool:
+            return await host.handles.get("p", ctx.task_id) is not None
+
+        await until(recorded)
         cc = dict(ctx.metadata[EXTENSION_URI])
         cc["path"] = [x for x in cc["path"] if x != "a"]
         back = msg("nested")
@@ -319,6 +325,94 @@ async def test_same_host_a_to_b_not_reentry(env):
     assert events[0].task.status.state == TaskState.TASK_STATE_COMPLETED
     assert results["b"].state == "completed"
     assert results["b"].text == "echo: hi"
+
+
+class Barrier:
+    """Holds every caller until ``n`` have arrived, so the calls overlap. ``first_in`` lets a
+    test send the next call only once the first is running (its origin is in the index)."""
+
+    def __init__(self, n: int) -> None:
+        self.n = n
+        self.arrived = 0
+        self.first_in = asyncio.Event()
+        self.all_in = asyncio.Event()
+
+    async def wait(self) -> None:
+        self.arrived += 1
+        self.first_in.set()
+        if self.arrived >= self.n:
+            self.all_in.set()
+        await asyncio.wait_for(self.all_in.wait(), 5)
+
+
+async def test_parallel_fanout_same_agent_admitted(env):
+    barrier = Barrier(2)
+    results: dict[str, Any] = {}
+
+    async def orch_run(ctx):
+        one = asyncio.create_task(host.client.consult("leaf", "one", wait_seconds=5))
+        await asyncio.wait_for(barrier.first_in.wait(), 5)
+        two = await host.client.consult("leaf", "two", wait_seconds=5)
+        results["leaf"] = [await one, two]
+        yield Done(text="orch done")
+
+    async def leaf_run(ctx):
+        await barrier.wait()
+        yield Done(text=f"leaf: {ctx.text}")
+
+    e = await env(spec("orch", Fn(orch_run)), spec("leaf", Fn(leaf_run)))
+    host = e.host
+    await e.register("leaf")
+    events = await e.send("orch", "start")
+    assert events[0].task.status.state == TaskState.TASK_STATE_COMPLETED
+    assert [r.state for r in results["leaf"]] == ["completed", "completed"]
+    assert sorted(r.text for r in results["leaf"]) == ["leaf: one", "leaf: two"]
+    rejected, _ = await host.index.list(state=REJECTED)
+    assert rejected == []
+
+
+async def test_diamond_admitted(env):
+    """PM -> arch -> sec and PM -> rev -> sec in one origin, with both sec calls overlapping."""
+    barrier = Barrier(2)
+    results: dict[str, Any] = {}
+
+    async def pm_run(ctx):
+        results["pm"] = await asyncio.gather(
+            host.client.consult("arch", "design", wait_seconds=5),
+            host.client.consult("rev", "review", wait_seconds=5),
+        )
+        yield Done(text="pm done")
+
+    def middle(name: str):
+        async def run(ctx):
+            if name == "rev":  # reach sec only while arch's call to it is running
+                await asyncio.wait_for(barrier.first_in.wait(), 5)
+            res = await host.client.consult("sec", name, wait_seconds=5)
+            results[name] = res
+            yield Done(text=f"{name}: {res.state}")
+
+        return run
+
+    async def sec_run(ctx):
+        await barrier.wait()
+        yield Done(text=f"sec ok for {ctx.text}")
+
+    e = await env(
+        spec("pm", Fn(pm_run)),
+        spec("arch", Fn(middle("arch"))),
+        spec("rev", Fn(middle("rev"))),
+        spec("sec", Fn(sec_run)),
+    )
+    host = e.host
+    await e.register("arch", "rev", "sec")
+    events = await e.send("pm", "start")
+    assert events[0].task.status.state == TaskState.TASK_STATE_COMPLETED
+    assert results["arch"].state == "completed" and results["rev"].state == "completed"
+    assert [r.text for r in results["pm"]] == ["arch: completed", "rev: completed"]
+    rows, _ = await host.index.list(agent_id="sec")
+    assert len({r["origin"] for r in rows}) == 1  # really one chain
+    rejected, _ = await host.index.list(state=REJECTED)
+    assert rejected == []
 
 
 async def test_contextvars_supply_inbound_and_caller(env):
