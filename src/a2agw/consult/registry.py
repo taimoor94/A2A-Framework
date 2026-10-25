@@ -71,6 +71,8 @@ class PartnerRecord(BaseModel):
     # Phase 1 partner files still load.
     signed_key_id: str | None = None
     pending_key_id: str | None = None
+    # Name of the client-certificate config (PartnerClient ``tls``) used to call this partner.
+    tls_ref: str | None = None
 
     @model_validator(mode="before")
     @classmethod

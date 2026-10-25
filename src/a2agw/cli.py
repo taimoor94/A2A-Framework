@@ -142,15 +142,26 @@ def serve(
     config: ConfigOpt = Path("a2agw.yaml"),
     host: Annotated[str, typer.Option("--host")] = "127.0.0.1",
     port: Annotated[int, typer.Option("--port")] = 8000,
+    ssl_certfile: Annotated[str | None, typer.Option("--ssl-certfile")] = None,
+    ssl_keyfile: Annotated[str | None, typer.Option("--ssl-keyfile")] = None,
+    ssl_ca_certs: Annotated[str | None, typer.Option("--ssl-ca-certs")] = None,
+    require_client_cert: Annotated[
+        bool, typer.Option("--require-client-cert", help="mTLS: demand a client certificate")
+    ] = False,
 ) -> None:
-    """Run the gateway."""
-    import uvicorn
-
+    """Run the gateway (HTTPS with --ssl-certfile; identity still comes from API key or JWT)."""
     cfg = load_config(config)
     config_dir = config.resolve().parent
     gw = build_host(cfg, config_dir=config_dir)
     asyncio.run(register_partners(gw, cfg, config_dir=config_dir))
-    uvicorn.run(gw.app(), host=host, port=port)
+    gw.run(
+        host=host,
+        port=port,
+        ssl_certfile=ssl_certfile,
+        ssl_keyfile=ssl_keyfile,
+        ssl_ca_certs=ssl_ca_certs,
+        require_client_cert=require_client_cert,
+    )
 
 
 # -- partners --------------------------------------------------------------------------------

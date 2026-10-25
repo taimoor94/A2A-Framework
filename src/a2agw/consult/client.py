@@ -27,9 +27,10 @@ import asyncio
 import inspect
 import logging
 import math
+import threading
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextvars import ContextVar
 from typing import Any, Literal
 
@@ -73,6 +74,7 @@ from a2agw.consult.results import (
     Track,
     build_result,
 )
+from a2agw.consult.tls import TlsClientConfig
 from a2agw.context.call_context import (
     EXTENSION_URI,
     CallContext,
@@ -330,8 +332,12 @@ class PartnerClient:
         http: httpx.AsyncClient | None = None,
         default_deadline_s: float = 60.0,
         agent_id: str = "client",
+        tls: Mapping[str, TlsClientConfig] | None = None,
     ) -> None:
         self.registry = registry
+        self.tls: dict[str, TlsClientConfig] = dict(tls or {})
+        self._tls_http: dict[str, httpx.AsyncClient] = {}
+        self._tls_lock = threading.Lock()
         self.credentials = credentials
         self.handles = handles
         self.bus = bus
@@ -339,7 +345,7 @@ class PartnerClient:
         self.default_deadline_s = default_deadline_s
         self.agent_id = agent_id
         self._own_http: httpx.AsyncClient | None = None
-        self._clients: dict[tuple[str, str], Client] = {}
+        self._clients: dict[tuple[str, str, str], Client] = {}
         self._breakers: dict[str, CircuitBreaker] = {}
         self._bulkheads: dict[str, Bulkhead] = {}
         self._cleanups: set[asyncio.Task[None]] = set()  # keeps cleanup tasks referenced
@@ -355,8 +361,26 @@ class PartnerClient:
             )
         return self._own_http
 
+    def _http_for(self, rec: PartnerRecord) -> httpx.AsyncClient:
+        """The httpx client for ``rec``: the per-``tls_ref`` mTLS client when it has one
+        (even if ``http`` was injected), else the shared client. Raises KeyError for an
+        unknown ref; callers fail closed."""
+        ref = rec.tls_ref
+        if ref is None:
+            return self._http_client()
+        with self._tls_lock:  # one client per ref, built on first use
+            hc = self._tls_http.get(ref)
+            if hc is None:
+                hc = httpx.AsyncClient(
+                    verify=self.tls[ref].ssl_context(),
+                    follow_redirects=False,
+                    timeout=httpx.Timeout(30.0, connect=10.0),
+                )
+                self._tls_http[ref] = hc
+            return hc
+
     def _client_for(self, rec: PartnerRecord) -> Client | None:
-        key = (rec.id, rec.card_hash)
+        key = (rec.id, rec.card_hash, rec.tls_ref or "")
         cached = self._clients.get(key)
         if cached is not None:
             return cached
@@ -366,7 +390,7 @@ class PartnerClient:
         if binding is None:
             return None
         config = ClientConfig(
-            httpx_client=self._http_client(),
+            httpx_client=self._http_for(rec),
             streaming=card.capabilities.streaming,
             supported_protocol_bindings=[binding],
         )
@@ -445,7 +469,12 @@ class PartnerClient:
             await self.registry.verify_endpoints(partner_id)
         except CardFetchError:
             return rec, None, self._unavailable(partner_id, rec, "unsafe endpoint")
-        client = self._client_for(rec)
+        if rec.tls_ref is not None and rec.tls_ref not in self.tls:
+            return rec, None, self._unavailable(partner_id, rec, "tls config missing")
+        try:
+            client = self._client_for(rec)
+        except ValueError:  # unreadable/invalid client certificate: fail closed
+            return rec, None, self._unavailable(partner_id, rec, "tls config missing")
         if client is None:
             return rec, None, self._unavailable(partner_id, rec, "no supported binding")
         return rec, client, None
@@ -1346,6 +1375,10 @@ class PartnerClient:
                 t.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
         self._clients.clear()
+        with self._tls_lock:
+            tls_clients, self._tls_http = list(self._tls_http.values()), {}
+        for hc in tls_clients:
+            await hc.aclose()
         if self._own_http is not None:
             await self._own_http.aclose()
             self._own_http = None

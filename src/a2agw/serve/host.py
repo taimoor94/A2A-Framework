@@ -588,12 +588,43 @@ class AgentHost:
         self._app = app
         return app
 
-    def run(self, host: str = "127.0.0.1", port: int = 8000) -> None:
+    def run(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8000,
+        *,
+        ssl_certfile: str | None = None,
+        ssl_keyfile: str | None = None,
+        ssl_ca_certs: str | None = None,
+        require_client_cert: bool = False,
+    ) -> None:
         """Serve the app with uvicorn.
 
         Binds ``127.0.0.1`` (this machine only) by default. Pass ``host="0.0.0.0"`` to accept
         connections from other machines, and configure ``auth`` before doing so.
+
+        TLS: give ``ssl_certfile`` (and ``ssl_keyfile``) to serve HTTPS. With
+        ``require_client_cert=True`` the TLS handshake demands a client certificate signed by
+        ``ssl_ca_certs`` (required in that case). The certificate is checked at the TLS layer
+        only: ASGI servers do not expose the peer certificate, so a caller's identity still
+        comes from its API key or JWT, never from the certificate.
         """
+        import ssl
+
         import uvicorn
 
-        uvicorn.run(self.app(), host=host, port=port)
+        kwargs: dict[str, Any] = {}
+        if require_client_cert and not ssl_ca_certs:
+            raise ValueError("require_client_cert needs ssl_ca_certs")
+        if require_client_cert and not ssl_certfile:
+            raise ValueError("require_client_cert needs ssl_certfile")
+        if ssl_certfile:
+            kwargs.update(
+                ssl_certfile=ssl_certfile,
+                ssl_keyfile=ssl_keyfile,
+                ssl_ca_certs=ssl_ca_certs,
+                ssl_cert_reqs=ssl.CERT_REQUIRED if require_client_cert else ssl.CERT_NONE,
+            )
+        elif ssl_keyfile or ssl_ca_certs:
+            raise ValueError("ssl_keyfile / ssl_ca_certs need ssl_certfile")
+        uvicorn.run(self.app(), host=host, port=port, **kwargs)
