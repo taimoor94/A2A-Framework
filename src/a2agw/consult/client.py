@@ -243,8 +243,31 @@ async def _aclose(stream: Any) -> None:
 
 Note = Callable[[], Awaitable[None]]
 
+# A send whose first response was still awaited when the call was interrupted: the future
+# of that first event and the stream it belongs to.
+InFlight = list[tuple["asyncio.Future[StreamResponse | None]", AsyncIterator[StreamResponse]]]
+
+
+async def _drop_inflight(inflight: InFlight) -> None:
+    """Abandon sends still waiting for their first event (e.g. after a timeout)."""
+    while inflight:
+        fut, agen = inflight.pop()
+        fut.cancel()
+        await asyncio.gather(fut, return_exceptions=True)
+        await _aclose(agen)
+
 
 class PartnerClient:
+    """Outbound A2A client for registered partners (see the module docstring).
+
+    Cancellation: when a ``consult`` is itself cancelled (e.g. its inbound task was
+    cancelled), the partner task it targeted is cancelled too, in a bounded background
+    cleanup that ``aclose`` drains. For a reply (``task_id`` given) that means the existing
+    multi-turn partner task is cancelled, not just the reply. If the call was cancelled
+    before the partner answered, the cleanup keeps waiting for that first response (or, as a
+    fallback, looks the task up by the context this call generated) to find the task.
+    """
+
     def __init__(
         self,
         registry: PartnerRegistry,
@@ -539,6 +562,7 @@ class PartnerClient:
 
         track = Track(task_id, ctx_id)
         recorded = False
+        inflight: InFlight = []
 
         async def note() -> None:
             nonlocal recorded
@@ -560,6 +584,7 @@ class PartnerClient:
                 reply=bool(task_id),
                 generated_context=generated_context,
                 note=note,
+                inflight=inflight,
             )
             if isinstance(outcome, ToolResult):
                 return outcome
@@ -568,7 +593,7 @@ class PartnerClient:
             # The inbound task was cancelled mid-call, possibly before the partner task's
             # handle was recorded: cancel_for_inbound could not find it, so clean up here.
             await self._cleanup_cancelled(
-                partner_id, client, track, generated_context, inbound_task_id, cc.origin
+                partner_id, client, track, generated_context, inbound_task_id, cc.origin, inflight
             )
             raise
 
@@ -586,6 +611,7 @@ class PartnerClient:
         reply: bool,
         generated_context: bool,
         note: Note,
+        inflight: InFlight,
     ) -> str | None | ToolResult:
         """Bulkhead, breaker and drive. Returns the drive outcome, or an early result."""
         try:
@@ -604,6 +630,7 @@ class PartnerClient:
                         reply=reply,
                         generated_context=generated_context,
                         note=note,
+                        inflight=inflight,
                     )
                 except ProtocolViolation:
                     probe.success()  # the partner answered, wrongly
@@ -652,20 +679,23 @@ class PartnerClient:
         generated_context: bool,
         inbound_task_id: str | None,
         origin: str | None,
+        inflight: InFlight,
     ) -> None:
         """Cancel partner work started by a consult that is itself being cancelled.
 
         Runs in its own task, bounded by ``CANCEL_CLEANUP_S``, so the caller's cancellation
-        cannot interrupt it; never raises (the caller re-raises its CancelledError)."""
+        cannot interrupt it; never raises (the caller re-raises its CancelledError).
+        ``aclose`` drains these tasks before closing the HTTP clients."""
         work = asyncio.create_task(
             self._cancel_orphans(
-                partner_id, client, track, generated_context, inbound_task_id, origin
+                partner_id, client, track, generated_context, inbound_task_id, origin, inflight
             )
         )
         self._cleanups.add(work)
         work.add_done_callback(self._cleanups.discard)
         try:
-            _, pending = await asyncio.wait({work}, timeout=CANCEL_CLEANUP_S)
+            # The body bounds itself; the margin covers closing a stream after its timeout.
+            _, pending = await asyncio.wait({work}, timeout=CANCEL_CLEANUP_S + ACLOSE_TIMEOUT_S)
         except asyncio.CancelledError:
             return  # cancelled again while waiting: the cleanup carries on in the background
         if pending:
@@ -680,40 +710,93 @@ class PartnerClient:
         generated_context: bool,
         inbound_task_id: str | None,
         origin: str | None,
+        inflight: InFlight,
     ) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + CANCEL_CLEANUP_S
         try:
-            if track.task_id is not None:
-                ids = [track.task_id]
-            elif generated_context and track.context_id is not None:
-                # Only a context this call generated: a shared one may hold unrelated tasks.
-                page = await _sdk(
-                    client.list_tasks(
-                        ListTasksRequest(context_id=track.context_id, page_size=20),
-                        context=self._ctx(CANCEL_CLEANUP_S),
+            async with asyncio.timeout_at(deadline):
+                answered = False
+                if track.task_id is None and inflight:
+                    # The send was still waiting for its first event: keep waiting (for at
+                    # most half the budget) so the partner's own response names the task.
+                    answered = await self._await_first(
+                        track, inflight, loop.time() + CANCEL_CLEANUP_S / 2
                     )
-                )
-                ids = [
-                    t.id
-                    for t in page.tasks
-                    if t.id and t.context_id == track.context_id and t.status.state not in TERMINAL
-                ]
-            else:
-                ids = []
-            for tid in ids:
-                try:
-                    task = await self._fetch(client, tid, CANCEL_CLEANUP_S, cancel=True)
-                    state = TaskState.Name(task.status.state)
-                except Exception:  # noqa: BLE001 - best effort; the handle stays non-terminal
-                    logger.warning(
-                        "cancel of partner %s task after cancelled call failed", partner_id
-                    )
-                    state = TaskState.Name(TaskState.TASK_STATE_WORKING)
-                if self.handles is not None:
-                    await self.handles.record(
-                        tid, partner_id, track.context_id, inbound_task_id, origin, state
-                    )
+                if track.task_id is not None:
+                    ids = [track.task_id]
+                elif answered:
+                    ids = []  # the partner answered without a task (a direct message)
+                elif generated_context and track.context_id is not None:
+                    # Only a context this call generated: a shared one may hold unrelated tasks.
+                    ids = await self._orphans_by_context(client, track.context_id, deadline)
+                else:
+                    ids = []
+                for tid in ids:
+                    try:
+                        task = await self._fetch(
+                            client, tid, max(deadline - loop.time(), 0.0), cancel=True
+                        )
+                        state = TaskState.Name(task.status.state)
+                    except Exception:  # noqa: BLE001 - best effort; the handle stays non-terminal
+                        logger.warning(
+                            "cancel of partner %s task after cancelled call failed", partner_id
+                        )
+                        state = TaskState.Name(TaskState.TASK_STATE_WORKING)
+                    if self.handles is not None:
+                        await self.handles.record(
+                            tid, partner_id, track.context_id, inbound_task_id, origin, state
+                        )
+        except TimeoutError:
+            logger.warning("cleanup of cancelled call to partner %s timed out", partner_id)
         except Exception:  # cleanup must never raise
             logger.exception("cleanup of cancelled call to partner %s failed", partner_id)
+        finally:
+            await _drop_inflight(inflight)
+
+    @staticmethod
+    async def _await_first(track: Track, inflight: InFlight, until: float) -> bool:
+        """Wait (until ``until``) for the first event of an interrupted send and apply it.
+        Returns whether a valid first event arrived."""
+        fut, agen = inflight.pop()
+        try:
+            async with asyncio.timeout_at(until):
+                first = await asyncio.shield(fut)
+            if first is None:
+                return False
+            track.apply(first)
+            return True
+        except (TimeoutError, Exception):  # noqa: BLE001 - fall back to the context lookup
+            logger.debug("no first event from interrupted send")
+            return False
+        finally:
+            inflight.append((fut, agen))  # closed by _drop_inflight
+
+    async def _orphans_by_context(
+        self, client: Client, context_id: str, deadline: float
+    ) -> list[str]:
+        """Non-terminal tasks in a context this call generated. The partner may persist its
+        task after we gave up on the send, so an empty or failed lookup is retried with
+        backoff until ``deadline``."""
+        loop = asyncio.get_running_loop()
+        delay = 0.05
+        while True:
+            try:
+                page = await _sdk(
+                    client.list_tasks(
+                        ListTasksRequest(context_id=context_id, page_size=20),
+                        context=self._ctx(max(deadline - loop.time(), 0.0)),
+                    )
+                )
+                tasks = [t for t in page.tasks if t.id and t.context_id == context_id]
+                if tasks:
+                    return [t.id for t in tasks if t.status.state not in TERMINAL]
+            except (MissingCredential, InvalidCredential):
+                raise
+            except Exception as e:  # noqa: BLE001 - retried until the deadline
+                logger.debug("orphan lookup failed: %s", type(e).__name__)
+            await asyncio.sleep(min(delay, max(deadline - loop.time(), 0.0)))
+            delay = min(delay * 2, 0.5)
 
     @staticmethod
     def _request(
@@ -753,19 +836,30 @@ class PartnerClient:
         reply: bool,
         generated_context: bool,
         note: Note,
+        inflight: InFlight,
     ) -> str | None:
         """Send and follow. Returns None on success, or the failure reason."""
         loop = asyncio.get_running_loop()
 
         async def open_stream() -> tuple[AsyncIterator[StreamResponse], StreamResponse]:
             agen = client.send_message(request, context=self._ctx(deadline - loop.time()))
+            # The first event is awaited in its own task, shielded: if this call is
+            # interrupted, the send stays registered in ``inflight`` so a timeout can drop it
+            # and a cancellation cleanup can still learn the partner's task id from it.
+            fut = asyncio.ensure_future(_next(agen))
+            slot = (fut, agen)
+            inflight.append(slot)
             try:
-                first = await _next(agen)
+                first = await asyncio.shield(fut)
+            except asyncio.CancelledError:
+                raise
             except BaseException as e:
+                inflight.remove(slot)
                 await _aclose(agen)
                 if isinstance(e, Exception) and _kind(e) == "connect":
                     raise _ConnectFailed from e
                 raise
+            inflight.remove(slot)
             if first is None:
                 await _aclose(agen)
                 raise StopAsyncIteration
@@ -791,6 +885,7 @@ class PartnerClient:
         except (MissingCredential, InvalidCredential):
             return "credential error"
         except TimeoutError:
+            await _drop_inflight(inflight)
             return await recover(timed_out=True)
         except StopAsyncIteration:
             probe.success()
@@ -1072,11 +1167,20 @@ class PartnerClient:
     # -- lifecycle ---------------------------------------------------------------------
 
     async def aclose(self) -> None:
-        """Drop cached SDK clients and close the httpx client this object owns.
+        """Drain cancellation cleanups, drop cached SDK clients and close the httpx client
+        this object owns.
 
+        Cleanups still cancelling partner work get up to ``CANCEL_CLEANUP_S`` to finish (they
+        need the HTTP clients and the handle store); whatever remains is then cancelled.
         SDK clients close their httpx client, so they are only closed (through it) when the
         client is ours; an injected ``http`` client is left open for its owner.
         """
+        if self._cleanups:
+            pending = set(self._cleanups)
+            _, left = await asyncio.wait(pending, timeout=CANCEL_CLEANUP_S)
+            for t in left:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
         self._clients.clear()
         if self._own_http is not None:
             await self._own_http.aclose()

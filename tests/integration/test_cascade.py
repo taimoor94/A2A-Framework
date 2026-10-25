@@ -6,6 +6,7 @@ import asyncio
 from typing import Any
 
 import pytest
+from a2a.server.tasks import DatabaseTaskStore
 from a2a.types import (
     CancelTaskRequest,
     SendMessageRequest,
@@ -127,6 +128,85 @@ async def test_cancel_before_first_event_cancels_partner_task(env):
     await until(b_canceled)
     [handle] = await host.handles.by_inbound(a_task)
     assert handle["state"] == CANCELED
+
+
+async def test_cancel_before_first_event_with_slow_partner_persist(env, monkeypatch):
+    """Regression (final review, finding 1): B persists its task only after A is cancelled,
+    so a single ``list_tasks`` by context finds nothing. The cleanup must still cancel B's
+    task (via B's own first response, or by retrying the lookup) and record the handle."""
+    real_save = DatabaseTaskStore.save
+
+    async def slow_save(self, task, *args, **kwargs):
+        if self.task_model.__tablename__ == "tasks_b":
+            await asyncio.sleep(0.3)
+        return await real_save(self, task, *args, **kwargs)
+
+    monkeypatch.setattr(DatabaseTaskStore, "save", slow_save)
+    b = Blocker()
+
+    async def a_run(ctx):
+        await host.client.consult("b", "go", wait_seconds=5)
+        await asyncio.Event().wait()
+        yield Done(text="never")
+
+    e = await env(spec("a", Fn(a_run)), spec("b", b))
+    host = e.host
+    e.partner_hc._transport.apps["t"] = delay_first_response(host.app(), "b", 0.5)
+    await e.register("b")
+
+    events = await e.send("a", "start", return_immediately=True)
+    a_task = events[0].task.id
+    await asyncio.wait_for(b.started.wait(), 5)
+    await e.client("a").cancel_task(CancelTaskRequest(id=a_task))
+
+    async def b_canceled() -> bool:
+        rows, _ = await host.index.list(agent_id="b")
+        return [r["state"] for r in rows] == [CANCELED]
+
+    await until(b_canceled)
+
+    async def handle_canceled() -> bool:
+        rows = await host.handles.by_inbound(a_task)
+        return [r["state"] for r in rows] == [CANCELED]
+
+    await until(handle_canceled)
+
+
+async def test_shutdown_drains_cleanup_before_engine_dispose(env, monkeypatch):
+    """Finding 2: a cancellation cleanup started just before shutdown still cancels the
+    partner task and records its handle before the host disposes its engine."""
+    p = Blocker()
+    partner = await env(spec("p", p), db="partner.db")
+    slow_p = delay_first_response(partner.host.app(), "p", 0.3)
+    a = await env(spec("a", Fn(echo)), apps={"t": slow_p})
+    host = a.host
+    await host.partners.add_from_card("p", MessageToDict(partner.host.cards["p"]), "internal")
+
+    t = asyncio.create_task(host.client.consult("p", "go", wait_seconds=5, inbound_task_id="in-s"))
+    await asyncio.wait_for(p.started.wait(), 5)
+    t.cancel()  # starts the cleanup ...
+    await asyncio.sleep(0.02)
+    t.cancel()  # ... and stops waiting for it: the cleanup runs in the background
+    with pytest.raises(asyncio.CancelledError):
+        await t
+    assert host.client._cleanups
+
+    at_dispose: dict[str, Any] = {}
+    engine = host.engine
+    real_dispose = type(engine).dispose
+
+    async def dispose(self, *args, **kwargs):
+        if self is engine:
+            at_dispose["handles"] = await host.handles.by_inbound("in-s")
+            at_dispose["cleanups"] = len(host.client._cleanups)
+        return await real_dispose(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(engine), "dispose", dispose)
+    await host.shutdown()
+    assert at_dispose["cleanups"] == 0
+    assert [h["state"] for h in at_dispose["handles"]] == [CANCELED]
+    rows, _ = await partner.host.index.list(agent_id="p")
+    assert [r["state"] for r in rows] == [CANCELED]
 
 
 async def test_restart_cancels_outbound_of_failed_inbound(env, tmp_path):

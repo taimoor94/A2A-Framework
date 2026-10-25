@@ -311,6 +311,32 @@ async def test_direct_message_reply(env):
     await handler.aclose()
 
 
+async def test_cancelled_consult_answered_by_direct_message_skips_lookup(env):
+    """A cancelled call whose first response turns out to be a direct message has no partner
+    task to cancel: the cleanup ends at once instead of polling the context."""
+    app, card, handler = direct_app()
+
+    async def slow(scope, receive, send):
+        async def send_later(message):
+            if message["type"] == "http.response.start" and scope["method"] == "POST":
+                await asyncio.sleep(0.2)
+            await send(message)
+
+        await app(scope, receive, send_later)
+
+    e = await env(register=False, apps={"d": slow})
+    await e.registry.add_from_card("direct", MessageToDict(card), "internal")
+    t = asyncio.create_task(e.client.consult("direct", "hi", wait_seconds=5))
+    await asyncio.sleep(0.05)
+    started = asyncio.get_running_loop().time()
+    t.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await t
+    assert asyncio.get_running_loop().time() - started < 1.0
+    assert "ListTasks" not in rpc_methods(e.transport)
+    await handler.aclose()
+
+
 async def test_rest_only_partner(env):
     e = await env(spec("alpha", Echo()), register=False)
     card = e.card("alpha")
@@ -761,6 +787,88 @@ async def test_cancelled_consult_releases_probe_and_slot(env):
     assert e.client._bulkhead("slow").in_use == 0
     assert breaker.allow()  # the abandoned probe was given back
     gated.gate.set()
+
+
+class LateDelivery(httpx.AsyncBaseTransport):
+    """Delivers the streaming send to the partner only after ``delay`` seconds and never
+    answers it; every other request passes straight through."""
+
+    def __init__(self, inner: httpx.AsyncBaseTransport, delay: float) -> None:
+        self.inner = inner
+        self.delay = delay
+        self.responses: list[httpx.Response] = []
+        self.forwarders: list[asyncio.Task] = []
+
+    async def handle_async_request(self, request):
+        body = await request.aread()
+        if b"SendStreamingMessage" not in body:
+            return await self.inner.handle_async_request(request)
+
+        async def forward() -> None:
+            await asyncio.sleep(self.delay)
+            copy = httpx.Request(request.method, request.url, headers=request.headers, content=body)
+            self.responses.append(await self.inner.handle_async_request(copy))
+
+        self.forwarders.append(asyncio.create_task(forward()))
+        await asyncio.Event().wait()  # the caller never hears back
+        raise AssertionError("unreachable")
+
+    async def close(self) -> None:
+        await asyncio.gather(*self.forwarders, return_exceptions=True)
+        for r in self.responses:
+            await r.aclose()
+
+
+async def test_cancelled_consult_retries_context_lookup_until_task_appears(env, monkeypatch):
+    """Finding 1 fallback: no first event ever arrives and the partner creates its task only
+    after the first lookups came back empty; the lookup is retried and the task cancelled."""
+    monkeypatch.setattr(client_mod, "CANCEL_CLEANUP_S", 2.0)  # waits 1 s for a first event
+    gated = Gated()
+    e = await env(spec("slow", gated))
+    late = LateDelivery(e.transport, delay=1.3)
+    e.hc._transport = late
+    t = asyncio.create_task(e.client.consult("slow", "go", wait_seconds=5, inbound_task_id="in-l"))
+    await asyncio.sleep(0.1)  # the send is in flight
+    t.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await t
+    assert gated.started.is_set()  # the partner only received the message meanwhile
+    methods = rpc_methods(e.transport)
+    assert methods.count("ListTasks") >= 2  # first lookups were empty and retried
+    [row] = await e.handles.by_inbound("in-l")
+    assert row["state"] == "TASK_STATE_CANCELED"
+    assert (await e.client.check("slow", row["task_id"])).state == "canceled"
+    await late.close()
+
+
+async def test_aclose_drains_cleanup_tasks(env):
+    """Finding 2: a cleanup still running in the background when the client closes runs to
+    completion before the HTTP clients go away."""
+    gated = Gated()
+    e = await env(spec("slow", gated))
+    res = await e.client.consult("slow", "go", wait_seconds=0.2, inbound_task_id="in-d")
+    assert res.state == "working"
+    real_fetch = e.client._fetch
+
+    async def slow_fetch(*args, **kwargs):
+        await asyncio.sleep(0.3)
+        return await real_fetch(*args, **kwargs)
+
+    e.client._fetch = slow_fetch  # type: ignore[method-assign]
+    _, sdk_client, _ = await e.client._prepare("slow")
+    track = results_mod.Track(res.task_id, res.context_id)
+    waiter = asyncio.create_task(
+        e.client._cleanup_cancelled("slow", sdk_client, track, False, "in-d", None, [])
+    )
+    await asyncio.sleep(0.05)
+    waiter.cancel()  # the cancelled consult stops waiting; its cleanup carries on
+    await waiter
+    assert len(e.client._cleanups) == 1
+    await e.client.aclose()
+    assert not e.client._cleanups
+    [row] = await e.handles.by_inbound("in-d")
+    assert row["state"] == "TASK_STATE_CANCELED"
+    assert (await e.client.check("slow", res.task_id)).state == "canceled"
 
 
 async def test_503_before_any_event_looks_task_up(env):
