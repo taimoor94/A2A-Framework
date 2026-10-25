@@ -12,6 +12,7 @@ Binaries are looked up in ``A2AGW_PG_BIN``, then on ``PATH`` (``pg_ctl``), then 
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import signal
 import socket
@@ -40,16 +41,39 @@ def _has_tools(directory: Path) -> bool:
     return all((directory / tool).is_file() for tool in _TOOLS)
 
 
+MIN_VERSION = 14
+
+
+def _version_ok(directory: Path) -> bool:
+    """``pg_ctl --version`` reports at least ``MIN_VERSION``."""
+    try:
+        out = subprocess.run(
+            [str(directory / "pg_ctl"), "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=_ENV,
+        ).stdout
+        match = re.search(r"\(PostgreSQL\) (\d+)", out)
+        return match is not None and int(match.group(1)) >= MIN_VERSION
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+
+
 def find_pg_bin() -> Path | None:
-    """A2AGW_PG_BIN, else the directory of ``pg_ctl`` on PATH, else Homebrew's postgresql@16."""
+    """A2AGW_PG_BIN, else the directory of ``pg_ctl`` on PATH, else Homebrew's postgresql@16.
+    The first directory with all the tools and a new enough version wins."""
     env = os.environ.get("A2AGW_PG_BIN")
     if env:
-        candidate = Path(env)
-        return candidate if _has_tools(candidate) else None
-    found = shutil.which("pg_ctl")
-    if found and _has_tools(Path(found).resolve().parent):
-        return Path(found).resolve().parent
-    return HOMEBREW_BIN if _has_tools(HOMEBREW_BIN) else None
+        candidates = [Path(env)]
+    else:
+        found = shutil.which("pg_ctl")
+        candidates = ([Path(found).resolve().parent] if found else []) + [HOMEBREW_BIN]
+    for directory in candidates:
+        if _has_tools(directory) and _version_ok(directory):
+            return directory
+    return None
 
 
 def _stop(bin_dir: Path, data: Path) -> None:
@@ -63,7 +87,10 @@ def _stop(bin_dir: Path, data: Path) -> None:
     )
     pidfile = data / "postmaster.pid"
     try:
-        pid = int(pidfile.read_text().split()[0])
+        lines = pidfile.read_text().splitlines()
+        pid = int(lines[0])
+        if Path(lines[1]).resolve() != data.resolve():  # line 2 is the data directory
+            return
     except (OSError, ValueError, IndexError):
         return
     try:

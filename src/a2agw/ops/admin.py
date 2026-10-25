@@ -1,4 +1,4 @@
-"""Read-only management API, mounted by AgentHost under /a2agw/admin.
+"""Management API (read only, except POST /tasks/reap), mounted by AgentHost under /a2agw/admin.
 
 Every route except /healthz needs a principal with the ``a2agw:admin`` scope.
 Authentication happens in the host middleware; here we only read ``scope["user"]``.
@@ -9,6 +9,8 @@ Secrets (credential refs, headers) are never part of any response.
 Audit: every admitted admin request appends one ``admin.read`` event (the path category in
 ``detail.reason``); a request refused for lack of the admin scope appends ``authz.deny``.
 ``/audit`` lists audit events (newest first) and ``/audit/verify`` checks the hash chain.
+``POST /tasks/reap?agent=<id>`` fails the open tasks of an agent no gateway serves (409 for
+one this host serves) and appends a ``task.reap`` event.
 ``/push`` reports per-agent push delivery counters (no URLs, task ids or config contents).
 """
 
@@ -99,12 +101,13 @@ def admin_routes(host: AgentHost) -> list[Route]:
         else:
             await log.emit(ev)
 
-    def guarded(category: str, fn: Handler) -> Handler:
+    def guarded(category: str, fn: Handler, *, read: bool = True) -> Handler:
         async def wrapper(request: Request) -> Response:
             if not _allowed(host, request):
                 await audit(request, "authz.deny", "forbidden", f"admin {category}")
                 return JSONResponse({"error": "forbidden"}, status_code=403)
-            await audit(request, "admin.read", "ok", category)
+            if read:
+                await audit(request, "admin.read", "ok", category)
             try:
                 return await fn(request)
             except _BadRequest as exc:
@@ -246,8 +249,42 @@ def admin_routes(host: AgentHost) -> list[Route]:
             }
         )
 
-    def route(name: str, fn: Handler) -> Route:
-        return Route(f"{ADMIN_PREFIX}/{name}", guarded(name.replace("/", "."), fn), methods=["GET"])
+    async def tasks_reap(request: Request) -> Response:
+        agent_id = _str_param(request, "agent")
+        if agent_id is None:
+            raise _BadRequest("agent")
+        if host.index is None:
+            return JSONResponse({"error": "not started"}, status_code=503)
+        from a2agw.serve.host import AgentServedError
+
+        try:
+            report = await host.reap(agent_id)
+        except AgentServedError:
+            return JSONResponse({"error": "agent is served by this gateway"}, status_code=409)
+        user = request.scope.get("user")
+        log = getattr(host, "audit", None)
+        if log is not None:
+            await log.emit(
+                AuditEvent(
+                    actor=user.principal.id if isinstance(user, PrincipalUser) else "anonymous",
+                    action="task.reap",
+                    agent_id=agent_id,
+                    outcome="reaped",
+                    detail={"count": len(report.failed)},
+                )
+            )
+        return JSONResponse(
+            {
+                "reaped": len(report.failed),
+                "outbound_cancelled": report.outbound_cancelled,
+                "cancel_errors": len(report.cancel_errors),
+                "errors": len(report.errors),
+            }
+        )
+
+    def route(name: str, fn: Handler, *, method: str = "GET") -> Route:
+        handler = guarded(name.replace("/", "."), fn, read=method == "GET")
+        return Route(f"{ADMIN_PREFIX}/{name}", handler, methods=[method])
 
     return [
         Route(HEALTH_PATH, healthz, methods=["GET"]),
@@ -258,6 +295,7 @@ def admin_routes(host: AgentHost) -> list[Route]:
         route("audit", audit_list),
         route("audit/verify", audit_verify),
         route("push", push),
+        route("tasks/reap", tasks_reap, method="POST"),
     ]
 
 

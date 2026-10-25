@@ -179,7 +179,7 @@ class GatewayAuthBackend(AuthenticationBackend):
             logger.warning("jwt rejected: %s", type(e).__name__)
             raise _fail() from None
         sub = claims.get("sub")
-        if not isinstance(sub, str) or not sub.strip():
+        if not isinstance(sub, str) or not sub.strip() or "\x00" in sub:
             logger.warning("jwt rejected: %s", "InvalidSubject")
             raise _fail()
         raw = claims.get(cfg.scopes_claim, [])

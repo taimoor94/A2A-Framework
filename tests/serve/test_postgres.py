@@ -15,7 +15,7 @@ import httpx
 import pytest
 from a2a.client import ClientConfig, ClientFactory
 from a2a.types import GetTaskRequest, Message, Part, Role, SendMessageRequest, TaskState
-from a2a.utils.errors import TaskNotFoundError
+from a2a.utils.errors import InvalidParamsError, TaskNotFoundError
 from sqlalchemy import text
 
 from a2agw.consult.handles import OutboundHandleStore
@@ -24,7 +24,13 @@ from a2agw.ops.audit import AuditEvent, AuditLog
 from a2agw.serve.agent import AgentSpec, SkillSpec
 from a2agw.serve.host import AgentHost
 from a2agw.serve.push import PushSettings
-from a2agw.serve.store import TaskIndex, create_engine, recover_on_startup, task_store_for
+from a2agw.serve.store import (
+    TaskIndex,
+    create_engine,
+    reap_tasks,
+    recover_on_startup,
+    task_store_for,
+)
 
 W = "TASK_STATE_WORKING"
 FAILED = "TASK_STATE_FAILED"
@@ -92,17 +98,28 @@ def _ev(**kw) -> AuditEvent:
 
 
 @pytest.mark.postgres
-async def test_postgres_engine_pool_settings(pg_url):
-    eng = await create_engine(pg_url)
+async def test_postgres_engine_survives_dropped_connections_and_allows_overflow(pg_url):
+    eng, admin = await create_engine(pg_url), await create_engine(pg_url)
     try:
-        pool = eng.sync_engine.pool
-        assert pool.size() == 10 and pool._max_overflow == 10  # type: ignore[attr-defined]
-        assert pool._pre_ping is True  # type: ignore[attr-defined]
-        assert pool._recycle == 1800  # type: ignore[attr-defined]
         async with eng.connect() as conn:
+            pid = (await conn.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+        async with admin.begin() as conn:  # the server drops the pooled connection
+            await conn.execute(text("SELECT pg_terminate_backend(:p)"), {"p": pid})
+        async with eng.connect() as conn:  # pool_pre_ping replaces it
             assert (await conn.execute(text("SELECT 1"))).scalar_one() == 1
+
+        # pool_size 10 + max_overflow 10: twenty connections at once (the default is 15).
+        async def hold() -> int:
+            async with eng.connect() as conn:
+                await conn.execute(text("SELECT pg_sleep(0.3)"))
+                return 1
+
+        assert sum(await asyncio.gather(*(hold() for _ in range(20)))) == 20
+        # No public accessor for the recycle time; this reads the pool's private setting.
+        assert eng.sync_engine.pool._recycle == 1800  # type: ignore[attr-defined]
     finally:
         await eng.dispose()
+        await admin.dispose()
 
 
 # -- dialect regressions (each runs on both backends) ----------------------------------
@@ -318,3 +335,226 @@ async def test_recovery_cancels_real_outbound_handles(db_url):
         assert report.failed == ["in-1"] and report.outbound_cancelled == 1
     finally:
         await eng.dispose()
+
+
+# -- NUL bytes, generic internal errors -------------------------------------------------
+
+
+def _msg(*, context_id: str = "", text: str = "hi secretword") -> Message:
+    return Message(
+        message_id=uuid.uuid4().hex,
+        role=Role.ROLE_USER,
+        parts=[Part(text=text)],
+        context_id=context_id,
+    )
+
+
+@pytest.mark.parametrize("where", ["context_id", "text", "message_id"])
+async def test_nul_is_invalid_params_without_leaking(tmp_path, db_url, where):
+    e = Env(tmp_path, db_url=db_url, audit=True)
+    e.host.add(spec("alpha"))
+    await e.start()
+    try:
+        if where == "context_id":
+            message = _msg(context_id="c\x00x")
+        elif where == "text":
+            message = _msg(text="a\x00b secretword")
+        else:
+            message = _msg()
+            message.message_id = "m\x00"
+        with pytest.raises(InvalidParamsError) as exc:
+            await send_one(e.client("alpha"), message)
+        shown = str(exc.value)
+        assert "invalid characters" in shown
+        for leak in ("INSERT", "SELECT", "secretword", "parameters"):
+            assert leak not in shown
+        assert (await e.host.index.list())[0] == []
+        # The host is still healthy.
+        assert await send_one(e.client("alpha"), _msg())
+    finally:
+        await e.stop()
+
+
+async def test_database_error_is_a_generic_internal_error(tmp_path, db_url, monkeypatch, caplog):
+    e = Env(tmp_path, db_url=db_url)
+    e.host.add(spec("alpha"))
+    await e.start()
+    try:
+        tid = task_id_of(await send_one(e.client("alpha"), _msg()))
+        store = e.host.handlers["alpha"].task_store
+
+        async def boom(*args, **kwargs):
+            raise RuntimeError("SELECT secret_column FROM tasks WHERE password = 'hunter2'")
+
+        monkeypatch.setattr(store, "get", boom)
+        with caplog.at_level("ERROR"), pytest.raises(Exception) as exc:
+            await e.client("alpha").get_task(GetTaskRequest(id=tid))
+        shown = str(exc.value)
+        assert "internal error" in shown.lower()
+        for leak in ("secret_column", "hunter2", "SELECT"):
+            assert leak not in shown
+        assert "RuntimeError" in caplog.text and "hunter2" not in caplog.text
+    finally:
+        await e.stop()
+
+
+async def test_nul_in_audit_fields_is_replaced(db_url):
+    eng = await create_engine(db_url)
+    try:
+        log = AuditLog(eng)
+        await log.initialize()
+        await log.append(
+            AuditEvent(
+                actor="jwt:a\x00b",
+                action="inbound.admit",
+                outcome="o\x00k",
+                detail={"reason": "r\x00r"},
+            )
+        )
+        [row], _ = await log.query({}, 5)
+        assert row["actor"] == "jwt:a�b" and row["detail"]["reason"] == "r�r"
+        assert await log.verify_chain() is None
+    finally:
+        await eng.dispose()
+
+
+# -- bounded cross-process audit lock ----------------------------------------------------
+
+
+@pytest.mark.postgres
+async def test_advisory_lock_wait_is_bounded(pg_url, monkeypatch):
+    from a2agw.ops import audit as audit_mod
+
+    monkeypatch.setattr(audit_mod, "LOCK_TIMEOUT_S", 0.5)
+    eng, holder = await create_engine(pg_url), await create_engine(pg_url)
+    try:
+        log = AuditLog(eng)
+        await log.initialize()
+        async with holder.connect() as conn:
+            tx = await conn.begin()
+            await conn.execute(
+                text("SELECT pg_advisory_xact_lock(:k)"), {"k": audit_mod._ADVISORY_KEY}
+            )
+            started = asyncio.get_running_loop().time()
+            await log.emit(_ev())  # never raises; counts the failure
+            elapsed = asyncio.get_running_loop().time() - started
+            await tx.rollback()
+        assert elapsed < 3 and log.audit_errors == 1
+        await log.emit(_ev())  # the lock is free again
+        assert log.audit_errors == 1
+        assert len((await log.query({}, 10))[0]) == 1
+    finally:
+        await eng.dispose()
+        await holder.dispose()
+
+
+# -- reaping tasks of agents nobody serves ---------------------------------------------
+
+
+async def _seed_orphans(eng):
+    index, handles = TaskIndex(eng), OutboundHandleStore(eng)
+    await index.initialize()
+    await handles.initialize()
+    await index.upsert("gone-1", "gone", "key:a", "c", W, None)
+    await index.upsert("gone-2", "gone", "key:a", "c", "TASK_STATE_COMPLETED", None)
+    await index.upsert("other-1", "other", "key:a", "c", W, None)
+    await handles.record("p1", "px", None, "gone-1", None, W, caller_id="key:a")
+    return index, handles
+
+
+async def test_reap_tasks_fails_open_tasks_and_cancels_handles(db_url):
+    eng = await create_engine(db_url)
+    try:
+        index, handles = await _seed_orphans(eng)
+        cancelled: list[str] = []
+
+        async def cancel(h):
+            cancelled.append(h["task_id"])
+
+        report = await reap_tasks(index, handles, cancel, "gone")
+        assert report.failed == ["gone-1"] and cancelled == ["p1"]
+        states = {r["task_id"]: r["state"] for r in (await index.list())[0]}
+        assert states == {
+            "gone-1": FAILED,
+            "gone-2": "TASK_STATE_COMPLETED",
+            "other-1": W,
+        }
+        assert await index.count_active_outside({"other"}) == 0
+    finally:
+        await eng.dispose()
+
+
+async def test_host_warns_about_foreign_open_tasks_and_reaps_via_admin(tmp_path, db_url, caplog):
+    eng = await create_engine(db_url)
+    await _seed_orphans(eng)
+    await eng.dispose()
+    e = Env(tmp_path, db_url=db_url, audit=True, admin_without_auth=True)
+    e.host.add(spec("alpha"))
+    with caplog.at_level("WARNING"):
+        await e.start()
+    try:
+        assert "2 non-terminal task(s)" in caplog.text and "a2agw tasks reap" in caplog.text
+        assert await e.host.index.count_active_outside({"alpha"}) == 2  # recovery skipped them
+        hc = httpx.AsyncClient(transport=httpx.ASGITransport(app=e.host.app()), base_url="http://t")
+        async with hc:
+            url = "/a2agw/admin/tasks/reap"
+            assert (await hc.post(url)).status_code == 400  # agent is required
+            assert (await hc.post(url, params={"agent": "alpha"})).status_code == 409
+            assert (await hc.get(url, params={"agent": "gone"})).status_code != 200
+            r = await hc.post(url, params={"agent": "gone"})
+            assert r.status_code == 200 and r.json()["reaped"] == 1
+            assert (await hc.post(url, params={"agent": "gone"})).json()["reaped"] == 0
+        states = {r["task_id"]: r["state"] for r in (await e.host.index.list())[0]}
+        assert states["gone-1"] == FAILED and states["other-1"] == W
+        await e.host.audit.drain()
+        rows, _ = await e.host.audit.query({"action": "task.reap"}, 10)
+        assert [(r["agent_id"], r["outcome"]) for r in rows[::-1]] == [
+            ("gone", "reaped"),
+            ("gone", "reaped"),
+        ]
+    finally:
+        await e.stop()
+
+
+async def test_admin_reap_needs_the_admin_scope(tmp_path, db_url):
+    e = Env(tmp_path, db_url=db_url)  # no auth, no admin_without_auth: admin fails closed
+    e.host.add(spec("alpha"))
+    await e.start()
+    try:
+        hc = httpx.AsyncClient(transport=httpx.ASGITransport(app=e.host.app()), base_url="http://t")
+        async with hc:
+            r = await hc.post("/a2agw/admin/tasks/reap", params={"agent": "gone"})
+        assert r.status_code == 403
+    finally:
+        await e.stop()
+
+
+def test_cli_tasks_reap(tmp_path):
+    from typer.testing import CliRunner
+
+    from a2agw import cli
+
+    db = tmp_path / "gw.db"
+    url = f"sqlite+aiosqlite:///{db}"
+
+    async def seed():
+        eng = await create_engine(url)
+        await _seed_orphans(eng)
+        await eng.dispose()
+
+    asyncio.run(seed())
+    cfg = tmp_path / "a2agw.yaml"
+    cfg.write_text(f"base_url: http://localhost\ndb_url: {url}\nagents: []\n")
+    r = CliRunner().invoke(cli.app, ["tasks", "reap", "--agent", "gone", "-c", str(cfg)])
+    assert r.exit_code == 0, r.output
+    assert "reaped 1 task(s)" in r.output
+
+    async def states():
+        eng = await create_engine(url)
+        try:
+            return {r["task_id"]: r["state"] for r in (await TaskIndex(eng).list())[0]}
+        finally:
+            await eng.dispose()
+
+    assert asyncio.run(states())["gone-1"] == FAILED
+    assert asyncio.run(states())["other-1"] == W  # other agents' tasks untouched

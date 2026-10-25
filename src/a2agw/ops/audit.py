@@ -50,6 +50,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal, get_args
 
 from sqlalchemy import Column, Float, Integer, MetaData, String, Table, Text, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from a2agw._ddl import retry_ddl
@@ -69,6 +70,7 @@ Action = Literal[
     "partner.enable",
     "partner.update",
     "admin.read",
+    "task.reap",
 ]
 ACTIONS: frozenset[str] = frozenset(get_args(Action))
 DETAIL_KEYS = frozenset(
@@ -142,11 +144,12 @@ def canonical_json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
-_SURROGATE = re.compile("[\ud800-\udfff]")
+_SURROGATE = re.compile("[\ud800-\udfff\x00]")
 
 
 def _text(value: str) -> str:
-    """Lone surrogates (not encodable as UTF-8) become U+FFFD before storing and hashing."""
+    """Lone surrogates (not encodable as UTF-8) and NUL (rejected by PostgreSQL text columns)
+    become U+FFFD before storing and hashing."""
     return _SURROGATE.sub("\ufffd", value)
 
 
@@ -258,11 +261,7 @@ class AuditLog:
         try:
             async with self._engine.begin() as conn:
                 if conn.dialect.name == "postgresql":
-                    # Serializes writers across processes (the asyncio lock covers only this
-                    # one); released when the transaction ends.
-                    await conn.execute(
-                        text("SELECT pg_advisory_xact_lock(:k)"), {"k": _ADVISORY_KEY}
-                    )
+                    await self._advisory_lock(conn)
                 last = (
                     await conn.execute(select(t.c.hash).order_by(t.c.seq.desc()).limit(1))
                 ).scalar_one_or_none()
@@ -272,6 +271,19 @@ class AuditLog:
                 return int(result.inserted_primary_key[0])
         finally:
             self._lock.release()
+
+    @staticmethod
+    async def _advisory_lock(conn: Any) -> None:
+        """Serialize writers across processes (the asyncio lock covers only this one); held
+        until the transaction ends. The wait is bounded like the in-process lock."""
+        await conn.execute(text(f"SET LOCAL lock_timeout = '{int(LOCK_TIMEOUT_S * 1000)}ms'"))
+        try:
+            await conn.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _ADVISORY_KEY})
+        except DBAPIError as exc:
+            code = getattr(exc.orig, "sqlstate", None) or getattr(exc.orig, "pgcode", None)
+            if code == "55P03":  # lock_not_available
+                raise TimeoutError("audit lock wait timed out") from None
+            raise
 
     async def emit(self, ev: AuditEvent) -> None:
         """Append, never raising: failures are logged and counted (fail-open)."""

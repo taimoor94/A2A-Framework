@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import signal
@@ -14,7 +15,7 @@ from typing import Any
 
 import httpx
 from a2a.server.context import ServerCallContext
-from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.request_handlers import DefaultRequestHandler, RequestHandler
 from a2a.server.routes import (
     create_agent_card_routes,
     create_jsonrpc_routes,
@@ -22,7 +23,9 @@ from a2a.server.routes import (
 )
 from a2a.server.tasks import TaskStore
 from a2a.types import AgentCard, SendMessageRequest
-from a2a.utils.errors import InvalidParamsError
+from a2a.utils.errors import A2AError, InternalError, InvalidParamsError
+from google.protobuf.json_format import MessageToDict
+from google.protobuf.message import Message as ProtoMessage
 from sqlalchemy.ext.asyncio import AsyncEngine
 from starlette.applications import Starlette
 from starlette.authentication import AuthCredentials, AuthenticationError
@@ -66,6 +69,7 @@ from a2agw.serve.store import (
     RecoveryReport,
     TaskIndex,
     create_engine,
+    reap_tasks,
     recover_on_startup,
     task_store_for,
 )
@@ -122,6 +126,73 @@ def _on_exit_signal(callback: Callable[[], None]) -> Iterator[None]:
 __all__ = ["ADMIN_PREFIX", "HEALTH_PATH", "AgentHost"]
 
 
+class AgentServedError(ValueError):
+    """The agent is served by this gateway, so its tasks must not be reaped."""
+
+
+def _strings(value: Any) -> Iterator[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            yield from _strings(k)
+            yield from _strings(v)
+    elif isinstance(value, list):
+        for v in value:
+            yield from _strings(v)
+
+
+def _reject_nul(arg: Any) -> None:
+    """NUL cannot be stored by PostgreSQL text/JSON columns: refuse it at the boundary."""
+    if isinstance(arg, ProtoMessage) and any("\x00" in s for s in _strings(MessageToDict(arg))):
+        raise InvalidParamsError(message="invalid characters")
+
+
+def _guard_handler_method(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Wrap a request handler method: NUL-free params, and no exception detail (SQL, bound
+    parameters, message text) leaves the gateway. Non-A2A exceptions become a generic
+    InternalError; the class name is logged."""
+
+    def internal(exc: Exception) -> InternalError:
+        logger.error("request failed: %s", type(exc).__name__)
+        return InternalError(message="internal error")
+
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        for arg in args:
+            _reject_nul(arg)
+        try:
+            result = fn(self, *args, **kwargs)
+        except A2AError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - nothing but A2A errors may reach callers
+            raise internal(exc) from None
+        if inspect.isasyncgen(result):
+
+            async def stream() -> AsyncGenerator[Any, None]:
+                try:
+                    async for item in result:
+                        yield item
+                except A2AError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    raise internal(exc) from None
+
+            return stream()
+
+        async def call() -> Any:
+            try:
+                return await result
+            except A2AError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise internal(exc) from None
+
+        return call()
+
+    wrapper.__name__ = getattr(fn, "__name__", "handler")
+    return wrapper
+
+
 class LimitedRequestHandler(DefaultRequestHandler):
     """DefaultRequestHandler that rejects messages with too many parts."""
 
@@ -143,6 +214,15 @@ class LimitedRequestHandler(DefaultRequestHandler):
         self._check_parts(params)
         async for event in super().on_message_send_stream(params, context):
             yield event
+
+
+for _method in dir(RequestHandler):
+    if _method.startswith("on_") and callable(getattr(LimitedRequestHandler, _method, None)):
+        setattr(
+            LimitedRequestHandler,
+            _method,
+            _guard_handler_method(getattr(LimitedRequestHandler, _method)),
+        )
 
 
 class _BodyLimitMiddleware:
@@ -656,6 +736,28 @@ class AgentHost:
             durable={i: s.adapter.durable_sessions for i, s in self.specs.items()},
             handles=handles,
             cancel_outbound=self._cancel_outbound,
+            cancel_timeout_s=self.default_deadline_s,
+        )
+        foreign = await index.count_active_outside(set(self.specs))
+        if foreign:
+            logger.warning(
+                "%d non-terminal task(s) belong to agents this gateway does not serve; if no "
+                "other gateway serves them, run `a2agw tasks reap --agent <id>`",
+                foreign,
+            )
+
+    async def reap(self, agent_id: str) -> RecoveryReport:
+        """Fail the non-terminal tasks of an agent nobody serves and cancel their outbound
+        partner tasks (as maintenance calls). ``AgentServedError`` for an agent of this host."""
+        if agent_id in self.specs:
+            raise AgentServedError(f"agent {agent_id!r} is served by this gateway")
+        if self.index is None:
+            raise RuntimeError("host not started")
+        return await reap_tasks(
+            self.index,
+            self.handles,
+            self._cancel_outbound,
+            agent_id,
             cancel_timeout_s=self.default_deadline_s,
         )
 

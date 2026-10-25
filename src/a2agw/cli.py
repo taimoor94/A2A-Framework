@@ -35,7 +35,9 @@ card_app = typer.Typer(help="Agent Card tools.", no_args_is_help=True)
 audit_app = typer.Typer(help="Export and verify the audit log (read only).", no_args_is_help=True)
 app.add_typer(partners_app, name="partners")
 app.add_typer(card_app, name="card")
+tasks_app = typer.Typer(help="Maintenance of stored tasks.", no_args_is_help=True)
 app.add_typer(audit_app, name="audit")
+app.add_typer(tasks_app, name="tasks")
 
 KNOWN_ERRORS = (ConfigError, CardFetchError, UnsafeURL, KeyError, ValueError, OSError)
 OUTPUT_CAP = 64 * 1024
@@ -453,3 +455,33 @@ def audit_verify(config: ConfigOpt = Path("a2agw.yaml")) -> None:
         typer.echo(f"audit chain broken at seq {bad}", err=True)
         raise typer.Exit(1)
     typer.echo("audit chain ok")
+
+
+# -- tasks -----------------------------------------------------------------------------------
+@tasks_app.command("reap")
+@guarded
+def tasks_reap(
+    agent: Annotated[str, typer.Option("--agent", help="Agent id nobody serves any more.")],
+    config: ConfigOpt = Path("a2agw.yaml"),
+) -> None:
+    """Fail the open tasks of an agent that no gateway serves, and cancel their partner tasks.
+
+    Refused for an agent the configured gateway serves."""
+
+    async def run() -> None:
+        cfg = load_config(config)
+        host = build_host(cfg, config_dir=config.resolve().parent)
+        if agent in host.specs:
+            raise ConfigError(f"agent {agent!r} is served by this gateway; refusing to reap it")
+        host.specs.clear()  # recovery must not touch the served agents' tasks from here
+        await host.startup()
+        try:
+            report = await host.reap(agent)
+        finally:
+            await host.shutdown()
+        typer.echo(
+            f"reaped {len(report.failed)} task(s); cancelled {report.outbound_cancelled} "
+            f"partner task(s); {len(report.cancel_errors)} cancel error(s)"
+        )
+
+    asyncio.run(run())

@@ -12,7 +12,7 @@ A framework-agnostic gateway for the [A2A (Agent2Agent) protocol](https://a2a-pr
 - Call-context extension: trace, hop budget, deadline, call budget, and re-entry detection across agent networks.
 - API-key and JWT auth with per-agent authorization, an SSRF guard, and an untrusted-text envelope for partner output.
 - OpenTelemetry tracing, JSON logs, and a read-only admin API with an SSE event stream.
-- SQLite task store, with recovery of in-flight tasks on restart.
+- SQLite or PostgreSQL (`pip install a2a-gateway[postgres]`) task store, with recovery of in-flight tasks on restart. Several gateways can share one PostgreSQL database if each serves different agent ids (one gateway per agent id per database); the audit chain is serialized across them by an advisory lock. SQLite is for a single process.
 - A CLI: `init`, `serve`, `partners`, `card validate`, `call`.
 - **Conformance:** the inbound side passes the A2A TCK at MUST level. See [docs/conformance.md](docs/conformance.md).
 
@@ -233,7 +233,7 @@ a2agw audit export -c a2agw.yaml --since 2026-10-01T00:00:00Z > audit.jsonl
 a2agw audit verify -c a2agw.yaml                                          # exit 1 if broken
 ```
 
-The audit log is fail-open for availability: a failed append is logged and counted in `audit_errors` (shown by `/a2agw/admin/healthz`), and the request goes on. Every event is its own committed transaction, so each audited request pays one extra commit (on sqlite in WAL mode, the default here, that is one fsync per event); waiting for the audit lock is capped at 5 s, after which the event is counted as an audit error rather than blocking the request. Denials of anonymous callers are coalesced to one row per agent (or admin category) per 60 s, with `detail.count` holding the number suppressed; authenticated denials are recorded one by one. Phase 2 assumes a single gateway process writes to a given database. `AgentHost(audit=False)` turns the audit log off.
+The audit log is fail-open for availability: a failed append is logged and counted in `audit_errors` (shown by `/a2agw/admin/healthz`), and the request goes on. Every event is its own committed transaction, so each audited request pays one extra commit (on sqlite in WAL mode, the default here, that is one fsync per event); waiting for the audit lock is capped at 5 s, after which the event is counted as an audit error rather than blocking the request. Denials of anonymous callers are coalesced to one row per agent (or admin category) per 60 s, with `detail.count` holding the number suppressed; authenticated denials are recorded one by one. On PostgreSQL, gateways sharing a database append to one chain, serialized by an advisory lock (waiting is capped like the in-process lock); on SQLite assume a single writer process. Run one gateway per agent id per database: if an agent is moved or removed, the host logs how many open tasks belong to agents it does not serve, and `a2agw tasks reap --agent <id> -c a2agw.yaml` (or `POST /a2agw/admin/tasks/reap?agent=<id>`, admin scope, audited as `task.reap`) fails those tasks and cancels their partner tasks. Reaping an agent the gateway serves is refused (CLI error, HTTP 409). `AgentHost(audit=False)` turns the audit log off.
 
 ## Observability
 

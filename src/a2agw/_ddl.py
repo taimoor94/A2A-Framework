@@ -22,11 +22,11 @@ ATTEMPTS = 6
 # duplicate_table, duplicate_column, duplicate_object, unique_violation (pg_type race),
 # deadlock_detected, serialization_failure
 _PG_SQLSTATES = frozenset({"42P07", "42701", "42710", "23505", "40P01", "40001"})
-_MESSAGES = ("already exists", "duplicate column")
+_MESSAGES = ("already exists", "duplicate column", "database is locked")
 
 
 def is_duplicate_object(exc: BaseException) -> bool:
-    """Whether ``exc`` is a database error meaning another session created the object first."""
+    """Whether ``exc`` means another session created the object first (or holds a lock)."""
     if not isinstance(exc, DBAPIError):
         return False
     orig = exc.orig

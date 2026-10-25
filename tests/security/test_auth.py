@@ -152,6 +152,13 @@ async def test_jwt_rs256_valid(pub_pem, priv_pem):
     assert body["scopes"] == ["read", "write"]
 
 
+async def test_jwt_subject_with_nul_is_401(pub_pem, priv_pem):
+    bad = token(priv_pem, sub="a\x00b")
+    async with make_client(jwt_config(pub_pem)) as c:
+        r = await c.get("/", headers={"Authorization": f"Bearer {bad}"})
+    await assert_401(r)
+
+
 async def test_jwt_scope_list_claim(pub_pem, priv_pem):
     async with make_client(jwt_config(pub_pem, scopes_claim="perms")) as c:
         t = token(priv_pem, perms=["x", "y"])

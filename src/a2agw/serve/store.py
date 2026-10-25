@@ -89,8 +89,10 @@ def _sqlite_pragmas(dbapi_conn: Any, _record: Any) -> None:
     instead of failing with "database is locked"."""
     cur = dbapi_conn.cursor()
     try:
-        cur.execute("PRAGMA journal_mode=WAL")
+        # busy_timeout first: switching to WAL itself needs a lock that other starting
+        # gateways may hold.
         cur.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+        cur.execute("PRAGMA journal_mode=WAL")
     finally:
         cur.close()
 
@@ -232,6 +234,11 @@ class TaskIndex:
         stmt = select(_index_table).where(_index_table.c.state.in_(sorted(states)))
         async with self._engine.connect() as conn:
             return [dict(r._mapping) for r in (await conn.execute(stmt)).all()]
+
+    async def count_active_outside(self, agent_ids: set[str]) -> int:
+        """Non-terminal rows of agents not in ``agent_ids`` (served by another gateway, or
+        orphaned by a removed agent)."""
+        return sum(1 for r in await self.by_state(_ACTIVE_STATES) if r["agent_id"] not in agent_ids)
 
     async def blocked_downstream(self, agent_id: str, origin: str, exclude_task_id: str) -> bool:
         """Whether ``agent_id`` has a non-terminal task in ``origin``, other than
@@ -376,3 +383,36 @@ async def _cancel_all(
             report.cancel_errors.append(f"{task_id}:{handle.get('partner_id')}")
         else:
             report.outbound_cancelled += 1
+
+
+async def reap_tasks(
+    index: TaskIndex,
+    handles: OutboundHandleStore | None,
+    cancel_outbound: Callable[..., Awaitable[object]] | None,
+    agent_id: str,
+    *,
+    cancel_timeout_s: float = 60.0,
+) -> RecoveryReport:
+    """Mark every non-terminal index row of ``agent_id`` FAILED and cancel their non-terminal
+    outbound handles. For agents no gateway serves any more (nobody recovers their tasks).
+    The caller must make sure no gateway is serving the agent."""
+    report = RecoveryReport()
+    to_cancel: list[tuple[str, dict[str, Any]]] = []
+    failed_state = TaskState.Name(TaskState.TASK_STATE_FAILED)
+    for row in await index.by_state(_ACTIVE_STATES):
+        if row["agent_id"] != agent_id:
+            continue
+        task_id = row["task_id"]
+        try:
+            if handles is not None and cancel_outbound is not None:
+                for handle in await handles.by_inbound(task_id):
+                    if handle.get("state") not in _TERMINAL_STATES:
+                        to_cancel.append((task_id, handle))
+            await index.set_state(task_id, failed_state)
+            report.failed.append(task_id)
+        except Exception:
+            logger.exception("reaping failed for task %s", task_id)
+            report.errors.append(task_id)
+    if to_cancel and cancel_outbound is not None:
+        await _cancel_all(to_cancel, cancel_outbound, cancel_timeout_s, report)
+    return report
