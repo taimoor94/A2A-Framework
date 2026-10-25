@@ -334,3 +334,97 @@ async def test_add_after_startup_rejected(env):
 async def test_app_is_cached(env):
     e = await env(spec("alpha"))
     assert e.host.app() is e.host.app()
+
+
+# -- REST binding conformance (A2A spec 1.0 sections 5.4 and 11.1) -------------------------
+
+REST_HEADERS = {"A2A-Version": "1.0"}
+
+
+async def _rest_send(hc: httpx.AsyncClient, agent_id: str = "alpha") -> httpx.Response:
+    body = {
+        "message": {
+            "messageId": uuid.uuid4().hex,
+            "role": "ROLE_USER",
+            "parts": [{"text": "hi"}],
+        }
+    }
+    return await hc.post(f"/agents/{agent_id}/rest/message:send", json=body, headers=REST_HEADERS)
+
+
+async def test_rest_responses_use_application_json(env):
+    e = await env(spec("alpha"))
+    r = await _rest_send(e.http())
+    assert r.status_code == 200
+    assert r.headers["content-type"].split(";")[0] == "application/json"
+    assert r.json()["task"]["status"]["state"] == "TASK_STATE_COMPLETED"
+
+
+async def test_rest_cancel_of_terminal_task_is_409(env):
+    e = await env(spec("alpha"))
+    hc = e.http()
+    tid = (await _rest_send(hc)).json()["task"]["id"]
+    r = await hc.post(f"/agents/alpha/rest/tasks/{tid}:cancel", headers=REST_HEADERS)
+    assert r.status_code == 409
+    assert r.headers["content-type"].split(";")[0] == "application/json"
+    err = r.json()["error"]
+    assert err["code"] == 409
+    assert any(d.get("reason") == "TASK_NOT_CANCELABLE" for d in err["details"])
+    assert int(r.headers["content-length"]) == len(r.content)
+
+
+async def test_rest_other_errors_keep_their_status(env):
+    e = await env(spec("alpha"))
+    r = await e.http().get("/agents/alpha/rest/tasks/nope", headers=REST_HEADERS)
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == 404
+
+
+async def test_rest_cancel_via_sdk_client_maps_to_not_cancelable(env):
+    from a2a.client import ClientConfig as _Config
+    from a2a.types import CancelTaskRequest
+    from a2a.utils.errors import TaskNotCancelableError
+
+    e = await env(spec("alpha"))
+    card = e.host.cards["alpha"]
+    client = ClientFactory(
+        _Config(httpx_client=e.http(), streaming=False, supported_protocol_bindings=["HTTP+JSON"])
+    ).create(card)
+    events = await send_one(client, msg())
+    with pytest.raises(TaskNotCancelableError):
+        await client.cancel_task(CancelTaskRequest(id=task_id_of(events)))
+
+
+async def test_jsonrpc_errors_unchanged(env):
+    e = await env(spec("alpha"))
+    hc = e.http()
+    tid = (await _rest_send(hc)).json()["task"]["id"]
+    body = {"jsonrpc": "2.0", "id": 1, "method": "CancelTask", "params": {"id": tid}}
+    r = await hc.post("/agents/alpha/", json=body, headers=REST_HEADERS)
+    assert r.status_code == 200
+    assert r.json()["error"]["code"] == -32002
+
+
+async def test_rest_conformance_passes_large_error_bodies_through():
+    from starlette.responses import Response
+
+    from a2agw.serve.host import _RestConformance
+
+    big = b'{"error": {"code": 400, "details": [{"reason": "TASK_NOT_CANCELABLE"}]}' + b" " * 70000
+    big += b"}"
+    app = _RestConformance(Response(big, status_code=400, media_type="application/a2a+json"))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as hc:
+        r = await hc.get("/")
+    assert r.status_code == 400 and r.content == big
+    assert r.headers["content-type"].startswith("application/json")
+
+
+async def test_rest_conformance_leaves_non_json_errors_alone():
+    from starlette.responses import PlainTextResponse
+
+    from a2agw.serve.host import _RestConformance
+
+    app = _RestConformance(PlainTextResponse("nope", status_code=400))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as hc:
+        r = await hc.get("/")
+    assert r.status_code == 400 and r.text == "nope"

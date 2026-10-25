@@ -56,6 +56,10 @@ class AgentSpec(BaseModel):
     streaming: bool = True
     tenant: str = ""
     allow_reentry: bool = False
+    # Lets the adapter answer a new turn with a bare A2A Message (a ``Reply`` first event).
+    # The task is then created lazily, on the adapter's first other event: until then it is
+    # not visible to GetTask/CancelTask and no WORKING status is sent.
+    direct_replies: bool = False
 
     @field_validator("id")
     @classmethod

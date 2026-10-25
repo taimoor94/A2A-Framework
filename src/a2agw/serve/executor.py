@@ -6,6 +6,7 @@ import asyncio
 import dataclasses
 import logging
 import time
+import uuid
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -15,7 +16,7 @@ from a2a.helpers import new_task_from_user_message, new_text_part
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.server.tasks import TaskUpdater
-from a2a.types import Message, Part, TaskState
+from a2a.types import Message, Part, Role, TaskState
 from google.protobuf.json_format import MessageToDict
 from opentelemetry import trace as otel_trace
 from opentelemetry.trace import Status as SpanStatus
@@ -31,7 +32,16 @@ from a2agw.context.call_context import (
     use_call,
     use_inbound,
 )
-from a2agw.core.events import ArtifactChunk, Done, Failed, NeedAuth, NeedInput, Status, Usage
+from a2agw.core.events import (
+    ArtifactChunk,
+    Done,
+    Failed,
+    NeedAuth,
+    NeedInput,
+    Reply,
+    Status,
+    Usage,
+)
 from a2agw.core.spi import InboundContext
 from a2agw.ops.bus import EventBus, GatewayEvent
 from a2agw.ops.telemetry import extract_parent, get_tracer
@@ -75,6 +85,10 @@ class _Run:
     last_state: int | None = None
     terminal: bool = False  # this run emitted a terminal state; later changes are ignored
     cancelled: bool = False  # cancel() claimed the task; only cancel() writes from now on
+    # direct_replies: the user message whose Task is not enqueued yet, and whether WORKING
+    # is owed once it is.
+    pending: Message | None = None
+    working_due: bool = False
     # Serializes this run's index writes with cancel()'s, so an in-flight write never lands
     # after CANCELED.
     lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
@@ -180,7 +194,22 @@ class AdapterExecutor(AgentExecutor):
             )
         )
 
+    async def _materialize(self, run: _Run) -> None:
+        """Enqueue the deferred Task (direct_replies) before the first task event."""
+        message = run.pending
+        if message is None:
+            return
+        run.pending = None
+        await run.updater.event_queue.enqueue_event(new_task_from_user_message(message))
+        await self._record(run, TaskState.TASK_STATE_SUBMITTED)
+        if run.working_due:
+            run.working_due = False
+            await self._status(run, TaskState.TASK_STATE_WORKING)
+
     async def _status(self, run: _Run, state: int, text: str | None = None) -> None:
+        if run.terminal or run.cancelled:
+            return
+        await self._materialize(run)
         if run.terminal or run.cancelled:
             return
         if state in _TERMINAL:
@@ -202,6 +231,11 @@ class AdapterExecutor(AgentExecutor):
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         message = context.message
         task_id, context_id = context.task_id, context.context_id
+        current = context.current_task
+        if current is not None and current.context_id:
+            # The SDK generates a fresh context id for a follow-up that names only the taskId;
+            # the task's own context is the one its events must carry.
+            context_id = current.context_id
         if message is None or not task_id or not context_id:  # pragma: no cover
             raise ValueError("execute() requires a message, task_id and context_id")
         principal, owner = _caller(context)
@@ -228,7 +262,9 @@ class AdapterExecutor(AgentExecutor):
         updater = run.updater
         current = context.current_task
         resumed = current is not None and current.status.state in _RESUMABLE
-        if current is None:
+        if current is None and self.spec.direct_replies:
+            run.pending = message  # the adapter may still answer with a bare Message
+        elif current is None:
             await updater.event_queue.enqueue_event(new_task_from_user_message(message))
             await self._record(run, TaskState.TASK_STATE_SUBMITTED)
         elif resumed:
@@ -331,7 +367,10 @@ class AdapterExecutor(AgentExecutor):
         ):
             try:
                 try:
-                    await self._status(run, TaskState.TASK_STATE_WORKING)
+                    if run.pending is not None:
+                        run.working_due = True  # sent with the Task, if one is created
+                    else:
+                        await self._status(run, TaskState.TASK_STATE_WORKING)
                     events = self.spec.adapter.run(inbound)
                     async for ev in events:
                         if await self._apply(run, ev):
@@ -371,6 +410,8 @@ class AdapterExecutor(AgentExecutor):
     async def _apply(self, run: _Run, ev: object) -> bool:
         """Map one adapter event onto the task. Returns True when the run should stop."""
         updater = run.updater
+        if not isinstance(ev, Reply | Usage):
+            await self._materialize(run)  # every other event belongs to a task
         match ev:
             case Status(text=text):
                 await self._status(run, TaskState.TASK_STATE_WORKING, text)
@@ -398,6 +439,22 @@ class AdapterExecutor(AgentExecutor):
                 if text is not None:
                     await updater.add_artifact([Part(text=text)], name="result")
                 await self._status(run, TaskState.TASK_STATE_COMPLETED)
+                return True
+            case Reply(text=text):
+                if run.pending is None:  # a task exists: the reply completes it
+                    await self._status(run, TaskState.TASK_STATE_COMPLETED, text)
+                    return True
+                run.pending = None
+                run.terminal = True
+                self._close(updater.task_id)
+                await updater.event_queue.enqueue_event(
+                    Message(
+                        message_id=uuid.uuid4().hex,
+                        role=Role.ROLE_AGENT,
+                        context_id=updater.context_id,
+                        parts=[new_text_part(text)],
+                    )
+                )
                 return True
             case Failed(error=error):
                 otel_trace.get_current_span().set_status(SpanStatus(StatusCode.ERROR))

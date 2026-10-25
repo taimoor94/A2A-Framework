@@ -49,4 +49,13 @@ class Failed:
     error: str
 
 
-AgentEvent = Status | ArtifactChunk | NeedInput | NeedAuth | Usage | Done | Failed
+@dataclass(frozen=True)
+class Reply:
+    """Answer with a message. As the first event of a new turn on an agent with
+    ``AgentSpec.direct_replies``, it is a bare A2A Message and no task is created; otherwise
+    it completes the task with this text as the status message."""
+
+    text: str
+
+
+AgentEvent = Status | ArtifactChunk | NeedInput | NeedAuth | Usage | Done | Failed | Reply

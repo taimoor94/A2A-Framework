@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -132,6 +133,104 @@ class _BodyLimitMiddleware:
 
 class _TooLarge(Exception):
     pass
+
+
+# A2A 1.0 section 5.4: HTTP statuses for error reasons the SDK maps differently.
+_REST_STATUS_BY_REASON = {
+    "TASK_NOT_CANCELABLE": 409,
+    "CONTENT_TYPE_NOT_SUPPORTED": 415,
+    "INVALID_AGENT_RESPONSE": 502,
+}
+_A2A_JSON = b"application/a2a+json"
+_MAX_ERROR_BODY = 64 * 1024
+
+
+def _remapped_error(body: bytes) -> tuple[int, bytes] | None:
+    """(status, body) for a REST error body whose reason maps to another status, else None."""
+    try:
+        payload = json.loads(body)
+        error = payload["error"]
+        reasons = [d.get("reason") for d in error.get("details", []) if isinstance(d, dict)]
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+    for reason in reasons:
+        status = _REST_STATUS_BY_REASON.get(reason)
+        if status is not None and error.get("code") != status:
+            error["code"] = status
+            return status, json.dumps(payload, separators=(",", ":")).encode()
+    return None
+
+
+class _RestConformance:
+    """Aligns the SDK's HTTP+JSON responses with A2A 1.0.
+
+    - Section 11.1: responses use ``Content-Type: application/json`` (the SDK labels them
+      ``application/a2a+json``).
+    - Section 5.4: ``TaskNotCancelableError`` is 409, ``ContentTypeNotSupportedError`` 415
+      and ``InvalidAgentResponseError`` 502 (the SDK sends 400, 400 and 500). The error body's
+      ``code`` field is updated to match.
+
+    Only error responses (status >= 400) with a small, non-streaming body are buffered.
+    JSON-RPC answers errors with HTTP 200 and is therefore untouched.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        start: Message | None = None
+        chunks: list[bytes] = []
+        size = 0
+
+        async def flush(status: int, headers: list[tuple[bytes, bytes]], body: bytes) -> None:
+            headers = [(k, v) for k, v in headers if k.lower() != b"content-length"]
+            headers.append((b"content-length", str(len(body)).encode()))
+            await send({**start, "status": status, "headers": headers})  # type: ignore[dict-item]
+            await send({"type": "http.response.body", "body": body})
+
+        async def conforming_send(message: Message) -> None:
+            nonlocal start, size
+            if message["type"] == "http.response.start":
+                headers = [
+                    (k, b"application/json" + v[len(_A2A_JSON) :])
+                    if k.lower() == b"content-type" and v.startswith(_A2A_JSON)
+                    else (k, v)
+                    for k, v in message.get("headers", [])
+                ]
+                message = {**message, "headers": headers}
+                ctype = {k.lower(): v for k, v in headers}.get(b"content-type", b"")
+                if message["status"] >= 400 and b"json" in ctype:
+                    start = message  # hold it until the body is known
+                    return
+                await send(message)
+                return
+            if start is None or message["type"] != "http.response.body":
+                await send(message)
+                return
+            chunks.append(message.get("body", b""))
+            size += len(chunks[-1])
+            more = message.get("more_body", False)
+            if size > _MAX_ERROR_BODY:  # too big to inspect: pass through unchanged
+                held, start = start, None
+                await send(held)
+                for chunk in chunks:
+                    await send({"type": "http.response.body", "body": chunk, "more_body": True})
+                chunks.clear()
+                if not more:
+                    await send({"type": "http.response.body", "body": b""})
+                return
+            if more:
+                return
+            body = b"".join(chunks)
+            remapped = _remapped_error(body)
+            status, body = remapped if remapped is not None else (start["status"], body)
+            await flush(status, list(start["headers"]), body)
+            start = None
+
+        await self.app(scope, receive, conforming_send)
 
 
 def _anonymous_user() -> PrincipalUser:
@@ -330,7 +429,9 @@ class AgentHost:
                 Mount(
                     f"/agents/{agent_id}",
                     app=_AgentAuthorizer(
-                        Starlette(routes=sub_routes), spec, enforce=self.auth is not None
+                        _RestConformance(Starlette(routes=sub_routes)),
+                        spec,
+                        enforce=self.auth is not None,
                     ),
                 )
             )

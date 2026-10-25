@@ -24,7 +24,7 @@ from a2a.types import (
 from google.protobuf.json_format import MessageToDict
 
 from a2agw.context.call_context import CallContext, current_call
-from a2agw.core.events import ArtifactChunk, Done, NeedInput, Status, Usage
+from a2agw.core.events import ArtifactChunk, Done, NeedInput, Reply, Status, Usage
 from a2agw.core.spi import InboundContext
 from a2agw.security.principal import Principal, PrincipalUser
 
@@ -641,3 +641,111 @@ async def test_cancel_is_bounded_when_adapter_ignores_it(make_server, caplog):
     await asyncio.wait_for(finished.wait(), timeout=1.0)
     assert await _index_state(h) == ST(TaskState.TASK_STATE_CANCELED)
     assert ST(TaskState.TASK_STATE_COMPLETED) not in _states(h)
+
+
+# -- direct message replies (A2A TCK DM-MSG-001) ------------------------------------------
+
+
+class ScriptAdapter:
+    durable_sessions = False
+
+    def __init__(self, *events) -> None:
+        self.events = events
+
+    async def run(self, ctx: InboundContext):
+        for ev in self.events:
+            yield ev
+
+
+async def test_direct_reply_returns_a_message_and_creates_no_task(make_server):
+    h = await make_server(ScriptAdapter(Reply("hello")), direct_replies=True)
+    for streaming in (True, False):
+        events = [
+            ev
+            async for ev in h.client(streaming=streaming).send_message(
+                SendMessageRequest(message=user_msg("hi"))
+            )
+        ]
+        assert [ev.WhichOneof("payload") for ev in events] == ["message"]
+        reply = events[0].message
+        assert reply.role == Role.ROLE_AGENT
+        assert [p.text for p in reply.parts] == ["hello"]
+        assert reply.task_id == "" and reply.context_id
+    rows, _ = await h.index.list(agent_id="echo")
+    assert rows == []  # no task was ever created
+
+
+async def test_direct_replies_still_run_task_flows(make_server):
+    h = await make_server(ScriptAdapter(Status("thinking"), Done(text="ok")), direct_replies=True)
+    events, task = await send(h.client(streaming=True), user_msg("hi"))
+    assert events[0].WhichOneof("payload") == "task"
+    assert task.status.state == TaskState.TASK_STATE_COMPLETED
+    seen = [
+        ST(ev.status_update.status.state)
+        for ev in events
+        if ev.WhichOneof("payload") == "status_update"
+    ]
+    assert seen[0] == "TASK_STATE_WORKING" and seen[-1] == "TASK_STATE_COMPLETED"
+    [row] = (await h.index.list(agent_id="echo"))[0]
+    assert row["state"] == "TASK_STATE_COMPLETED"
+
+
+async def test_direct_replies_task_created_for_adapter_with_no_events(make_server):
+    h = await make_server(ScriptAdapter(), direct_replies=True)
+    _, task = await send(h.client(streaming=False), user_msg("hi"))
+    assert task.status.state == TaskState.TASK_STATE_COMPLETED
+
+
+async def test_reply_without_direct_replies_completes_the_task(make_server):
+    h = await make_server(ScriptAdapter(Reply("hello")))
+    events, task = await send(h.client(streaming=False), user_msg("hi"))
+    assert events[0].WhichOneof("payload") == "task"
+    assert task.status.state == TaskState.TASK_STATE_COMPLETED
+    assert status_text(task) == "hello"
+
+
+async def test_reply_after_task_events_completes_the_task(make_server):
+    h = await make_server(ScriptAdapter(Status("working"), Reply("hello")), direct_replies=True)
+    _, task = await send(h.client(streaming=True), user_msg("hi"))
+    assert task.status.state == TaskState.TASK_STATE_COMPLETED
+    assert status_text(task) == "hello"
+
+
+async def test_direct_replies_done_with_text_creates_task_first(make_server):
+    h = await make_server(ScriptAdapter(Done(text="ok")), direct_replies=True)
+    for streaming in (True, False):
+        events, task = await send(h.client(streaming=streaming), user_msg("hi"))
+        assert events[0].WhichOneof("payload") == "task"
+        assert task.status.state == TaskState.TASK_STATE_COMPLETED
+        assert [p.text for a in task.artifacts for p in a.parts] == ["ok"]
+
+
+async def test_direct_replies_rejection_creates_task(make_server):
+    h = await make_server(ScriptAdapter(Reply("never")), direct_replies=True)
+    bad = user_msg("hi", metadata={"https://a2agw.dev/ext/call-context/v1": "garbage"})
+    _, task = await send(h.client(streaming=False), bad)
+    assert task.status.state == TaskState.TASK_STATE_REJECTED
+
+
+async def test_follow_up_without_context_id_resumes_in_task_context(make_server):
+    """A follow-up naming only the taskId stays in the task's context (TCK history tests)."""
+    seen: list[InboundContext] = []
+
+    class Asker:
+        durable_sessions = False
+
+        async def run(self, ctx: InboundContext):
+            seen.append(ctx)
+            if not ctx.resumed:
+                yield NeedInput("more?")
+            else:
+                yield Done(text="thanks")
+
+    h = await make_server(Asker())
+    client = h.client(streaming=False)
+    _, task = await send(client, user_msg("start"))
+    assert task.status.state == TaskState.TASK_STATE_INPUT_REQUIRED
+    _, task2 = await send(client, user_msg("more", task_id=task.id))
+    assert task2.status.state == TaskState.TASK_STATE_COMPLETED
+    assert task2.context_id == task.context_id
+    assert [c.context_id for c in seen] == [task.context_id, task.context_id]
