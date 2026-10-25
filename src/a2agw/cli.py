@@ -29,6 +29,7 @@ from a2agw.consult.guarded_net import fixed_tier, guarded_async_client
 from a2agw.consult.netguard import UnsafeURL, check_url
 from a2agw.consult.registry import MAX_CARD_BYTES, CardFetchError, PartnerRegistry
 from a2agw.ops.audit import ACTIONS, AuditLog, parse_since
+from a2agw.serve.host import GRACEFUL_TIMEOUT_S
 
 app = typer.Typer(help="A2A gateway: serve agents and manage partner agents.", no_args_is_help=True)
 partners_app = typer.Typer(help="Manage the partner registry.", no_args_is_help=True)
@@ -155,6 +156,12 @@ def serve(
     require_client_cert: Annotated[
         bool, typer.Option("--require-client-cert", help="mTLS: demand a client certificate")
     ] = False,
+    graceful_timeout: Annotated[
+        float,
+        typer.Option(
+            "--graceful-timeout", min=0, help="Seconds to wait for open requests on shutdown."
+        ),
+    ] = GRACEFUL_TIMEOUT_S,
 ) -> None:
     """Run the gateway (HTTPS with --ssl-certfile; identity still comes from API key or JWT)."""
     for flag, f in (
@@ -175,6 +182,7 @@ def serve(
         ssl_keyfile=ssl_keyfile,
         ssl_ca_certs=ssl_ca_certs,
         require_client_cert=require_client_cert,
+        graceful_timeout_s=graceful_timeout,
     )
 
 

@@ -77,7 +77,7 @@ ID    TIER      STATUS  HASH          PENDING
 echo  internal  active  da7686314f77
 ```
 
-Restart `a2agw serve` to load new partners. Partners are registered gateway-wide, but an agent only gets them as tools if its code builds them with `partner_tools` / `as_langchain_tools` (see below); the echo agent does not. Open `agent.py` and edit the function: it is a normal Python function.
+A running `a2agw serve` picks up the new partner after `curl -X POST -H "X-API-Key: $ADMIN_KEY" localhost:8000/a2agw/admin/partners/reload` (admin scope, audited as `partner.reload`; it re-reads `partners.yaml`, and an invalid file changes nothing), or on its next start. Partners are registered gateway-wide, but an agent only gets them as tools if its code builds them with `partner_tools` / `as_langchain_tools` (see below); the echo agent does not. Open `agent.py` and edit the function: it is a normal Python function.
 
 ```python
 from a2agw.adapters.callable import agent
@@ -113,7 +113,7 @@ host.add(booker)
 uvicorn.run(host.app(), port=8000)
 ```
 
-`host.run(port=8000)` is a shortcut for the last line. Like uvicorn and `a2agw serve`, it binds `127.0.0.1` by default; pass `host="0.0.0.0"` to accept remote connections, and configure `auth` first.
+`host.run(port=8000)` is a shortcut for the last line. Like uvicorn and `a2agw serve`, it binds `127.0.0.1` by default; pass `host="0.0.0.0"` to accept remote connections, and configure `auth` first. On SIGINT/SIGTERM both wait at most 10 s for open requests before shutting down (`host.run(graceful_timeout_s=...)`, `a2agw serve --graceful-timeout`).
 
 Events: `Status`, `ArtifactChunk`, `NeedInput`, `NeedAuth`, `Usage`, `Done`, `Failed`, `Reply`.
 
@@ -177,7 +177,7 @@ Give those tools to a tool-calling model, a LangGraph `ToolNode`, or call them d
 
 ## Security defaults
 
-- **Trust tiers.** Every partner has a tier: `internal`, `partner`, or `public`. The SSRF guard checks outbound card and endpoint URLs. Outside the `internal` tier, hostnames are resolved and private, loopback, link-local, and metadata addresses are refused. The `internal` tier skips the address checks, so use it only for agents you operate.
+- **Trust tiers.** Every partner has a tier: `internal`, `partner`, or `public`. The SSRF guard checks outbound card and endpoint URLs. Outside the `internal` tier, hostnames are resolved and private, loopback, link-local, and metadata addresses are refused. The `internal` tier skips the address checks (cloud metadata addresses excepted), so use it only for agents you operate. See [Security model: outbound connections](#security-model-outbound-connections).
 - **https.** Required for every tier except `internal`.
 - **Pinned cards and quarantine.** Endpoints come from the card you registered. If a refreshed card changes, the partner is quarantined and its old card stays in force until you approve the new one against its hash:
   ```bash
@@ -204,6 +204,16 @@ access = AgentAccess(
 )
 # attach it to an agent: @agent(id="deployer", description="...", access=access)
 ```
+
+### Security model: outbound connections
+
+Every outbound connection the gateway makes itself (partner calls, card and JWKS fetches, the inbound JWT JWKS, OAuth token requests and push webhooks) goes through a guarded client:
+
+- **DNS rebinding.** The client resolves the host itself at connect time, vets every address for the host's tier and connects only to a vetted IP address (TLS still verifies the hostname). A DNS answer that changes after the URL check cannot redirect the connection. When a host has several addresses they are raced (happy eyeballs, 250 ms apart) within one connect timeout. A refused address is permanent: the call is not retried, counts as a circuit-breaker failure and returns `unavailable` ("unsafe partner address"); a push delivery is skipped (`skipped_unsafe`).
+- **Cloud metadata.** `169.254.169.254`, `fd00:ec2::254` and `100.100.100.200` are refused on every tier, `internal` included, and with `PushSettings(allow_private=True)`.
+- **Proxies are ignored.** A proxy would resolve names itself and defeat the checks, so `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` do not apply to guarded clients; the host logs one warning at startup when any of them is set. Egress has to be allowed directly (or controlled at the network layer).
+- **Logs.** httpx/httpcore do not log the guarded clients' requests (URLs can carry credentials); other clients in your process log as you configure them.
+- **The inbound JWT JWKS** is vetted with `auth.jwt.jwks_tier` (default `internal`; set `public` for a hosted IdP to require https and a public address). Keys are cached for 5 minutes; an unknown `kid` refetches at most every 30 s.
 
 ### mTLS
 
@@ -254,6 +264,7 @@ The read-only admin API is mounted on the host:
 | `GET /a2agw/admin/partners` | Partners with tier, status, card hash, breaker state, in-flight calls |
 | `GET /a2agw/admin/tasks` | Task index; filters `agent`, `state`, `limit`, `cursor` |
 | `GET /a2agw/admin/events` | Server-sent event stream (`task.state`, `partner.call`) |
+| `POST /a2agw/admin/partners/reload` | Re-reads the partners file; returns the ids added, updated and removed |
 
 ## Configuration
 
@@ -275,6 +286,7 @@ auth:                                                # omit for no authenticatio
     issuer: https://login.example.com
     audience: a2agw
     jwks_url: https://login.example.com/.well-known/jwks.json   # or public_key_pem: |
+    jwks_tier: public                                # SSRF tier for the JWKS host (default internal)
     scopes_claim: scope
 
 agents:                                              # module:attribute, importable from this dir

@@ -463,9 +463,81 @@ def test_run_binds_localhost_by_default(monkeypatch):
     host.run()
     host.run(host="0.0.0.0", port=9000)
     assert calls == [
-        {"host": "127.0.0.1", "port": 8000},
-        {"host": "0.0.0.0", "port": 9000},
+        {"host": "127.0.0.1", "port": 8000, "timeout_graceful_shutdown": 10},
+        {"host": "0.0.0.0", "port": 9000, "timeout_graceful_shutdown": 10},
     ]
+
+
+def test_run_passes_graceful_timeout(monkeypatch):
+    import uvicorn
+
+    calls: list[dict] = []
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: calls.append(kw))
+    AgentHost("http://localhost:8000").run(graceful_timeout_s=3.5)
+    assert calls[0]["timeout_graceful_shutdown"] == 3.5
+
+
+async def _exit_signal_with_previous(sig, prev, *, loop=None):
+    """Install _on_exit_signal over ``prev`` (bound to ``loop``, default the running one) and
+    deliver ``sig`` to it; return (callback ran, exception raised by the handler)."""
+    import signal
+    from unittest import mock
+
+    from a2agw.serve import host as host_mod
+
+    ran: list[bool] = []
+    original = signal.getsignal(sig)
+    signal.signal(sig, prev)
+    raised: BaseException | None = None
+    try:
+        target = loop or asyncio.get_running_loop()
+        with mock.patch.object(host_mod.asyncio, "get_running_loop", lambda: target):
+            ctx = host_mod._on_exit_signal(lambda: ran.append(True))
+            ctx.__enter__()
+        try:
+            try:
+                signal.getsignal(sig)(sig, None)
+            except BaseException as exc:  # noqa: BLE001
+                raised = exc
+            await asyncio.sleep(0)
+        finally:
+            ctx.__exit__(None, None, None)
+    finally:
+        signal.signal(sig, original)
+    return bool(ran), raised
+
+
+@pytest.mark.parametrize("prev_name", ["SIG_DFL", "SIG_IGN"])
+async def test_exit_signal_default_sigint_raises_keyboard_interrupt(prev_name):
+    import signal
+
+    ran, raised = await _exit_signal_with_previous(signal.SIGINT, getattr(signal, prev_name))
+    assert ran
+    assert isinstance(raised, KeyboardInterrupt)
+
+
+@pytest.mark.parametrize("prev_name", ["SIG_DFL", "SIG_IGN"])
+async def test_exit_signal_default_sigterm_does_nothing_more(prev_name):
+    """SIGTERM over SIG_DFL/SIG_IGN only ends the streams: no re-raise (which would kill the
+    process before the lifespan shutdown) and no exception."""
+    import signal
+
+    ran, raised = await _exit_signal_with_previous(signal.SIGTERM, getattr(signal, prev_name))
+    assert ran and raised is None
+
+
+async def test_exit_signal_closed_loop_is_ignored():
+    """A signal arriving after the loop closed must not raise RuntimeError from the handler."""
+    import signal
+
+    seen: list[int] = []
+    closed = asyncio.new_event_loop()
+    closed.close()
+    ran, raised = await _exit_signal_with_previous(
+        signal.SIGTERM, lambda s, f: seen.append(s), loop=closed
+    )
+    assert raised is None and not ran
+    assert seen == [signal.SIGTERM]  # the previous handler still ran
 
 
 async def test_startup_failure_disposes_engine(tmp_path, monkeypatch):
@@ -490,3 +562,36 @@ async def test_startup_failure_disposes_engine(tmp_path, monkeypatch):
         await host.startup()
     assert len(disposed) == 1
     assert host.engine is None and host.client is None
+
+
+_PROXY_ENV = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
+
+
+@pytest.mark.parametrize("var", ["HTTPS_PROXY", "http_proxy", "ALL_PROXY"])
+async def test_env_proxy_warned_once_at_startup(tmp_path, monkeypatch, caplog, var):
+    import logging
+
+    for name in _PROXY_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(var, "http://user:s3cret@proxy.example:3128")
+    host = AgentHost("http://t", db_url=f"sqlite+aiosqlite:///{tmp_path / 'p.db'}", audit=False)
+    host.add(spec("alpha"))
+    with caplog.at_level(logging.WARNING, logger="a2agw.serve.host"):
+        await host.startup()
+        await host.shutdown()
+    lines = [r.getMessage() for r in caplog.records if "proxies" in r.getMessage()]
+    assert len(lines) == 1 and var in lines[0] and "ignore" in lines[0]
+    assert "s3cret" not in caplog.text and "proxy.example" not in caplog.text
+
+
+async def test_no_proxy_warning_without_env_proxies(tmp_path, monkeypatch, caplog):
+    import logging
+
+    for name in _PROXY_ENV:
+        monkeypatch.delenv(name, raising=False)
+    host = AgentHost("http://t", db_url=f"sqlite+aiosqlite:///{tmp_path / 'p.db'}", audit=False)
+    host.add(spec("alpha"))
+    with caplog.at_level(logging.WARNING, logger="a2agw.serve.host"):
+        await host.startup()
+        await host.shutdown()
+    assert "prox" not in caplog.text

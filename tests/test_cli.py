@@ -208,6 +208,10 @@ def test_serve_registers_and_runs(tmp_path, monkeypatch):
     r = run("serve", "-c", str(tmp_path / "a2agw.yaml"), "--port", "9123")
     assert r.exit_code == 0, r.output
     assert calls["port"] == 9123 and calls["host"] == "127.0.0.1"
+    assert calls["timeout_graceful_shutdown"] == 10
+    r = run("serve", "-c", str(tmp_path / "a2agw.yaml"), "--graceful-timeout", "2.5")
+    assert r.exit_code == 0, r.output
+    assert calls["timeout_graceful_shutdown"] == 2.5
     import sys
 
     sys.modules.pop("t20_serve_agent", None)

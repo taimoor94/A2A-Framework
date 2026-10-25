@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import signal
 import threading
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator
@@ -91,8 +92,11 @@ _REGISTRY_ACTIONS = {
     "disabled": "partner.disable",
     "enabled": "partner.enable",
     "updated": "partner.update",
+    "removed": "partner.remove",
 }
 _EXIT_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+# Default bound on uvicorn's wait for open requests at shutdown.
+GRACEFUL_TIMEOUT_S = 10.0
 
 
 @contextmanager
@@ -110,15 +114,18 @@ def _on_exit_signal(callback: Callable[[], None]) -> Iterator[None]:
     previous: dict[int, Any] = {sig: signal.getsignal(sig) for sig in _EXIT_SIGNALS}
 
     def handler(sig: int, frame: Any) -> None:
-        loop.call_soon_threadsafe(callback)
+        try:
+            loop.call_soon_threadsafe(callback)
+        except RuntimeError:  # the loop is already closed: nothing left to end
+            pass
         prev = previous[sig]
-        if callable(prev):
+        if prev in (None, signal.SIG_DFL, signal.SIG_IGN):
+            # No Python handler before ours: emulate the default for SIGINT
+            # (KeyboardInterrupt); for the others, ending the streams is all we do.
+            if sig == signal.SIGINT:
+                signal.default_int_handler(sig, frame)
+        elif callable(prev):
             prev(sig, frame)
-        elif prev == signal.SIG_DFL and sig == signal.SIGINT:
-            signal.default_int_handler(sig, frame)
-        elif prev == signal.SIG_DFL:
-            signal.signal(sig, signal.SIG_DFL)
-            signal.raise_signal(sig)
 
     for sig in _EXIT_SIGNALS:
         signal.signal(sig, handler)
@@ -128,6 +135,22 @@ def _on_exit_signal(callback: Callable[[], None]) -> Iterator[None]:
         for sig, prev in previous.items():
             if signal.getsignal(sig) is handler:
                 signal.signal(sig, prev)
+
+
+_PROXY_VARS = frozenset({"http_proxy", "https_proxy", "all_proxy"})
+
+
+def _warn_env_proxies() -> None:
+    """One WARNING when proxy env vars are set: guarded outbound clients connect directly
+    (a proxy would resolve names itself, defeating the address checks). Names only: proxy
+    URLs can carry credentials."""
+    names = sorted(k for k, v in os.environ.items() if k.lower() in _PROXY_VARS and v.strip())
+    if names:
+        logger.warning(
+            "%s set: guarded outbound clients (partners, cards, JWKS, OAuth, push) ignore "
+            "environment proxies and connect directly",
+            "/".join(names),
+        )
 
 
 __all__ = ["ADMIN_PREFIX", "HEALTH_PATH", "AgentHost", "AgentServedError", "RecentActivityError"]
@@ -636,6 +659,7 @@ class AgentHost:
             raise
 
     async def _startup(self) -> None:
+        _warn_env_proxies()
         push = self.push
         push_fernet = push.fernet() if push is not None else None  # fail before opening
         self.bus.reopen()
@@ -828,6 +852,14 @@ class AgentHost:
         if unknown:
             logger.warning("policy routing rules name unknown partner ids: %s", ", ".join(unknown))
 
+    def reload_partners(self) -> dict[str, list[str]]:
+        """Re-read the partners file into the running registry (``PartnerRegistry.reload``),
+        so partners added with the CLI are usable without a restart. ValueError if there is
+        no partners file or it is invalid (the registry is then unchanged)."""
+        changes = self.partners.reload()
+        self._warn_unknown_routing_partners()
+        return changes
+
     def partner_tools(self, agent_id: str, **kwargs: Any) -> list[PartnerTool]:
         """``partner_tools`` for one of this host's agents, filtered by the host's policy."""
         return partner_tools(self.partners, policy=self.policy, agent_id=agent_id, **kwargs)
@@ -910,8 +942,12 @@ class AgentHost:
         ssl_keyfile: str | None = None,
         ssl_ca_certs: str | None = None,
         require_client_cert: bool = False,
+        graceful_timeout_s: float | None = GRACEFUL_TIMEOUT_S,
     ) -> None:
         """Serve the app with uvicorn.
+
+        On shutdown uvicorn waits at most ``graceful_timeout_s`` seconds for open requests
+        (``None``: no bound) before the lifespan shutdown runs.
 
         Binds ``127.0.0.1`` (this machine only) by default. Pass ``host="0.0.0.0"`` to accept
         connections from other machines, and configure ``auth`` before doing so.
@@ -940,4 +976,10 @@ class AgentHost:
             )
         elif ssl_keyfile or ssl_ca_certs:
             raise ValueError("ssl_keyfile / ssl_ca_certs need ssl_certfile")
-        uvicorn.run(self.app(), host=host, port=port, **kwargs)
+        uvicorn.run(
+            self.app(),
+            host=host,
+            port=port,
+            timeout_graceful_shutdown=graceful_timeout_s,
+            **kwargs,
+        )

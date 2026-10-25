@@ -69,6 +69,8 @@ Action = Literal[
     "partner.disable",
     "partner.enable",
     "partner.update",
+    "partner.remove",
+    "partner.reload",
     "admin.read",
     "task.reap",
 ]

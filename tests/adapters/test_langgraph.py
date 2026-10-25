@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import types
 import uuid
 from typing import Annotated, Any, TypedDict
 
@@ -17,7 +18,7 @@ from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResu
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
-from langgraph.types import interrupt
+from langgraph.types import Command, interrupt
 
 from a2agw.adapters.langgraph import GraphAdapter
 from a2agw.core.events import ArtifactChunk, Done, Failed, NeedInput, Usage
@@ -143,6 +144,47 @@ async def test_state_read_error_with_real_saver_propagates(monkeypatch, caplog):
     with pytest.raises(SaverDown):
         await collect(adapter, ctx("postgres", resumed=True))
     assert "SaverDown" in caplog.text
+
+
+class _RemoteLike:
+    """RemoteGraph shape: ``aget_state`` and ``astream``, no ``checkpointer`` attribute."""
+
+    def __init__(self, state=None, error: Exception | None = None) -> None:
+        self.state = state
+        self.error = error
+        self.payloads: list = []
+
+    async def aget_state(self, config, *args, **kwargs):
+        if self.error is not None:
+            raise self.error
+        return self.state
+
+    async def astream(self, payload, config=None, stream_mode=None):
+        self.payloads.append(payload)
+        if isinstance(payload, Command):
+            yield "messages", (AIMessageChunk(content="resumed"), {})
+        else:
+            yield "updates", {"__interrupt__": [types.SimpleNamespace(value="which db?")]}
+
+
+async def test_remote_graph_without_checkpointer_attr_resumes():
+    """RemoteGraph has aget_state but no local checkpointer: its pending interrupt resumes."""
+    interrupt = types.SimpleNamespace(value="which db?")
+    graph = _RemoteLike(state=types.SimpleNamespace(interrupts=(interrupt,), tasks=()))
+    adapter = GraphAdapter(graph)
+    evs = await collect(adapter, ctx())
+    assert isinstance(evs[-1], NeedInput) and evs[-1].question == "which db?"
+    await collect(adapter, ctx("postgres", resumed=True))
+    assert isinstance(graph.payloads[-1], Command)
+
+
+async def test_remote_graph_state_error_propagates():
+    class RemoteDown(RuntimeError):
+        pass
+
+    adapter = GraphAdapter(_RemoteLike(error=RemoteDown("server down")))
+    with pytest.raises(RemoteDown):
+        await collect(adapter, ctx("postgres", resumed=True))
 
 
 async def test_subgraph_interrupt_maps_and_resumes():

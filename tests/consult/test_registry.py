@@ -691,3 +691,56 @@ async def test_unverified_refresh_clears_stale_pin(tmp_path, signing):
     reg3.load()
     assert reg3.get("p1").signed_key_id is None
     assert await reg3.refresh("p1") == "quarantined"  # re-pin needs approval
+
+
+# -- reload (Task 10) -------------------------------------------------------------------
+
+
+async def test_reload_adds_updates_removes_and_keeps_identity(tmp_path):
+    path = tmp_path / "partners.yaml"
+    live = PartnerRegistry(path)
+    await live.add_from_card("keep", CARD, "partner")
+    await live.add_from_card("change", CARD, "partner")
+    await live.add_from_card("gone", CARD, "partner")
+    keep = live.get("keep")
+    events: list[tuple[str, str]] = []
+    live.on_change = lambda rec, ev: events.append((rec.id, ev))
+
+    cli = PartnerRegistry(path)  # another process (the CLI) edits the file
+    cli.load()
+    await cli.add_from_card("new", CARD, "public")
+    cli.disable("change")
+    cli._records.pop("gone")
+    cli.save()
+
+    changes = live.reload()
+    assert changes == {"added": ["new"], "updated": ["change"], "removed": ["gone"]}
+    assert live.get("keep") is keep  # unchanged records keep their identity
+    assert live.get("change").status == "disabled"
+    assert live.get("new").tier == "public"
+    with pytest.raises(KeyError):
+        live.get("gone")
+    assert sorted(events) == [("change", "updated"), ("gone", "removed"), ("new", "added")]
+    assert live.reload() == {"added": [], "updated": [], "removed": []}
+
+
+async def test_reload_invalid_file_changes_nothing(tmp_path):
+    path = tmp_path / "partners.yaml"
+    live = PartnerRegistry(path)
+    await live.add_from_card("keep", CARD, "partner")
+    before = path.read_text()
+    path.write_text(before.replace("card_hash: ", "card_hash: 0", 1))  # tampered hash
+    with pytest.raises(ValueError, match="hash mismatch"):
+        live.reload()
+    assert [r.id for r in live.all()] == ["keep"]
+    path.write_text("not: a list\n")
+    with pytest.raises(ValueError):
+        live.reload()
+    assert [r.id for r in live.all()] == ["keep"]
+
+
+def test_reload_needs_a_file(tmp_path):
+    with pytest.raises(ValueError, match="no partners file"):
+        PartnerRegistry().reload()
+    reg = PartnerRegistry(tmp_path / "missing.yaml")
+    assert reg.reload() == {"added": [], "updated": [], "removed": []}

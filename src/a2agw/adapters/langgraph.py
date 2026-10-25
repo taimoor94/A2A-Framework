@@ -72,7 +72,9 @@ class GraphAdapter:
     logged. ``interrupt()`` needs a checkpointer: LangGraph 1.2 does not raise on the first
     turn without one, so the adapter yields ``Failed`` instead of ``NeedInput``. On a resumed
     turn the thread must be paused at an interrupt (checked with ``aget_state``); otherwise
-    the message is treated as a fresh follow-up and goes through ``input_mapper``.
+    the message is treated as a fresh follow-up and goes through ``input_mapper``. A graph
+    with ``aget_state`` but no ``checkpointer`` attribute (``RemoteGraph``) is assumed to
+    keep state; errors from its ``aget_state`` fail the task.
 
     Each turn replaces the "output" artifact (same artifact id, first chunk not appended). A
     turn interrupted after streaming leaves its last chunk with ``last=False``.
@@ -100,17 +102,25 @@ class GraphAdapter:
         cp = getattr(self.graph, "checkpointer", None)
         return isinstance(cp, BaseCheckpointSaver) and not isinstance(cp, InMemorySaver)
 
+    def _may_have_state(self) -> bool:
+        """True if the graph can keep thread state: a real checkpointer, or ``aget_state``
+        without a local ``checkpointer`` attribute (a ``RemoteGraph``: the state lives on the
+        server)."""
+        if not hasattr(self.graph, "checkpointer"):
+            return hasattr(self.graph, "aget_state")
+        return isinstance(self.graph.checkpointer, BaseCheckpointSaver)
+
     async def _has_pending_interrupt(self, config: dict) -> bool:
         """True if the thread is paused at an interrupt, so ``Command(resume=...)`` applies."""
         if not hasattr(self.graph, "aget_state"):
             return True  # cannot tell: assume the executor's resumed flag is right
-        if not isinstance(getattr(self.graph, "checkpointer", None), BaseCheckpointSaver):
+        if not self._may_have_state():
             return False  # no checkpointer: nothing to resume
         try:
             state = await self.graph.aget_state(config)
         except Exception as e:
-            # A real saver failed: resuming from fresh input would silently lose the paused
-            # thread, so the task fails instead.
+            # The state store (local saver or remote server) failed: resuming from fresh
+            # input would silently lose the paused thread, so the task fails instead.
             logger.error("checkpointer state read failed: %s", type(e).__name__)
             raise
         if getattr(state, "interrupts", None):
@@ -164,9 +174,7 @@ class GraphAdapter:
                         interrupted = True
                         for ev in usage():
                             yield ev
-                        if not isinstance(
-                            getattr(self.graph, "checkpointer", None), BaseCheckpointSaver
-                        ):
+                        if not self._may_have_state():
                             yield Failed(_NO_SAVER)
                         else:
                             yield NeedInput(question=_question(found[0]))

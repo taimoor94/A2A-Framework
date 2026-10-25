@@ -1,4 +1,5 @@
-"""Management API (read only, except POST /tasks/reap), mounted by AgentHost under /a2agw/admin.
+"""Management API (read only, except POST /tasks/reap and POST /partners/reload), mounted by
+AgentHost under /a2agw/admin.
 
 Every route except /healthz needs a principal with the ``a2agw:admin`` scope.
 Authentication happens in the host middleware; here we only read ``scope["user"]``.
@@ -13,6 +14,10 @@ Audit: every admitted admin request appends one ``admin.read`` event (the path c
 ``confirm=true`` it is a dry run (counts only); 409 for an agent this host serves or tasks
 changed within 10 minutes (unless ``force=true``). Every attempt is audited as ``task.reap``.
 ``/push`` reports per-agent push delivery counters (no URLs, task ids or config contents).
+``POST /partners/reload`` re-reads the partners file into the running registry (partners added
+with ``a2agw partners add`` become usable without a restart) and returns the ids added,
+updated and removed; 422 if the file is invalid (nothing changes). Audited as
+``partner.reload``.
 """
 
 from __future__ import annotations
@@ -296,6 +301,17 @@ def admin_routes(host: AgentHost) -> list[Route]:
             }
         )
 
+    async def partners_reload(request: Request) -> Response:
+        try:
+            changes = host.reload_partners()
+        except (ValueError, OSError) as exc:
+            # The message may quote the file; only its class goes out (and to the audit).
+            await audit(request, "partner.reload", "error", type(exc).__name__)
+            return JSONResponse({"error": "partners file not reloaded"}, status_code=422)
+        counts = ", ".join(f"{k} {len(v)}" for k, v in changes.items())
+        await audit(request, "partner.reload", "ok", counts)
+        return JSONResponse(changes)
+
     def route(name: str, fn: Handler, *, method: str = "GET") -> Route:
         handler = guarded(name.replace("/", "."), fn, read=method == "GET")
         return Route(f"{ADMIN_PREFIX}/{name}", handler, methods=[method])
@@ -310,6 +326,7 @@ def admin_routes(host: AgentHost) -> list[Route]:
         route("audit/verify", audit_verify),
         route("push", push),
         route("tasks/reap", tasks_reap, method="POST"),
+        route("partners/reload", partners_reload, method="POST"),
     ]
 
 

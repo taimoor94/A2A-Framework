@@ -14,6 +14,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "a2a-sdk", extra = ["http-server", "sqlite", "telemetry"] },
+    { name = "httpcore" },
     { name = "httpx" },
     { name = "opentelemetry-sdk" },
     { name = "pydantic" },
@@ -57,7 +58,8 @@ requires-dist = [
     { name = "a2a-sdk", extras = ["http-server", "sqlite", "telemetry"], specifier = ">=1.2.3,<2" },
     { name = "asyncpg", marker = "extra == 'all'", specifier = ">=0.30" },
     { name = "asyncpg", marker = "extra == 'postgres'", specifier = ">=0.30" },
-    { name = "httpx" },
+    { name = "httpcore", specifier = ">=1.0,<2" },
+    { name = "httpx", specifier = ">=0.28,<0.29" },
     { name = "langchain-core", marker = "extra == 'all'", specifier = ">=1.7" },
     { name = "langchain-core", marker = "extra == 'langchain'", specifier = ">=1.7" },
     { name = "langchain-core", marker = "extra == 'langgraph'", specifier = ">=1.7" },

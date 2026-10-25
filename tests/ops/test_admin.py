@@ -381,3 +381,55 @@ async def test_exit_signal_ends_events_stream_before_lifespan_shutdown(tmp_path)
         assert signal.getsignal(signal.SIGTERM) is uvicorn_handler  # restored
     finally:
         signal.signal(signal.SIGTERM, original)
+
+
+async def test_partners_reload_makes_cli_added_partner_usable(make, tmp_path):
+    """A partner added to the file by the CLI while the host runs is usable after
+    POST /partners/reload, by the host's already running PartnerClient (no restart)."""
+    from streaming_asgi import StreamingASGITransport
+
+    partner = AgentHost("http://p", db_url=f"sqlite+aiosqlite:///{tmp_path / 'p.db'}")
+    partner.add(spec("echo"))
+    await partner.startup()
+    outbound = httpx.AsyncClient(transport=StreamingASGITransport({"p": partner.app()}))
+    pf = tmp_path / "partners.yaml"
+    pf.write_text("partners: []\n")
+    try:
+        host, hc = await make(spec(), auth=auth(), partners_path=pf, partner_http=outbound)
+        client = host.client
+        assert (await client.consult("echo", "hi", wait_seconds=5)).reason == "unknown partner"
+
+        cli = PartnerRegistry(pf)  # `a2agw partners add`, another process
+        cli.load()
+        await cli.add_from_card("echo", MessageToDict(partner.cards["echo"]), "internal")
+
+        url = "/a2agw/admin/partners/reload"
+        assert (await hc.post(url, headers=USER)).status_code == 403
+        r = await hc.post(url, headers=ADMIN)
+        assert r.status_code == 200
+        assert r.json() == {"added": ["echo"], "updated": [], "removed": []}
+        assert host.client is client  # same running client
+        res = await client.consult("echo", "hi", wait_seconds=5)
+        assert res.state == "completed" and res.text == "echo: hi"
+
+        events = (await hc.get("/a2agw/admin/audit?action=partner.reload", headers=ADMIN)).json()
+        assert [(e["actor"], e["outcome"]) for e in events["events"]] == [("key:ops", "ok")]
+        adds = (await hc.get("/a2agw/admin/audit?action=partner.add", headers=ADMIN)).json()
+        assert [e["partner_id"] for e in adds["events"]] == ["echo"]
+
+        # An invalid file is refused and changes nothing.
+        pf_before = pf.read_text()
+        pf.write_text("partners: {}\n")
+        r = await hc.post(url, headers=ADMIN)
+        assert r.status_code == 422 and r.json() == {"error": "partners file not reloaded"}
+        assert [p.id for p in host.partners.all()] == ["echo"]
+
+        # Removing it from the file removes it from the running host.
+        assert "echo" in pf_before
+        pf.write_text("partners: []\n")
+        r = await hc.post(url, headers=ADMIN)
+        assert r.json() == {"added": [], "updated": [], "removed": ["echo"]}
+        assert (await client.consult("echo", "hi", wait_seconds=5)).reason == "unknown partner"
+    finally:
+        await outbound.aclose()
+        await partner.shutdown()

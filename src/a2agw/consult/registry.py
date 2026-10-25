@@ -369,7 +369,42 @@ class PartnerRegistry:
     def load(self) -> None:
         if self.path is None or not self.path.exists():
             return
-        data = yaml.safe_load(self.path.read_text())
+        self._records = self._read_file(self.path)
+
+    def reload(self) -> dict[str, list[str]]:
+        """Re-read the partners file (e.g. after ``a2agw partners add`` on a running host).
+
+        The whole file is validated first; if it is invalid nothing changes (ValueError).
+        Then, in one step without awaiting: new partners are added, changed records replace
+        the old ones, partners no longer in the file are removed, and unchanged records keep
+        their identity. ``on_change`` fires per partner ("added", "updated", "removed"); the
+        file is not rewritten. A ``PartnerClient`` on this registry sees the result on its
+        next call. A missing file counts as empty. Returns the ids per change."""
+        if self.path is None:
+            raise ValueError("registry has no partners file")
+        fresh = self._read_file(self.path) if self.path.exists() else {}
+        old = self._records
+        added = [i for i in fresh if i not in old]
+        removed = [i for i in old if i not in fresh]
+        updated = [
+            i
+            for i in fresh
+            if i in old and fresh[i].model_dump(mode="json") != old[i].model_dump(mode="json")
+        ]
+        keep = set(old) - set(updated)
+        self._records = {i: old[i] if i in keep else r for i, r in fresh.items()}
+        if self.on_change is not None:
+            for event, ids, source in (
+                ("added", added, self._records),
+                ("updated", updated, self._records),
+                ("removed", removed, old),
+            ):
+                for i in ids:
+                    self.on_change(source[i], event)
+        return {"added": added, "updated": updated, "removed": removed}
+
+    def _read_file(self, path: Path) -> dict[str, PartnerRecord]:
+        data = yaml.safe_load(path.read_text())
         if not isinstance(data, dict) or not isinstance(data.get("partners"), list):
             raise ValueError("partner file must be a mapping with a 'partners' list")  # noqa: TRY004
         records: dict[str, PartnerRecord] = {}
@@ -378,7 +413,7 @@ class PartnerRegistry:
             if rec.id in records:
                 raise ValueError(f"duplicate partner id in file: {rec.id!r}")
             records[rec.id] = rec
-        self._records = records
+        return records
 
     @staticmethod
     def _validate_loaded(item: Any) -> PartnerRecord:
