@@ -51,3 +51,9 @@ pythonpath = ["tests", "."]  # shared helpers (streaming_asgi) and examples/
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+ignore_missing_imports = true  # protobuf / yaml stubs
+files = ["src/a2agw/core", "src/a2agw/context"]
