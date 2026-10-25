@@ -18,8 +18,11 @@ CARD = {
     "description": "does things",
     "version": "1.0",
     "supportedInterfaces": [
-        {"url": "https://partner.example.com/rpc", "protocolBinding": "JSONRPC",
-         "protocolVersion": "1.0"}
+        {
+            "url": "https://partner.example.com/rpc",
+            "protocolBinding": "JSONRPC",
+            "protocolVersion": "1.0",
+        }
     ],
     "capabilities": {},
     "defaultInputModes": ["text/plain"],
@@ -103,9 +106,15 @@ async def test_unsafe_card_url_rejected():
 
 
 async def test_metadata_endpoint_in_card_rejected():
-    bad = variant(supportedInterfaces=[
-        {"url": "https://169.254.169.254/", "protocolBinding": "JSONRPC",
-         "protocolVersion": "1.0"}])
+    bad = variant(
+        supportedInterfaces=[
+            {
+                "url": "https://169.254.169.254/",
+                "protocolBinding": "JSONRPC",
+                "protocolVersion": "1.0",
+            }
+        ]
+    )
     reg = PartnerRegistry()
     with pytest.raises(CardFetchError, match="unsafe"):
         await reg.add_from_card("p1", bad, "public")
@@ -175,8 +184,10 @@ async def test_refresh_extension_change_quarantines():
     route = respx.get(CARD_URL).respond(200, json=CARD)
     reg = PartnerRegistry()
     await reg.add_from_url("p1", URL, "public")
-    route.respond(200, json=variant(
-        capabilities={"extensions": [{"uri": "https://evil/ext", "required": True}]}))
+    route.respond(
+        200,
+        json=variant(capabilities={"extensions": [{"uri": "https://evil/ext", "required": True}]}),
+    )
     assert await reg.refresh("p1") == "quarantined"
 
 
@@ -198,9 +209,18 @@ async def test_refresh_rechecks_endpoints():
     route = respx.get(CARD_URL).respond(200, json=CARD)
     reg = PartnerRegistry()
     await reg.add_from_url("p1", URL, "public")
-    route.respond(200, json=variant(supportedInterfaces=[
-        {"url": "https://169.254.169.254/", "protocolBinding": "JSONRPC",
-         "protocolVersion": "1.0"}]))
+    route.respond(
+        200,
+        json=variant(
+            supportedInterfaces=[
+                {
+                    "url": "https://169.254.169.254/",
+                    "protocolBinding": "JSONRPC",
+                    "protocolVersion": "1.0",
+                }
+            ]
+        ),
+    )
     with pytest.raises(CardFetchError, match="unsafe"):
         await reg.refresh("p1")
     assert reg.get("p1").status == "active" and reg.get("p1").pending_card is None

@@ -15,26 +15,12 @@ from langchain_core.runnables import Runnable
 from langchain_core.runnables.utils import AddableDict
 from langchain_core.tools import StructuredTool
 
-from a2agw.adapters._stream import stream_events
+from a2agw.adapters._stream import content_text, stream_events
 from a2agw.consult.client import PartnerClient
 from a2agw.consult.tools import UNTRUSTED_NOTE, PartnerTool, invoke
 from a2agw.core.events import AgentEvent, ArtifactChunk, Usage
 from a2agw.core.spi import InboundContext
 from a2agw.security.principal import Principal
-
-
-def _content_text(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        out = []
-        for block in content:
-            if isinstance(block, str):
-                out.append(block)
-            elif isinstance(block, dict) and block.get("type") == "text":
-                out.append(str(block.get("text", "")))
-        return "".join(out)
-    return ""
 
 
 class RunnableAdapter:
@@ -77,7 +63,7 @@ class RunnableAdapter:
                 if isinstance(chunk, str):
                     text = chunk
                 elif isinstance(chunk, BaseMessage):
-                    text = _content_text(chunk.content)
+                    text = content_text(chunk.content)
                     um = getattr(chunk, "usage_metadata", None)
                     if um:
                         saw_usage = True

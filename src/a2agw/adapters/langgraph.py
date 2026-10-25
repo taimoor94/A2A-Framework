@@ -19,9 +19,9 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
-from a2agw.adapters._stream import stream_events
-from a2agw.adapters.langchain import _content_text, as_langchain_tools
-from a2agw.core.events import AgentEvent, Done, NeedInput, Usage
+from a2agw.adapters._stream import content_text, stream_events
+from a2agw.adapters.langchain import as_langchain_tools
+from a2agw.core.events import AgentEvent, Done, Failed, NeedInput, Usage
 from a2agw.core.spi import InboundContext
 
 __all__ = ["GraphAdapter", "as_langchain_tools"]
@@ -29,6 +29,9 @@ __all__ = ["GraphAdapter", "as_langchain_tools"]
 logger = logging.getLogger(__name__)
 
 _INTERRUPT = "__interrupt__"
+_NO_SAVER = (
+    "graph called interrupt() but has no checkpointer; compile with one to use input-required"
+)
 
 
 def _default_input(ctx: InboundContext) -> dict:
@@ -48,7 +51,7 @@ def _last_ai_text(update: Any, output_key: str) -> str | None:
     items = value if isinstance(value, list | tuple) else [value]
     for msg in reversed(items):
         if isinstance(msg, AIMessage):
-            return _content_text(msg.content)
+            return content_text(msg.content)
     return None
 
 
@@ -66,8 +69,14 @@ class GraphAdapter:
 
     An ``interrupt()`` ends the turn with ``NeedInput``: the question is the interrupt value
     (a ``str``, else its JSON). With several interrupts the first is used and the rest are
-    logged. ``interrupt()`` needs a checkpointer: without one LangGraph raises, the exception
-    propagates and the task fails. ``durable_sessions`` is true only for a persistent
+    logged. ``interrupt()`` needs a checkpointer: LangGraph 1.2 does not raise on the first
+    turn without one, so the adapter yields ``Failed`` instead of ``NeedInput``. On a resumed
+    turn the thread must be paused at an interrupt (checked with ``aget_state``); otherwise
+    the message is treated as a fresh follow-up and goes through ``input_mapper``.
+
+    Each turn replaces the "output" artifact (same artifact id, first chunk not appended). A
+    turn interrupted after streaming leaves its last chunk with ``last=False``.
+    ``durable_sessions`` is true only for a persistent
     checkpointer (anything but ``InMemorySaver``), so a restarted gateway keeps
     ``input-required`` tasks; with an in-memory one they are failed on restart.
     """
@@ -91,6 +100,18 @@ class GraphAdapter:
         cp = getattr(self.graph, "checkpointer", None)
         return isinstance(cp, BaseCheckpointSaver) and not isinstance(cp, InMemorySaver)
 
+    async def _has_pending_interrupt(self, config: dict) -> bool:
+        """True if the thread is paused at an interrupt, so ``Command(resume=...)`` applies."""
+        if not hasattr(self.graph, "aget_state"):
+            return True  # cannot tell: assume the executor's resumed flag is right
+        try:
+            state = await self.graph.aget_state(config)
+        except Exception:  # noqa: BLE001  (e.g. no checkpointer: nothing to resume)
+            return False
+        if getattr(state, "interrupts", None):
+            return True
+        return any(getattr(t, "interrupts", None) for t in getattr(state, "tasks", ()) or ())
+
     async def run(self, ctx: InboundContext) -> AsyncIterator[AgentEvent]:
         tokens_in = tokens_out = 0
         saw_usage = False
@@ -103,8 +124,12 @@ class GraphAdapter:
 
         async def source() -> AsyncIterator[Any]:
             nonlocal tokens_in, tokens_out, saw_usage, streamed, final_text, interrupted
-            payload: Any = Command(resume=ctx.text) if ctx.resumed else self.input_mapper(ctx)
             config = {"configurable": {"thread_id": ctx.context_id}}
+            payload: Any = self.input_mapper(ctx)
+            if ctx.resumed and await self._has_pending_interrupt(config):
+                payload = Command(resume=ctx.text)
+            # The (mode, data) unpack below assumes ``subgraphs=False`` (the default); a
+            # subgraph interrupt still surfaces as an ``__interrupt__`` update of the parent.
             async for mode, data in self.graph.astream(
                 payload, config=config, stream_mode=["messages", "updates"]
             ):
@@ -112,16 +137,17 @@ class GraphAdapter:
                     chunk, metadata = data
                     if not isinstance(chunk, AIMessage | AIMessageChunk):
                         continue
-                    if self.stream_nodes is not None and (
-                        (metadata or {}).get("langgraph_node") not in self.stream_nodes
-                    ):
-                        continue
                     um = getattr(chunk, "usage_metadata", None)
                     if um:
                         saw_usage = True
                         tokens_in += int(um.get("input_tokens", 0) or 0)
                         tokens_out += int(um.get("output_tokens", 0) or 0)
-                    text = _content_text(chunk.content)
+                    # Usage counts every node; ``stream_nodes`` only limits streamed text.
+                    if self.stream_nodes is not None and (
+                        (metadata or {}).get("langgraph_node") not in self.stream_nodes
+                    ):
+                        continue
+                    text = content_text(chunk.content)
                     if text:
                         streamed = True
                         yield text
@@ -133,7 +159,12 @@ class GraphAdapter:
                         interrupted = True
                         for ev in usage():
                             yield ev
-                        yield NeedInput(question=_question(found[0]))
+                        if not isinstance(
+                            getattr(self.graph, "checkpointer", None), BaseCheckpointSaver
+                        ):
+                            yield Failed(_NO_SAVER)
+                        else:
+                            yield NeedInput(question=_question(found[0]))
                         return
                     for update in data.values():
                         last = _last_ai_text(update, self.output_key)

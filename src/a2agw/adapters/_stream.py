@@ -13,6 +13,21 @@ from a2agw.core.events import AgentEvent, ArtifactChunk
 EVENT_TYPES = tuple(AgentEvent.__args__)  # type: ignore[attr-defined]
 
 
+def content_text(content: Any) -> str:
+    """Text of LangChain message content (a str, or a list of str / text blocks)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for block in content:
+            if isinstance(block, str):
+                out.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                out.append(str(block.get("text", "")))
+        return "".join(out)
+    return ""
+
+
 def text_chunk(text: str, *, first: bool, last: bool) -> ArtifactChunk:
     return ArtifactChunk(
         parts=[Part(text=text)], name="output", artifact_id="output", append=not first, last=last

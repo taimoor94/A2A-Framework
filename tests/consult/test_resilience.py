@@ -159,7 +159,9 @@ async def test_retry_succeeds_and_cap():
     async def sleep(d):
         delays.append(d)
 
-    assert await with_retry(fn, attempts=4, base=1.0, cap=1.5, sleep=sleep, rand=lambda: 0.0) == "ok"
+    assert (
+        await with_retry(fn, attempts=4, base=1.0, cap=1.5, sleep=sleep, rand=lambda: 0.0) == "ok"
+    )
     assert delays == pytest.approx([0.5, 0.75, 0.75])
 
 

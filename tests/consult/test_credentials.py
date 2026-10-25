@@ -86,9 +86,12 @@ async def test_interceptor_headers_reach_httpx_request():
         return httpx.Response(500)
 
     card = AgentCard(
-        name="x", description="d", version="1",
-        supported_interfaces=[AgentInterface(
-            url="http://t/rpc", protocol_binding="JSONRPC", protocol_version="1.0")],
+        name="x",
+        description="d",
+        version="1",
+        supported_interfaces=[
+            AgentInterface(url="http://t/rpc", protocol_binding="JSONRPC", protocol_version="1.0")
+        ],
     )
     hc = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     ic = CredentialInterceptor(StaticCredentials({"p1": {"X-Key": SECRET}}), partner())

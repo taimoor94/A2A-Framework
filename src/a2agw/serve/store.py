@@ -185,9 +185,7 @@ class TaskIndex:
         async with self._engine.connect() as conn:
             return [dict(r._mapping) for r in (await conn.execute(stmt)).all()]
 
-    async def blocked_downstream(
-        self, agent_id: str, origin: str, exclude_task_id: str
-    ) -> bool:
+    async def blocked_downstream(self, agent_id: str, origin: str, exclude_task_id: str) -> bool:
         """Whether ``agent_id`` has a non-terminal task in ``origin``, other than
         ``exclude_task_id``, that is waiting on at least one non-terminal outbound partner task.
 

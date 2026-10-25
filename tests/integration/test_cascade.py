@@ -89,9 +89,7 @@ class Env:
 
     async def register(self, *ids: str) -> None:
         for i in ids:
-            await self.host.partners.add_from_card(
-                i, MessageToDict(self.host.cards[i]), "internal"
-            )
+            await self.host.partners.add_from_card(i, MessageToDict(self.host.cards[i]), "internal")
 
     async def send(self, agent_id: str, text: str, **config: Any):
         req = SendMessageRequest(message=msg(text))
@@ -249,9 +247,7 @@ async def test_restart_cancels_outbound_of_failed_inbound(env, tmp_path):
     a1 = await env(
         spec("a", Fn(a_run)), apps={"t": partner.host.app()}, partners_path=partners_path
     )
-    await a1.host.partners.add_from_card(
-        "p", MessageToDict(partner.host.cards["p"]), "internal"
-    )
+    await a1.host.partners.add_from_card("p", MessageToDict(partner.host.cards["p"]), "internal")
     assert partners_path.exists()
     events = await a1.send("a", "start", return_immediately=True)
     a_task = events[0].task.id
@@ -259,9 +255,7 @@ async def test_restart_cancels_outbound_of_failed_inbound(env, tmp_path):
     [handle] = await a1.host.handles.by_inbound(a_task)
     await a1.host.shutdown()  # the gateway goes down with the inbound task still WORKING
 
-    a2 = await env(
-        spec("a", Fn(echo)), apps={"t": partner.host.app()}, partners_path=partners_path
-    )
+    a2 = await env(spec("a", Fn(echo)), apps={"t": partner.host.app()}, partners_path=partners_path)
     report = a2.host.last_recovery
     assert report is not None
     assert report.failed == [a_task]

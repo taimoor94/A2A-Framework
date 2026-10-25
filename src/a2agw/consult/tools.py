@@ -76,10 +76,27 @@ class PartnerTool:
 # -- schemas -----------------------------------------------------------------------------
 
 _ASK_PROPS: dict[str, Any] = {
-    "message": {"type": "string", "minLength": 1, "maxLength": 65536, "description": "What to ask the partner."},
-    "task_id": {"type": "string", "maxLength": 256, "description": "Continue an existing partner task."},
-    "context_id": {"type": "string", "maxLength": 256, "description": "Continue an existing conversation."},
-    "data": {"type": "object", "x-max-json-bytes": 32768, "description": "Optional structured data to send."},
+    "message": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 65536,
+        "description": "What to ask the partner.",
+    },
+    "task_id": {
+        "type": "string",
+        "maxLength": 256,
+        "description": "Continue an existing partner task.",
+    },
+    "context_id": {
+        "type": "string",
+        "maxLength": 256,
+        "description": "Continue an existing conversation.",
+    },
+    "data": {
+        "type": "object",
+        "x-max-json-bytes": 32768,
+        "description": "Optional structured data to send.",
+    },
     "wait_seconds": {
         "type": "number",
         "minimum": 0,
@@ -115,7 +132,9 @@ def _companions() -> list[PartnerTool]:
                 "type": "array",
                 "minItems": 1,
                 "maxItems": 20,
-                "items": _schema({k: dict(v) for k, v in _HANDLE.items()}, ["partner_id", "task_id"]),
+                "items": _schema(
+                    {k: dict(v) for k, v in _HANDLE.items()}, ["partner_id", "task_id"]
+                ),
             },
             "seconds": {"type": "number", "minimum": 0, "maximum": 300, "default": 30},
         },
@@ -255,9 +274,7 @@ def partner_tools(
                     sid = s.get("id") if isinstance(s.get("id"), str) else s.get("name")
                     name = _unique(_safe_name(f"{base}__{sid}"), taken)
                     tools.append(
-                        PartnerTool(
-                            name, _describe(rec, [s]), _ask_schema(), rec.id, "consult"
-                        )
+                        PartnerTool(name, _describe(rec, [s]), _ask_schema(), rec.id, "consult")
                     )
             else:
                 tools.append(
@@ -424,7 +441,9 @@ async def _wait(
     loop = asyncio.get_running_loop()
     deadline = loop.time() + seconds
     while True:
-        results = list(await asyncio.gather(*(client.check(p, t, caller=caller) for p, t in handles)))
+        results = list(
+            await asyncio.gather(*(client.check(p, t, caller=caller) for p, t in handles))
+        )
         if any(r.state != "working" for r in results):
             return results
         remaining = deadline - loop.time()

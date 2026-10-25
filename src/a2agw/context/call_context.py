@@ -219,7 +219,9 @@ def use_call(cc: CallContext | None) -> Iterator[CallContext | None]:
 
 # Set by the inbound executor while an adapter runs, so outbound calls made by that adapter
 # (e.g. through partner tools) are linked to the inbound task and made on behalf of its caller.
-current_inbound_task: ContextVar[str | None] = ContextVar("a2agw_current_inbound_task", default=None)
+current_inbound_task: ContextVar[str | None] = ContextVar(
+    "a2agw_current_inbound_task", default=None
+)
 current_principal: ContextVar[Principal | None] = ContextVar(
     "a2agw_current_principal", default=None
 )

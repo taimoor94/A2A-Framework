@@ -20,7 +20,7 @@ from langgraph.graph.message import add_messages
 from langgraph.types import interrupt
 
 from a2agw.adapters.langgraph import GraphAdapter
-from a2agw.core.events import ArtifactChunk, Done, NeedInput, Usage
+from a2agw.core.events import ArtifactChunk, Done, Failed, NeedInput, Usage
 from a2agw.core.spi import InboundContext
 from a2agw.serve.agent import AgentSpec, SkillSpec
 from a2agw.serve.host import AgentHost
@@ -101,13 +101,42 @@ async def test_structured_interrupt_value_is_json():
     assert evs == [NeedInput(question='{"q": "which?", "n": 1}')]
 
 
-async def test_interrupt_without_checkpointer_cannot_resume():
-    # langgraph 1.2 still reports the interrupt without a checkpointer, but resuming raises
-    # (nothing was saved); the adapter lets that propagate so the task fails.
-    adapter = GraphAdapter(ask_graph(None))
-    assert await collect(adapter, ctx()) == [NeedInput(question="which db?")]
-    with pytest.raises(Exception):  # noqa: B017
-        await collect(adapter, ctx("x", resumed=True))
+async def test_interrupt_without_checkpointer_fails_fast():
+    evs = await collect(GraphAdapter(ask_graph(None)), ctx())
+    assert len(evs) == 1 and isinstance(evs[0], Failed)
+    assert "no checkpointer" in evs[0].error
+
+
+async def test_resume_on_completed_thread_runs_as_fresh_input():
+    adapter = GraphAdapter(echo_graph(InMemorySaver()))
+    await collect(adapter, ctx("one"))
+    evs = await collect(adapter, ctx("two", resumed=True))
+    assert "".join(text_of(e) for e in evs if isinstance(e, ArtifactChunk)) == "echo:two"
+
+
+async def test_resume_with_no_checkpoint_runs_as_fresh_input():
+    evs = await collect(
+        GraphAdapter(echo_graph(InMemorySaver())), ctx("hello", resumed=True, context_id="new")
+    )
+    assert "".join(text_of(e) for e in evs if isinstance(e, ArtifactChunk)) == "echo:hello"
+
+
+async def test_subgraph_interrupt_maps_and_resumes():
+    sub = ask_graph(None)  # inherits the parent's checkpointer
+    g = StateGraph(State)
+    g.add_node("sub", sub)
+    g.add_edge(START, "sub")
+    adapter = GraphAdapter(g.compile(checkpointer=InMemorySaver()))
+    assert await collect(adapter, ctx("go")) == [NeedInput(question="which db?")]
+    evs = await collect(adapter, ctx("pg", resumed=True))
+    assert "using pg" in "".join(text_of(e) for e in evs if isinstance(e, ArtifactChunk))
+
+
+async def test_usage_counts_nodes_excluded_by_stream_nodes():
+    graph = llm_graph(UsageModel())
+    evs = await collect(GraphAdapter(graph, stream_nodes={"nowhere"}), ctx())
+    assert not any(isinstance(e, ArtifactChunk) for e in evs)
+    assert Usage(tokens_in=5, tokens_out=2) in evs
 
 
 async def test_custom_input_mapper_and_thread_id():

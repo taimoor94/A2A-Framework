@@ -640,7 +640,9 @@ class PartnerClient:
         Runs in its own task, bounded by ``CANCEL_CLEANUP_S``, so the caller's cancellation
         cannot interrupt it; never raises (the caller re-raises its CancelledError)."""
         work = asyncio.create_task(
-            self._cancel_orphans(partner_id, client, track, generated_context, inbound_task_id, origin)
+            self._cancel_orphans(
+                partner_id, client, track, generated_context, inbound_task_id, origin
+            )
         )
         self._cleanups.add(work)
         work.add_done_callback(self._cleanups.discard)
@@ -684,7 +686,9 @@ class PartnerClient:
                     task = await self._fetch(client, tid, CANCEL_CLEANUP_S, cancel=True)
                     state = TaskState.Name(task.status.state)
                 except Exception:  # noqa: BLE001 - best effort; the handle stays non-terminal
-                    logger.warning("cancel of partner %s task after cancelled call failed", partner_id)
+                    logger.warning(
+                        "cancel of partner %s task after cancelled call failed", partner_id
+                    )
                     state = TaskState.Name(TaskState.TASK_STATE_WORKING)
                 if self.handles is not None:
                     await self.handles.record(

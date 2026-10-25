@@ -110,9 +110,10 @@ class PartnerRegistry:
 
     async def _fetch_with(self, client: httpx.AsyncClient, url: str) -> dict[str, Any]:
         try:
-            async with asyncio.timeout(FETCH_TIMEOUT_S), client.stream(
-                "GET", url, follow_redirects=False, timeout=FETCH_TIMEOUT_S
-            ) as resp:
+            async with (
+                asyncio.timeout(FETCH_TIMEOUT_S),
+                client.stream("GET", url, follow_redirects=False, timeout=FETCH_TIMEOUT_S) as resp,
+            ):
                 if 300 <= resp.status_code < 400:
                     raise CardFetchError("redirects are not followed")
                 if resp.status_code != 200:
