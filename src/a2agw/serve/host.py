@@ -44,6 +44,7 @@ from a2agw.security.auth import (
     authorize,
     on_auth_error,
 )
+from a2agw.security.cardsign import CardSigner
 from a2agw.security.principal import Principal, PrincipalUser
 from a2agw.serve.agent import AgentSpec, build_card
 from a2agw.serve.executor import AdapterExecutor
@@ -390,8 +391,11 @@ class AgentHost:
         partner_http: httpx.AsyncClient | None = None,
         default_deadline_s: float = 60.0,
         card_cache_control: str | None = "public, max-age=300",
+        card_signer: CardSigner | None = None,
     ) -> None:
         self.base_url = base_url
+        # Signs every card built at startup (per-agent and the single-agent root card).
+        self.card_signer = card_signer
         # Cache-Control on every agent card response (A2A 1.0 section 8.6.1); None omits it.
         self.card_cache_control = card_cache_control
         self.auth = auth
@@ -473,6 +477,8 @@ class AgentHost:
             # Cancelling an inbound task cancels the partner tasks it started.
             executor.on_cancel = client.cancel_for_inbound
             card = build_card(spec, self.base_url, security=self.auth)
+            if self.card_signer is not None:
+                card = self.card_signer.sign(card)
             handler = LimitedRequestHandler(
                 agent_executor=executor,
                 task_store=store,

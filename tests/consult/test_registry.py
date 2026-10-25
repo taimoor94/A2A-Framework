@@ -412,3 +412,183 @@ async def test_enable_reactivates_disabled_only():
     assert events[-1] == "enabled"
     with pytest.raises(KeyError):
         reg.enable("nope")
+
+
+# -- signed cards ------------------------------------------------------------
+
+
+def _keypair(tmp_path, name):
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    priv = tmp_path / f"{name}.pem"
+    priv.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+    pub = tmp_path / f"{name}.pub.pem"
+    pub.write_bytes(
+        key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+    )
+    return priv, pub
+
+
+@pytest.fixture
+def signing(tmp_path):
+    """Two trusted EC keys (k1, k2) and one untrusted key (kx)."""
+    from a2a.client.card_resolver import parse_agent_card
+    from google.protobuf.json_format import MessageToDict
+
+    from a2agw.security.cardsign import CardSigner, CardVerifier, load_public_key
+
+    pairs = {kid: _keypair(tmp_path, kid) for kid in ("k1", "k2", "kx")}
+    verifier = CardVerifier({kid: load_public_key(pairs[kid][1]) for kid in ("k1", "k2")})
+
+    def sign(card, kid="k1"):
+        signed = CardSigner(pairs[kid][0], kid, "ES256").sign(parse_agent_card(copy.deepcopy(card)))
+        return MessageToDict(signed)
+
+    return verifier, sign
+
+
+def signed_registry(verifier, path=None):
+    return PartnerRegistry(path, verifier=verifier, require_signed=frozenset({"public"}))
+
+
+def test_require_signed_needs_verifier():
+    with pytest.raises(ValueError, match="verifier"):
+        PartnerRegistry(require_signed=frozenset({"public"}))
+
+
+@respx.mock
+async def test_registry_requires_signature_for_public_tier(signing):
+    verifier, sign = signing
+    reg = signed_registry(verifier)
+    with pytest.raises(CardFetchError, match="card signature invalid"):
+        await reg.add_from_card("p1", CARD, "public")
+    with pytest.raises(CardFetchError, match="card signature invalid"):
+        await reg.add_from_card("p1", sign(CARD, "kx"), "public")
+    tampered = sign(CARD)
+    tampered["description"] = "evil"
+    with pytest.raises(CardFetchError, match="card signature invalid"):
+        await reg.add_from_card("p1", tampered, "public")
+    assert reg.all() == []
+    rec = await reg.add_from_card("p1", sign(CARD), "public")
+    assert rec.signed_kid == "k1" and rec.status == "active"
+    # Tiers outside require_signed are not verified.
+    assert (await reg.add_from_card("p2", CARD, "partner")).signed_kid is None
+    respx.get(CARD_URL).respond(200, json=sign(CARD, "k2"))
+    assert (await reg.add_from_url("p3", URL, "public")).signed_kid == "k2"
+
+
+@respx.mock
+async def test_refresh_with_new_kid_quarantines(signing):
+    verifier, sign = signing
+    route = respx.get(CARD_URL).respond(200, json=sign(CARD))
+    reg = signed_registry(verifier)
+    events = []
+    reg.on_change = lambda r, e: events.append(e)
+    await reg.add_from_url("p1", URL, "public")
+    # Same content, same kid (ECDSA signatures differ each time): not a change.
+    route.respond(200, json=sign(CARD))
+    assert await reg.refresh("p1") == "unchanged"
+    assert reg.get("p1").status == "active"
+    # Same content signed with a different (trusted) key: quarantine.
+    route.respond(200, json=sign(CARD, "k2"))
+    assert await reg.refresh("p1") == "quarantined"
+    rec = reg.get("p1")
+    assert rec.status == "quarantined" and rec.signed_kid == "k1"
+    assert rec.pending_kid == "k2" and rec.pending_card is not None
+    assert events[-1] == "quarantined"
+    reg.approve("p1", card_hash(rec.pending_card))
+    assert rec.status == "active" and rec.signed_kid == "k2"
+    assert rec.pending_kid is None and rec.pending_card is None
+    assert await reg.refresh("p1") == "unchanged"
+    assert rec.status == "active"
+
+
+@respx.mock
+async def test_refresh_with_bad_signature_quarantines(signing):
+    verifier, sign = signing
+    route = respx.get(CARD_URL).respond(200, json=sign(CARD))
+    reg = signed_registry(verifier)
+    await reg.add_from_url("p1", URL, "public")
+    for bad in (CARD, sign(CARD, "kx")):
+        route.respond(200, json=bad)
+        assert await reg.refresh("p1") == "quarantined"
+        rec = reg.get("p1")
+        assert rec.status == "quarantined" and rec.signed_kid == "k1"
+        # An unverified card is never staged for approval.
+        assert rec.pending_card is None and rec.pending_kid is None
+    # A good signature with the known key and the approved content lifts the quarantine.
+    route.respond(200, json=sign(CARD))
+    assert await reg.refresh("p1") == "unchanged"
+    assert reg.get("p1").status == "active"
+
+
+async def test_signed_kid_persists(tmp_path, signing):
+    verifier, sign = signing
+    p = tmp_path / "partners.yaml"
+    reg = signed_registry(verifier, p)
+    await reg.add_from_card("p1", sign(CARD), "public")
+    reg2 = signed_registry(verifier, p)
+    reg2.load()
+    assert reg2.get("p1").signed_kid == "k1"
+    assert reg2.get("p1") == reg.get("p1")
+
+
+def test_load_phase1_yaml_without_signed_kid(tmp_path):
+    from google.protobuf.json_format import MessageToDict
+
+    from a2agw.consult.registry import _normalize
+
+    card = MessageToDict(_normalize(CARD)[1])
+    p = tmp_path / "partners.yaml"
+    # Exactly the field set a Phase 1 registry wrote.
+    _write(
+        p,
+        [
+            {
+                "id": "p1",
+                "card_url": URL,
+                "card": card,
+                "card_hash": card_hash(card),
+                "tier": "public",
+                "status": "quarantined",
+                "credential_ref": None,
+                "tags": [],
+                "fetched_at": 1.0,
+                "ttl_s": 3600,
+                "pending_card": card,
+            }
+        ],
+    )
+    reg = PartnerRegistry(p)
+    reg.load()
+    rec = reg.get("p1")
+    assert rec.signed_kid is None and rec.pending_kid is None
+    assert rec.status == "quarantined"
+
+
+@respx.mock
+async def test_verifier_crash_fails_closed(signing):
+    verifier, sign = signing
+    route = respx.get(CARD_URL).respond(200, json=sign(CARD))
+    reg = signed_registry(verifier)
+    await reg.add_from_url("p1", URL, "public")
+
+    async def boom(card):
+        raise RuntimeError("bug")
+
+    verifier.verify = boom
+    with pytest.raises(CardFetchError, match="card signature invalid"):
+        await reg.add_from_card("p2", sign(CARD), "public")
+    route.respond(200, json=sign(CARD))
+    assert await reg.refresh("p1") == "quarantined"
+    assert reg.get("p1").pending_card is None

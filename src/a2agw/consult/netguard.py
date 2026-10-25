@@ -21,6 +21,10 @@ class UnsafeURL(ValueError):
     """The URL is not allowed for the given tier. The reason never contains resolved IPs."""
 
 
+class FetchError(Exception):
+    """A guarded GET failed. The reason never contains the response body."""
+
+
 async def _resolve(host: str) -> list[str]:
     """Resolve host to address strings. Raises OSError when unresolvable."""
     loop = asyncio.get_running_loop()
@@ -85,3 +89,48 @@ async def check_url(url: str, tier: Tier) -> None:
             raise UnsafeURL("host could not be resolved")
     if not all(_is_public(a) for a in addrs):
         raise UnsafeURL("host resolves to a non-public address")
+
+
+def _size_label(n: int) -> str:
+    mib = 1024 * 1024
+    return f"{n // mib} MiB" if n % mib == 0 else f"{n} bytes"
+
+
+async def _safe_get(
+    url: str,
+    tier: Tier,
+    *,
+    max_bytes: int,
+    deadline_s: float,
+    http: httpx.AsyncClient | None = None,
+) -> bytes:
+    """GET `url` after the SSRF check for `tier`: no redirects, a body cap and one total deadline.
+
+    The deadline covers the DNS check, the connection and the whole body. Raises UnsafeURL
+    when the URL is refused and FetchError for every other failure."""
+    try:
+        async with asyncio.timeout(deadline_s):
+            await check_url(url, tier)
+            if http is not None:
+                return await _get_capped(http, url, max_bytes, deadline_s)
+            async with httpx.AsyncClient(follow_redirects=False, timeout=deadline_s) as c:
+                return await _get_capped(c, url, max_bytes, deadline_s)
+    except TimeoutError:
+        raise FetchError("timed out") from None
+
+
+async def _get_capped(client: httpx.AsyncClient, url: str, max_bytes: int, timeout: float) -> bytes:
+    try:
+        async with client.stream("GET", url, follow_redirects=False, timeout=timeout) as resp:
+            if 300 <= resp.status_code < 400:
+                raise FetchError("redirects are not followed")
+            if resp.status_code != 200:
+                raise FetchError(f"unexpected status {resp.status_code}")
+            buf = bytearray()
+            async for chunk in resp.aiter_bytes():
+                buf.extend(chunk)
+                if len(buf) > max_bytes:
+                    raise FetchError(f"response exceeds {_size_label(max_bytes)}")
+    except httpx.HTTPError as e:
+        raise FetchError(f"request failed: {type(e).__name__}") from None
+    return bytes(buf)
