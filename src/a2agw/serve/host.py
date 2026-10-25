@@ -513,7 +513,12 @@ class AgentHost:
         self._app = app
         return app
 
-    def run(self, host: str = "0.0.0.0", port: int = 8000) -> None:
+    def run(self, host: str = "127.0.0.1", port: int = 8000) -> None:
+        """Serve the app with uvicorn.
+
+        Binds ``127.0.0.1`` (this machine only) by default. Pass ``host="0.0.0.0"`` to accept
+        connections from other machines, and configure ``auth`` before doing so.
+        """
         import uvicorn
 
         uvicorn.run(self.app(), host=host, port=port)

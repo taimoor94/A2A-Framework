@@ -111,6 +111,8 @@ host.add(booker)
 uvicorn.run(host.app(), port=8000)
 ```
 
+`host.run(port=8000)` is a shortcut for the last line. Like uvicorn and `a2agw serve`, it binds `127.0.0.1` by default; pass `host="0.0.0.0"` to accept remote connections, and configure `auth` first.
+
 Events: `Status`, `ArtifactChunk`, `NeedInput`, `NeedAuth`, `Usage`, `Done`, `Failed`, `Reply`.
 
 ### A LangGraph agent

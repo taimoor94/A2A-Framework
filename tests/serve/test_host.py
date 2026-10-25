@@ -449,3 +449,18 @@ async def test_partners_path_accepts_str(tmp_path):
     )
     host.partners.load()  # raised AttributeError when the str was passed through
     assert host.partners.all() == []
+
+
+def test_run_binds_localhost_by_default(monkeypatch):
+    """Finding 3: AgentHost.run() must not expose the host on every interface by default."""
+    import uvicorn
+
+    calls: list[dict] = []
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: calls.append(kw))
+    host = AgentHost("http://localhost:8000")
+    host.run()
+    host.run(host="0.0.0.0", port=9000)
+    assert calls == [
+        {"host": "127.0.0.1", "port": 8000},
+        {"host": "0.0.0.0", "port": 9000},
+    ]

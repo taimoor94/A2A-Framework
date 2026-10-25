@@ -104,10 +104,15 @@ class GraphAdapter:
         """True if the thread is paused at an interrupt, so ``Command(resume=...)`` applies."""
         if not hasattr(self.graph, "aget_state"):
             return True  # cannot tell: assume the executor's resumed flag is right
+        if not isinstance(getattr(self.graph, "checkpointer", None), BaseCheckpointSaver):
+            return False  # no checkpointer: nothing to resume
         try:
             state = await self.graph.aget_state(config)
-        except Exception:  # noqa: BLE001  (e.g. no checkpointer: nothing to resume)
-            return False
+        except Exception as e:
+            # A real saver failed: resuming from fresh input would silently lose the paused
+            # thread, so the task fails instead.
+            logger.error("checkpointer state read failed: %s", type(e).__name__)
+            raise
         if getattr(state, "interrupts", None):
             return True
         return any(getattr(t, "interrupts", None) for t in getattr(state, "tasks", ()) or ())

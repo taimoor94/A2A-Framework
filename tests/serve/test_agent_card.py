@@ -111,3 +111,51 @@ def test_empty_skills_rejected():
 def test_empty_name_rejected():
     with pytest.raises(ValidationError):
         _spec(name="")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"skills": [SkillSpec(id="s", name="S", description="d")], "input_modes": []},
+        {"output_modes": []},
+        {"version": ""},
+        {"provider": ("", "https://acme.example")},
+        {"provider": ("Acme", "")},
+    ],
+)
+def test_spec_fields_required_by_card_rejected_when_empty(bad):
+    """Finding 5: an empty value for a field the card marks REQUIRED is refused up front."""
+    with pytest.raises(ValidationError):
+        _spec(**bad)
+
+
+@pytest.mark.parametrize("field", ["id", "name", "description"])
+def test_empty_skill_field_rejected(field):
+    kw = {"id": "s", "name": "S", "description": "d", field: ""}
+    with pytest.raises(ValidationError):
+        SkillSpec(**kw)
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        {},
+        {"provider": None},
+        {"skills": [SkillSpec(id="x", name="X", description="d")]},
+        {"input_modes": ["text/plain"], "output_modes": ["application/json"]},
+        {"tenant": "t1", "streaming": False},
+    ],
+)
+@pytest.mark.parametrize(
+    "security",
+    [
+        None,
+        AuthConfig(api_keys={"a" * 64: ApiKeyEntry(principal_id="ci")}),
+    ],
+)
+def test_built_card_always_passes_sdk_validation(variant, security):
+    from a2a.utils.proto_utils import validate_proto_required_fields
+
+    card = build_card(_spec(**variant), "https://gw.example", security=security)
+    validate_proto_required_fields(card)
+    validate_proto_required_fields(parse_agent_card(MessageToDict(card)))

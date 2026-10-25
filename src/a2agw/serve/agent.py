@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from typing import Annotated
 
 from a2a.types import (
     AgentCapabilities,
@@ -24,15 +25,18 @@ from a2agw.security.auth import AgentAccess, AuthConfig
 
 _AGENT_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 
+# Fields the A2A card marks REQUIRED: an empty value would make every built card invalid.
+_NonEmpty = Annotated[str, Field(min_length=1)]
+
 
 def _default_modes() -> list[str]:
     return ["text/plain", "application/json"]
 
 
 class SkillSpec(BaseModel):
-    id: str
-    name: str
-    description: str
+    id: _NonEmpty
+    name: _NonEmpty
+    description: _NonEmpty
     tags: list[str] = Field(default_factory=list)
     examples: list[str] = Field(default_factory=list)
     # None = inherit the agent's default modes.
@@ -46,13 +50,13 @@ class AgentSpec(BaseModel):
     id: str
     name: str = Field(min_length=1)
     description: str = Field(min_length=1)
-    version: str = "0.1.0"
+    version: _NonEmpty = "0.1.0"
     skills: list[SkillSpec] = Field(min_length=1)
     adapter: InboundAdapter
-    provider: tuple[str, str] | None = None  # (organization, url)
+    provider: tuple[_NonEmpty, _NonEmpty] | None = None  # (organization, url)
     access: AgentAccess = Field(default_factory=AgentAccess)
-    input_modes: list[str] = Field(default_factory=_default_modes)
-    output_modes: list[str] = Field(default_factory=_default_modes)
+    input_modes: list[str] = Field(default_factory=_default_modes, min_length=1)
+    output_modes: list[str] = Field(default_factory=_default_modes, min_length=1)
     streaming: bool = True
     tenant: str = ""
     allow_reentry: bool = False

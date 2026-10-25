@@ -121,6 +121,30 @@ async def test_resume_with_no_checkpoint_runs_as_fresh_input():
     assert "".join(text_of(e) for e in evs if isinstance(e, ArtifactChunk)) == "echo:hello"
 
 
+async def test_resume_without_checkpointer_runs_as_fresh_input():
+    evs = await collect(GraphAdapter(echo_graph(None)), ctx("hello", resumed=True))
+    assert "".join(text_of(e) for e in evs if isinstance(e, ArtifactChunk)) == "echo:hello"
+
+
+async def test_state_read_error_with_real_saver_propagates(monkeypatch, caplog):
+    """Finding 4: a failing checkpointer read must fail the task, not silently restart the
+    paused thread from fresh input."""
+    graph = ask_graph(InMemorySaver())
+    adapter = GraphAdapter(graph)
+    await collect(adapter, ctx())  # paused at the interrupt
+
+    class SaverDown(RuntimeError):
+        pass
+
+    async def broken(config, *args, **kwargs):
+        raise SaverDown("db unavailable")
+
+    monkeypatch.setattr(graph, "aget_state", broken)
+    with pytest.raises(SaverDown):
+        await collect(adapter, ctx("postgres", resumed=True))
+    assert "SaverDown" in caplog.text
+
+
 async def test_subgraph_interrupt_maps_and_resumes():
     sub = ask_graph(None)  # inherits the parent's checkpointer
     g = StateGraph(State)
