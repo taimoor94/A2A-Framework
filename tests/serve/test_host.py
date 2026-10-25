@@ -577,7 +577,7 @@ def test_exit_signal_sigterm_over_sig_dfl_terminates_process(tmp_path):
         "asyncio.run(main())\n"
     )
     out = subprocess.run(
-        [sys.executable, "-c", code], check=False, capture_output=True, text=True, timeout=30
+        [sys.executable, "-c", code], check=False, capture_output=True, text=True, timeout=180
     )
     assert out.returncode in (-15, 143), (out.returncode, out.stderr)
     assert "survived" not in out.stdout

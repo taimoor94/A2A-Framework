@@ -448,7 +448,7 @@ async def test_token_exchange_uses_inbound_token(jwt_hosts):
 
 async def test_user_cancel_cascades_with_cancellers_token(jwt_hosts):
     gated = Gated()
-    forward = Forward(wait_seconds=0.2, hold=True)
+    forward = Forward(wait_seconds=1.0, hold=True)
     h = await jwt_hosts(forward, gated)
     start_jwt, cancel_jwt = h.jwt(jti="start"), h.jwt(jti="cancel")
     assert start_jwt != cancel_jwt

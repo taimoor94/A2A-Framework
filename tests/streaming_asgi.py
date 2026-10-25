@@ -1,4 +1,7 @@
-"""Test helper: an httpx transport that routes by host to ASGI apps and really streams."""
+"""Test helper: an httpx transport that routes by host to ASGI apps and really streams.
+
+An app that raises ``ConnectionError`` after it started its response breaks the body stream
+the way a dropped connection does (``httpx.RemoteProtocolError``)."""
 
 from __future__ import annotations
 
@@ -19,6 +22,10 @@ class _Body(httpx.AsyncByteStream):
             chunk = await self._queue.get()
             if chunk is None:
                 return
+            if isinstance(chunk, BaseException):  # the app failed mid-body: a broken stream
+                raise httpx.RemoteProtocolError(
+                    "peer closed connection without sending complete message body"
+                )
             if chunk:
                 yield chunk
 
@@ -85,6 +92,8 @@ class StreamingASGITransport(httpx.AsyncBaseTransport):
             except BaseException as e:  # noqa: BLE001
                 if not started.done():
                     started.set_exception(e if isinstance(e, Exception) else RuntimeError())
+                elif isinstance(e, ConnectionError) and not disconnected.is_set():
+                    queue.put_nowait(e)  # the server dropped the connection mid-response
             finally:
                 queue.put_nowait(None)
 

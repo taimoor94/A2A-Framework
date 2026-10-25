@@ -109,9 +109,9 @@ def test_over_bound_input_fails_closed():
 def test_huge_data_stops_serialising_early():
     clf = RegexPiiClassifier()
     big = {"items": ["x" * 1024] * 50_000}  # ~50 MB if fully serialised
-    start = time.perf_counter()
+    start = time.process_time()  # CPU time: unaffected by other processes on the machine
     assert clf.classify("", big) is C.CONFIDENTIAL
-    assert time.perf_counter() - start < 0.5
+    assert time.process_time() - start < 0.5
 
 
 def test_circular_data_raises():
@@ -197,6 +197,6 @@ def test_timestamps_and_snowflakes_not_flagged():
 def test_adversarial_input_is_fast(unit):
     text = (unit * (256 * 1024 // len(unit) + 1))[: 256 * 1024]
     clf = RegexPiiClassifier()
-    start = time.perf_counter()
+    start = time.process_time()  # CPU time: unaffected by other processes on the machine
     clf.classify(text, {"t": text[: 200 * 1024]})
-    assert time.perf_counter() - start < 0.5
+    assert time.process_time() - start < 0.5

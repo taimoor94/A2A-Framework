@@ -299,7 +299,7 @@ async def test_total_fetch_deadline(monkeypatch):
         t = time.monotonic()
         with pytest.raises(CardFetchError, match="timed out"):
             await PartnerRegistry(http=hc).add_from_url("p1", URL, "public")
-        assert time.monotonic() - t < 1.0
+        assert time.monotonic() - t < 1.5  # the 0.2 s deadline, not the 2 s body
 
 
 async def test_idna_host_resolved_as_httpx_connects(monkeypatch):

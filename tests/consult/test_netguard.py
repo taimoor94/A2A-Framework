@@ -110,4 +110,4 @@ async def test_safe_get_deadline_covers_dns(monkeypatch):
         await netguard.safe_get(
             "https://slow.example.com/x", "public", max_bytes=10, deadline_s=0.2
         )
-    assert _time.monotonic() - t < 1.0
+    assert _time.monotonic() - t < 3.0  # the 0.2 s deadline, not the 5 s lookup

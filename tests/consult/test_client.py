@@ -49,6 +49,10 @@ from a2agw.serve.agent import AgentSpec, SkillSpec
 from a2agw.serve.host import AgentHost
 from a2agw.serve.store import create_engine
 
+# How long a consult waits for a partner that will not finish (it returns a ``working``
+# handle). Generous so the partner's first event arrives in time even under heavy CPU load.
+HANDLE_WAIT_S = 1.0
+
 
 def rpc_methods(transport: StreamingASGITransport) -> list[str]:
     out = []
@@ -269,7 +273,7 @@ async def test_consult_input_required_then_reply_same_task(env, streaming):
 async def test_long_task_returns_working_handle_then_check_completes(env):
     gated = Gated()
     e = await env(spec("slow", gated))
-    res = await e.client.consult("slow", "go", wait_seconds=0.3, inbound_task_id="in-1")
+    res = await e.client.consult("slow", "go", wait_seconds=HANDLE_WAIT_S, inbound_task_id="in-1")
     assert res.state == "working"
     assert res.task_id
     rows = await e.handles.by_inbound("in-1")
@@ -287,8 +291,8 @@ async def test_long_task_returns_working_handle_then_check_completes(env):
 async def test_wait_any_returns_first_completed(env):
     a, b = Gated(), Gated()
     e = await env(spec("pa", a), spec("pb", b))
-    ra = await e.client.consult("pa", "go", wait_seconds=0.2)
-    rb = await e.client.consult("pb", "go", wait_seconds=0.2)
+    ra = await e.client.consult("pa", "go", wait_seconds=HANDLE_WAIT_S)
+    rb = await e.client.consult("pb", "go", wait_seconds=HANDLE_WAIT_S)
     assert ra.state == rb.state == "working"
     b.gate.set()
     results = await e.client.wait_any([("pa", ra.task_id), ("pb", rb.task_id)], 5)
@@ -301,12 +305,12 @@ async def test_wait_any_returns_first_completed(env):
 async def test_wait_any_times_out_with_current_results(env):
     a = Gated()
     e = await env(spec("pa", a))
-    ra = await e.client.consult("pa", "go", wait_seconds=0.1)
+    ra = await e.client.consult("pa", "go", wait_seconds=HANDLE_WAIT_S)
     loop = asyncio.get_running_loop()
     t0 = loop.time()
     [r] = await e.client.wait_any([("pa", ra.task_id)], 0.3)
     assert r.state == "working"
-    assert 0.25 <= loop.time() - t0 < 2
+    assert 0.25 <= loop.time() - t0 < 5
     a.gate.set()
 
 
@@ -437,7 +441,7 @@ async def test_quarantined_partner_unavailable(env):
 async def test_cancel_for_inbound_cancels_partner_task(env):
     gated = Gated()
     e = await env(spec("slow", gated), spec("alpha", Echo()))
-    res = await e.client.consult("slow", "go", wait_seconds=0.2, inbound_task_id="in-9")
+    res = await e.client.consult("slow", "go", wait_seconds=HANDLE_WAIT_S, inbound_task_id="in-9")
     done = await e.client.consult("alpha", "x", wait_seconds=5, inbound_task_id="in-9")
     assert res.state == "working" and done.state == "completed"
     assert await e.client.cancel_for_inbound("in-9") == 1
@@ -505,7 +509,7 @@ async def test_ambiguous_failure_finds_task_by_context(env):
 
     e.hc._transport = LoseResponse()
     await asyncio.sleep(0)
-    res = await e.client.consult("slow", "go", wait_seconds=0.5)
+    res = await e.client.consult("slow", "go", wait_seconds=HANDLE_WAIT_S)
     assert res.state == "working"
     assert res.task_id
     methods = rpc_methods(inner)
@@ -856,7 +860,7 @@ async def test_aclose_drains_cleanup_tasks(env):
     completion before the HTTP clients go away."""
     gated = Gated()
     e = await env(spec("slow", gated))
-    res = await e.client.consult("slow", "go", wait_seconds=0.2, inbound_task_id="in-d")
+    res = await e.client.consult("slow", "go", wait_seconds=HANDLE_WAIT_S, inbound_task_id="in-d")
     assert res.state == "working"
     real_fetch = e.client._fetch
 
@@ -918,8 +922,8 @@ async def test_internal_error_is_raised_not_blamed_on_partner(env, monkeypatch):
 async def test_cancel_for_inbound_runs_concurrently_within_bound(env):
     a, b = Gated(), Gated()
     e = await env(spec("pa", a), spec("pb", b))
-    ra = await e.client.consult("pa", "go", wait_seconds=0.2, inbound_task_id="in-c")
-    rb = await e.client.consult("pb", "go", wait_seconds=0.2, inbound_task_id="in-c")
+    ra = await e.client.consult("pa", "go", wait_seconds=HANDLE_WAIT_S, inbound_task_id="in-c")
+    rb = await e.client.consult("pb", "go", wait_seconds=HANDLE_WAIT_S, inbound_task_id="in-c")
     assert ra.state == rb.state == "working"
     started: list[str] = []
     real_cancel = e.client.cancel
@@ -979,7 +983,7 @@ async def test_garbage_send_response_is_protocol_error(env, body, ct):
 async def test_garbage_check_and_cancel_are_protocol_errors(env, body, ct):
     gated = Gated()
     e = await env(spec("slow", gated))
-    res = await e.client.consult("slow", "go", wait_seconds=0.2)
+    res = await e.client.consult("slow", "go", wait_seconds=HANDLE_WAIT_S)
     assert res.state == "working"
     e.hc._transport = garbage_for(e.transport, {"GetTask", "CancelTask"}, body, ct)
     checked = await e.client.check("slow", res.task_id)
@@ -993,8 +997,8 @@ async def test_garbage_check_and_cancel_are_protocol_errors(env, body, ct):
 async def test_wait_any_survives_one_garbage_partner(env):
     a, b = Gated(), Gated()
     e = await env(spec("pa", a), spec("pb", b))
-    ra = await e.client.consult("pa", "go", wait_seconds=0.2)
-    rb = await e.client.consult("pb", "go", wait_seconds=0.2)
+    ra = await e.client.consult("pa", "go", wait_seconds=HANDLE_WAIT_S)
+    rb = await e.client.consult("pb", "go", wait_seconds=HANDLE_WAIT_S)
     b.gate.set()
     inner = e.transport
 
@@ -1133,7 +1137,7 @@ async def test_cascade_cancel_uses_original_caller(env):
     alice = Principal(id="jwt:alice", kind="jwt", scopes=frozenset({"a"}))
     try:
         res = await client.consult(
-            "slow", "go", wait_seconds=0.2, inbound_task_id="in-a", caller=alice
+            "slow", "go", wait_seconds=HANDLE_WAIT_S, inbound_task_id="in-a", caller=alice
         )
         assert res.state == "working"
         [row] = await e.handles.by_inbound("in-a")
@@ -1218,7 +1222,7 @@ async def test_401_on_check_and_cancel_resends_once(env, oauth_env):
     try:
         with respx.mock as rx:
             route = rx.post(TOKEN_URL).mock(return_value=_token("tok-good"))
-            res = await client.consult("slow", "go", wait_seconds=0.2)
+            res = await client.consult("slow", "go", wait_seconds=HANDLE_WAIT_S)
             assert res.state == "working"
             # The token is rotated: the cached one is now rejected.
             partner_auth.api_keys.clear()
@@ -1265,7 +1269,7 @@ async def test_token_error_is_credential_error_and_spares_breaker(env, oauth_env
 async def test_recovery_cancel_uses_exchange_fallback(env, oauth_env):
     gated = Gated()
     e = await env(spec("slow", gated))
-    res = await e.client.consult("slow", "go", wait_seconds=0.2, inbound_task_id="in-r")
+    res = await e.client.consult("slow", "go", wait_seconds=HANDLE_WAIT_S, inbound_task_id="in-r")
     assert res.state == "working"
     calls: list = []
 

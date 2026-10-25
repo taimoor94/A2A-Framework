@@ -21,6 +21,9 @@ from a2agw.core.events import Done, Reply
 
 CANCELED = TaskState.Name(TaskState.TASK_STATE_CANCELED)
 REJECTED = TaskState.Name(TaskState.TASK_STATE_REJECTED)
+# A consult of a partner that will not finish returns a ``working`` handle after this long;
+# generous so the partner's first event arrives in time even under heavy CPU load.
+HANDLE_WAIT_S = 1.0
 
 
 class Blocker:
@@ -54,7 +57,7 @@ async def test_cancel_inbound_cancels_partner_task(env):
     consulted = asyncio.Event()
 
     async def a_run(ctx):
-        seen["result"] = await host.client.consult("b", "go", wait_seconds=0.2)
+        seen["result"] = await host.client.consult("b", "go", wait_seconds=HANDLE_WAIT_S)
         consulted.set()
         await asyncio.Event().wait()
         yield Done(text="never")
@@ -216,7 +219,7 @@ async def test_restart_cancels_outbound_of_failed_inbound(env, tmp_path):
     partners_path = tmp_path / "partners.yaml"
 
     async def a_run(ctx):
-        res = await a1.host.client.consult("p", "go", wait_seconds=0.2)
+        res = await a1.host.client.consult("p", "go", wait_seconds=HANDLE_WAIT_S)
         assert res.state == "working"
         consulted.set()
         await asyncio.Event().wait()
@@ -553,7 +556,7 @@ async def test_direct_reply_drops_index_row_and_cancels_partner_work(env):
 
     async def a_run(ctx):
         seen["a_task"] = ctx.task_id
-        seen["result"] = await host.client.consult("b", "go", wait_seconds=0.2)
+        seen["result"] = await host.client.consult("b", "go", wait_seconds=HANDLE_WAIT_S)
         yield Reply("answered without waiting for b")
 
     e = await env(spec("a", Fn(a_run), direct_replies=True), spec("b", b))

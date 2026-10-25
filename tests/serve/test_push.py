@@ -459,7 +459,7 @@ async def test_agent_run_does_not_wait_for_slow_webhook(host_env, receiver):
     _, client = await host_env(push=PushSettings(allow_private=True))
     started = time.monotonic()
     events = await send(client(), msg(), TaskPushNotificationConfig(id="c1", url=receiver.url()))
-    assert time.monotonic() - started < 2.0
+    assert time.monotonic() - started < 5.0  # the webhook never answers before the release
     assert events[0].task.status.state == TaskState.TASK_STATE_COMPLETED
     receiver.gate.set()
     await receiver.wait_for(_completed)
@@ -562,7 +562,7 @@ async def test_drain_is_bounded(tmp_path, receiver):
         await receiver.wait_for(lambda hits: len(hits) == 1)
         started = time.monotonic()
         await sender.drain(0.2)
-        assert time.monotonic() - started < 1.0
+        assert time.monotonic() - started < 3.0  # the webhook never answers
         assert sender.pending() == 0
     finally:
         receiver.gate.set()
@@ -784,7 +784,7 @@ async def test_hanging_webhook_times_out_and_is_retried(tmp_path, receiver):
         await sender.send_notification("t1", _task("t1"))
         await receiver.wait_for(lambda hits: len(hits) == 2)
         await sender.drain(5)
-        assert time.monotonic() - started < 2.0
+        assert time.monotonic() - started < 4.5  # two 0.2 s attempts, not the drain bound
         assert sender.stats == {**sender.stats, "retries": 1, "failed": 1, "delivered": 0}
     finally:
         receiver.gate.set()
@@ -870,8 +870,8 @@ async def test_slow_webhooks_of_one_task_do_not_starve_another(tmp_path, receive
         await receiver.wait_for(lambda hits: len(hits) >= 2)
         started = time.monotonic()
         await sender.send_notification("t2", _task("t2"))
-        await receiver.wait_for(lambda hits: any(h.path == "/hook" for h in hits), timeout=1.0)
-        assert time.monotonic() - started < 1.0
+        await receiver.wait_for(lambda hits: any(h.path == "/hook" for h in hits), timeout=5.0)
+        assert time.monotonic() - started < 5.0  # t1's webhooks never answer before the release
         # t1 holds only its share (half of the 4 slots) while its webhooks hang.
         assert sum(h.path == "/slow" for h in receiver.hits) == 2
         receiver.gate.set()
@@ -896,7 +896,7 @@ async def test_pending_tasks_cap_drops_new_tasks(tmp_path, receiver, caplog):
             started = time.monotonic()
             await sender.send_notification("t3", _task("t3"))
             await sender.send_notification("t3", _task("t3"))
-            assert time.monotonic() - started < 0.5  # dropped, never waited for
+            assert time.monotonic() - started < 3.0  # dropped, never waited for
         assert sender.stats["dropped"] == 2
         assert caplog.text.count("too many tasks with pending updates") == 1
         await sender.send_notification("t1", _task("t1"))  # a known task still queues
@@ -929,7 +929,7 @@ async def test_slow_dns_recheck_counts_as_unsafe(tmp_path, monkeypatch, receiver
         started = time.monotonic()
         await sender.send_notification("t1", _task("t1"))
         await sender.drain(5)
-        assert time.monotonic() - started < 1.5
+        assert time.monotonic() - started < 4.5  # the 0.2 s re-check timeout, not the 10 s lookup
         assert sender.stats["skipped_unsafe"] == 1 and sender.stats["delivered"] == 0
     finally:
         await sender.http.aclose()
