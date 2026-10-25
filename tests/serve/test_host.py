@@ -507,23 +507,47 @@ async def _exit_signal_with_previous(sig, prev, *, loop=None):
     return bool(ran), raised
 
 
-@pytest.mark.parametrize("prev_name", ["SIG_DFL", "SIG_IGN"])
-async def test_exit_signal_default_sigint_raises_keyboard_interrupt(prev_name):
+async def test_exit_signal_sigint_over_sig_dfl_raises_keyboard_interrupt():
     import signal
 
-    ran, raised = await _exit_signal_with_previous(signal.SIGINT, getattr(signal, prev_name))
-    assert ran
-    assert isinstance(raised, KeyboardInterrupt)
+    ran, raised = await _exit_signal_with_previous(signal.SIGINT, signal.SIG_DFL)
+    assert ran and isinstance(raised, KeyboardInterrupt)
 
 
-@pytest.mark.parametrize("prev_name", ["SIG_DFL", "SIG_IGN"])
-async def test_exit_signal_default_sigterm_does_nothing_more(prev_name):
-    """SIGTERM over SIG_DFL/SIG_IGN only ends the streams: no re-raise (which would kill the
-    process before the lifespan shutdown) and no exception."""
+@pytest.mark.parametrize("sig_name", ["SIGINT", "SIGTERM"])
+async def test_exit_signal_over_sig_ign_does_nothing_more(sig_name):
+    """SIG_IGN before ours: the streams end, and nothing else happens (no exception, no
+    termination)."""
     import signal
 
-    ran, raised = await _exit_signal_with_previous(signal.SIGTERM, getattr(signal, prev_name))
+    ran, raised = await _exit_signal_with_previous(
+        getattr(signal, sig_name), signal.SIG_IGN
+    )
     assert ran and raised is None
+
+
+def test_exit_signal_sigterm_over_sig_dfl_terminates_process(tmp_path):
+    """SIGTERM over SIG_DFL keeps its default action: the process dies by SIGTERM (checked
+    in a subprocess)."""
+    import subprocess
+    import sys
+
+    code = (
+        "import asyncio, signal\n"
+        "from a2agw.serve.host import _on_exit_signal\n"
+        "async def main():\n"
+        "    signal.signal(signal.SIGTERM, signal.SIG_DFL)\n"
+        "    with _on_exit_signal(lambda: None):\n"
+        "        signal.raise_signal(signal.SIGTERM)\n"
+        "        await asyncio.sleep(1)\n"
+        "    print('survived')\n"
+        "asyncio.run(main())\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], check=False, capture_output=True, text=True, timeout=30
+    )
+    assert out.returncode in (-15, 143), (out.returncode, out.stderr)
+    assert "survived" not in out.stdout
 
 
 async def test_exit_signal_closed_loop_is_ignored():

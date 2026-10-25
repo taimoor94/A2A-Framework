@@ -407,7 +407,7 @@ async def test_partners_reload_makes_cli_added_partner_usable(make, tmp_path):
         assert (await hc.post(url, headers=USER)).status_code == 403
         r = await hc.post(url, headers=ADMIN)
         assert r.status_code == 200
-        assert r.json() == {"added": ["echo"], "updated": [], "removed": []}
+        assert r.json() == {"added": ["echo"], "updated": [], "removed": [], "open_handles": 0}
         assert host.client is client  # same running client
         res = await client.consult("echo", "hi", wait_seconds=5)
         assert res.state == "completed" and res.text == "echo: hi"
@@ -421,15 +421,59 @@ async def test_partners_reload_makes_cli_added_partner_usable(make, tmp_path):
         pf_before = pf.read_text()
         pf.write_text("partners: {}\n")
         r = await hc.post(url, headers=ADMIN)
-        assert r.status_code == 422 and r.json() == {"error": "partners file not reloaded"}
+        assert r.status_code == 400 and r.json() == {"error": "partners file not reloaded"}
         assert [p.id for p in host.partners.all()] == ["echo"]
 
         # Removing it from the file removes it from the running host.
         assert "echo" in pf_before
         pf.write_text("partners: []\n")
         r = await hc.post(url, headers=ADMIN)
-        assert r.json() == {"added": [], "updated": [], "removed": ["echo"]}
+        assert r.json() == {"added": [], "updated": [], "removed": ["echo"], "open_handles": 0}
         assert (await client.consult("echo", "hi", wait_seconds=5)).reason == "unknown partner"
     finally:
         await outbound.aclose()
         await partner.shutdown()
+
+
+async def test_partners_reload_broken_yaml_is_400_audited_without_content(make, tmp_path):
+    pf = tmp_path / "partners.yaml"
+    pf.write_text("partners: []\n")
+    host, hc = await make(spec(), auth=auth(), partners_path=pf)
+    for broken in (b"partners: [\n  - id: s3cret-line\n  bad: : :\n", b"\xff\xfe s3cret-line"):
+        pf.write_bytes(broken)
+        r = await hc.post("/a2agw/admin/partners/reload", headers=ADMIN)
+        assert r.status_code == 400 and "s3cret" not in r.text
+    rows = (await hc.get("/a2agw/admin/audit?action=partner.reload", headers=ADMIN)).json()
+    assert [(e["outcome"], e["detail"]["reason"]) for e in rows["events"]] == [
+        ("error", "ValueError"),
+        ("error", "ValueError"),
+    ]
+    assert "s3cret" not in json.dumps(rows)
+    assert host.partners.all() == []
+
+
+async def test_partners_reload_refuses_removing_partner_with_open_handles(make, tmp_path):
+    from google.protobuf.json_format import MessageToDict as to_dict
+
+    pf = tmp_path / "partners.yaml"
+    pf.write_text("partners: []\n")
+    host, hc = await make(spec(), auth=auth(), partners_path=pf)
+    cli = PartnerRegistry(pf)
+    cli.load()
+    await cli.add_from_card("ghost", to_dict(host.cards["alpha"]), "internal")
+    url = "/a2agw/admin/partners/reload"
+    assert (await hc.post(url, headers=ADMIN)).json()["added"] == ["ghost"]
+    await host.handles.record("t1", "ghost", "c1", None, None, "TASK_STATE_WORKING")
+    await host.handles.record("t2", "ghost", "c1", None, None, "TASK_STATE_COMPLETED")
+    pf.write_text("partners: []\n")
+
+    r = await hc.post(url, headers=ADMIN)
+    assert r.status_code == 409 and r.json()["open_handles"] == 1
+    assert [p.id for p in host.partners.all()] == ["ghost"]  # unchanged
+    assert (await hc.post(url + "?force=maybe", headers=ADMIN)).status_code == 400
+    r = await hc.post(url + "?force=true", headers=ADMIN)
+    assert r.status_code == 200
+    assert r.json() == {"added": [], "updated": [], "removed": ["ghost"], "open_handles": 1}
+    assert host.partners.all() == []
+    rows = (await hc.get("/a2agw/admin/audit?action=partner.reload", headers=ADMIN)).json()
+    assert [e["outcome"] for e in rows["events"]][:2] == ["ok", "refused"]

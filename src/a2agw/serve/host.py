@@ -119,12 +119,16 @@ def _on_exit_signal(callback: Callable[[], None]) -> Iterator[None]:
         except RuntimeError:  # the loop is already closed: nothing left to end
             pass
         prev = previous[sig]
-        if prev in (None, signal.SIG_DFL, signal.SIG_IGN):
-            # No Python handler before ours: emulate the default for SIGINT
-            # (KeyboardInterrupt); for the others, ending the streams is all we do.
+        if prev is None or prev == signal.SIG_IGN:
+            return  # ignored before (None: installed outside Python): stay ignored
+        if prev == signal.SIG_DFL:
             if sig == signal.SIGINT:
-                signal.default_int_handler(sig, frame)
-        elif callable(prev):
+                signal.default_int_handler(sig, frame)  # KeyboardInterrupt
+            else:  # the default action: terminate by this signal
+                signal.signal(sig, signal.SIG_DFL)
+                signal.raise_signal(sig)
+            return
+        if callable(prev):
             prev(sig, frame)
 
     for sig in _EXIT_SIGNALS:
@@ -153,7 +157,14 @@ def _warn_env_proxies() -> None:
         )
 
 
-__all__ = ["ADMIN_PREFIX", "HEALTH_PATH", "AgentHost", "AgentServedError", "RecentActivityError"]
+__all__ = [
+    "ADMIN_PREFIX",
+    "HEALTH_PATH",
+    "AgentHost",
+    "AgentServedError",
+    "PartnersInUse",
+    "RecentActivityError",
+]
 
 
 def _strings(value: Any) -> Iterator[str]:
@@ -307,6 +318,14 @@ class _BodyLimitMiddleware:
             await self.app(scope, limited_receive, tracking_send)
         except _TooLarge:
             pass
+
+
+class PartnersInUse(Exception):
+    """A partner reload would remove partners that still have open outbound tasks."""
+
+    def __init__(self, open_handles: int) -> None:
+        super().__init__(f"{open_handles} open outbound task(s)")
+        self.open_handles = open_handles
 
 
 class _TooLarge(Exception):
@@ -852,13 +871,28 @@ class AgentHost:
         if unknown:
             logger.warning("policy routing rules name unknown partner ids: %s", ", ".join(unknown))
 
-    def reload_partners(self) -> dict[str, list[str]]:
-        """Re-read the partners file into the running registry (``PartnerRegistry.reload``),
-        so partners added with the CLI are usable without a restart. ValueError if there is
-        no partners file or it is invalid (the registry is then unchanged)."""
-        changes = self.partners.reload()
+    async def reload_partners(self, *, force: bool = False) -> dict[str, Any]:
+        """Re-read the partners file into the running registry, so partners added with the
+        CLI are usable without a restart (``PartnerRegistry.prepare_reload``/``apply_reload``).
+
+        Removing a partner that still has non-terminal outbound tasks (handles) would orphan
+        them: that is refused with ``PartnersInUse`` unless ``force``. The result has the ids
+        per change and ``open_handles``, the open handles of removed partners (logged when
+        not zero). ValueError if there is no partners file or it is invalid; RuntimeError if
+        the registry changed meanwhile. In every failure case the registry is unchanged."""
+        plan = self.partners.prepare_reload()
+        open_handles = 0
+        if plan.removed and self.handles is not None:
+            open_handles = sum((await self.handles.count_open(plan.removed)).values())
+        if open_handles and not force:
+            raise PartnersInUse(open_handles)
+        changes: dict[str, Any] = self.partners.apply_reload(plan)
+        if open_handles:
+            logger.warning(
+                "partner reload removed partners with %d open outbound task(s)", open_handles
+            )
         self._warn_unknown_routing_partners()
-        return changes
+        return {**changes, "open_handles": open_handles}
 
     def partner_tools(self, agent_id: str, **kwargs: Any) -> list[PartnerTool]:
         """``partner_tools`` for one of this host's agents, filtered by the host's policy."""

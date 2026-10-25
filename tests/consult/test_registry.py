@@ -744,3 +744,24 @@ def test_reload_needs_a_file(tmp_path):
         PartnerRegistry().reload()
     reg = PartnerRegistry(tmp_path / "missing.yaml")
     assert reg.reload() == {"added": [], "updated": [], "removed": []}
+
+
+def test_reload_broken_yaml_is_value_error_without_content(tmp_path):
+    path = tmp_path / "partners.yaml"
+    reg = PartnerRegistry(path)
+    for broken in (b"partners: [\n  - s3cret: : :\n", b"\xff\xfe s3cret"):
+        path.write_bytes(broken)
+        with pytest.raises(ValueError) as ei:
+            reg.reload()
+        assert "s3cret" not in str(ei.value) and ei.value.__cause__ is None
+
+
+async def test_apply_reload_refuses_stale_plan(tmp_path):
+    path = tmp_path / "partners.yaml"
+    reg = PartnerRegistry(path)
+    await reg.add_from_card("one", CARD, "partner")
+    plan = reg.prepare_reload()
+    await reg.add_from_card("two", CARD, "partner")  # changed after the plan was made
+    with pytest.raises(RuntimeError, match="changed"):
+        reg.apply_reload(plan)
+    assert {r.id for r in reg.all()} == {"one", "two"}

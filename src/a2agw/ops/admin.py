@@ -16,8 +16,9 @@ changed within 10 minutes (unless ``force=true``). Every attempt is audited as `
 ``/push`` reports per-agent push delivery counters (no URLs, task ids or config contents).
 ``POST /partners/reload`` re-reads the partners file into the running registry (partners added
 with ``a2agw partners add`` become usable without a restart) and returns the ids added,
-updated and removed; 422 if the file is invalid (nothing changes). Audited as
-``partner.reload``.
+updated and removed plus ``open_handles``; 400 if the file is invalid, 409 if removed partners
+still have open outbound tasks (unless ``force=true``). Nothing changes on an error. Every
+attempt is audited as ``partner.reload``.
 """
 
 from __future__ import annotations
@@ -302,13 +303,30 @@ def admin_routes(host: AgentHost) -> list[Route]:
         )
 
     async def partners_reload(request: Request) -> Response:
+        from a2agw.serve.host import PartnersInUse
+
+        raw = request.query_params.get("force", "false")
+        if raw not in ("true", "false"):
+            raise _BadRequest("force")
         try:
-            changes = host.reload_partners()
+            changes = await host.reload_partners(force=raw == "true")
+        except PartnersInUse as exc:
+            await audit(request, "partner.reload", "refused", f"open handles {exc.open_handles}")
+            return JSONResponse(
+                {
+                    "error": "removed partners have open outbound tasks; use force=true",
+                    "open_handles": exc.open_handles,
+                },
+                status_code=409,
+            )
+        except RuntimeError:
+            await audit(request, "partner.reload", "conflict", "registry changed")
+            return JSONResponse({"error": "registry changed during reload; retry"}, status_code=409)
         except (ValueError, OSError) as exc:
             # The message may quote the file; only its class goes out (and to the audit).
             await audit(request, "partner.reload", "error", type(exc).__name__)
-            return JSONResponse({"error": "partners file not reloaded"}, status_code=422)
-        counts = ", ".join(f"{k} {len(v)}" for k, v in changes.items())
+            return JSONResponse({"error": "partners file not reloaded"}, status_code=400)
+        counts = ", ".join(f"{k} {len(v)}" for k, v in changes.items() if isinstance(v, list))
         await audit(request, "partner.reload", "ok", counts)
         return JSONResponse(changes)
 

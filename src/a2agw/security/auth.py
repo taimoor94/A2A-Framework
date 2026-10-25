@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import hmac
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -25,7 +26,7 @@ from starlette.requests import HTTPConnection, Request
 from starlette.responses import JSONResponse
 
 from a2agw.consult import netguard
-from a2agw.consult.netguard import FetchError, Tier, UnsafeURL
+from a2agw.consult.netguard import Tier, UnsafeURL
 from a2agw.security.principal import Principal, PrincipalUser
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,7 @@ JWT_LEEWAY_SECONDS = 30
 JWKS_TIMEOUT_S = 5.0  # whole fetch: vetting, connect and body
 JWKS_TTL_S = 300.0  # PyJWKClient's default JWK set lifespan
 JWKS_REFETCH_MIN_S = 30.0  # unknown kid: at most one cache bypass per this
+JWKS_FAIL_BACKOFF_S = 30.0  # after a failed fetch, none is tried for this long
 JWKS_MAX_BYTES = 1024 * 1024
 
 
@@ -66,7 +68,10 @@ class JwtConfig(BaseModel):
         if bool(self.jwks_url) == bool(self.public_key_pem):
             raise ValueError("exactly one of jwks_url or public_key_pem is required")
         if self.jwks_url and not self.jwks_url.lower().startswith(("http://", "https://")):
-            raise ValueError("jwks_url must be http(s)")  # PyJWT also refuses other schemes
+            raise ValueError("jwks_url must be http(s)")
+        if self.jwks_url and self.jwks_url.lower().startswith("http://") and not _dev():
+            # Every tier: keys fetched in plain text could be swapped in transit.
+            raise ValueError("jwks_url must be https (http only with A2AGW_DEV=1)")
         return self
 
 
@@ -104,50 +109,77 @@ class JwksUnavailable(Exception):
     """The JWKS could not be fetched (refused, unreachable, bad status or malformed)."""
 
 
+def _dev() -> bool:
+    return os.environ.get("A2AGW_DEV") == "1"
+
+
 class _JwksCache:
     """The inbound JWT keys of one JWKS URL, fetched through a guarded client
     (``netguard.safe_get``: the host is vetted for ``tier`` at connect time, no redirects,
     a size cap and one ``JWKS_TIMEOUT_S`` deadline).
 
-    Same caching as PyJWKClient: the key set is kept ``JWKS_TTL_S``; an unknown kid refetches
-    it, at most once per ``JWKS_REFETCH_MIN_S``. Concurrent misses share one fetch."""
+    Caching like PyJWKClient: the key set is kept ``JWKS_TTL_S``; an unknown kid refetches
+    it, at most once per ``JWKS_REFETCH_MIN_S`` since the last attempt (successful or not).
+    After a failed fetch no fetch is tried for ``JWKS_FAIL_BACKOFF_S``: requests needing it
+    fail fast. Concurrent misses share one fetch: a waiter that finds another fetch completed
+    meanwhile (``_generation`` moved, whatever its outcome) uses its result and never fetches
+    again itself."""
 
     def __init__(self, url: str, tier: Tier) -> None:
         self.url = url
         self.tier = tier
         self._keys: dict[str, jwt.PyJWK] = {}
-        self._fetched_at: float | None = None
+        self._fetched_at: float | None = None  # last successful fetch
+        self._attempted_at: float | None = None  # last fetch, successful or not
+        self._failed_at: float | None = None  # last failed fetch, cleared by a success
+        self._generation = 0  # completed fetches
         self._lock = asyncio.Lock()
 
     async def _refresh(self) -> None:
+        self._attempted_at = time.monotonic()
         try:
+            if self.url.lower().startswith("http://") and not _dev():
+                raise UnsafeURL("https is required")
             body = await netguard.safe_get(
                 self.url, self.tier, max_bytes=JWKS_MAX_BYTES, deadline_s=JWKS_TIMEOUT_S
             )
             jwk_set = jwt.PyJWKSet.from_json(body.decode("utf-8"))
-        except (UnsafeURL, FetchError) as e:
+        except Exception as e:  # noqa: BLE001 - refused, unreachable or malformed: fail closed
+            self._failed_at = time.monotonic()
             raise JwksUnavailable(type(e).__name__) from None
-        except Exception as e:  # noqa: BLE001 - any malformed JWKS: no keys, fail closed
-            raise JwksUnavailable(type(e).__name__) from None
+        finally:
+            self._generation += 1
         # Like PyJWKClient: signing keys only ("use" absent or "sig"), each with a kid.
         self._keys = {
             k.key_id: k for k in jwk_set.keys if k.key_id and k.public_key_use in ("sig", None)
         }
         self._fetched_at = time.monotonic()
+        self._failed_at = None
 
     def _fresh(self) -> bool:
         return self._fetched_at is not None and time.monotonic() - self._fetched_at < JWKS_TTL_S
 
+    def _cached(self, kid: str) -> jwt.PyJWK | None:
+        """The cached key, or None for an unknown kid; JwksUnavailable without a usable set."""
+        if not self._fresh():
+            raise JwksUnavailable("no current key set")
+        return self._keys.get(kid)
+
     async def key(self, kid: str) -> jwt.PyJWK | None:
         if self._fresh() and kid in self._keys:
             return self._keys[kid]
-        async with self._lock:  # single flight: whoever waited here sees the new set
-            if not self._fresh():
-                await self._refresh()
-            elif kid not in self._keys:
-                assert self._fetched_at is not None
-                if time.monotonic() - self._fetched_at >= JWKS_REFETCH_MIN_S:
-                    await self._refresh()
+        generation = self._generation
+        async with self._lock:
+            if self._generation != generation:
+                return self._cached(kid)  # a fetch finished while we waited: use its outcome
+            now = time.monotonic()
+            if self._failed_at is not None and now - self._failed_at < JWKS_FAIL_BACKOFF_S:
+                return self._cached(kid)  # backing off after a failure: no fetch
+            if self._fresh():
+                assert self._attempted_at is not None
+                if kid in self._keys or now - self._attempted_at < JWKS_REFETCH_MIN_S:
+                    return self._keys.get(kid)
+            await self._refresh()
             return self._keys.get(kid)
 
 

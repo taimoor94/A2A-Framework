@@ -9,6 +9,7 @@ import os
 import re
 import time
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -117,6 +118,20 @@ def _significant_differs(old: dict[str, Any], new: dict[str, Any]) -> bool:
     return any(old.get(k) != new.get(k) for k in keys)
 
 
+@dataclass
+class ReloadPlan:
+    """A validated partners file and its diff against the registry (``prepare_reload``)."""
+
+    fresh: dict[str, PartnerRecord]
+    added: list[str]
+    updated: list[str]
+    removed: list[str]
+    version: int
+
+    def changes(self) -> dict[str, list[str]]:
+        return {"added": self.added, "updated": self.updated, "removed": self.removed}
+
+
 class PartnerRegistry:
     """Registered partners. Card fetches go through a guarded client for the partner's tier
     (``a2agw.consult.guarded_net``: connects only to vetted addresses). An injected ``http``
@@ -142,6 +157,7 @@ class PartnerRegistry:
         self.verifier = verifier
         self.require_signed = frozenset(require_signed)
         self._records: dict[str, PartnerRecord] = {}
+        self._version = 0  # bumped by every change (reload plans are checked against it)
         self.on_change: Callable[[PartnerRecord, str], None] | None = None
 
     # -- fetching -------------------------------------------------------
@@ -352,6 +368,7 @@ class PartnerRegistry:
 
     # -- persistence ----------------------------------------------------
     def _changed(self, rec: PartnerRecord, event: str) -> None:
+        self._version += 1
         if self.path is not None:
             self.save()
         if self.on_change is not None:
@@ -370,41 +387,62 @@ class PartnerRegistry:
         if self.path is None or not self.path.exists():
             return
         self._records = self._read_file(self.path)
+        self._version += 1
 
-    def reload(self) -> dict[str, list[str]]:
-        """Re-read the partners file (e.g. after ``a2agw partners add`` on a running host).
-
-        The whole file is validated first; if it is invalid nothing changes (ValueError).
-        Then, in one step without awaiting: new partners are added, changed records replace
-        the old ones, partners no longer in the file are removed, and unchanged records keep
-        their identity. ``on_change`` fires per partner ("added", "updated", "removed"); the
-        file is not rewritten. A ``PartnerClient`` on this registry sees the result on its
-        next call. A missing file counts as empty. Returns the ids per change."""
+    def prepare_reload(self) -> ReloadPlan:
+        """Read and validate the partners file and diff it against the registry, without
+        changing anything (ValueError if there is no file path or the file is invalid; a
+        missing file counts as empty). Apply the plan with ``apply_reload``."""
         if self.path is None:
             raise ValueError("registry has no partners file")
         fresh = self._read_file(self.path) if self.path.exists() else {}
         old = self._records
-        added = [i for i in fresh if i not in old]
-        removed = [i for i in old if i not in fresh]
         updated = [
             i
             for i in fresh
             if i in old and fresh[i].model_dump(mode="json") != old[i].model_dump(mode="json")
         ]
-        keep = set(old) - set(updated)
-        self._records = {i: old[i] if i in keep else r for i, r in fresh.items()}
+        return ReloadPlan(
+            fresh=fresh,
+            added=[i for i in fresh if i not in old],
+            updated=updated,
+            removed=[i for i in old if i not in fresh],
+            version=self._version,
+        )
+
+    def apply_reload(self, plan: ReloadPlan) -> dict[str, list[str]]:
+        """Apply a plan in one step (no await): new partners are added, changed records
+        replace the old ones, removed ones go, unchanged records keep their identity.
+        ``on_change`` fires per partner ("added", "updated", "removed"); the file is not
+        rewritten. RuntimeError if the registry changed since the plan was made."""
+        if plan.version != self._version:
+            raise RuntimeError("partner registry changed during reload")
+        old = self._records
+        keep = set(old) - set(plan.updated)
+        self._records = {i: old[i] if i in keep else r for i, r in plan.fresh.items()}
+        self._version += 1
         if self.on_change is not None:
             for event, ids, source in (
-                ("added", added, self._records),
-                ("updated", updated, self._records),
-                ("removed", removed, old),
+                ("added", plan.added, self._records),
+                ("updated", plan.updated, self._records),
+                ("removed", plan.removed, old),
             ):
                 for i in ids:
                     self.on_change(source[i], event)
-        return {"added": added, "updated": updated, "removed": removed}
+        return plan.changes()
+
+    def reload(self) -> dict[str, list[str]]:
+        """Re-read the partners file (e.g. after ``a2agw partners add`` on a running host):
+        ``prepare_reload`` then ``apply_reload``. A ``PartnerClient`` on this registry sees
+        the result on its next call. Returns the ids per change."""
+        return self.apply_reload(self.prepare_reload())
 
     def _read_file(self, path: Path) -> dict[str, PartnerRecord]:
-        data = yaml.safe_load(path.read_text())
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (yaml.YAMLError, UnicodeDecodeError) as e:
+            # The parser's message quotes the offending lines: never pass it on.
+            raise ValueError(f"partner file is not valid YAML ({type(e).__name__})") from None
         if not isinstance(data, dict) or not isinstance(data.get("partners"), list):
             raise ValueError("partner file must be a mapping with a 'partners' list")  # noqa: TRY004
         records: dict[str, PartnerRecord] = {}

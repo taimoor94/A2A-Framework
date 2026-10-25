@@ -147,6 +147,23 @@ class OutboundHandleStore:
         async with self._engine.connect() as conn:
             return [dict(r._mapping) for r in (await conn.execute(stmt)).all()]
 
+    async def count_open(self, partner_ids: list[str]) -> dict[str, int]:
+        """Non-terminal handles per partner, for the given partners (absent: none)."""
+        if not partner_ids:
+            return {}
+        from a2agw.consult.results import TERMINAL_NAMES
+
+        stmt = (
+            select(_outbound.c.partner_id, func.count())
+            .where(
+                _outbound.c.partner_id.in_(partner_ids),
+                _outbound.c.state.notin_(sorted(TERMINAL_NAMES)),
+            )
+            .group_by(_outbound.c.partner_id)
+        )
+        async with self._engine.connect() as conn:
+            return {str(pid): int(n) for pid, n in (await conn.execute(stmt)).all()}
+
     async def seen_origin(self, origin: str) -> bool:
         stmt = select(_outbound.c.task_id).where(_outbound.c.origin == origin).limit(1)
         async with self._engine.connect() as conn:

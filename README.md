@@ -77,7 +77,7 @@ ID    TIER      STATUS  HASH          PENDING
 echo  internal  active  da7686314f77
 ```
 
-A running `a2agw serve` picks up the new partner after `curl -X POST -H "X-API-Key: $ADMIN_KEY" localhost:8000/a2agw/admin/partners/reload` (admin scope, audited as `partner.reload`; it re-reads `partners.yaml`, and an invalid file changes nothing), or on its next start. Partners are registered gateway-wide, but an agent only gets them as tools if its code builds them with `partner_tools` / `as_langchain_tools` (see below); the echo agent does not. Open `agent.py` and edit the function: it is a normal Python function.
+A running `a2agw serve` picks up the new partner after `curl -X POST -H "X-API-Key: $ADMIN_KEY" localhost:8000/a2agw/admin/partners/reload` (admin scope, audited as `partner.reload`; it re-reads `partners.yaml`; an invalid file is a 400 and changes nothing; removing a partner that still has open outbound tasks is a 409 unless `?force=true`), or on its next start. Partners are registered gateway-wide, but an agent only gets them as tools if its code builds them with `partner_tools` / `as_langchain_tools` (see below); the echo agent does not. Open `agent.py` and edit the function: it is a normal Python function.
 
 ```python
 from a2agw.adapters.callable import agent
@@ -210,10 +210,10 @@ access = AgentAccess(
 Every outbound connection the gateway makes itself (partner calls, card and JWKS fetches, the inbound JWT JWKS, OAuth token requests and push webhooks) goes through a guarded client:
 
 - **DNS rebinding.** The client resolves the host itself at connect time, vets every address for the host's tier and connects only to a vetted IP address (TLS still verifies the hostname). A DNS answer that changes after the URL check cannot redirect the connection. When a host has several addresses they are raced (happy eyeballs, 250 ms apart) within one connect timeout. A refused address is permanent: the call is not retried, counts as a circuit-breaker failure and returns `unavailable` ("unsafe partner address"); a push delivery is skipped (`skipped_unsafe`).
-- **Cloud metadata.** `169.254.169.254`, `fd00:ec2::254` and `100.100.100.200` are refused on every tier, `internal` included, and with `PushSettings(allow_private=True)`.
+- **Cloud metadata.** `169.254.169.254`, `fd00:ec2::254` and `100.100.100.200` are refused on every tier, `internal` included, and with `PushSettings(allow_private=True)`, also when written as IPv4-mapped, NAT64, 6to4 or IPv4-compatible IPv6, or as a decimal/hex IPv4 literal.
 - **Proxies are ignored.** A proxy would resolve names itself and defeat the checks, so `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` do not apply to guarded clients; the host logs one warning at startup when any of them is set. Egress has to be allowed directly (or controlled at the network layer).
 - **Logs.** httpx/httpcore do not log the guarded clients' requests (URLs can carry credentials); other clients in your process log as you configure them.
-- **The inbound JWT JWKS** is vetted with `auth.jwt.jwks_tier` (default `internal`; set `public` for a hosted IdP to require https and a public address). Keys are cached for 5 minutes; an unknown `kid` refetches at most every 30 s.
+- **The inbound JWT JWKS** is vetted with `auth.jwt.jwks_tier` (default `internal`; set `public` for a hosted IdP to require https and a public address). `jwks_url` must be https (plain http only with `A2AGW_DEV=1`). Keys are cached for 5 minutes; an unknown `kid` refetches at most every 30 s after the last attempt, a failed fetch is not retried for 30 s (requests fail fast with 401 meanwhile), and concurrent requests share one fetch.
 
 ### mTLS
 
@@ -264,7 +264,7 @@ The read-only admin API is mounted on the host:
 | `GET /a2agw/admin/partners` | Partners with tier, status, card hash, breaker state, in-flight calls |
 | `GET /a2agw/admin/tasks` | Task index; filters `agent`, `state`, `limit`, `cursor` |
 | `GET /a2agw/admin/events` | Server-sent event stream (`task.state`, `partner.call`) |
-| `POST /a2agw/admin/partners/reload` | Re-reads the partners file; returns the ids added, updated and removed |
+| `POST /a2agw/admin/partners/reload` | Re-reads the partners file; returns the ids added, updated and removed (`force=true` to remove partners with open outbound tasks) |
 
 ## Configuration
 

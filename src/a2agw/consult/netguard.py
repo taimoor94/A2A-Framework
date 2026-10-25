@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import os
+import re
 import socket
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal
@@ -33,12 +34,48 @@ async def _resolve(host: str) -> list[str]:
     return [str(info[4][0]) for info in infos]
 
 
+_NAT64 = ipaddress.IPv6Network("64:ff9b::/96")  # RFC 6052 well-known prefix
+_V4_COMPAT = ipaddress.IPv6Network("::/96")  # deprecated IPv4-compatible addresses
+
+
+def _embedded_ipv4(addr: ipaddress.IPv6Address) -> list[ipaddress.IPv4Address]:
+    """IPv4 addresses an IPv6 address carries: IPv4-mapped, 6to4, NAT64 (64:ff9b::/96),
+    IPv4-compatible (::a.b.c.d) and Teredo (server and client)."""
+    out: list[ipaddress.IPv4Address] = []
+    if addr.ipv4_mapped is not None:
+        out.append(addr.ipv4_mapped)
+    if addr.sixtofour is not None:
+        out.append(addr.sixtofour)
+    if addr in _NAT64 or (addr in _V4_COMPAT and int(addr) > 1):
+        out.append(ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF))
+    if addr.teredo is not None:
+        out.extend(addr.teredo)
+    return out
+
+
 def _is_metadata(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """A cloud metadata endpoint (also as an IPv4-mapped IPv6 address). Refused on every
-    tier, ``internal`` included: no partner, card, key or webhook legitimately lives there."""
-    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
-        addr = addr.ipv4_mapped
-    return addr in _METADATA_IPS
+    """A cloud metadata endpoint, also when embedded in an IPv6 address (mapped, 6to4,
+    NAT64, IPv4-compatible, Teredo). Refused on every tier, ``internal`` included: no
+    partner, card, key or webhook legitimately lives there."""
+    if addr in _METADATA_IPS:
+        return True
+    if isinstance(addr, ipaddress.IPv6Address):
+        return any(v4 in _METADATA_IPS for v4 in _embedded_ipv4(addr))
+    return False
+
+
+_LEGACY_V4 = re.compile(r"^(0x[0-9a-f]+|[0-9]+)(\.(0x[0-9a-f]+|[0-9]+)){0,3}$", re.IGNORECASE)
+
+
+def _legacy_ipv4(host: str) -> ipaddress.IPv4Address | None:
+    """Decimal, hex, octal or shortened IPv4 forms (``2852039166``, ``0xa9fea9fe``,
+    ``169.254.43518``) that the system resolver turns into an address without DNS."""
+    if not _LEGACY_V4.match(host):
+        return None
+    try:
+        return ipaddress.IPv4Address(socket.inet_aton(host))
+    except OSError:
+        return None
 
 
 def _parse_ip(text: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
@@ -49,14 +86,14 @@ def _parse_ip(text: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None
 
 
 def _is_public(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if _is_metadata(addr):
+        return False
     if isinstance(addr, ipaddress.IPv6Address):
         mapped = addr.ipv4_mapped
         if mapped is not None:
             addr = mapped
-        elif addr.sixtofour is not None and not _is_public(addr.sixtofour):
+        elif not all(_is_public(v4) for v4 in _embedded_ipv4(addr)):
             return False
-    if addr in _METADATA_IPS:
-        return False
     return not (
         addr.is_private
         or addr.is_loopback
@@ -135,7 +172,7 @@ async def check_url(url: str, tier: Tier) -> None:
     if tier == "internal":
         # R2: no lookup, unresolvable hosts allowed. A metadata IP literal is still refused
         # here; a name resolving to one is refused at connect time (resolve_and_vet).
-        addr = _parse_ip(host.strip("[]"))
+        addr = _parse_ip(host.strip("[]")) or _legacy_ipv4(host)
         if addr is not None and _is_metadata(addr):
             raise UnsafeURL("metadata address is not allowed")
         return

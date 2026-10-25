@@ -28,6 +28,7 @@ guard; that is the documented test seam.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import typing
@@ -35,7 +36,6 @@ from collections.abc import Callable, Iterable
 from contextvars import ContextVar
 
 import anyio
-import anyio.abc
 import httpcore
 import httpx
 
@@ -110,6 +110,35 @@ def _install_quiet_filter() -> None:
 _install_quiet_filter()
 
 
+async def _discard(
+    tasks: set[asyncio.Task[httpcore.AsyncNetworkStream]],
+    streams: list[httpcore.AsyncNetworkStream],
+) -> None:
+    """Cancel connection attempts and close every stream nobody will use (including ones an
+    attempt hands back although it was cancelled). Runs to completion even if cancelled."""
+
+    async def run() -> None:
+        for t in tasks:
+            t.cancel()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        tasks.clear()  # each late stream is closed once, even if called again
+        late = [r for r in results if isinstance(r, httpcore.AsyncNetworkStream)]
+        for stream in [*streams, *late]:
+            try:
+                await stream.aclose()
+            except Exception:  # noqa: BLE001, S110 - closing is best effort
+                pass
+
+    if not tasks and not streams:
+        return
+    cleanup = asyncio.ensure_future(run())
+    try:
+        await asyncio.shield(cleanup)
+    except asyncio.CancelledError:
+        await cleanup  # finish closing, then let the cancellation through
+        raise
+
+
 class _GuardedClient(httpx.AsyncClient):
     """``httpx.AsyncClient`` whose requests are not logged by httpx/httpcore (see above)."""
 
@@ -171,49 +200,58 @@ class GuardedBackend(httpcore.AsyncNetworkBackend):
         """Resolve and vet `host`, then race connections to the vetted addresses (happy
         eyeballs, RFC 8305): a new attempt starts every ``HAPPY_EYEBALLS_DELAY_S`` or as soon
         as the previous one fails; the first to connect wins and the others are cancelled
-        (a late loser's stream is closed). One `timeout` covers the lookup and all attempts."""
+        (a loser's stream that connected anyway is closed). One `timeout` covers the lookup
+        and all attempts. If this call is cancelled, every connected stream is closed.
+
+        Plain asyncio tasks, not an anyio task group: an anyio scope cancelled by the race
+        itself can swallow the caller's own cancellation."""
         deadline = None if timeout is None else time.monotonic() + timeout
         addrs = await self._vetted(host, timeout)
-        winner: list[httpcore.AsyncNetworkStream] = []
-        errors: list[Exception] = []
 
-        async def attempt(
-            tg: anyio.abc.TaskGroup, index: int, previous_failed: anyio.Event | None
-        ) -> None:
-            if previous_failed is not None:
-                with anyio.move_on_after(HAPPY_EYEBALLS_DELAY_S):
-                    await previous_failed.wait()
-            failed = anyio.Event()
-            if index + 1 < len(addrs):
-                tg.start_soon(attempt, tg, index + 1, failed)
+        async def attempt(ip: str) -> httpcore.AsyncNetworkStream:
             remaining = None if deadline is None else deadline - time.monotonic()
-            try:
-                if remaining is not None and remaining <= 0:
-                    raise httpcore.ConnectTimeout("timed out connecting")
-                stream = await self._inner.connect_tcp(
-                    addrs[index],
-                    port,
-                    timeout=remaining,
-                    local_address=local_address,
-                    socket_options=socket_options,
-                )
-            except Exception as exc:  # noqa: BLE001 - recorded; the last one is raised
-                errors.append(exc)
-                failed.set()
-                return
-            if winner:  # lost the race by a hair: close it
-                with anyio.CancelScope(shield=True):
-                    await stream.aclose()
-                return
-            winner.append(stream)
-            tg.cancel_scope.cancel()
+            if remaining is not None and remaining <= 0:
+                raise httpcore.ConnectTimeout("timed out connecting")
+            return await self._inner.connect_tcp(
+                ip,
+                port,
+                timeout=remaining,
+                local_address=local_address,
+                socket_options=socket_options,
+            )
 
-        left = None if deadline is None else max(deadline - time.monotonic(), 0.0)
-        with anyio.move_on_after(left):
-            async with anyio.create_task_group() as tg:
-                tg.start_soon(attempt, tg, 0, None)
-        if winner:
-            return winner[0]
+        pending: set[asyncio.Task[httpcore.AsyncNetworkStream]] = set()
+        connected: list[httpcore.AsyncNetworkStream] = []  # [0] is the winner
+        errors: list[BaseException] = []
+        started = 0
+        try:
+            while not connected:
+                if started < len(addrs):  # first round, stagger expired or an attempt failed
+                    pending.add(asyncio.ensure_future(attempt(addrs[started])))
+                    started += 1
+                if not pending:
+                    break
+                wait = HAPPY_EYEBALLS_DELAY_S if started < len(addrs) else None
+                if deadline is not None:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        break
+                    wait = left if wait is None else min(wait, left)
+                done, pending = await asyncio.wait(
+                    pending, timeout=wait, return_when=asyncio.FIRST_COMPLETED
+                )
+                for t in done:
+                    if t.exception() is None:
+                        connected.append(t.result())
+                    else:
+                        errors.append(t.exception())  # type: ignore[arg-type]
+            await _discard(pending, connected[1:])  # the losers
+        except BaseException:
+            # Cancelled (or failed) at any point: no stream may outlive this call unused.
+            await _discard(pending, connected)
+            raise
+        if connected:
+            return connected[0]
         if not errors:  # the overall deadline passed with attempts still pending
             raise httpcore.ConnectTimeout("timed out connecting")
         raise errors[-1]

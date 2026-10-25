@@ -571,7 +571,16 @@ async def test_injected_clients_bypass_the_guard(recorded):
 
 @pytest.mark.parametrize(
     "answer",
-    [[METADATA_IP], ["fd00:ec2::254"], ["::ffff:169.254.169.254"], ["10.0.0.1", METADATA_IP]],
+    [
+        [METADATA_IP],
+        ["fd00:ec2::254"],
+        ["::ffff:169.254.169.254"],
+        ["10.0.0.1", METADATA_IP],
+        ["64:ff9b::a9fe:a9fe"],  # NAT64
+        ["64:ff9b::6464:64c8"],  # NAT64 of 100.100.100.200
+        ["2002:a9fe:a9fe::1"],  # 6to4
+        ["::a9fe:a9fe"],  # IPv4-compatible
+    ],
 )
 async def test_metadata_ip_refused_on_internal_tier(answer):
     with pytest.raises(UnsafeURL, match="metadata"):
@@ -584,7 +593,18 @@ async def test_metadata_ip_refused_on_internal_tier(answer):
 
 
 @pytest.mark.parametrize(
-    "url", [f"http://{METADATA_IP}/latest", "http://[fd00:ec2::254]/", "http://100.100.100.200/"]
+    "url",
+    [
+        f"http://{METADATA_IP}/latest",
+        "http://[fd00:ec2::254]/",
+        "http://100.100.100.200/",
+        "http://[::ffff:a9fe:a9fe]/",
+        "http://[64:ff9b::a9fe:a9fe]/",
+        "http://[2002:a9fe:a9fe::]/",
+        "http://[::a9fe:a9fe]/",
+        "http://2852039166/",  # decimal 169.254.169.254
+        "http://0xa9fea9fe/",  # hex
+    ],
 )
 async def test_check_url_refuses_metadata_literal_on_internal_tier(url):
     with pytest.raises(UnsafeURL, match="metadata"):
@@ -593,6 +613,8 @@ async def test_check_url_refuses_metadata_literal_on_internal_tier(url):
 
 async def test_check_url_internal_still_allows_private_and_unresolvable():
     await netguard.check_url("http://10.0.0.1/", "internal")
+    await netguard.check_url("http://[64:ff9b::a00:5]/", "internal")  # NAT64 of 10.0.0.5
+    await netguard.check_url("http://167772161/", "internal")  # decimal 10.0.0.1
     await netguard.check_url("http://169.254.1.1/", "internal")  # link-local, not metadata
     await netguard.check_url("http://no-such-host.invalid/", "internal")
 
@@ -627,11 +649,13 @@ class _Scripted(httpcore.AsyncNetworkBackend):
         self.started.append((host, loop.time() - self.t0))
         action = self.script[host]
         try:
-            if action[0] == "hang":
+            if action[0] in ("hang", "slow_cancel"):
                 await asyncio.sleep(3600)
             await asyncio.sleep(action[1])
         except asyncio.CancelledError:
             self.cancelled.append(host)
+            if action[0] == "slow_cancel":  # a loser whose cancellation takes a while
+                await asyncio.sleep(action[1])
             if action[0] != "stubborn":
                 raise
             # Connected while being cancelled: the stream is handed back regardless.
@@ -769,3 +793,24 @@ def test_kind_classifies_unsafe_address():
     except httpx.ConnectError as exc:
         assert client_mod._kind(exc) == "unsafe"
     assert client_mod._kind(httpx.ConnectError("refused")) == "connect"
+
+
+async def test_happy_eyeballs_winner_closed_when_caller_cancelled():
+    """The caller is cancelled after a winner connected but before connect_tcp returned
+    (a loser is still being cancelled): the winner's stream is closed, not leaked."""
+    second = "93.184.216.35"
+    inner = _Scripted({PUBLIC_IP: ("slow_cancel", 0.5), second: ("ok", 0.01)})
+    backend = GuardedBackend(
+        fixed_tier("public"), resolver=resolver([PUBLIC_IP, second]), inner=inner
+    )
+    task = asyncio.create_task(backend.connect_tcp("api.example.com", 443, timeout=5))
+    for _ in range(200):  # until the second address has won
+        if inner.streams:
+            break
+        await asyncio.sleep(0.01)
+    assert inner.streams and not task.done()  # the loser's cancellation still runs
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 3)
+    (winner,) = inner.streams
+    assert winner.ip == second and winner.closed

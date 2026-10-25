@@ -270,7 +270,8 @@ def test_authorize_principal_allowlist_and_anonymous():
 
 
 @pytest.fixture
-def jwks_url(tmp_path, rsa_key):
+def jwks_url(tmp_path, rsa_key, monkeypatch):
+    monkeypatch.setenv("A2AGW_DEV", "1")  # the loopback test server speaks plain http
     # PyJWT refuses file:// JWKS URIs, so serve the JWKS from a loopback HTTP server.
     jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(rsa_key.public_key()))
     jwk.update(kid="k1", use="sig", alg="RS256")
@@ -311,7 +312,8 @@ async def test_jwks_unknown_kid_401(jwks_url, priv_pem):
         await assert_401(await c.get("/", headers={"Authorization": f"Bearer {t}"}))
 
 
-async def test_jwks_unreachable_401_and_logged(priv_pem, caplog):
+async def test_jwks_unreachable_401_and_logged(priv_pem, caplog, monkeypatch):
+    monkeypatch.setenv("A2AGW_DEV", "1")
     with socket.socket() as sk:  # grab a port that nothing listens on
         sk.bind(("127.0.0.1", 0))
         url = f"http://127.0.0.1:{sk.getsockname()[1]}/jwks.json"
@@ -543,3 +545,106 @@ async def test_jwt_bearer_kept_for_exchange_api_keys_never(pub_pem, priv_pem):
             assert "authorization" not in body["headers"]
             assert "x-api-key" not in body["headers"]
             assert "x-other" in body["headers"]
+
+
+# ---- JWKS failures and https (review fixes) ----
+
+
+def _failing_jwks(monkeypatch, delay: float = 0.05):
+    from a2agw.consult import netguard
+
+    calls: list[str] = []
+
+    async def failing(url, tier, **kw):
+        calls.append(url)
+        await asyncio.sleep(delay)
+        raise netguard.FetchError("timed out")
+
+    monkeypatch.setattr(netguard, "safe_get", failing)
+    return calls
+
+
+async def test_jwks_failure_is_single_flight_and_backs_off(monkeypatch):
+    calls = _failing_jwks(monkeypatch)
+    cache = auth_mod._JwksCache("https://idp.example/jwks", "internal")
+    res = await asyncio.gather(*(cache.key("k1") for _ in range(5)), return_exceptions=True)
+    assert all(isinstance(r, auth_mod.JwksUnavailable) for r in res)
+    assert len(calls) == 1  # the waiters used the failed fetch's outcome
+    for kid in ("k1", "k2", "k3"):  # within the back-off: fail fast, no fetch
+        with pytest.raises(auth_mod.JwksUnavailable):
+            await cache.key(kid)
+    assert len(calls) == 1
+    monkeypatch.setattr(auth_mod, "JWKS_FAIL_BACKOFF_S", 0.0)
+    with pytest.raises(auth_mod.JwksUnavailable):
+        await cache.key("k1")
+    assert len(calls) == 2  # the back-off over, one new attempt
+
+
+async def test_jwks_failure_through_http_is_one_fetch(monkeypatch, priv_pem):
+    calls = _failing_jwks(monkeypatch)
+    t = kid_token(priv_pem, "k1")
+    cfg = AuthConfig(jwt=JwtConfig(issuer=ISS, audience=AUD, jwks_url="https://idp.example/j"))
+    async with make_client(cfg) as c:
+        rs = await asyncio.gather(
+            *(c.get("/", headers={"Authorization": f"Bearer {t}"}) for _ in range(5))
+        )
+    assert [r.status_code for r in rs] == [401] * 5
+    assert len(calls) == 1
+
+
+async def test_jwks_random_kid_flood_rate_limited_after_failure(jwks_url, priv_pem, monkeypatch):
+    from a2agw.consult import netguard
+
+    calls = 0
+    real = netguard.safe_get
+
+    async def count(url, tier, **kw):
+        nonlocal calls
+        calls += 1
+        return await real(url, tier, **kw)
+
+    monkeypatch.setattr(netguard, "safe_get", count)
+    cache = auth_mod._JwksCache(jwks_url, "internal")
+    assert await cache.key("k1") is not None
+    assert calls == 1
+    flood = await asyncio.gather(*(cache.key(f"rnd{i}") for i in range(50)))
+    assert flood == [None] * 50 and calls == 1  # within JWKS_REFETCH_MIN_S of the fetch
+    # A failed bypass counts as an attempt too: the next flood does not refetch.
+    monkeypatch.setattr(auth_mod, "JWKS_REFETCH_MIN_S", 0.0)
+
+    async def down(url, tier, **kw):
+        nonlocal calls
+        calls += 1
+        raise netguard.FetchError("down")
+
+    monkeypatch.setattr(netguard, "safe_get", down)
+    res = await asyncio.gather(*(cache.key(f"x{i}") for i in range(20)), return_exceptions=True)
+    assert calls == 2
+    assert sum(isinstance(r, auth_mod.JwksUnavailable) for r in res) == 1
+    assert await cache.key("k1") is not None  # the current set stays in use
+    assert calls == 2
+
+
+def test_http_jwks_url_refused_without_dev(monkeypatch):
+    monkeypatch.delenv("A2AGW_DEV", raising=False)
+    with pytest.raises(ValueError, match="https"):
+        JwtConfig(issuer=ISS, audience=AUD, jwks_url="http://idp.internal/jwks")
+    monkeypatch.setenv("A2AGW_DEV", "1")
+    JwtConfig(issuer=ISS, audience=AUD, jwks_url="http://idp.internal/jwks")
+
+
+async def test_http_jwks_refused_at_fetch_without_dev(monkeypatch):
+    from a2agw.consult import netguard
+
+    called: list[str] = []
+
+    async def spy(url, tier, **kw):
+        called.append(url)
+        return b'{"keys": []}'
+
+    monkeypatch.setattr(netguard, "safe_get", spy)
+    monkeypatch.delenv("A2AGW_DEV", raising=False)
+    cache = auth_mod._JwksCache("http://idp.internal/jwks", "internal")
+    with pytest.raises(auth_mod.JwksUnavailable, match="UnsafeURL"):
+        await cache.key("k1")
+    assert called == []
