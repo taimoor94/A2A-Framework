@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -322,20 +323,114 @@ async def test_jwks_unreachable_401_and_logged(priv_pem, caplog):
     assert t not in caplog.text
 
 
-async def test_jwks_client_created_once(jwks_url, priv_pem, monkeypatch):
-    created = []
-    real = jwt.PyJWKClient
+async def test_jwks_fetched_once_and_cached(jwks_url, priv_pem, monkeypatch):
+    from a2agw.consult import netguard
 
-    def spy(*a, **kw):
-        created.append(kw)
-        return real(*a, **kw)
+    calls: list[dict] = []
+    real = netguard.safe_get
 
-    monkeypatch.setattr(auth_mod.jwt, "PyJWKClient", spy)
+    async def spy(url, tier, **kw):
+        calls.append({"url": url, "tier": tier, **kw})
+        return await real(url, tier, **kw)
+
+    monkeypatch.setattr(netguard, "safe_get", spy)
     async with make_client(jwks_config(jwks_url)) as c:
         h = {"Authorization": f"Bearer {kid_token(priv_pem, 'k1')}"}
         assert (await c.get("/", headers=h)).status_code == 200
         assert (await c.get("/", headers=h)).status_code == 200
-    assert len(created) == 1 and created[0]["timeout"] == 5
+    assert len(calls) == 1
+    assert calls[0]["deadline_s"] == 5 and calls[0]["tier"] == "internal"
+    assert "http" not in calls[0]  # no injected client: the guarded one
+
+
+async def test_jwks_host_vetted_by_guarded_client(priv_pem, monkeypatch, caplog):
+    """The JWKS host is resolved and vetted at connect time for ``jwks_tier`` (internal by
+    default): a host resolving to a metadata address is never connected to."""
+    from a2agw.consult import netguard
+    from a2agw.consult.guarded_net import GuardedBackend
+
+    seen: list[tuple[str, str]] = []
+    real_connect = GuardedBackend.connect_tcp
+
+    async def record(self, host, port, timeout=None, local_address=None, socket_options=None):
+        seen.append((host, self._tier_for_host(host)))
+        return await real_connect(self, host, port, timeout, local_address, socket_options)
+
+    async def to_metadata(host):
+        return ["169.254.169.254"]
+
+    connected: list[str] = []
+
+    async def never(self, host, port, timeout=None, local_address=None, socket_options=None):
+        connected.append(host)
+        raise AssertionError("must not connect")
+
+    import httpcore
+
+    monkeypatch.setattr(GuardedBackend, "connect_tcp", record)
+    monkeypatch.setattr(httpcore.AnyIOBackend, "connect_tcp", never)
+    monkeypatch.setattr(netguard, "_resolve", to_metadata)
+    t = kid_token(priv_pem, "k1")
+    for tier in ("internal", "public"):
+        cfg = AuthConfig(
+            jwt=JwtConfig(
+                issuer=ISS, audience=AUD, jwks_url="https://idp.example/jwks", jwks_tier=tier
+            )
+        )
+        with caplog.at_level(logging.ERROR, logger="a2agw.security.auth"):
+            async with make_client(cfg) as c:
+                await assert_401(await c.get("/", headers={"Authorization": f"Bearer {t}"}))
+    # public: refused by the pre-check before any connection attempt; internal: at connect.
+    assert seen == [("idp.example", "internal")]
+    assert connected == []
+    assert "jwks unreachable" in caplog.text and "idp.example" not in caplog.text
+
+
+async def test_jwks_concurrent_misses_share_one_fetch(jwks_url, priv_pem, monkeypatch):
+    from a2agw.consult import netguard
+
+    calls = 0
+    real = netguard.safe_get
+
+    async def slow(url, tier, **kw):
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.05)
+        return await real(url, tier, **kw)
+
+    monkeypatch.setattr(netguard, "safe_get", slow)
+    h = {"Authorization": f"Bearer {kid_token(priv_pem, 'k1')}"}
+    async with make_client(jwks_config(jwks_url)) as c:
+        rs = await asyncio.gather(*(c.get("/", headers=h) for _ in range(10)))
+    assert [r.status_code for r in rs] == [200] * 10
+    assert calls == 1
+
+
+async def test_jwks_unknown_kid_refetch_rate_limited(jwks_url, priv_pem, monkeypatch):
+    from a2agw.consult import netguard
+
+    calls = 0
+    real = netguard.safe_get
+
+    async def count(url, tier, **kw):
+        nonlocal calls
+        calls += 1
+        return await real(url, tier, **kw)
+
+    monkeypatch.setattr(netguard, "safe_get", count)
+    async with make_client(jwks_config(jwks_url)) as c:
+        ok = {"Authorization": f"Bearer {kid_token(priv_pem, 'k1')}"}
+        bad = {"Authorization": f"Bearer {kid_token(priv_pem, 'rotated')}"}
+        assert (await c.get("/", headers=ok)).status_code == 200
+        for _ in range(5):  # unknown kids right after a fetch: no refetch flood
+            await assert_401(await c.get("/", headers=bad))
+        assert calls == 1
+        monkeypatch.setattr(auth_mod, "JWKS_REFETCH_MIN_S", 0.0)
+        await assert_401(await c.get("/", headers=bad))
+        assert calls == 2  # one bypass once the rate limit allows it
+        monkeypatch.setattr(auth_mod, "JWKS_TTL_S", 0.0)
+        assert (await c.get("/", headers=ok)).status_code == 200
+        assert calls == 3  # expired set refetched
 
 
 # ---- logging ----

@@ -375,6 +375,35 @@ async def test_unknown_kid_forces_rate_limited_refetch(keys):
 
 
 @respx.mock
+async def test_failed_forced_refetch_backs_off_for_60s(keys):
+    """Unknown kid, forced refetch fails: no new forced refetch while that failure is under
+    60 s old; after that one more is allowed."""
+    import time
+
+    route = respx.get(JKU).respond(200, json=_jwks(keys, "ec", "old"))
+    verifier = CardVerifier(jwks_urls=[JKU])
+    old = signer(keys, "ec", kid="old", jku=JKU).sign(card())
+    await verifier.verify(old)
+    _fetched_at, cached = verifier._jwks[JKU]
+    verifier._jwks[JKU] = (time.monotonic() - 61, cached)  # a bypass is due
+    route.respond(500)
+    unknown = signer(keys, "rsa", kid="new", jku=JKU).sign(card())
+    with pytest.raises(CardSignatureError, match="jwks fetch failed"):
+        await verifier.verify(unknown)
+    assert route.call_count == 2
+    for _ in range(5):  # within the back-off: no fetch at all
+        with pytest.raises(CardSignatureError, match="no signature verifies"):
+            await verifier.verify(unknown)
+    assert route.call_count == 2
+    assert (await verifier.verify(old)).kid == "old"  # cached keys still in use
+    # 61 s after the failure the bypass may run again.
+    verifier._refetch_failed[JKU] = time.monotonic() - 61
+    route.respond(200, json=_jwks(keys, "rsa", "new"))
+    assert (await verifier.verify(unknown)).kid == "new"
+    assert route.call_count == 3
+
+
+@respx.mock
 async def test_failed_jwks_fetch_remembered_within_one_verify(keys):
     route = respx.get(JKU).respond(500)
     c = card()

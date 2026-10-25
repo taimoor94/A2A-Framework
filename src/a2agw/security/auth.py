@@ -7,8 +7,9 @@ import hashlib
 import hmac
 import logging
 import re
+import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import jwt
 from a2a.auth.user import UnauthenticatedUser, User
@@ -23,6 +24,8 @@ from starlette.authentication import (
 from starlette.requests import HTTPConnection, Request
 from starlette.responses import JSONResponse
 
+from a2agw.consult import netguard
+from a2agw.consult.netguard import FetchError, Tier, UnsafeURL
 from a2agw.security.principal import Principal, PrincipalUser
 
 logger = logging.getLogger(__name__)
@@ -33,6 +36,10 @@ ALLOWED_JWT_ALGORITHMS = ["RS256", "ES256", "EdDSA"]
 BEARER_STATE_KEY = "a2agw_bearer"
 _CREDENTIAL_HEADERS = frozenset({"authorization", "x-api-key"})
 JWT_LEEWAY_SECONDS = 30
+JWKS_TIMEOUT_S = 5.0  # whole fetch: vetting, connect and body
+JWKS_TTL_S = 300.0  # PyJWKClient's default JWK set lifespan
+JWKS_REFETCH_MIN_S = 30.0  # unknown kid: at most one cache bypass per this
+JWKS_MAX_BYTES = 1024 * 1024
 
 
 class PermissionDenied(Exception):
@@ -48,6 +55,9 @@ class JwtConfig(BaseModel):
     issuer: str
     audience: str
     jwks_url: str | None = None
+    # netguard tier the JWKS host is vetted with (the IdP is usually an internal service;
+    # use "public" for a hosted IdP to require https and a public address).
+    jwks_tier: Literal["internal", "partner", "public"] = "internal"
     public_key_pem: str | None = None
     scopes_claim: str = "scope"
 
@@ -90,6 +100,57 @@ _SHA256_HEX = re.compile(r"[0-9a-fA-F]{64}")
 _ANONYMOUS = Principal(id="anonymous", kind="anonymous", scopes=frozenset())
 
 
+class JwksUnavailable(Exception):
+    """The JWKS could not be fetched (refused, unreachable, bad status or malformed)."""
+
+
+class _JwksCache:
+    """The inbound JWT keys of one JWKS URL, fetched through a guarded client
+    (``netguard.safe_get``: the host is vetted for ``tier`` at connect time, no redirects,
+    a size cap and one ``JWKS_TIMEOUT_S`` deadline).
+
+    Same caching as PyJWKClient: the key set is kept ``JWKS_TTL_S``; an unknown kid refetches
+    it, at most once per ``JWKS_REFETCH_MIN_S``. Concurrent misses share one fetch."""
+
+    def __init__(self, url: str, tier: Tier) -> None:
+        self.url = url
+        self.tier = tier
+        self._keys: dict[str, jwt.PyJWK] = {}
+        self._fetched_at: float | None = None
+        self._lock = asyncio.Lock()
+
+    async def _refresh(self) -> None:
+        try:
+            body = await netguard.safe_get(
+                self.url, self.tier, max_bytes=JWKS_MAX_BYTES, deadline_s=JWKS_TIMEOUT_S
+            )
+            jwk_set = jwt.PyJWKSet.from_json(body.decode("utf-8"))
+        except (UnsafeURL, FetchError) as e:
+            raise JwksUnavailable(type(e).__name__) from None
+        except Exception as e:  # noqa: BLE001 - any malformed JWKS: no keys, fail closed
+            raise JwksUnavailable(type(e).__name__) from None
+        # Like PyJWKClient: signing keys only ("use" absent or "sig"), each with a kid.
+        self._keys = {
+            k.key_id: k for k in jwk_set.keys if k.key_id and k.public_key_use in ("sig", None)
+        }
+        self._fetched_at = time.monotonic()
+
+    def _fresh(self) -> bool:
+        return self._fetched_at is not None and time.monotonic() - self._fetched_at < JWKS_TTL_S
+
+    async def key(self, kid: str) -> jwt.PyJWK | None:
+        if self._fresh() and kid in self._keys:
+            return self._keys[kid]
+        async with self._lock:  # single flight: whoever waited here sees the new set
+            if not self._fresh():
+                await self._refresh()
+            elif kid not in self._keys:
+                assert self._fetched_at is not None
+                if time.monotonic() - self._fetched_at >= JWKS_REFETCH_MIN_S:
+                    await self._refresh()
+            return self._keys.get(kid)
+
+
 def _fail() -> AuthenticationError:
     # Deliberately uninformative: never reveal which check failed.
     return AuthenticationError("unauthenticated")
@@ -105,7 +166,7 @@ class GatewayAuthBackend(AuthenticationBackend):
 
     def __init__(self, config: AuthConfig) -> None:
         self._config = config
-        self._jwks_client: jwt.PyJWKClient | None = None
+        self._jwks: _JwksCache | None = None
 
     async def authenticate(self, conn: HTTPConnection) -> tuple[AuthCredentials, User] | None:
         api_key = conn.headers.get("x-api-key")
@@ -155,10 +216,14 @@ class GatewayAuthBackend(AuthenticationBackend):
             if cfg.public_key_pem:
                 key: Any = cfg.public_key_pem
             elif cfg.jwks_url:
-                if self._jwks_client is None:
-                    self._jwks_client = jwt.PyJWKClient(cfg.jwks_url, cache_keys=True, timeout=5)
-                signing = await asyncio.to_thread(self._jwks_client.get_signing_key_from_jwt, token)
-                key = signing
+                if self._jwks is None:
+                    self._jwks = _JwksCache(cfg.jwks_url, cfg.jwks_tier)
+                kid = jwt.get_unverified_header(token).get("kid")
+                if not isinstance(kid, str) or not kid:
+                    raise jwt.InvalidTokenError("no kid")
+                key = await self._jwks.key(kid)
+                if key is None:
+                    raise jwt.InvalidTokenError("unknown kid")
             else:
                 raise _fail()
             claims = jwt.decode(
@@ -172,8 +237,8 @@ class GatewayAuthBackend(AuthenticationBackend):
             )
         except AuthenticationError:
             raise
-        except jwt.PyJWKClientConnectionError:
-            logger.error("jwks unreachable")
+        except JwksUnavailable as e:
+            logger.error("jwks unreachable: %s", e)
             raise _fail() from None
         except Exception as e:  # noqa: BLE001 - any failure is a plain 401
             logger.warning("jwt rejected: %s", type(e).__name__)

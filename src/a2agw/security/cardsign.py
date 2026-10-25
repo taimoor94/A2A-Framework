@@ -39,6 +39,7 @@ JWKS_MAX_BYTES = 1024 * 1024
 JWKS_DEADLINE_S = 10.0
 JWKS_TTL_S = 300.0
 JWKS_REFETCH_MIN_S = 60.0  # unknown-kid cache bypass, at most once per URL per this
+JWKS_REFETCH_FAIL_BACKOFF_S = 60.0  # after a failed bypass, no new one for this long
 MAX_SIGNATURES = 8  # signatures examined per card; more is a DoS lever, not a use case
 MIN_RSA_BITS = 2048
 
@@ -232,6 +233,7 @@ class CardVerifier:
         self.jwks_urls = frozenset(jwks_urls)
         self._http = http
         self._jwks: dict[str, tuple[float, dict[str, PyJWK]]] = {}
+        self._refetch_failed: dict[str, float] = {}  # url -> when a forced refetch failed
 
     async def _fetch_jwks(self, url: str) -> dict[str, PyJWK]:
         try:
@@ -258,9 +260,20 @@ class CardVerifier:
         if kid in keys:
             return keys[kid]
         # Unknown kid: the partner may have rotated. Bypass the cache, at most once per
-        # JWKS_REFETCH_MIN_S per URL, so unknown kids cannot turn into a fetch flood.
-        if time.monotonic() - fetched_at >= JWKS_REFETCH_MIN_S:
-            return (await self._fetch_jwks(url)).get(kid)
+        # JWKS_REFETCH_MIN_S per URL, so unknown kids cannot turn into a fetch flood. A failed
+        # bypass is not retried for JWKS_REFETCH_FAIL_BACKOFF_S (the cached keys stay in use).
+        now = time.monotonic()
+        failed_at = self._refetch_failed.get(url)
+        if failed_at is not None and now - failed_at < JWKS_REFETCH_FAIL_BACKOFF_S:
+            return None
+        if now - fetched_at >= JWKS_REFETCH_MIN_S:
+            try:
+                keys = await self._fetch_jwks(url)
+            except CardSignatureError:
+                self._refetch_failed[url] = time.monotonic()
+                raise
+            self._refetch_failed.pop(url, None)
+            return keys.get(kid)
         return None
 
     async def _key_for(
