@@ -7,7 +7,7 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from postgres_support import _pg_server, pg_url  # noqa: F401 - shared fixtures
+from postgres_support import _pg_server, pg_url, pg_url_factory  # noqa: F401 - fixtures
 from streaming_asgi import StreamingASGITransport
 
 from a2agw.consult import client as client_mod
@@ -17,6 +17,30 @@ from a2agw.serve.host import AgentHost
 # The OTel global provider can be set once per process; ``_span_exporter`` registers its
 # in-memory exporter here so spans never pile up across the session.
 INSTALLED_EXPORTERS: list = []
+
+
+@pytest.fixture(
+    params=["sqlite", pytest.param("postgres", marks=pytest.mark.postgres)],
+)
+def db_factory(request, tmp_path):
+    """Calls return a fresh database URL on each backend: a tmp sqlite file, or a throwaway
+    Postgres database (the test is skipped when no PostgreSQL binaries are available)."""
+    if request.param == "postgres":
+        return request.getfixturevalue("pg_url_factory")
+    count = 0
+
+    def make() -> str:
+        nonlocal count
+        count += 1
+        return f"sqlite+aiosqlite:///{tmp_path / f'db{count}.sqlite'}"
+
+    return make
+
+
+@pytest.fixture
+def db_url(db_factory) -> str:
+    """One fresh database URL, on sqlite and on Postgres (see ``db_factory``)."""
+    return db_factory()
 
 
 @pytest.fixture(autouse=True)

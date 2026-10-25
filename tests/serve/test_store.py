@@ -25,8 +25,8 @@ def _ctx(owner: str) -> ServerCallContext:
 
 
 @pytest.fixture
-async def engine(tmp_path):
-    eng = await create_engine(f"sqlite+aiosqlite:///{tmp_path / 't.db'}")
+async def engine(db_url):
+    eng = await create_engine(db_url)
     yield eng
     await eng.dispose()
 
@@ -223,9 +223,9 @@ async def test_task_store_for_is_idempotent(engine):
         task_store_for(engine, "bad name; drop")
 
 
-async def test_two_engines_same_agent_id(tmp_path):
-    e1 = await create_engine(f"sqlite+aiosqlite:///{tmp_path / 'one.db'}")
-    e2 = await create_engine(f"sqlite+aiosqlite:///{tmp_path / 'two.db'}")
+async def test_two_engines_same_agent_id(db_factory):
+    e1 = await create_engine(db_factory())
+    e2 = await create_engine(db_factory())
     try:
         s1, s2 = task_store_for(e1, "a"), task_store_for(e2, "a")
         await s1.initialize()

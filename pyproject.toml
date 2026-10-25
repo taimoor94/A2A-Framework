@@ -24,7 +24,8 @@ dependencies = [
 [project.optional-dependencies]
 langchain = ["langchain-core>=1.7"]
 langgraph = ["langgraph>=1.2", "langchain-core>=1.7"]
-all = ["langchain-core>=1.7", "langgraph>=1.2"]
+postgres = ["asyncpg>=0.30"]
+all = ["langchain-core>=1.7", "langgraph>=1.2", "asyncpg>=0.30"]
 
 [project.scripts]
 a2agw = "a2agw.cli:app"

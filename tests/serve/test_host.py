@@ -74,9 +74,11 @@ def key_auth(**keys: str) -> AuthConfig:
 
 
 class Env:
-    def __init__(self, tmp_path, **host_kwargs) -> None:
+    def __init__(self, tmp_path, *, db_url: str | None = None, **host_kwargs) -> None:
         self.host = AgentHost(
-            "http://t", db_url=f"sqlite+aiosqlite:///{tmp_path / 'host.db'}", **host_kwargs
+            "http://t",
+            db_url=db_url or f"sqlite+aiosqlite:///{tmp_path / 'host.db'}",
+            **host_kwargs,
         )
         self._clients: list[httpx.AsyncClient] = []
 
@@ -222,9 +224,9 @@ async def test_too_many_parts_invalid_params(env, streaming):
     assert events
 
 
-async def test_restart_recovers(tmp_path):
+async def test_restart_recovers(tmp_path, db_url):
     blocker = Blocker()
-    e1 = Env(tmp_path)
+    e1 = Env(tmp_path, db_url=db_url)
     e1.host.add(spec("alpha", blocker))
     await e1.start()
     events = await send_one(e1.client("alpha"), msg(), return_immediately=True)
@@ -235,7 +237,7 @@ async def test_restart_recovers(tmp_path):
     assert [(r["task_id"], r["state"]) for r in rows] == [(tid, working)]
     await e1.stop()
 
-    e2 = Env(tmp_path)
+    e2 = Env(tmp_path, db_url=db_url)
     e2.host.add(spec("alpha"))
     await e2.start()
     try:

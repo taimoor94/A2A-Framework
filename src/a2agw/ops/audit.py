@@ -49,8 +49,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal, get_args
 
-from sqlalchemy import Column, Float, Integer, MetaData, String, Table, Text, select
+from sqlalchemy import Column, Float, Integer, MetaData, String, Table, Text, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine
+
+from a2agw._ddl import retry_ddl
 
 log = logging.getLogger(__name__)
 
@@ -88,6 +90,7 @@ GENESIS_HASH = "0" * 64
 LOCK_TIMEOUT_S = 5.0  # module constant so tests can shorten it
 COALESCE_WINDOW_S = 60.0
 _BATCH = 500
+_ADVISORY_KEY = 0x61326177_61756469  # 'a2aw' 'audi': one chain per database
 
 _metadata = MetaData()
 AUDIT_TABLE = Table(
@@ -224,8 +227,11 @@ class AuditLog:
         self.audit_errors = 0  # failed emits since start (admin /healthz)
 
     async def initialize(self) -> None:
-        async with self._engine.begin() as conn:
-            await conn.run_sync(_metadata.create_all)
+        async def create() -> None:
+            async with self._engine.begin() as conn:
+                await conn.run_sync(_metadata.create_all, checkfirst=True)
+
+        await retry_ddl(create)
 
     # -- writing ---------------------------------------------------------------------------
 
@@ -251,6 +257,12 @@ class AuditLog:
             raise TimeoutError("audit lock wait timed out") from None
         try:
             async with self._engine.begin() as conn:
+                if conn.dialect.name == "postgresql":
+                    # Serializes writers across processes (the asyncio lock covers only this
+                    # one); released when the transaction ends.
+                    await conn.execute(
+                        text("SELECT pg_advisory_xact_lock(:k)"), {"k": _ADVISORY_KEY}
+                    )
                 last = (
                     await conn.execute(select(t.c.hash).order_by(t.c.seq.desc()).limit(1))
                 ).scalar_one_or_none()

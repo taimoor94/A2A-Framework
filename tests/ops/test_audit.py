@@ -23,8 +23,8 @@ from a2agw.serve.store import create_engine
 
 
 @pytest.fixture
-async def engine(tmp_path):
-    eng = await create_engine(f"sqlite+aiosqlite:///{tmp_path / 'audit.db'}")
+async def engine(db_url):
+    eng = await create_engine(db_url)
     yield eng
     await eng.dispose()
 
@@ -239,26 +239,6 @@ def test_cli_missing_database_is_an_error_and_not_created(tmp_path):
     r = runner.invoke(cli.app, ["audit", "verify", "-c", _config(tmp_path, db)])
     assert r.exit_code == 1 and "error" in r.output
     assert not db.exists()
-
-
-@pytest.mark.postgres
-async def test_chain_and_tamper_detection_on_postgres(pg_url):
-    eng = await create_engine(pg_url)
-    try:
-        a = AuditLog(eng)
-        await a.initialize()
-        seqs = await asyncio.gather(*(a.append(ev(task_id=f"t{i}")) for i in range(20)))
-        assert await a.verify_chain() is None
-        rows, cur = await a.query({"action": "inbound.admit"}, 5, None)
-        assert len(rows) == 5 and cur is not None
-        middle = sorted(seqs)[10]
-        async with eng.begin() as conn:
-            await conn.execute(
-                text("UPDATE a2agw_audit SET outcome = 'x' WHERE seq = :s"), {"s": middle}
-            )
-        assert await a.verify_chain() == middle
-    finally:
-        await eng.dispose()
 
 
 # -- fix round 1 -------------------------------------------------------------------------

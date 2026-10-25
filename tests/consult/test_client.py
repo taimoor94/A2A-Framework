@@ -1166,13 +1166,8 @@ async def test_cascade_cancel_uses_original_caller(env):
         await client.aclose()
 
 
-async def test_handles_migration_adds_caller_id(tmp_path):
-    await _check_caller_id_migration(f"sqlite+aiosqlite:///{tmp_path / 'old.db'}")
-
-
-@pytest.mark.postgres
-async def test_handles_migration_adds_caller_id_postgres(pg_url):
-    await _check_caller_id_migration(pg_url)
+async def test_handles_migration_adds_caller_id(db_url):
+    await _check_caller_id_migration(db_url)
 
 
 async def _check_caller_id_migration(url: str) -> None:

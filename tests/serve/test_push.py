@@ -591,13 +591,11 @@ async def test_host_shutdown_drains_and_closes_client(tmp_path, receiver):
 # -- stores ----------------------------------------------------------------------------
 
 
-async def test_store_tables_per_agent_and_reusable_across_engines(tmp_path):
+async def test_store_tables_per_agent_and_reusable_across_engines(db_factory):
     from a2a.server.context import ServerCallContext
 
     ctx = ServerCallContext()
-    engines = [
-        await create_engine(f"sqlite+aiosqlite:///{tmp_path / f'{n}.db'}") for n in ("a", "b")
-    ]
+    engines = [await create_engine(db_factory()) for _ in range(2)]
     try:
         for engine in engines:  # same agent id on two engines: no duplicate-table error
             store = push_config_store_for(engine, "my-agent")
@@ -746,15 +744,17 @@ async def test_other_principal_cannot_read_or_delete_config(host_env):
     assert len(await store.get_info_for_dispatch(tid)) == 1
 
 
-@pytest.mark.postgres
-async def test_store_on_postgres_with_encryption(pg_url):
+async def test_store_with_encryption_and_limits(db_url):
     from a2a.server.context import ServerCallContext
     from cryptography.fernet import Fernet, MultiFernet
 
-    engine = await create_engine(pg_url)
+    engine = await create_engine(db_url)
     try:
         store = push_config_store_for(
-            engine, "pg-agent", fernet=MultiFernet([Fernet(Fernet.generate_key())])
+            engine,
+            "pg-agent",
+            fernet=MultiFernet([Fernet(Fernet.generate_key())]),
+            max_configs_per_task=2,
         )
         await store.initialize()
         ctx = ServerCallContext()
@@ -765,6 +765,13 @@ async def test_store_on_postgres_with_encryption(pg_url):
         assert [(c.id, c.token) for c in got] == [("c", "tok")]
         await store.delete_info("t", ctx, "c")
         assert await store.get_info("t", ctx) == []
+        for i in range(2):
+            await store.set_info(
+                "lim", TaskPushNotificationConfig(id=f"c{i}", url="https://x/"), ctx
+            )
+        with pytest.raises(InvalidParamsError, match="too many"):
+            await store.set_info("lim", TaskPushNotificationConfig(id="c9", url="https://x/"), ctx)
+        assert await store.delete_for_task("lim") == 2
     finally:
         await engine.dispose()
 

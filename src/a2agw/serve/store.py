@@ -33,9 +33,10 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects import sqlite as sqlite_dialect
-from sqlalchemy.engine import URL
+from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
+from a2agw._ddl import retry_ddl
 from a2agw.consult.handles import OUTBOUND_TABLE
 from a2agw.security.principal import Principal, PrincipalUser
 
@@ -95,7 +96,14 @@ def _sqlite_pragmas(dbapi_conn: Any, _record: Any) -> None:
 
 
 async def create_engine(url: str = "sqlite+aiosqlite:///a2agw.db") -> AsyncEngine:
-    engine = create_async_engine(url)
+    if make_url(url).get_backend_name() == "postgresql":
+        # pre_ping replaces connections the server or a proxy dropped; recycle keeps them
+        # younger than typical idle timeouts.
+        engine = create_async_engine(
+            url, pool_pre_ping=True, pool_size=10, max_overflow=10, pool_recycle=1800
+        )
+    else:
+        engine = create_async_engine(url)
     if _is_file_sqlite(engine.url):
         event.listen(engine.sync_engine, "connect", _sqlite_pragmas)
     return engine
@@ -153,10 +161,13 @@ class TaskIndex:
         self._engine = engine
 
     async def initialize(self) -> None:
-        async with self._engine.begin() as conn:
-            await conn.run_sync(_metadata.create_all)
-            # The re-entry query joins the outbound handles, so make sure that table exists.
-            await conn.run_sync(OUTBOUND_TABLE.create, checkfirst=True)
+        async def create() -> None:
+            async with self._engine.begin() as conn:
+                await conn.run_sync(_metadata.create_all, checkfirst=True)
+                # The re-entry query joins the outbound handles, so make sure the table exists.
+                await conn.run_sync(OUTBOUND_TABLE.create, checkfirst=True)
+
+        await retry_ddl(create)
 
     async def upsert(
         self,
@@ -293,6 +304,9 @@ async def recover_on_startup(
 ) -> RecoveryReport:
     """Spec 11a item 5: fail orphaned in-flight tasks, keep durable input-required ones.
 
+    Only the tasks of agents in ``stores`` are touched: gateways sharing one database each
+    recover their own agents.
+
     The non-terminal outbound handles of every failed task are then cancelled concurrently,
     within ``cancel_timeout_s`` overall. A cancel that raises or times out is reported in
     ``cancel_errors``; every other one counts in ``outbound_cancelled``.
@@ -302,6 +316,8 @@ async def recover_on_startup(
     failed_state = TaskState.Name(TaskState.TASK_STATE_FAILED)
     for row in await index.by_state(_ACTIVE_STATES):
         task_id, agent_id, owner = row["task_id"], row["agent_id"], row["owner"]
+        if agent_id not in stores:
+            continue  # another gateway sharing this database serves that agent
         if row["state"] in _RESUMABLE_STATES and durable.get(agent_id, False):
             report.kept.append(task_id)
             continue

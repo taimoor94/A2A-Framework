@@ -26,6 +26,8 @@ from sqlalchemy.dialects import sqlite as sqlite_dialect
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from a2agw._ddl import retry_ddl
+
 _metadata = MetaData()
 _outbound = Table(
     "a2agw_outbound",
@@ -49,14 +51,17 @@ class OutboundHandleStore:
         self._engine = engine
 
     async def initialize(self) -> None:
-        async with self._engine.begin() as conn:
-            await conn.run_sync(_metadata.create_all)
-            # Phase 1 tables lack caller_id: add it (works on sqlite and postgres alike).
-            columns = await conn.run_sync(
-                lambda sync: {c["name"] for c in inspect(sync).get_columns(_outbound.name)}
-            )
-            if "caller_id" not in columns:
-                await self._add_caller_id(conn)
+        async def migrate() -> None:
+            async with self._engine.begin() as conn:
+                await conn.run_sync(_metadata.create_all, checkfirst=True)
+                # Phase 1 tables lack caller_id: add it (works on sqlite and postgres alike).
+                columns = await conn.run_sync(
+                    lambda sync: {c["name"] for c in inspect(sync).get_columns(_outbound.name)}
+                )
+                if "caller_id" not in columns:
+                    await self._add_caller_id(conn)
+
+        await retry_ddl(migrate)
 
     @staticmethod
     async def _add_caller_id(conn: AsyncConnection) -> None:

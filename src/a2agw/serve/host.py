@@ -31,6 +31,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import BaseRoute, Mount, get_route_path
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from a2agw._ddl import retry_ddl
 from a2agw.consult.client import PartnerClient
 from a2agw.consult.credentials import CredentialProvider
 from a2agw.consult.handles import OutboundHandleStore
@@ -574,7 +575,7 @@ class AgentHost:
             )
         for agent_id, spec in self.specs.items():
             store = task_store_for(engine, agent_id)
-            await store.initialize()
+            await retry_ddl(store.initialize)
             stores[agent_id] = store
             executor = AdapterExecutor(spec, index, self.bus, policy=self.policy, audit=audit)
             # Cancelling an inbound task cancels the partner tasks it started.
@@ -591,7 +592,7 @@ class AgentHost:
                     fernet=push_fernet,
                     max_configs_per_task=push.max_configs_per_task,
                 )
-                await push_store.initialize()
+                await retry_ddl(push_store.initialize)
                 sender = GuardedPushSender(
                     self.push_http,
                     push_store,
