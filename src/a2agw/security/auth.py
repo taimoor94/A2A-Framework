@@ -136,7 +136,7 @@ class _JwksCache:
         self._lock = asyncio.Lock()
 
     async def _refresh(self) -> None:
-        self._attempted_at = time.monotonic()
+        previous_attempt, self._attempted_at = self._attempted_at, time.monotonic()
         try:
             if self.url.lower().startswith("http://") and not _dev():
                 raise UnsafeURL("https is required")
@@ -144,11 +144,16 @@ class _JwksCache:
                 self.url, self.tier, max_bytes=JWKS_MAX_BYTES, deadline_s=JWKS_TIMEOUT_S
             )
             jwk_set = jwt.PyJWKSet.from_json(body.decode("utf-8"))
+        except asyncio.CancelledError:
+            # Our caller went away: no outcome. The generation stays, so the next waiter in
+            # line fetches itself instead of taking this as a finished fetch.
+            self._attempted_at = previous_attempt
+            raise
         except Exception as e:  # noqa: BLE001 - refused, unreachable or malformed: fail closed
             self._failed_at = time.monotonic()
-            raise JwksUnavailable(type(e).__name__) from None
-        finally:
             self._generation += 1
+            raise JwksUnavailable(type(e).__name__) from None
+        self._generation += 1
         # Like PyJWKClient: signing keys only ("use" absent or "sig"), each with a kid.
         self._keys = {
             k.key_id: k for k in jwk_set.keys if k.key_id and k.public_key_use in ("sig", None)

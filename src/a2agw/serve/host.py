@@ -119,8 +119,14 @@ def _on_exit_signal(callback: Callable[[], None]) -> Iterator[None]:
         except RuntimeError:  # the loop is already closed: nothing left to end
             pass
         prev = previous[sig]
-        if prev is None or prev == signal.SIG_IGN:
-            return  # ignored before (None: installed outside Python): stay ignored
+        if prev == signal.SIG_IGN:
+            return  # ignored before: stay ignored, whatever the signal
+        if prev is None:
+            # Installed outside Python: SIGINT still raises KeyboardInterrupt, the others
+            # only end the streams.
+            if sig == signal.SIGINT:
+                signal.default_int_handler(sig, frame)
+            return
         if prev == signal.SIG_DFL:
             if sig == signal.SIGINT:
                 signal.default_int_handler(sig, frame)  # KeyboardInterrupt
@@ -137,7 +143,9 @@ def _on_exit_signal(callback: Callable[[], None]) -> Iterator[None]:
         yield
     finally:
         for sig, prev in previous.items():
-            if signal.getsignal(sig) is handler:
+            # None (installed outside Python) cannot be reinstalled from Python: ours stays,
+            # and it emulates that default (its loop callback is then a no-op).
+            if prev is not None and signal.getsignal(sig) is handler:
                 signal.signal(sig, prev)
 
 
@@ -878,8 +886,12 @@ class AgentHost:
         Removing a partner that still has non-terminal outbound tasks (handles) would orphan
         them: that is refused with ``PartnersInUse`` unless ``force``. The result has the ids
         per change and ``open_handles``, the open handles of removed partners (logged when
-        not zero). ValueError if there is no partners file or it is invalid; RuntimeError if
-        the registry changed meanwhile. In every failure case the registry is unchanged."""
+        not zero). ValueError if there is no partners file or it is invalid; ReloadConflict
+        if the registry changed meanwhile. In every failure case the registry is unchanged.
+
+        Known window: the open handles are counted while awaiting ``count_open``; a partner
+        task started for a removed partner during that await is not counted, so the removal
+        can still orphan it."""
         plan = self.partners.prepare_reload()
         open_handles = 0
         if plan.removed and self.handles is not None:

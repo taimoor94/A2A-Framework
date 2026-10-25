@@ -303,6 +303,7 @@ def admin_routes(host: AgentHost) -> list[Route]:
         )
 
     async def partners_reload(request: Request) -> Response:
+        from a2agw.consult.registry import ReloadConflict
         from a2agw.serve.host import PartnersInUse
 
         raw = request.query_params.get("force", "false")
@@ -319,13 +320,16 @@ def admin_routes(host: AgentHost) -> list[Route]:
                 },
                 status_code=409,
             )
-        except RuntimeError:
+        except ReloadConflict:
             await audit(request, "partner.reload", "conflict", "registry changed")
             return JSONResponse({"error": "registry changed during reload; retry"}, status_code=409)
         except (ValueError, OSError) as exc:
             # The message may quote the file; only its class goes out (and to the audit).
             await audit(request, "partner.reload", "error", type(exc).__name__)
             return JSONResponse({"error": "partners file not reloaded"}, status_code=400)
+        except Exception as exc:
+            await audit(request, "partner.reload", "error", type(exc).__name__)
+            raise  # a bug, not a bad file: a plain 500
         counts = ", ".join(f"{k} {len(v)}" for k, v in changes.items() if isinstance(v, list))
         await audit(request, "partner.reload", "ok", counts)
         return JSONResponse(changes)

@@ -526,6 +526,39 @@ async def test_exit_signal_over_sig_ign_does_nothing_more(sig_name):
     assert ran and raised is None
 
 
+async def test_exit_signal_over_none_previous():
+    """``None`` (a handler installed outside Python): SIGINT still raises KeyboardInterrupt,
+    any other signal only ends the streams."""
+    import signal
+    from unittest import mock
+
+    from a2agw.serve import host as host_mod
+
+    for sig, expect in ((signal.SIGINT, KeyboardInterrupt), (signal.SIGTERM, None)):
+        real = signal.getsignal
+
+        def fake(s, real=real, sig=sig):
+            return None if s == sig else real(s)
+
+        ran: list[bool] = []
+        original = signal.getsignal(sig)
+        try:
+            with mock.patch.object(host_mod.signal, "getsignal", fake):
+                ctx = host_mod._on_exit_signal(lambda ran=ran: ran.append(True))
+                ctx.__enter__()
+            raised = None
+            try:
+                real(sig)(sig, None)
+            except BaseException as exc:  # noqa: BLE001
+                raised = exc
+            await asyncio.sleep(0)
+            ctx.__exit__(None, None, None)
+        finally:
+            signal.signal(sig, original)
+        assert ran
+        assert (type(raised) if raised is not None else None) is expect
+
+
 def test_exit_signal_sigterm_over_sig_dfl_terminates_process(tmp_path):
     """SIGTERM over SIG_DFL keeps its default action: the process dies by SIGTERM (checked
     in a subprocess)."""

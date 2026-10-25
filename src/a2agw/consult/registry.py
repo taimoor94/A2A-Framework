@@ -118,6 +118,10 @@ def _significant_differs(old: dict[str, Any], new: dict[str, Any]) -> bool:
     return any(old.get(k) != new.get(k) for k in keys)
 
 
+class ReloadConflict(RuntimeError):
+    """The registry changed between ``prepare_reload`` and ``apply_reload``."""
+
+
 @dataclass
 class ReloadPlan:
     """A validated partners file and its diff against the registry (``prepare_reload``)."""
@@ -414,9 +418,9 @@ class PartnerRegistry:
         """Apply a plan in one step (no await): new partners are added, changed records
         replace the old ones, removed ones go, unchanged records keep their identity.
         ``on_change`` fires per partner ("added", "updated", "removed"); the file is not
-        rewritten. RuntimeError if the registry changed since the plan was made."""
+        rewritten. ReloadConflict if the registry changed since the plan was made."""
         if plan.version != self._version:
-            raise RuntimeError("partner registry changed during reload")
+            raise ReloadConflict("partner registry changed during reload")
         old = self._records
         keep = set(old) - set(plan.updated)
         self._records = {i: old[i] if i in keep else r for i, r in plan.fresh.items()}

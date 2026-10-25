@@ -477,3 +477,37 @@ async def test_partners_reload_refuses_removing_partner_with_open_handles(make, 
     assert host.partners.all() == []
     rows = (await hc.get("/a2agw/admin/audit?action=partner.reload", headers=ADMIN)).json()
     assert [e["outcome"] for e in rows["events"]][:2] == ["ok", "refused"]
+
+
+async def test_partners_reload_conflict_is_409_other_runtime_error_is_500(make, tmp_path):
+    from a2agw.consult.registry import ReloadConflict
+
+    pf = tmp_path / "partners.yaml"
+    pf.write_text("partners: []\n")
+    host, _ = await make(spec(), auth=auth(), partners_path=pf)
+    hc = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=host.app(), raise_app_exceptions=False),
+        base_url="http://t",
+    )
+    url = "/a2agw/admin/partners/reload"
+    try:
+        def conflict(plan):
+            raise ReloadConflict("partner registry changed during reload")
+
+        host.partners.apply_reload = conflict  # type: ignore[method-assign]
+        r = await hc.post(url, headers=ADMIN)
+        assert r.status_code == 409 and "retry" in r.json()["error"]
+
+        def bug(plan):
+            raise RuntimeError("unexpected")
+
+        host.partners.apply_reload = bug  # type: ignore[method-assign]
+        r = await hc.post(url, headers=ADMIN)
+        assert r.status_code == 500
+        rows = (await hc.get("/a2agw/admin/audit?action=partner.reload", headers=ADMIN)).json()
+        assert [(e["outcome"], e["detail"]["reason"]) for e in rows["events"]] == [
+            ("error", "RuntimeError"),
+            ("conflict", "registry changed"),
+        ]
+    finally:
+        await hc.aclose()

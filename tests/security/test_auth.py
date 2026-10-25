@@ -648,3 +648,34 @@ async def test_http_jwks_refused_at_fetch_without_dev(monkeypatch):
     with pytest.raises(auth_mod.JwksUnavailable, match="UnsafeURL"):
         await cache.key("k1")
     assert called == []
+
+
+async def test_jwks_cancelled_fetch_does_not_satisfy_waiters(jwks_url, monkeypatch):
+    """The request that started the fetch is cancelled mid-fetch: its waiters still get a
+    fetch (one of them makes it) and the key."""
+    from a2agw.consult import netguard
+
+    started = asyncio.Event()
+    calls = 0
+    real = netguard.safe_get
+
+    async def slow_first(url, tier, **kw):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            await asyncio.sleep(3600)  # cancelled below
+        return await real(url, tier, **kw)
+
+    monkeypatch.setattr(netguard, "safe_get", slow_first)
+    cache = auth_mod._JwksCache(jwks_url, "internal")
+    first = asyncio.create_task(cache.key("k1"))
+    await started.wait()
+    waiters = [asyncio.create_task(cache.key("k1")) for _ in range(3)]
+    await asyncio.sleep(0.01)  # queued on the lock
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    keys = await asyncio.wait_for(asyncio.gather(*waiters), 5)
+    assert all(k is not None and k.key_id == "k1" for k in keys)
+    assert calls == 2  # one new fetch, shared by the waiters
