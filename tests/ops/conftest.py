@@ -1,4 +1,5 @@
 import pytest
+from conftest import INSTALLED_EXPORTERS
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -12,6 +13,7 @@ def _span_exporter():
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
     trace.set_tracer_provider(provider)
+    INSTALLED_EXPORTERS.append(exporter)
     return exporter
 
 

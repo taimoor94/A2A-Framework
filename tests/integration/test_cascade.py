@@ -3,45 +3,23 @@
 from __future__ import annotations
 
 import asyncio
-import uuid
 from typing import Any
 
-import httpx
 import pytest
-from a2a.client import ClientConfig, ClientFactory
 from a2a.types import (
     CancelTaskRequest,
-    Message,
-    Part,
-    Role,
-    SendMessageConfiguration,
     SendMessageRequest,
     TaskState,
 )
+from cascade_support import Fn, msg, spec
 from google.protobuf.json_format import MessageToDict
-from streaming_asgi import StreamingASGITransport
 
-from a2agw.consult import client as client_mod
 from a2agw.consult.tools import invoke, partner_tools
 from a2agw.context.call_context import EXTENSION_URI, current_inbound_task, current_principal
 from a2agw.core.events import Done
-from a2agw.serve.agent import AgentSpec, SkillSpec
-from a2agw.serve.host import AgentHost
 
 CANCELED = TaskState.Name(TaskState.TASK_STATE_CANCELED)
 REJECTED = TaskState.Name(TaskState.TASK_STATE_REJECTED)
-
-
-class Fn:
-    """Adapter whose behaviour is a test-supplied async generator function of the context."""
-
-    durable_sessions = False
-
-    def __init__(self, fn) -> None:
-        self.fn = fn
-
-    def run(self, ctx):
-        return self.fn(ctx)
 
 
 class Blocker:
@@ -58,86 +36,6 @@ class Blocker:
 
 async def echo(ctx):
     yield Done(text=f"echo: {ctx.text}")
-
-
-def spec(agent_id: str, adapter, **kw) -> AgentSpec:
-    return AgentSpec(
-        id=agent_id,
-        name=agent_id.title(),
-        description=f"Test agent {agent_id}",
-        skills=[SkillSpec(id="s", name="S", description="d")],
-        adapter=adapter,
-        **kw,
-    )
-
-
-def msg(text: str) -> Message:
-    return Message(message_id=uuid.uuid4().hex, role=Role.ROLE_USER, parts=[Part(text=text)])
-
-
-class Env:
-    def __init__(self, host: AgentHost, partner_hc: httpx.AsyncClient):
-        self.host = host
-        self.partner_hc = partner_hc  # the host's outbound client
-        self.hc = httpx.AsyncClient(  # inbound callers of this host
-            transport=StreamingASGITransport({"t": host.app()}), base_url="http://t"
-        )
-
-    def client(self, agent_id: str, *, streaming: bool = False):
-        card = self.host.cards[agent_id]
-        return ClientFactory(ClientConfig(httpx_client=self.hc, streaming=streaming)).create(card)
-
-    async def register(self, *ids: str) -> None:
-        for i in ids:
-            await self.host.partners.add_from_card(i, MessageToDict(self.host.cards[i]), "internal")
-
-    async def send(self, agent_id: str, text: str, **config: Any):
-        req = SendMessageRequest(message=msg(text))
-        if config:
-            req.configuration.CopyFrom(SendMessageConfiguration(**config))
-        return [ev async for ev in self.client(agent_id).send_message(req)]
-
-
-@pytest.fixture
-def fast(monkeypatch):
-    monkeypatch.setenv("A2AGW_DEV", "1")
-    monkeypatch.setattr(client_mod, "POLL_MIN_S", 0.02)
-    monkeypatch.setattr(client_mod, "POLL_MAX_S", 0.05)
-    monkeypatch.setattr(client_mod, "WAIT_ANY_INTERVAL_S", 0.05)
-
-
-@pytest.fixture
-async def env(tmp_path, fast):
-    made: list[Env] = []
-
-    async def _make(
-        *specs: AgentSpec,
-        db: str = "host.db",
-        apps: dict[str, Any] | None = None,
-        **host_kwargs: Any,
-    ) -> Env:
-        transport = StreamingASGITransport(dict(apps or {}))
-        partner_hc = httpx.AsyncClient(transport=transport, base_url="http://t")
-        host = AgentHost(
-            "http://t",
-            db_url=f"sqlite+aiosqlite:///{tmp_path / db}",
-            partner_http=partner_hc,
-            **host_kwargs,
-        )
-        for s in specs:
-            host.add(s)
-        # Unless told otherwise, partners are the host's own agents.
-        transport.apps.setdefault("t", host.app())
-        e = Env(host, partner_hc)
-        made.append(e)
-        await host.startup()
-        return e
-
-    yield _make
-    for e in made:
-        await e.host.shutdown()
-        await e.hc.aclose()
-        await e.partner_hc.aclose()
 
 
 async def until(predicate, timeout: float = 5.0) -> None:

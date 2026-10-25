@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from opentelemetry import context as otel_context
@@ -33,7 +34,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _PROPAGATOR = TraceContextTextMapPropagator()
-_STD_RECORD_KEYS = frozenset(logging.makeLogRecord({}).__dict__)
 
 
 def get_tracer() -> trace.Tracer:
@@ -63,7 +63,7 @@ class JsonFormatter(logging.Formatter):
         ctx = trace.get_current_span().get_span_context()
         valid = ctx.is_valid
         out = {
-            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S") + f".{int(record.msecs):03d}Z",
+            "ts": datetime.fromtimestamp(record.created, UTC).isoformat(timespec="milliseconds"),
             "level": record.levelname,
             "logger": record.name,
             "msg": record.getMessage(),
@@ -72,10 +72,16 @@ class JsonFormatter(logging.Formatter):
         }
         if record.exc_info:
             out["exc"] = self.formatException(record.exc_info)
+        if record.stack_info:
+            out["stack"] = self.formatStack(record.stack_info)
         return json.dumps(out, default=str)
 
 
 def _install_json_logs() -> None:
+    """Format every root-logger handler as JSON; add a stderr handler if there are none.
+
+    The root logger's level is left unchanged. Calling this repeatedly adds nothing.
+    """
     root = logging.getLogger()
     if not root.handlers:
         root.addHandler(logging.StreamHandler())
@@ -93,23 +99,23 @@ def setup_telemetry(
 
     OpenTelemetry allows one global provider per process: if one exists, a warning is logged
     and the existing provider is returned (with ``exporter`` not attached).
+
+    ``json_logs`` applies to all root-logger handlers (see ``_install_json_logs``).
     """
-    provider = TracerProvider(resource=Resource.create({"service.name": service_name}))
-    if exporter is not None:
-        processor = (
-            SimpleSpanProcessor(exporter)
-            if isinstance(exporter, InMemorySpanExporter)
-            else BatchSpanProcessor(exporter)
-        )
-        provider.add_span_processor(processor)
     current = trace.get_tracer_provider()
     # The default is a proxy (or no-op) provider, not an SDK one.
     if isinstance(current, TracerProvider):
         logger.warning("a tracer provider is already installed; telemetry setup ignored")
         result = current
     else:
-        trace.set_tracer_provider(provider)
-        result = provider
+        result = TracerProvider(resource=Resource.create({"service.name": service_name}))
+        if exporter is not None:
+            result.add_span_processor(
+                SimpleSpanProcessor(exporter)
+                if isinstance(exporter, InMemorySpanExporter)
+                else BatchSpanProcessor(exporter)
+            )
+        trace.set_tracer_provider(result)
     if json_logs:
         _install_json_logs()
     return result

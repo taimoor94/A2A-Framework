@@ -17,6 +17,7 @@ from a2a.server.events import EventQueue
 from a2a.server.tasks import TaskUpdater
 from a2a.types import Message, Part, TaskState
 from google.protobuf.json_format import MessageToDict
+from opentelemetry import trace as otel_trace
 from opentelemetry.trace import Status as SpanStatus
 from opentelemetry.trace import StatusCode
 
@@ -337,13 +338,17 @@ class AdapterExecutor(AgentExecutor):
                             break
                     else:
                         await self._status(run, TaskState.TASK_STATE_COMPLETED)
+                except asyncio.CancelledError:
+                    if not run.cancelled:  # an unrequested cancel becomes a failure upstream
+                        span.set_status(SpanStatus(StatusCode.ERROR))
+                    raise
                 except Exception:  # CancelledError is a BaseException and propagates
                     logger.exception(
                         "adapter for agent %s failed on task %s",
                         self.spec.id,
                         run.updater.task_id,
                     )
-                    span.set_status(SpanStatus(StatusCode.ERROR, "adapter failed"))
+                    span.set_status(SpanStatus(StatusCode.ERROR))
                     await self._status(run, TaskState.TASK_STATE_FAILED, "internal error")
             finally:
                 if events is not None:
@@ -395,6 +400,7 @@ class AdapterExecutor(AgentExecutor):
                 await self._status(run, TaskState.TASK_STATE_COMPLETED)
                 return True
             case Failed(error=error):
+                otel_trace.get_current_span().set_status(SpanStatus(StatusCode.ERROR))
                 await self._status(run, TaskState.TASK_STATE_FAILED, error)
                 return True
             case _:

@@ -476,7 +476,9 @@ class PartnerClient:
         started = time.monotonic()
         token = _caller.set(caller if caller is not None else current_principal.get())
         try:
-            with get_tracer().start_as_current_span("a2agw.partner_call") as span:
+            with get_tracer().start_as_current_span(
+                "a2agw.partner_call", record_exception=False, set_status_on_exception=False
+            ) as span:
                 span.set_attribute("a2agw.partner_id", partner_id)
                 if task_id:
                     span.set_attribute("a2a.task_id", task_id)
