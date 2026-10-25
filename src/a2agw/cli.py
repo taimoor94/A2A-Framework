@@ -25,6 +25,7 @@ from a2agw.config import (
     partners_path,
     register_partners,
 )
+from a2agw.consult.guarded_net import fixed_tier, guarded_async_client
 from a2agw.consult.netguard import UnsafeURL, check_url
 from a2agw.consult.registry import MAX_CARD_BYTES, CardFetchError, PartnerRegistry
 from a2agw.ops.audit import ACTIONS, AuditLog, parse_since
@@ -346,7 +347,8 @@ async def _call(url: str, message: str, api_key: str | None, tier: Tier, timeout
     if api_key:
         params["X-API-Key"] = api_key
     state, text = "unknown", ""
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as hc:
+    # Guarded: connects only to addresses vetted for `tier` at connect time.
+    async with guarded_async_client(fixed_tier(tier), timeout=timeout) as hc:
         client = ClientFactory(ClientConfig(httpx_client=hc, streaming=False)).create(
             rec.agent_card
         )

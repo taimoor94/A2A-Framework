@@ -21,6 +21,7 @@ from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH
 from google.protobuf.json_format import MessageToDict
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from a2agw.consult.guarded_net import fixed_tier
 from a2agw.consult.netguard import (
     FetchError,
     Tier,
@@ -117,6 +118,11 @@ def _significant_differs(old: dict[str, Any], new: dict[str, Any]) -> bool:
 
 
 class PartnerRegistry:
+    """Registered partners. Card fetches go through a guarded client for the partner's tier
+    (``a2agw.consult.guarded_net``: connects only to vetted addresses). An injected ``http``
+    client is used as given and bypasses that guard: it is the test seam. mTLS card fetches
+    (``tls_ref``) always use a guarded client, even when ``http`` is injected."""
+
     def __init__(
         self,
         path: Path | None = None,
@@ -147,7 +153,9 @@ class PartnerRegistry:
             cfg = self.tls.get(tls_ref)
             if cfg is None:
                 raise CardFetchError("tls config missing")
-            own = http = build_async_client(cfg, httpx.Timeout(FETCH_TIMEOUT_S))
+            own = http = build_async_client(
+                cfg, httpx.Timeout(FETCH_TIMEOUT_S), tier_for_host=fixed_tier(tier)
+            )
         try:
             body = await safe_get(
                 url, tier, max_bytes=MAX_CARD_BYTES, deadline_s=FETCH_TIMEOUT_S, http=http

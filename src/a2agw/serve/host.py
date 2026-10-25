@@ -63,6 +63,7 @@ from a2agw.serve.push import (
     PushSettings,
     make_push_url_validator,
     push_config_store_for,
+    push_http_client,
 )
 from a2agw.serve.reap import (
     AgentServedError,
@@ -585,6 +586,7 @@ class AgentHost:
             Path(partners_path) if partners_path is not None else None, http=partner_http
         )
         self.credentials = credentials
+        # Injected for tests: used as given, bypassing the guarded outbound clients.
         self.partner_http = partner_http
         self.default_deadline_s = default_deadline_s
         self.handles: OutboundHandleStore | None = None
@@ -655,11 +657,7 @@ class AgentHost:
             # Each agent's sender caps its POSTs at max_concurrent_deliveries; size the pool so
             # one agent's slow webhooks cannot exhaust the connections of the others.
             slots = push.max_concurrent_deliveries * max(1, len(self.specs))
-            self.push_http = httpx.AsyncClient(
-                follow_redirects=False,
-                timeout=push.timeout_s,
-                limits=httpx.Limits(max_connections=slots, max_keepalive_connections=slots),
-            )
+            self.push_http = push_http_client(push, slots=slots)
         for agent_id, spec in self.specs.items():
             store = task_store_for(engine, agent_id)
             await retry_ddl(store.initialize)

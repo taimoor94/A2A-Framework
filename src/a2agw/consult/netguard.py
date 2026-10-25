@@ -6,6 +6,7 @@ import asyncio
 import ipaddress
 import os
 import socket
+from collections.abc import Awaitable, Callable
 from typing import Any, Literal
 
 import httpx
@@ -69,26 +70,55 @@ def check_url_syntax(url: str) -> tuple[str, str]:
     return parsed.scheme, host
 
 
+Resolver = Callable[[str], Awaitable[list[str]]]
+
+
+class Unresolvable(UnsafeURL):
+    """The host has no usable address. The reason never names the host."""
+
+
+async def resolve_and_vet(host: str, tier: Tier, *, resolver: Resolver | None = None) -> list[str]:
+    """The addresses `host` may be connected to for `tier`, in resolver order, de-duplicated.
+
+    An IP literal is vetted as is (no lookup). For the ``internal`` tier the addresses are
+    not checked (R2); for any other tier every address must be public, otherwise the whole
+    answer is refused (UnsafeURL). Raises Unresolvable when there is no address. This is the
+    one implementation shared by ``check_url`` and the guarded network backend
+    (``a2agw.consult.guarded_net``), which connects only to the addresses returned here."""
+    try:
+        ipaddress.ip_address(host.split("%", 1)[0])
+        resolved = [host]
+    except ValueError:
+        lookup = resolver if resolver is not None else _resolve  # module global, patchable
+        try:
+            resolved = list(dict.fromkeys(await lookup(host)))
+        except (OSError, ValueError):
+            raise Unresolvable("host could not be resolved") from None
+        if not resolved:
+            raise Unresolvable("host could not be resolved")
+    if tier == "internal":
+        return resolved
+    try:
+        addrs = [ipaddress.ip_address(a.split("%", 1)[0]) for a in resolved]
+    except ValueError:
+        raise Unresolvable("host could not be resolved") from None
+    if not all(_is_public(a) for a in addrs):
+        raise UnsafeURL("host resolves to a non-public address")
+    return resolved
+
+
 async def check_url(url: str, tier: Tier) -> None:
-    """Raise UnsafeURL if `url` must not be fetched/called for `tier`."""
+    """Raise UnsafeURL if `url` must not be fetched/called for `tier`.
+
+    This gives an early, clear error. Enforcement happens again at connect time: the
+    guarded clients (``a2agw.consult.guarded_net``) re-resolve and connect only to a vetted
+    address, so a DNS answer that changes after this check cannot redirect the connection."""
     scheme, host = check_url_syntax(url)
     if tier == "internal":
         return  # R2: no IP checks, unresolvable hosts allowed
     if scheme != "https" and os.environ.get("A2AGW_DEV") != "1":
         raise UnsafeURL("https is required")
-
-    try:
-        addrs = [ipaddress.ip_address(host)]
-    except ValueError:
-        try:
-            resolved = await _resolve(host)
-            addrs = [ipaddress.ip_address(a.split("%", 1)[0]) for a in resolved]
-        except (OSError, ValueError):
-            raise UnsafeURL("host could not be resolved") from None
-        if not addrs:
-            raise UnsafeURL("host could not be resolved")
-    if not all(_is_public(a) for a in addrs):
-        raise UnsafeURL("host resolves to a non-public address")
+    await resolve_and_vet(host, tier)
 
 
 def _size_label(n: int) -> str:
@@ -107,7 +137,9 @@ async def safe_get(
     """GET `url` after the SSRF check for `tier`: no redirects, a body cap and one total deadline.
 
     The deadline covers the DNS check, the connection and the whole body. Raises UnsafeURL
-    when the URL is refused and FetchError for every other failure."""
+    when the URL is refused and FetchError for every other failure. Without ``http`` the
+    request goes through a guarded client for `tier` (connects only to vetted addresses);
+    an injected ``http`` client is used as given (the test seam)."""
     return await _guarded("GET", url, tier, max_bytes, deadline_s, http, {})
 
 
@@ -144,7 +176,9 @@ async def _guarded(
             await check_url(url, tier)
             if http is not None:
                 return await _capped(http, method, url, max_bytes, deadline_s, kwargs)
-            async with httpx.AsyncClient(follow_redirects=False, timeout=deadline_s) as c:
+            from a2agw.consult.guarded_net import fixed_tier, guarded_async_client
+
+            async with guarded_async_client(fixed_tier(tier), timeout=deadline_s) as c:
                 return await _capped(c, method, url, max_bytes, deadline_s, kwargs)
     except TimeoutError:
         raise FetchError("timed out") from None

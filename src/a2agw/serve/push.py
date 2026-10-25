@@ -78,7 +78,8 @@ from google.protobuf.json_format import MessageToDict
 from sqlalchemy import and_, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from a2agw.consult.netguard import UnsafeURL, check_url
+from a2agw.consult.guarded_net import fixed_tier, guarded_async_client
+from a2agw.consult.netguard import Tier, UnsafeURL, check_url
 from a2agw.security.cardsign import CardSigner
 
 if TYPE_CHECKING:
@@ -90,6 +91,7 @@ __all__ = [
     "PushSettings",
     "make_push_url_validator",
     "push_config_store_for",
+    "push_http_client",
 ]
 
 logger = logging.getLogger(__name__)
@@ -185,10 +187,25 @@ class PushSettings:
             ) from None
 
 
+def push_tier(allow_private: bool) -> Tier:
+    return "internal" if allow_private else "public"
+
+
+def push_http_client(settings: PushSettings, *, slots: int) -> httpx.AsyncClient:
+    """The webhook client: a guarded client (``a2agw.consult.guarded_net``) that connects only
+    to addresses vetted for the push tier at connect time, so a webhook host re-pointed to a
+    private address after the URL check is still refused. ``slots`` sizes its pool."""
+    return guarded_async_client(
+        fixed_tier(push_tier(settings.allow_private)),
+        timeout=settings.timeout_s,
+        limits=httpx.Limits(max_connections=slots, max_keepalive_connections=slots),
+    )
+
+
 def make_push_url_validator(allow_private: bool) -> UrlValidator:
     """An SDK ``push_url_validator``: netguard's ``internal`` tier when private webhooks are
     allowed, else ``public``. Returns False for any URL netguard refuses."""
-    tier = "internal" if allow_private else "public"
+    tier = push_tier(allow_private)
 
     async def validate(url: str) -> bool:
         try:
@@ -307,6 +324,10 @@ class GuardedPushSender(PushNotificationSender):
     Implements the SDK's ``PushNotificationSender`` directly rather than subclassing
     ``BasePushNotificationSender``: that class delivers inline, logs webhook URLs and does not
     retry. The payload is the same: the update as a ``StreamResponse`` in JSON.
+
+    ``http`` should come from ``push_http_client`` (what ``AgentHost`` uses), which vets the
+    webhook's address again at connect time; any other client is used as given and bypasses
+    that guard (the test seam).
     """
 
     def __init__(

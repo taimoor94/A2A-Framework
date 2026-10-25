@@ -65,7 +65,9 @@ from a2agw.consult.credentials import (
     CredentialInterceptor,
     CredentialProvider,
 )
+from a2agw.consult.guarded_net import guarded_async_client
 from a2agw.consult.handles import OutboundHandleStore
+from a2agw.consult.netguard import Tier, UnsafeURL, check_url_syntax
 from a2agw.consult.registry import CardFetchError, PartnerRecord, PartnerRegistry
 from a2agw.consult.resilience import Bulkhead, Busy, CircuitBreaker, with_retry
 from a2agw.consult.results import (
@@ -113,6 +115,8 @@ BINDINGS = ("JSONRPC", "HTTP+JSON")  # in order of preference
 _AMBIGUOUS_STATUS = {502, 503, 504}  # the partner (or a proxy) may have accepted the message
 PROTOCOL_ERROR = "partner protocol error"
 AUTH_REJECTED = "partner rejected credentials"  # HTTP 401 to the send, after any resend
+
+_STRICTNESS: dict[Tier, int] = {"internal": 0, "partner": 1, "public": 2}
 
 # The inbound caller whose credentials apply to the current outbound call.
 _caller: ContextVar[Principal | None] = ContextVar("a2agw_outbound_caller", default=None)
@@ -389,22 +393,48 @@ class PartnerClient:
         if self.http is not None:
             return self.http
         if self._own_http is None:
-            self._own_http = httpx.AsyncClient(
-                follow_redirects=False, timeout=httpx.Timeout(30.0, connect=10.0)
+            self._own_http = guarded_async_client(
+                self._tier_for_host, timeout=httpx.Timeout(30.0, connect=10.0)
             )
         return self._own_http
 
+    def _tier_for_host(self, host: str) -> Tier:
+        """The netguard tier the guarded clients vet ``host`` with: the tier of the registered
+        partner whose card URL or interface URL names that host (the strictest one if several
+        do), and ``public`` for any other host."""
+        host = host.lower()
+        tiers: set[Tier] = set()
+        for rec in self.registry.all():
+            ifaces = rec.card.get("supportedInterfaces", [])
+            urls = [rec.card_url, *(i.get("url", "") for i in ifaces if isinstance(i, dict))]
+            for url in urls:
+                if not isinstance(url, str) or not url:
+                    continue  # e.g. no card URL (added from a card)
+                try:
+                    if check_url_syntax(url)[1].lower() == host:
+                        tiers.add(rec.tier)
+                except UnsafeURL:
+                    continue
+        found = max(tiers, key=_STRICTNESS.__getitem__, default=None)
+        return found if found is not None else "public"
+
     def _http_for(self, rec: PartnerRecord) -> httpx.AsyncClient:
         """The httpx client for ``rec``: the per-``tls_ref`` mTLS client when it has one
-        (even if ``http`` was injected), else the shared client. Raises KeyError for an
-        unknown ref; callers fail closed."""
+        (even if ``http`` was injected), else the shared client. Both are guarded clients
+        (``a2agw.consult.guarded_net``) vetting each host for its partner's tier; an injected
+        ``http`` is used as given and bypasses the guard (the test seam). Raises KeyError for
+        an unknown ref; callers fail closed."""
         ref = rec.tls_ref
         if ref is None:
             return self._http_client()
         with self._tls_lock:  # one client per ref, built on first use
             hc = self._tls_http.get(ref)
             if hc is None:
-                hc = build_async_client(self.tls[ref], httpx.Timeout(30.0, connect=10.0))
+                hc = build_async_client(
+                    self.tls[ref],
+                    httpx.Timeout(30.0, connect=10.0),
+                    tier_for_host=self._tier_for_host,
+                )
                 self._tls_http[ref] = hc
             return hc
 

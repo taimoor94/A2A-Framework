@@ -10,11 +10,15 @@ from __future__ import annotations
 import logging
 import os
 import ssl
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
+from a2agw.consult.guarded_net import fixed_tier, guarded_async_client
+from a2agw.consult.netguard import Tier
 
 logger = logging.getLogger(__name__)
 _WARNED: set[Path] = set()
@@ -91,6 +95,14 @@ class TlsClientConfig:
         return ctx
 
 
-def build_async_client(cfg: TlsClientConfig, timeout: httpx.Timeout) -> httpx.AsyncClient:
-    """An httpx client presenting ``cfg``'s certificate; no redirects."""
-    return httpx.AsyncClient(verify=cfg.ssl_context(), follow_redirects=False, timeout=timeout)
+def build_async_client(
+    cfg: TlsClientConfig,
+    timeout: httpx.Timeout,
+    *,
+    tier_for_host: Callable[[str], Tier] | None = None,
+) -> httpx.AsyncClient:
+    """A guarded httpx client (``a2agw.consult.guarded_net``) presenting ``cfg``'s
+    certificate: it connects only to addresses vetted for ``tier_for_host(host)`` (default:
+    every host is ``public``, the strictest) and never follows redirects."""
+    tiers = tier_for_host if tier_for_host is not None else fixed_tier("public")
+    return guarded_async_client(tiers, verify=cfg.ssl_context(), timeout=timeout)
