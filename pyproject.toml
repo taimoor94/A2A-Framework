@@ -36,6 +36,7 @@ dev = [
     "respx",
     "ruff",
     "mypy",
+    "langgraph-checkpoint-sqlite>=3.1.2",
 ]
 
 [tool.hatch.build.targets.wheel]
