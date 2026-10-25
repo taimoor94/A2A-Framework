@@ -3,13 +3,17 @@ from typing import Any
 import httpx
 import pytest
 from cascade_support import Env
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from streaming_asgi import StreamingASGITransport
 
 from a2agw.consult import client as client_mod
 from a2agw.serve.agent import AgentSpec
 from a2agw.serve.host import AgentHost
 
-# The OTel global provider can be set once per process; tests/ops/conftest.py registers its
+# The OTel global provider can be set once per process; ``_span_exporter`` registers its
 # in-memory exporter here so spans never pile up across the session.
 INSTALLED_EXPORTERS: list = []
 
@@ -19,6 +23,24 @@ def _clear_span_exporters():
     for exporter in INSTALLED_EXPORTERS:
         exporter.clear()
     yield
+
+
+@pytest.fixture(scope="session")
+def _span_exporter():
+    """One global provider per process: installed once for the whole session."""
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    trace.set_tracer_provider(provider)
+    INSTALLED_EXPORTERS.append(exporter)
+    return exporter
+
+
+@pytest.fixture
+def spans(_span_exporter):
+    _span_exporter.clear()
+    yield _span_exporter
+    _span_exporter.clear()
 
 
 @pytest.fixture
