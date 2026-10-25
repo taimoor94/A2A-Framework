@@ -8,21 +8,14 @@ import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
-from a2a.types import Part
-
+from a2agw.adapters._stream import stream_events
 from a2agw.consult.client import PartnerClient
 from a2agw.consult.tools import UNTRUSTED_NOTE, PartnerTool, invoke
-from a2agw.core.events import AgentEvent, ArtifactChunk, Done
+from a2agw.core.events import AgentEvent, Done
 from a2agw.core.spi import InboundContext
 from a2agw.serve.agent import AgentSpec, SkillSpec
 
 _EVENT_TYPES = tuple(AgentEvent.__args__)  # type: ignore[attr-defined]
-
-
-def _chunk(text: str, *, first: bool, last: bool) -> ArtifactChunk:
-    return ArtifactChunk(
-        parts=[Part(text=text)], name="output", artifact_id="output", append=not first, last=last
-    )
 
 
 class CallableAdapter:
@@ -59,40 +52,10 @@ class CallableAdapter:
         elif isinstance(result, _EVENT_TYPES):
             yield result
         elif hasattr(result, "__aiter__") or hasattr(result, "__next__"):
-            async for ev in _stream(result):
+            async for ev in stream_events(result):
                 yield ev
         else:
             raise TypeError(f"callable agent returned unsupported {type(result).__name__}")
-
-
-async def _items(source: Any) -> AsyncIterator[Any]:
-    if hasattr(source, "__aiter__"):
-        async for item in source:
-            yield item
-    else:
-        for item in source:
-            yield item
-
-
-async def _stream(source: Any) -> AsyncIterator[AgentEvent]:
-    pending: str | None = None
-    first = True
-    async for item in _items(source):
-        if isinstance(item, str):
-            if pending is not None:
-                yield _chunk(pending, first=first, last=False)
-                first = False
-            pending = item
-        elif isinstance(item, _EVENT_TYPES):
-            if pending is not None:
-                yield _chunk(pending, first=first, last=False)
-                first = False
-                pending = None
-            yield item
-        else:
-            raise TypeError(f"callable agent yielded unsupported {type(item).__name__}")
-    if pending is not None:
-        yield _chunk(pending, first=first, last=True)
 
 
 def as_functions(
