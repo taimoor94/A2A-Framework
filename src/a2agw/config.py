@@ -8,6 +8,8 @@ overwritten; URL partners are refreshed instead, so a changed card goes through 
 from __future__ import annotations
 
 import importlib
+import inspect
+import logging
 import os
 import re
 import sys
@@ -18,9 +20,13 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from a2agw.consult.credentials import EnvCredentials
+from a2agw.consult.netguard import UnsafeURL
+from a2agw.consult.registry import CardFetchError
 from a2agw.security.auth import AuthConfig
 from a2agw.serve.agent import AgentSpec
 from a2agw.serve.host import AgentHost
+
+logger = logging.getLogger(__name__)
 
 
 class ConfigError(Exception):
@@ -91,6 +97,23 @@ class GatewayConfig(BaseModel):
     credentials: dict[str, CredentialConfig] = Field(default_factory=dict)
     telemetry: TelemetryConfig | None = None
 
+    @model_validator(mode="after")
+    def _credential_refs_exist(self) -> GatewayConfig:
+        for p in self.partners:
+            if p.credential_ref is not None and p.credential_ref not in self.credentials:
+                raise ValueError(f"partner {p.id!r}: unknown credential_ref {p.credential_ref!r}")
+        return self
+
+
+def _interpolate_tree(node: Any, env: dict[str, str], source: str) -> Any:
+    if isinstance(node, str):
+        return interpolate(node, env, source=source)
+    if isinstance(node, list):
+        return [_interpolate_tree(x, env, source) for x in node]
+    if isinstance(node, dict):
+        return {k: _interpolate_tree(v, env, source) for k, v in node.items()}
+    return node
+
 
 def load_config(path: str | Path, env: dict[str, str] | None = None) -> GatewayConfig:
     p = Path(path)
@@ -98,11 +121,12 @@ def load_config(path: str | Path, env: dict[str, str] | None = None) -> GatewayC
         text = p.read_text()
     except OSError:
         raise ConfigError(f"cannot read config file {p}") from None
-    text = interpolate(text, dict(os.environ) if env is None else env, source=str(p))
     try:
         data = yaml.safe_load(text)
     except yaml.YAMLError:
         raise ConfigError(f"{p}: invalid YAML") from None
+    # Interpolate string scalars only, after parsing: env values can never add YAML structure.
+    data = _interpolate_tree(data, dict(os.environ) if env is None else env, str(p))
     if not isinstance(data, dict):
         raise ConfigError(f"{p}: config must be a mapping")
     try:
@@ -125,19 +149,33 @@ def _load_agent(ref: str, config_dir: Path) -> AgentSpec:
     sys.path.insert(0, added)
     try:
         module = importlib.import_module(module_name)
-        obj: Any = getattr(module, attr)
-    except (ImportError, AttributeError) as e:
-        raise ConfigError(f"cannot import agent {ref!r}: {type(e).__name__}") from None
+    except Exception as e:  # noqa: BLE001 - any failure in user code, incl. SyntaxError
+        raise ConfigError(
+            f"failed to import agent module {module_name}: {type(e).__name__}"
+        ) from None
     finally:
         if added in sys.path:
             sys.path.remove(added)
+    try:
+        obj: Any = getattr(module, attr)
+    except AttributeError:
+        raise ConfigError(f"agent {ref!r}: module has no attribute {attr}") from None
     if not isinstance(obj, AgentSpec) and callable(obj):
         try:
+            required = [
+                p
+                for p in inspect.signature(obj).parameters.values()
+                if p.default is p.empty
+                and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+            ]
+        except (TypeError, ValueError):
+            required = []
+        if required:
+            raise ConfigError(f"agent {ref!r} must be an AgentSpec or a zero-argument callable")
+        try:
             obj = obj()
-        except TypeError:
-            raise ConfigError(
-                f"agent {ref!r} must be an AgentSpec or a zero-argument callable"
-            ) from None
+        except Exception as e:  # noqa: BLE001
+            raise ConfigError(f"agent factory {ref!r} raised {type(e).__name__}") from None
     if not isinstance(obj, AgentSpec):
         raise ConfigError(f"agent {ref!r} is not an AgentSpec or a factory returning one")
     return obj
@@ -190,6 +228,7 @@ async def register_partners(
 
     Existing URL partners are refreshed (a changed card is quarantined, never overwritten).
     Existing card_file partners are left alone.
+    An unreachable or unsafe URL partner logs a warning and startup continues; its state is unchanged.
     """
     config_dir = Path(config_dir).resolve()
     reg = host.partners
@@ -198,12 +237,18 @@ async def register_partners(
     for p in cfg.partners:
         if p.id in known:
             if p.url is not None:
-                await reg.refresh(p.id)
+                try:
+                    await reg.refresh(p.id)
+                except (CardFetchError, UnsafeURL) as e:
+                    logger.warning("partner %s: refresh failed (%s); state unchanged", p.id, e)
             continue
         if p.url is not None:
-            await reg.add_from_url(
-                p.id, p.url, p.tier, credential_ref=p.credential_ref, tags=p.tags
-            )
+            try:
+                await reg.add_from_url(
+                    p.id, p.url, p.tier, credential_ref=p.credential_ref, tags=p.tags
+                )
+            except (CardFetchError, UnsafeURL) as e:
+                logger.warning("partner %s: not registered (%s); continuing", p.id, e)
         else:
             assert p.card_file is not None
             card = _read_card(config_dir / p.card_file)

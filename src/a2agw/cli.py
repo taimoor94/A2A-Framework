@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import unicodedata
 from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeVar, cast
@@ -24,7 +25,7 @@ from a2agw.config import (
     register_partners,
 )
 from a2agw.consult.netguard import UnsafeURL, check_url
-from a2agw.consult.registry import CardFetchError, PartnerRegistry
+from a2agw.consult.registry import MAX_CARD_BYTES, CardFetchError, PartnerRegistry
 
 app = typer.Typer(help="A2A gateway: serve agents and manage partner agents.", no_args_is_help=True)
 partners_app = typer.Typer(help="Manage the partner registry.", no_args_is_help=True)
@@ -32,7 +33,7 @@ card_app = typer.Typer(help="Agent Card tools.", no_args_is_help=True)
 app.add_typer(partners_app, name="partners")
 app.add_typer(card_app, name="card")
 
-KNOWN_ERRORS = (ConfigError, CardFetchError, UnsafeURL, KeyError, ValueError)
+KNOWN_ERRORS = (ConfigError, CardFetchError, UnsafeURL, KeyError, ValueError, OSError)
 OUTPUT_CAP = 64 * 1024
 Tier = Literal["internal", "partner", "public"]
 TIERS = ("internal", "partner", "public")
@@ -122,9 +123,12 @@ def init(
         "agent.py": AGENT_TEMPLATE,
         ".env.example": ENV_TEMPLATE,
     }
-    existing = [n for n in files if (directory / n).exists()]
+    existing = [n for n in files if (directory / n).exists() or (directory / n).is_symlink()]
     if existing and not force:
         raise ValueError(f"refusing to overwrite {', '.join(existing)} (use --force)")
+    links = [n for n in files if (directory / n).is_symlink()]
+    if links:
+        raise ValueError(f"refusing to write through symlink: {', '.join(links)}")
     directory.mkdir(parents=True, exist_ok=True)
     for name, content in files.items():
         (directory / name).write_text(content)
@@ -273,7 +277,10 @@ def card_validate(
         card = rec.agent_card
     else:
         try:
-            data = yaml.safe_load(Path(target).read_text())
+            raw = Path(target).read_bytes()[: MAX_CARD_BYTES + 1]
+            if len(raw) > MAX_CARD_BYTES:
+                raise ValueError("agent card exceeds 1 MiB")
+            data = yaml.safe_load(raw)
         except (OSError, yaml.YAMLError):
             raise ValueError(f"cannot read card file {target}") from None
         if not isinstance(data, dict):
@@ -296,10 +303,22 @@ def _result_text(task: Any) -> str:
     return "\n".join(c for c in chunks if c)
 
 
+def _origin(url: str) -> tuple[str, str, int]:
+    u = httpx.URL(url)
+    return u.scheme, u.host, u.port or (443 if u.scheme == "https" else 80)
+
+
 async def _call(url: str, message: str, api_key: str | None, tier: Tier, timeout: float) -> str:
     await check_url(url, tier)
     rec = await PartnerRegistry().add_from_url("call", url, tier)
     params = {"A2A-Version": "1.0"}
+    origin = _origin(url)
+    endpoints = [i.url for i in rec.agent_card.supported_interfaces]
+    cross = any(_origin(u) != origin for u in endpoints)
+    if api_key and cross:
+        raise ValueError("card endpoint origin differs from the URL; refusing to send the API key")
+    if cross:
+        typer.echo("warning: card endpoint origin differs from the URL", err=True)
     if api_key:
         params["X-API-Key"] = api_key
     state, text = "unknown", ""
@@ -322,6 +341,7 @@ async def _call(url: str, message: str, api_key: str | None, tier: Tier, timeout
         except Exception as e:  # noqa: BLE001 - SDK errors may carry request details
             raise ValueError(f"call failed: {type(e).__name__}") from None
     text = text.encode()[:OUTPUT_CAP].decode(errors="ignore")
+    text = "".join(c for c in text if c in "\n\t" or unicodedata.category(c) != "Cc")
     return f"state: {state}\n{text}"
 
 
