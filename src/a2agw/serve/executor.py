@@ -17,6 +17,8 @@ from a2a.server.events import EventQueue
 from a2a.server.tasks import TaskUpdater
 from a2a.types import Message, Part, TaskState
 from google.protobuf.json_format import MessageToDict
+from opentelemetry.trace import Status as SpanStatus
+from opentelemetry.trace import StatusCode
 
 from a2agw.context.call_context import (
     BudgetExceeded,
@@ -31,6 +33,7 @@ from a2agw.context.call_context import (
 from a2agw.core.events import ArtifactChunk, Done, Failed, NeedAuth, NeedInput, Status, Usage
 from a2agw.core.spi import InboundContext
 from a2agw.ops.bus import EventBus, GatewayEvent
+from a2agw.ops.telemetry import extract_parent, get_tracer
 from a2agw.security.principal import Principal, PrincipalUser
 from a2agw.serve.agent import AgentSpec
 from a2agw.serve.store import TaskIndex
@@ -308,8 +311,23 @@ class AdapterExecutor(AgentExecutor):
 
     async def _drive(self, run: _Run, inbound: InboundContext) -> None:
         events: Any = None
+        span_attrs = {
+            "a2agw.agent_id": self.spec.id,
+            "a2a.task_id": run.updater.task_id,
+            "a2agw.hop": inbound.call.hop,
+        }
         # Outbound calls made by the adapter (partner tools) link to this task and caller.
-        with use_call(inbound.call), use_inbound(inbound.task_id, inbound.principal):
+        with (
+            get_tracer().start_as_current_span(
+                "a2agw.inbound",
+                context=extract_parent(inbound.call.traceparent),
+                attributes=span_attrs,
+                record_exception=False,
+                set_status_on_exception=False,
+            ) as span,
+            use_call(inbound.call),
+            use_inbound(inbound.task_id, inbound.principal),
+        ):
             try:
                 try:
                     await self._status(run, TaskState.TASK_STATE_WORKING)
@@ -325,6 +343,7 @@ class AdapterExecutor(AgentExecutor):
                         self.spec.id,
                         run.updater.task_id,
                     )
+                    span.set_status(SpanStatus(StatusCode.ERROR, "adapter failed"))
                     await self._status(run, TaskState.TASK_STATE_FAILED, "internal error")
             finally:
                 if events is not None:

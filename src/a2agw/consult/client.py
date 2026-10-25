@@ -52,6 +52,8 @@ from a2a.types import (
 from a2a.utils.constants import VERSION_HEADER
 from a2a.utils.errors import A2AError, TaskNotCancelableError
 from google.protobuf.json_format import ParseError
+from opentelemetry.trace import Status as SpanStatus
+from opentelemetry.trace import StatusCode
 
 from a2agw.consult.credentials import (
     CredentialInterceptor,
@@ -78,6 +80,7 @@ from a2agw.context.call_context import (
     current_principal,
 )
 from a2agw.ops.bus import EventBus, GatewayEvent
+from a2agw.ops.telemetry import get_tracer, with_current_traceparent
 from a2agw.security.principal import Principal
 
 __all__ = ["PartnerClient", "ToolResult"]
@@ -473,16 +476,29 @@ class PartnerClient:
         started = time.monotonic()
         token = _caller.set(caller if caller is not None else current_principal.get())
         try:
-            result = await self._consult(
-                partner_id,
-                message,
-                files=files,
-                data=data,
-                task_id=task_id,
-                context_id=context_id,
-                wait_seconds=wait_seconds,
-                inbound_task_id=inbound_task_id,
-            )
+            with get_tracer().start_as_current_span("a2agw.partner_call") as span:
+                span.set_attribute("a2agw.partner_id", partner_id)
+                if task_id:
+                    span.set_attribute("a2a.task_id", task_id)
+                try:
+                    result = await self._consult(
+                        partner_id,
+                        message,
+                        files=files,
+                        data=data,
+                        task_id=task_id,
+                        context_id=context_id,
+                        wait_seconds=wait_seconds,
+                        inbound_task_id=inbound_task_id,
+                    )
+                except BaseException:
+                    span.set_status(SpanStatus(StatusCode.ERROR))
+                    raise
+                if result.provenance and result.provenance.get("tier"):
+                    span.set_attribute("a2agw.tier", str(result.provenance["tier"]))
+                if result.task_id:
+                    span.set_attribute("a2a.task_id", result.task_id)
+                span.set_attribute("a2agw.result_state", result.state)
         finally:
             _caller.reset(token)
         self._publish(result, started)
@@ -504,7 +520,7 @@ class PartnerClient:
         if early is not None:
             return early
         assert rec is not None and client is not None
-        cc = current_call.get() or CallContext.new(self.agent_id)
+        cc = with_current_traceparent(current_call.get() or CallContext.new(self.agent_id))
         timeout = self._timeout(min(wait_seconds, self.default_deadline_s), cc)
         if not timeout > 0:
             return self._unavailable(partner_id, rec, "deadline exceeded")
