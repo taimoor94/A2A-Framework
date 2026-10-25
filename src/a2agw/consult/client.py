@@ -35,6 +35,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mappin
 from contextvars import ContextVar
 from typing import Any, Literal
 
+import httpcore
 import httpx
 from a2a.client import Client, ClientCallContext, ClientConfig, ClientFactory
 from a2a.client.interceptors import AfterArgs, BeforeArgs, ClientCallInterceptor
@@ -196,11 +197,19 @@ def _http_root(exc: BaseException) -> httpx.HTTPError | None:
 
 
 def _has_ssl_error(exc: BaseException) -> bool:
+    """A certificate-verification failure, or an SSL error raised while connecting (under an
+    httpx/httpcore ConnectError). An SSL error while reading after the request was written
+    is not one: it may follow delivery, so it stays a transport error (lookup, no resend)."""
     seen: BaseException | None = exc
+    connecting = False
     for _ in range(10):
         if seen is None:
             return False
-        if isinstance(seen, ssl.SSLError):
+        if isinstance(seen, ssl.SSLCertVerificationError):
+            return True
+        if isinstance(seen, (httpx.ConnectError, httpcore.ConnectError)):
+            connecting = True
+        if isinstance(seen, ssl.SSLError) and connecting:
             return True
         seen = seen.__cause__ or seen.__context__
     return False

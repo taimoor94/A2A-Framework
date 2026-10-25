@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import datetime
 import ipaddress
+import itertools
 import socket
 import ssl
 
+import httpcore
 import httpx
 import pytest
 import uvicorn
@@ -405,8 +407,21 @@ async def test_card_fetch_and_refresh_use_mtls(tls_server, pki):
         await PartnerRegistry().add_from_url("gamma", url, "internal", tls_ref="nope")
 
 
-def test_ssl_error_in_cause_chain_is_connect_failure():
-    err = httpx.ReadError("")
-    err.__cause__ = ssl.SSLError("tlsv13 alert certificate required")
-    assert client_mod._kind(err) == "connect"
-    assert client_mod._kind(httpx.ReadError("")) == "transport"
+def _chain(*excs):
+    for outer, inner in itertools.pairwise(excs):
+        outer.__cause__ = inner
+    return excs[0]
+
+
+def test_kind_classifies_tls_errors_by_phase():
+    kind = client_mod._kind
+    verify = ssl.SSLCertVerificationError("bad cert")
+    assert kind(_chain(httpx.ReadError(""), verify)) == "connect"
+    assert kind(_chain(httpx.ConnectError(""), ssl.SSLError("handshake"))) == "connect"
+    assert (
+        kind(_chain(httpx.ConnectError(""), httpcore.ConnectError(""), ssl.SSLError("x")))
+        == "connect"
+    )
+    # an SSL error while reading (after the request was written) may follow delivery
+    assert kind(_chain(httpx.ReadError(""), ssl.SSLError("alert"))) == "transport"
+    assert kind(httpx.ReadError("")) == "transport"
