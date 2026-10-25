@@ -508,3 +508,67 @@ async def test_admin_audit_verify_reports_first_bad_seq(env):
         )
     r = await e.hc.get("/a2agw/admin/audit/verify")
     assert r.json() == {"ok": False, "first_bad_seq": bad}
+
+
+# -- fix round 1 -------------------------------------------------------------------------
+
+
+async def test_llm_label_cannot_lower_unknown_classification(env):
+    """Reviewer probe (lower.py) end to end: the tool argument "public" does not defeat
+    unknown_classification above the partner's ceiling."""
+    policy = engine_for(
+        defaults={"unknown_classification": "confidential"},
+        egress={"partner_ceilings": {"b": "public"}},
+    )
+    e = await env(spec("a", Fn(echo)), spec("b", Fn(echo)), policy=policy)
+    await e.register("b")
+    tool = next(t for t in e.host.partner_tools("a") if t.partner_id == "b")
+    res = await invoke(tool, {"message": "secret", "classification": "public"}, e.host.client, None)
+    assert res["state"] == "rejected"
+    assert "confidential exceeds public" in res["reason"]
+    direct = await e.host.client.consult("b", "secret", classification="public")
+    assert direct.state == "rejected"
+
+
+async def test_anonymous_denials_are_coalesced_authenticated_are_not(env):
+    policy = engine_for(
+        authz=[
+            {"principal": "key:alice", "agents": ["a"], "effect": "allow"},
+        ]
+    )
+    e = await env(spec("a", Fn(echo)), auth=auth(), policy=policy)
+    for _ in range(5):  # anonymous callers never reach the agent: auth answers 401 first
+        await e.hc.post("/agents/a/", json={})
+    async with as_caller(e, "mallory-secret") as hc:
+        for _ in range(3):
+            assert (await hc.post("/agents/a/", json={})).status_code == 403
+    deny = [r for r in await rows(e.host) if r["action"] == "authz.deny"]
+    assert [r["actor"] for r in deny] == ["key:mallory"] * 3
+
+    # Without auth every caller is anonymous: one row per agent per window.
+    e2 = await env(
+        spec("x", Fn(echo)),
+        db="anon.db",
+        policy=engine_for(authz=[{"principal": "key:alice", "agents": ["x"], "effect": "allow"}]),
+    )
+    for _ in range(5):
+        assert (await e2.hc.post("/agents/x/", json={})).status_code == 403
+    deny2 = [r for r in await rows(e2.host) if r["action"] == "authz.deny"]
+    assert len(deny2) == 1 and deny2[0]["actor"] == "anonymous"
+    await e2.host.audit.flush_coalesced()
+    deny2 = [r for r in await rows(e2.host) if r["action"] == "authz.deny"]
+    assert [json.loads(r["detail_json"])["count"] for r in deny2] == [0, 3]
+
+
+async def test_consult_exception_still_audits_partner_call(env, monkeypatch):
+    e = await env(spec("b", Fn(echo)), policy=engine_for())
+    await e.register("b")
+
+    async def boom(*a, **kw):
+        raise RuntimeError("internal bug")
+
+    monkeypatch.setattr(e.host.client, "_consult", boom)
+    with pytest.raises(RuntimeError):
+        await e.host.client.consult("b", "hi")
+    calls = [r for r in await rows(e.host) if r["action"] == "partner.call"]
+    assert len(calls) == 1 and calls[0]["outcome"] == "error"

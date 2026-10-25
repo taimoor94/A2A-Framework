@@ -87,14 +87,16 @@ def admin_routes(host: AgentHost) -> list[Route]:
             return
         user = request.scope.get("user")
         principal = user.principal if isinstance(user, PrincipalUser) else None
-        await log.emit(
-            AuditEvent(
-                actor=principal.id if principal is not None else "anonymous",
-                action=action,
-                outcome=outcome,
-                detail={"reason": reason},
-            )
+        ev = AuditEvent(
+            actor=principal.id if principal is not None else "anonymous",
+            action=action,
+            outcome=outcome,
+            detail={"reason": reason},
         )
+        if action == "authz.deny" and (principal is None or principal.kind == "anonymous"):
+            await log.emit_coalesced(ev, reason)  # one row per admin category per window
+        else:
+            await log.emit(ev)
 
     def guarded(category: str, fn: Handler) -> Handler:
         async def wrapper(request: Request) -> Response:

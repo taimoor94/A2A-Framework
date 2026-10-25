@@ -8,13 +8,27 @@ fails its own hash, a deleted row breaks the link of the row after it. Removing 
 the *end* of the table cannot be detected from the table alone; export the log (``a2agw
 audit export``) to keep an external copy of the head.
 
+The chain is tamper-*evident* against edits made without recomputing it, not against an
+attacker with write access to the database: such an attacker can rewrite rows and
+recompute every hash from the edit onwards. Exported copies kept outside the database
+(and their head hash) are the anchor for comparing against.
+
 What is stored: ids (principal, agent, partner, task), the action, its outcome, a
 classification name and a small ``detail`` dict restricted to ``DETAIL_KEYS`` with string
 values cut to ``DETAIL_MAX_CHARS``. Never message text, artifact contents or secrets.
 
 Concurrency: appends are serialized by an ``asyncio.Lock`` per ``AuditLog`` (read the last
 hash, insert, in one transaction). Phase 2 assumes a single writer process per database;
-two processes appending to the same table could fork the chain.
+two processes appending to the same table could fork the chain. Each event is its own
+committed transaction (one fsync per event on sqlite WAL). Waiting for the lock is bounded
+by ``LOCK_TIMEOUT_S``: a stalled database turns into counted audit errors, not into stuck
+requests.
+
+Coalescing: ``emit_coalesced`` writes at most one row per key per ``COALESCE_WINDOW_S``
+(used for anonymous ``authz.deny``, so unauthenticated floods cannot fill the table). Each
+such row stands for itself plus ``detail.count`` events suppressed before it since the
+previous row for the key; ``flush_coalesced`` (called at host shutdown) writes the
+remainder, so rows + sum(count) is the number of events.
 
 Availability: ``emit``/``submit`` never raise. An audit failure is logged (exception class
 only) and counted in ``audit_errors`` (reported by admin ``/healthz``); the request that
@@ -24,10 +38,12 @@ caused it proceeds (fail-open for availability, by design).
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import logging
 import math
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -69,6 +85,8 @@ DETAIL_KEYS = frozenset(
 DETAIL_MAX_CHARS = 256
 FIELD_MAX_CHARS = 256
 GENESIS_HASH = "0" * 64
+LOCK_TIMEOUT_S = 5.0  # module constant so tests can shorten it
+COALESCE_WINDOW_S = 60.0
 _BATCH = 500
 
 _metadata = MetaData()
@@ -121,8 +139,16 @@ def canonical_json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _text(value: str) -> str:
+    """Lone surrogates (not encodable as UTF-8) become U+FFFD before storing and hashing."""
+    return _SURROGATE.sub("\ufffd", value)
+
+
 def _cut(value: str | None, limit: int = FIELD_MAX_CHARS) -> str | None:
-    return value[:limit] if isinstance(value, str) else None
+    return _text(value[:limit]) if isinstance(value, str) else None
 
 
 def _finite(value: Any) -> bool:
@@ -136,7 +162,7 @@ def sanitize_detail(detail: dict[str, Any] | None) -> dict[str, Any]:
         if key not in DETAIL_KEYS:
             continue
         if isinstance(value, str):
-            out[key] = value[:DETAIL_MAX_CHARS]
+            out[key] = _text(value[:DETAIL_MAX_CHARS])
         elif value is None or isinstance(value, bool | int) or _finite(value):
             out[key] = value
     return out
@@ -184,11 +210,17 @@ def _public(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _with_count(ev: AuditEvent, count: int) -> AuditEvent:
+    return dataclasses.replace(ev, detail={**ev.detail, "count": count})
+
+
 class AuditLog:
     def __init__(self, engine: AsyncEngine) -> None:
         self._engine = engine
         self._lock = asyncio.Lock()
         self._pending: set[asyncio.Task[None]] = set()
+        # emit_coalesced: key -> [window start (monotonic), suppressed count, last event]
+        self._coalesce: dict[tuple[str, str], list[Any]] = {}
         self.audit_errors = 0  # failed emits since start (admin /healthz)
 
     async def initialize(self) -> None:
@@ -212,14 +244,22 @@ class AuditLog:
             "detail_json": canonical_json(sanitize_detail(ev.detail)),
         }
         t = AUDIT_TABLE
-        async with self._lock, self._engine.begin() as conn:
-            last = (
-                await conn.execute(select(t.c.hash).order_by(t.c.seq.desc()).limit(1))
-            ).scalar_one_or_none()
-            row["prev_hash"] = last or GENESIS_HASH
-            row["hash"] = _digest(row)
-            result = await conn.execute(t.insert().values(**row))
-            return int(result.inserted_primary_key[0])
+        try:
+            async with asyncio.timeout(LOCK_TIMEOUT_S):
+                await self._lock.acquire()
+        except TimeoutError:
+            raise TimeoutError("audit lock wait timed out") from None
+        try:
+            async with self._engine.begin() as conn:
+                last = (
+                    await conn.execute(select(t.c.hash).order_by(t.c.seq.desc()).limit(1))
+                ).scalar_one_or_none()
+                row["prev_hash"] = last or GENESIS_HASH
+                row["hash"] = _digest(row)
+                result = await conn.execute(t.insert().values(**row))
+                return int(result.inserted_primary_key[0])
+        finally:
+            self._lock.release()
 
     async def emit(self, ev: AuditEvent) -> None:
         """Append, never raising: failures are logged and counted (fail-open)."""
@@ -228,6 +268,27 @@ class AuditLog:
         except Exception as exc:  # noqa: BLE001 - audit must not break the request
             self.audit_errors += 1
             log.warning("audit append failed for %s: %s", ev.action, type(exc).__name__)
+
+    async def emit_coalesced(self, ev: AuditEvent, category: str) -> None:
+        """Like ``emit``, but at most one row per (action, category) per window; the row
+        carries ``detail.count`` = events suppressed since the previous row for that key."""
+        key = (ev.action, category)
+        now = time.monotonic()
+        state = self._coalesce.get(key)
+        if state is not None and now - state[0] < COALESCE_WINDOW_S:
+            state[1] += 1
+            state[2] = ev
+            return
+        suppressed = state[1] if state is not None else 0
+        self._coalesce[key] = [now, 0, None]
+        await self.emit(_with_count(ev, suppressed))
+
+    async def flush_coalesced(self) -> None:
+        """Write one row per key that still has suppressed events (e.g. at shutdown)."""
+        pending = [(k, s) for k, s in self._coalesce.items() if s[1] > 0 and s[2] is not None]
+        self._coalesce.clear()
+        for _key, (_start, suppressed, last) in pending:
+            await self.emit(_with_count(last, suppressed - 1))
 
     def submit(self, ev: AuditEvent) -> None:
         """Fire-and-forget ``emit`` from sync code running on the event loop."""

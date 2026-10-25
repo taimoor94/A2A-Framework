@@ -384,18 +384,21 @@ class _AgentAuthorizer:
         self, scope: Scope, receive: Receive, send: Send, principal: Principal | None, **detail: Any
     ) -> None:
         if self.audit is not None:
-            await self.audit.emit(
-                AuditEvent(
-                    actor=principal.id if principal is not None else "anonymous",
-                    action="authz.deny",
-                    agent_id=self.spec.id,
-                    outcome="forbidden",
-                    detail={
-                        "principal_kind": principal.kind if principal is not None else "anonymous",
-                        **detail,
-                    },
-                )
+            ev = AuditEvent(
+                actor=principal.id if principal is not None else "anonymous",
+                action="authz.deny",
+                agent_id=self.spec.id,
+                outcome="forbidden",
+                detail={
+                    "principal_kind": principal.kind if principal is not None else "anonymous",
+                    **detail,
+                },
             )
+            if principal is None or principal.kind == "anonymous":
+                # Unauthenticated callers cannot flood the log: one row per agent per window.
+                await self.audit.emit_coalesced(ev, f"agent:{self.spec.id}")
+            else:
+                await self.audit.emit(ev)
         await JSONResponse({"error": "forbidden"}, status_code=403)(scope, receive, send)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -657,6 +660,7 @@ class AgentHost:
         if self.client is not None:
             await self.client.aclose()
         if self.audit is not None:
+            await self.audit.flush_coalesced()
             await self.audit.drain()  # registry events still being written
         if self.engine is not None:
             await self.engine.dispose()

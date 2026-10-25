@@ -668,8 +668,23 @@ class PartnerClient:
                         wait_seconds=wait_seconds,
                         inbound_task_id=inbound_task_id,
                     )
-                except BaseException:
+                except BaseException as exc:
                     span.set_status(SpanStatus(StatusCode.ERROR))
+                    if self.audit is not None:
+                        ev = self._call_event(
+                            principal,
+                            agent_id,
+                            partner_id,
+                            inbound_task_id,
+                            decision,
+                            classification,
+                            "error",
+                            None,
+                        )
+                        if isinstance(exc, Exception):
+                            await self.audit.emit(ev)
+                        else:  # cancellation: never delay it on a database write
+                            self.audit.submit(ev)
                     raise
                 if result.provenance and result.provenance.get("tier"):
                     span.set_attribute("a2agw.tier", str(result.provenance["tier"]))
@@ -680,23 +695,42 @@ class PartnerClient:
             _caller.reset(token)
         self._publish(result, started)
         if self.audit is not None:
-            label = decision.classification if decision is not None else classification
             await self.audit.emit(
-                AuditEvent(
-                    actor=principal.id if principal is not None else "system",
-                    action="partner.call",
-                    agent_id=agent_id,
-                    partner_id=partner_id,
-                    task_id=inbound_task_id,
-                    classification=label if isinstance(label, Classification) else None,
-                    outcome=result.state,
-                    detail={
-                        "state": result.state,
-                        "tier": (result.provenance or {}).get("tier"),
-                    },
+                self._call_event(
+                    principal,
+                    agent_id,
+                    partner_id,
+                    inbound_task_id,
+                    decision,
+                    classification,
+                    result.state,
+                    (result.provenance or {}).get("tier"),
                 )
             )
         return result
+
+    @staticmethod
+    def _call_event(
+        principal: Principal | None,
+        agent_id: str,
+        partner_id: str,
+        inbound_task_id: str | None,
+        decision: Decision | None,
+        classification: Classification | str | None,
+        outcome: str,
+        tier: Any,
+    ) -> AuditEvent:
+        label = decision.classification if decision is not None else classification
+        return AuditEvent(
+            actor=principal.id if principal is not None else "system",
+            action="partner.call",
+            agent_id=agent_id,
+            partner_id=partner_id,
+            task_id=inbound_task_id,
+            classification=label if isinstance(label, Classification) else None,
+            outcome=outcome,
+            detail={"state": outcome, "tier": tier},
+        )
 
     def _egress(
         self,

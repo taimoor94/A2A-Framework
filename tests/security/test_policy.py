@@ -223,9 +223,25 @@ def test_unknown_classification_used_when_nothing_classifies():
     engine = PolicyEngine(pol)
     d = engine.egress("a", _partner("pub", tier="public"), None, "", None)
     assert d.classification is C.CONFIDENTIAL and not d.allowed
-    # an explicit value counts as classifying the data
+    # Raise-only: an explicit lower label never goes below unknown_classification.
     d = engine.egress("a", _partner("pub", tier="public"), C.PUBLIC, "", None)
-    assert d.classification is C.PUBLIC and d.allowed
+    assert d.classification is C.CONFIDENTIAL and not d.allowed
+    # ... but a higher explicit label raises it.
+    d = engine.egress("a", _partner("p"), C.RESTRICTED, "", None)
+    assert d.classification is C.RESTRICTED and not d.allowed
+
+
+def test_explicit_label_cannot_lower_below_unknown_classification_regression():
+    """Reviewer probe: an LLM label "public" must not defeat unknown_classification."""
+    pol = _policy(
+        defaults={"unknown_classification": "confidential"},
+        egress={"tier_ceilings": {"public": "public"}},
+    )
+    engine = PolicyEngine(pol)
+    pub = _partner("p", tier="public")
+    assert not engine.egress("bot", pub, None, "secret", None).allowed
+    d = engine.egress("bot", pub, C.parse("public"), "secret", None)
+    assert not d.allowed and d.classification is C.CONFIDENTIAL
 
 
 def test_classifier_cannot_lower_unknown_classification():

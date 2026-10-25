@@ -259,3 +259,68 @@ async def test_chain_and_tamper_detection_on_postgres(pg_url):
         assert await a.verify_chain() == middle
     finally:
         await eng.dispose()
+
+
+# -- fix round 1 -------------------------------------------------------------------------
+
+
+async def test_lone_surrogate_in_principal_id_still_audited():
+    """Reviewer probe (surr.py): a lone surrogate must not make the append fail."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    eng = create_async_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        a = AuditLog(eng)
+        await a.initialize()
+        await a.emit(
+            AuditEvent(
+                actor="jwt:\ud800x",
+                action="inbound.admit",
+                outcome="admitted",
+                detail={"reason": "r\udfffr"},
+            )
+        )
+        assert a.audit_errors == 0
+        rows, _ = await a.query({}, 10)
+        assert rows[0]["actor"] == "jwt:�x"
+        assert rows[0]["detail"]["reason"] == "r�r"
+        assert await a.verify_chain() is None
+    finally:
+        await eng.dispose()
+
+
+async def test_lock_wait_is_bounded_and_counted(log, monkeypatch):
+    from a2agw.ops import audit as audit_mod
+
+    monkeypatch.setattr(audit_mod, "LOCK_TIMEOUT_S", 0.05)
+    await log._lock.acquire()  # a stalled writer holds the lock
+    try:
+        await log.emit(ev())
+    finally:
+        log._lock.release()
+    assert log.audit_errors == 1
+    await log.emit(ev())  # recovers once the lock is free
+    assert log.audit_errors == 1
+    assert len((await log.query({}, 10, None))[0]) == 1
+
+
+async def test_emit_coalesced_one_row_per_window_with_count(log, monkeypatch):
+    from a2agw.ops import audit as audit_mod
+
+    clock = [1000.0]
+    monkeypatch.setattr(audit_mod.time, "monotonic", lambda: clock[0])
+    deny = ev("authz.deny", actor="anonymous", outcome="forbidden")
+    for _ in range(5):
+        await log.emit_coalesced(deny, "agent:a")
+    await log.emit_coalesced(deny, "agent:b")  # another category has its own window
+    rows, _ = await log.query({}, 10, None, ascending=True)
+    assert len(rows) == 2 and [r["detail"]["count"] for r in rows] == [0, 0]
+    clock[0] += 61  # next window: the row carries the 4 suppressed before it
+    await log.emit_coalesced(deny, "agent:a")
+    await log.emit_coalesced(deny, "agent:a")  # suppressed again
+    await log.flush_coalesced()
+    rows, _ = await log.query({}, 10, None, ascending=True)
+    counts = [r["detail"]["count"] for r in rows if r["action"] == "authz.deny"]
+    assert counts == [0, 0, 4, 0]
+    assert len(rows) + sum(counts) == 8  # every event is accounted for
+    assert await log.verify_chain() is None

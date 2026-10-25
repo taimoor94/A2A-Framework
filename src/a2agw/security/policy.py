@@ -39,10 +39,12 @@ authorize(principal, agent_id, skill_id)
     ``Decision.rule`` is the rule's ``id`` or ``authz[i]``; ids must be unique.
 
 egress(agent_id, partner, classification, text, data)
-    label = max(explicit classification, ``defaults.agent_classification[agent]``), or
-    ``defaults.unknown_classification`` when neither is given; effective = max(label,
-    classifier result if a classifier is configured), so a classifier can raise but never
-    lower the level. ceiling = ``egress.partner_ceilings[partner.id]`` if set,
+    effective = max(explicit classification if given,
+    ``defaults.agent_classification[agent]`` if set else ``defaults.unknown_classification``,
+    classifier result if a classifier is configured). Labels only ever raise the level: an
+    explicit label (which may come from an LLM tool argument) can never go below the agent
+    default or ``unknown_classification``, and neither can the classifier. The classifier
+    sees the message text and ``data``, not file attachments. ceiling = ``egress.partner_ceilings[partner.id]`` if set,
     else ``egress.tier_ceilings[partner.tier]`` (missing tiers keep their defaults).
     Allowed iff effective <= ceiling. ``Decision.classification`` is the effective value.
 
@@ -299,13 +301,11 @@ class PolicyEngine:
         text: str,
         data: dict[str, Any] | None,
     ) -> Decision:
-        labels: list[Classification] = []
+        defaults = self.policy.defaults
+        # Raise-only: the floor is the agent default, else unknown_classification.
+        eff = defaults.agent_classification.get(agent_id, defaults.unknown_classification)
         if classification is not None:
-            labels.append(Classification(classification))
-        default = self.policy.defaults.agent_classification.get(agent_id)
-        if default is not None:
-            labels.append(default)
-        eff = max(labels) if labels else self.policy.defaults.unknown_classification
+            eff = max(eff, Classification(classification))
         if self.classifier is not None:
             eff = max(eff, Classification(self.classifier.classify(text, data)))
 
