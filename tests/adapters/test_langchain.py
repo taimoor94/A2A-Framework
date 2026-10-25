@@ -209,3 +209,15 @@ async def test_runnable_agent_served_end_to_end(world):
     task = events[-1].task
     assert task.status.state == TaskState.TASK_STATE_COMPLETED
     assert "lc says x" in "".join(p.text for a in task.artifacts for p in a.parts)
+
+
+async def test_multi_delta_dict_chain_merged():
+    from langchain_core.runnables import RunnablePassthrough
+
+    chain = RunnableLambda(lambda t: {"a": t}) | RunnablePassthrough.assign(
+        b=lambda d: "y", c=lambda d: "z"
+    )
+    evs = await collect(RunnableAdapter(chain), "x")
+    [c] = [e for e in evs if isinstance(e, ArtifactChunk)]
+    assert c.name == "result"
+    assert MessageToDict(c.parts[0])["data"] == {"a": "x", "b": "y", "c": "z"}

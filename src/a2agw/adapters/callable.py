@@ -8,14 +8,13 @@ import inspect
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
+from a2agw.adapters._stream import EVENT_TYPES as _EVENT_TYPES
 from a2agw.adapters._stream import stream_events
 from a2agw.consult.client import PartnerClient
 from a2agw.consult.tools import UNTRUSTED_NOTE, PartnerTool, invoke
 from a2agw.core.events import AgentEvent, Done
 from a2agw.core.spi import InboundContext
 from a2agw.serve.agent import AgentSpec, SkillSpec
-
-_EVENT_TYPES = tuple(AgentEvent.__args__)  # type: ignore[attr-defined]
 
 
 class CallableAdapter:

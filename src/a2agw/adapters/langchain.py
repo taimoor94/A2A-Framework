@@ -12,6 +12,7 @@ from typing import Any
 from a2a.helpers import new_data_part
 from langchain_core.messages import BaseMessage
 from langchain_core.runnables import Runnable
+from langchain_core.runnables.utils import AddableDict
 from langchain_core.tools import StructuredTool
 
 from a2agw.adapters._stream import stream_events
@@ -41,9 +42,10 @@ class RunnableAdapter:
 
     The input is the inbound text, or ``{input_key: text}`` when ``input_key`` is set. Chunks
     may be ``str``, message chunks (their text content is used) or dicts. Text streams as the
-    artifact "output" (final chunk marked ``last``). If the runnable yields dicts, the last
-    one is published as a data artifact named "result". Token usage found on message chunks is
-    summed and reported as one ``Usage`` event at the end.
+    artifact "output" (final chunk marked ``last``). If the runnable yields dicts, the partial
+    dicts are merged and published as a data artifact named "result". Token usage found on
+    message chunks is summed (chunk usage is a per-chunk delta, the ``AIMessageChunk``
+    convention) and reported as one ``Usage`` event at the end.
     """
 
     def __init__(
@@ -64,7 +66,13 @@ class RunnableAdapter:
             config = {"configurable": {"thread_id": ctx.context_id}}
             async for chunk in self.runnable.astream(payload, config=config):  # type: ignore[arg-type]
                 if isinstance(chunk, dict):
-                    final = chunk
+                    # Merge partial dicts the way Runnable.ainvoke does.
+                    if final is None:
+                        final = chunk
+                    elif isinstance(final, AddableDict) and isinstance(chunk, AddableDict):
+                        final = final + chunk
+                    else:
+                        final = {**final, **chunk}
                     continue
                 if isinstance(chunk, str):
                     text = chunk
@@ -99,12 +107,13 @@ def as_langchain_tools(
     def make(tool: PartnerTool) -> StructuredTool:
         async def call(**kwargs: Any) -> str:
             result = await invoke(tool, kwargs, client, inbound_task_id=None, caller=caller)
-            return json.dumps(result)
+            return json.dumps(result, default=str)
 
         return StructuredTool.from_function(
             coroutine=call,
             name=tool.name,
             description=tool.description + "\n\n" + UNTRUSTED_NOTE,
+            # A dict args_schema is not validated by LangChain; ``invoke`` validates instead.
             args_schema=tool.parameters,
             handle_tool_error=True,
         )
