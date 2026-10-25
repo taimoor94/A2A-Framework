@@ -247,6 +247,14 @@ class PartnerRegistry:
         self._changed(rec, "disabled")
         return rec
 
+    def enable(self, id: str) -> PartnerRecord:
+        rec = self.get(id)
+        if rec.status != "disabled":
+            raise ValueError(f"partner {id!r} is not disabled (status: {rec.status})")
+        rec.status = "active"
+        self._changed(rec, "enabled")
+        return rec
+
     # -- queries --------------------------------------------------------
     def get(self, id: str) -> PartnerRecord:
         try:

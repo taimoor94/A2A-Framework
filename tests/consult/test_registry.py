@@ -396,3 +396,19 @@ async def test_load_rejects_bad_endpoint(tmp_path):
     _write(p, [rec])
     with pytest.raises(ValueError, match="userinfo"):
         PartnerRegistry(p).load()
+
+
+@respx.mock
+async def test_enable_reactivates_disabled_only():
+    respx.get(CARD_URL).respond(200, json=CARD)
+    reg = PartnerRegistry()
+    events = []
+    reg.on_change = lambda r, e: events.append(e)
+    await reg.add_from_url("p1", URL, "public")
+    with pytest.raises(ValueError, match="not disabled"):
+        reg.enable("p1")
+    reg.disable("p1")
+    assert reg.enable("p1").status == "active"
+    assert events[-1] == "enabled"
+    with pytest.raises(KeyError):
+        reg.enable("nope")
