@@ -243,6 +243,7 @@ def test_setup_twice_adds_no_duplicate_handler(spans):
 
     root = logging.getLogger()
     before = list(root.handlers)
+    formatters = {h: h.formatter for h in before}  # setup_telemetry re-formats these too
     try:
         setup_telemetry("svc")
         after_first = list(root.handlers)
@@ -251,3 +252,5 @@ def test_setup_twice_adds_no_duplicate_handler(spans):
         assert all(isinstance(h.formatter, JsonFormatter) for h in root.handlers)
     finally:
         root.handlers[:] = before
+        for h, fmt in formatters.items():
+            h.setFormatter(fmt)

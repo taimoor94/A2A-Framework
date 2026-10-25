@@ -352,3 +352,27 @@ async def test_delete_removes_only_that_row(index):
     await index.delete("missing")  # deleting an unknown id is a no-op
     rows, _ = await index.list(agent_id="a1")
     assert [r["task_id"] for r in rows] == ["t2"]
+
+
+async def test_file_sqlite_engine_uses_wal_and_busy_timeout(tmp_path):
+    """Finding 6: concurrent readers and a writer must not fail with "database is locked"."""
+    from sqlalchemy import text
+
+    eng = await create_engine(f"sqlite+aiosqlite:///{tmp_path / 'wal.db'}")
+    try:
+        async with eng.connect() as conn:
+            assert (await conn.execute(text("PRAGMA journal_mode"))).scalar() == "wal"
+            assert (await conn.execute(text("PRAGMA busy_timeout"))).scalar() == 5000
+    finally:
+        await eng.dispose()
+
+
+async def test_in_memory_sqlite_engine_skips_pragmas():
+    from sqlalchemy import text
+
+    eng = await create_engine("sqlite+aiosqlite:///:memory:")
+    try:
+        async with eng.connect() as conn:
+            assert (await conn.execute(text("PRAGMA journal_mode"))).scalar() == "memory"
+    finally:
+        await eng.dispose()

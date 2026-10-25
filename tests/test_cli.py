@@ -301,3 +301,27 @@ def test_serve_registers_partners_before_uvicorn(tmp_path, monkeypatch):
     monkeypatch.setattr(uvicorn, "run", lambda app, **kw: order.append("run"))
     assert run("serve", "-c", str(tmp_path / "a2agw.yaml")).exit_code == 0
     assert order == ["register", "run"]
+
+
+@respx.mock
+def test_call_reads_api_key_from_env(monkeypatch):
+    """Finding 10: A2AGW_API_KEY supplies the key when --api-key is not given."""
+    respx.get(URL + "/.well-known/agent-card.json").respond(200, json=CARD)
+    seen: list[str | None] = []
+
+    def rpc(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("x-api-key"))
+        body = json.loads(request.content)
+        task = {"id": "t1", "contextId": "c1", "status": {"state": "TASK_STATE_COMPLETED"}}
+        return httpx.Response(
+            200, json={"jsonrpc": "2.0", "id": body["id"], "result": {"task": task}}
+        )
+
+    respx.post(URL + "/rpc").mock(side_effect=rpc)
+    monkeypatch.setenv("A2AGW_API_KEY", "env-key-456")
+    r = run("call", URL, "ping")
+    assert r.exit_code == 0, r.output
+    r = run("call", URL, "ping", "--api-key", "flag-key-789")  # the flag wins
+    assert r.exit_code == 0, r.output
+    assert seen == ["env-key-456", "flag-key-789"]
+    assert "env-key-456" not in r.output

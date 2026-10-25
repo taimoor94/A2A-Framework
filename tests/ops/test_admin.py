@@ -301,3 +301,82 @@ async def test_healthz_public(make):
     assert HEALTH_PATH == "/a2agw/admin/healthz"
     r = await hc.get(HEALTH_PATH)
     assert r.status_code == 200 and r.json() == {"status": "ok"}
+
+
+def _events_scope() -> dict:
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "headers": [],
+        "scheme": "http",
+        "path": "/a2agw/admin/events",
+        "raw_path": b"/a2agw/admin/events",
+        "query_string": b"",
+        "server": ("t", 80),
+        "client": ("127.0.0.1", 1),
+        "root_path": "",
+    }
+
+
+async def _open_events_stream(host):
+    sent: list[dict] = []
+
+    async def receive():
+        await asyncio.Event().wait()  # the client never disconnects
+
+    async def send(message):
+        sent.append(message)
+
+    task = asyncio.create_task(host.app()(_events_scope(), receive, send))
+    for _ in range(100):
+        if host.bus._subscribers:
+            break
+        await asyncio.sleep(0.01)
+    assert len(host.bus._subscribers) == 1
+    return task, sent
+
+
+async def test_events_stream_ends_on_close_all(make):
+    """Finding 8: an open /events stream with a connected client ends on close_all."""
+    host, _ = await make(spec(), admin_without_auth=True)
+    task, sent = await _open_events_stream(host)
+    host.bus.close_all()
+    await asyncio.wait_for(task, 2)
+    assert sent[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
+    assert host.bus._subscribers == set()
+
+
+async def test_events_stream_ends_on_host_shutdown(make):
+    host, _ = await make(spec(), admin_without_auth=True)
+    task, _ = await _open_events_stream(host)
+    await host.shutdown()
+    await asyncio.wait_for(task, 2)
+
+
+async def test_exit_signal_ends_events_stream_before_lifespan_shutdown(tmp_path):
+    """Uvicorn waits for open responses before the lifespan shutdown: the exit signal itself
+    must end /events, then reach the previously installed (uvicorn's) handler."""
+    import signal
+
+    host = AgentHost(
+        "http://t", db_url=f"sqlite+aiosqlite:///{tmp_path / 'sig.db'}", admin_without_auth=True
+    )
+    host.add(spec())
+    app = host.app()
+    seen: list[int] = []
+
+    def uvicorn_handler(sig, frame):
+        seen.append(sig)
+
+    original = signal.signal(signal.SIGTERM, uvicorn_handler)
+    try:
+        async with app.router.lifespan_context(app):
+            task, _ = await _open_events_stream(host)
+            signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+            await asyncio.wait_for(task, 2)  # ended while the app is still up
+            assert seen == [signal.SIGTERM]
+        assert signal.getsignal(signal.SIGTERM) is uvicorn_handler  # restored
+    finally:
+        signal.signal(signal.SIGTERM, original)

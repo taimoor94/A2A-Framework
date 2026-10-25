@@ -464,3 +464,27 @@ def test_run_binds_localhost_by_default(monkeypatch):
         {"host": "127.0.0.1", "port": 8000},
         {"host": "0.0.0.0", "port": 9000},
     ]
+
+
+async def test_startup_failure_disposes_engine(tmp_path, monkeypatch):
+    """Finding 11: a bad partners file must not leak the engine opened before it."""
+    from sqlalchemy.ext.asyncio import AsyncEngine
+
+    bad = tmp_path / "partners.yaml"
+    bad.write_text("not: a partner list\n")
+    disposed: list[AsyncEngine] = []
+    real_dispose = AsyncEngine.dispose
+
+    async def dispose(self, *args, **kwargs):
+        disposed.append(self)
+        return await real_dispose(self, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncEngine, "dispose", dispose)
+    host = AgentHost(
+        "http://t", db_url=f"sqlite+aiosqlite:///{tmp_path / 'h.db'}", partners_path=bad
+    )
+    host.add(spec("alpha"))
+    with pytest.raises(ValueError, match="partners"):
+        await host.startup()
+    assert len(disposed) == 1
+    assert host.engine is None and host.client is None

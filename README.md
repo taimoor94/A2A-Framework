@@ -62,6 +62,8 @@ state: TASK_STATE_COMPLETED
 echo: hello
 ```
 
+For an agent behind API-key auth, set `A2AGW_API_KEY` in the environment rather than passing `--api-key`: a key on the command line is visible to other users in `ps` and is saved in your shell history. `--api-key` overrides the variable when both are set.
+
 Register an agent as a partner of your gateway. This fetches its card and saves it to `partners.yaml` next to `a2agw.yaml`. Here the agent registers itself, which is enough to see the flow; use another agent's URL in practice:
 
 ```bash
@@ -100,7 +102,7 @@ from a2agw import AgentHost, Done, NeedInput, Status, agent
 @agent(id="booker", description="Books a table.")
 async def booker(ctx):
     if not ctx.resumed:
-        yield NeedInput("For how many people?")      # task becomes input-required
+        yield NeedInput("For how many people?")  # task becomes input-required
         return
     yield Status("checking availability")
     yield Done(f"Booked a table for {ctx.text}.")
@@ -129,7 +131,7 @@ from a2agw.adapters.langgraph import GraphAdapter
 
 
 def ask(state: MessagesState):
-    answer = interrupt("Which environment?")          # -> input-required
+    answer = interrupt("Which environment?")  # -> input-required
     return {"messages": [("ai", f"Deploying to {answer}")]}
 
 
@@ -183,7 +185,7 @@ Give those tools to a tool-calling model, a LangGraph `ToolNode`, or call them d
   a2agw partners list                   # shows the PENDING flag and the hash
   a2agw partners approve acme --hash <hash-from-list>
   ```
-- **Access control needs `auth`.** Without an `auth` section every caller is anonymous and `AgentAccess` is not enforced, so that setup is for local development only. Once `auth` is set, anonymous callers are always denied on agent endpoints; `allow_anonymous: true` only opens the public card and healthz endpoints.
+- **Access control needs `auth`.** Without an `auth` section every caller is anonymous and `AgentAccess` is not enforced, so that setup is for local development only. Once `auth` is set, anonymous callers are always denied on agent endpoints. Agent cards and healthz are public either way, so `allow_anonymous: true` opens nothing extra: it only changes the answer to a request without credentials on an agent route from 401 (unauthenticated) to 403 (forbidden).
 - **Principals are prefixed.** `AgentAccess(allowed_principals=...)` takes `key:<principal_id>` for API keys and `jwt:<sub>` for JWTs. An unprefixed id matches nothing.
 - **Untrusted partner text.** Text from partners is capped at 64 KiB, and results carry `provenance.untrusted = true`. `UNTRUSTED_NOTE` is appended to the partner tools' descriptions so the model treats partner output as data, not instructions. Binary artifacts are never inlined.
 - **Call-context limits.** Every call carries a call context: at most 8 hops by default, an absolute deadline (the default inbound ceiling is 1 hour; it is checked when a call is admitted, not enforced mid-run), an optional call budget (`max_calls`), and the path of agents already involved. A call that comes back to an agent already on its path is rejected unless that agent sets `allow_reentry`. Limits only ever tighten as the context travels. Cancelling an inbound task cancels the partner tasks it started.
@@ -208,7 +210,7 @@ access = AgentAccess(
 ```python
 from a2agw import setup_telemetry
 
-setup_telemetry("my-gateway")        # JSON logs plus an OpenTelemetry tracer provider
+setup_telemetry("my-gateway")  # JSON logs plus an OpenTelemetry tracer provider
 ```
 
 Or set `telemetry:` in `a2agw.yaml`. Two span names are emitted: `a2agw.inbound` for each inbound task and `a2agw.partner_call` for each outbound call. The trace context travels between agents in the call-context extension (`https://a2agw.dev/ext/call-context/v1`), so one request is one trace across the whole network. Spans carry identifiers and states, never message text or credentials. To export over OTLP, pass your own exporter to `setup_telemetry(exporter=...)`, or set `telemetry.otlp_endpoint` (needs `opentelemetry-exporter-otlp`).
@@ -234,7 +236,7 @@ partners_file: partners.yaml                         # partner registry, relativ
 admin_without_auth: false                            # true = open admin API (development only)
 
 auth:                                                # omit for no authentication
-  allow_anonymous: false                             # true only opens card + healthz
+  allow_anonymous: false                             # true: no-credential agent calls get 403, not 401
   api_keys:                                          # key: sha256 hex of the API key
     "<64-char sha256 hex>":
       principal_id: ci-bot                           # becomes key:ci-bot

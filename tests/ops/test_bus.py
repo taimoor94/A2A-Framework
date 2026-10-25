@@ -125,3 +125,22 @@ async def test_recent_ring_buffer():
     assert bus.recent(2) == events[3:]
     assert bus.recent(10) == events[2:]
     assert bus.recent(0) == []
+
+
+async def test_close_all_ends_open_and_new_subscriptions():
+    """Finding 8: close_all wakes every pending iteration; until reopen, new ones end at once."""
+    bus = EventBus()
+    a, b = bus.subscribe(), bus.subscribe()
+    pending = [asyncio.create_task(anext(s, None)) for s in (a, b)]
+    await asyncio.sleep(0)
+    bus.close_all()
+    assert await asyncio.wait_for(asyncio.gather(*pending), 1) == [None, None]
+    assert bus._subscribers == set()
+    late = bus.subscribe()
+    assert await asyncio.wait_for(anext(late, None), 1) is None
+    bus.reopen()
+    live = bus.subscribe()
+    ev = GatewayEvent("partner.call", "x", {})
+    bus.publish(ev)
+    assert await anext(live) == ev
+    await live.aclose()

@@ -4,6 +4,9 @@
 full, its oldest event is dropped to make room for the new one, and ``dropped``
 is incremented. A ring buffer of recent events is kept for late readers.
 
+``close_all`` ends every open subscription (and any made until ``reopen``), so long-lived
+consumers such as the admin SSE stream finish when the gateway shuts down.
+
 ``subscribe`` registers its queue immediately, so an event published right after
 ``subscribe`` returns is delivered. ``subscribe_with_replay`` takes the snapshot
 and registers the queue in one synchronous step, so a replay-then-live consumer
@@ -53,10 +56,15 @@ class Subscription:
 
     async def aclose(self) -> None:
         """Unregister this subscriber. Idempotent."""
+        self.close()
+
+    def close(self) -> None:
+        """Synchronous ``aclose``: unregister and wake a pending ``__anext__``. Idempotent."""
         if self._closed:
             return
         self._closed = True
         self._bus._subscribers.discard(self._queue)
+        self._bus._subs.discard(self)
         # Wake a __anext__ that is already waiting on the queue.
         if self._queue.full():
             self._queue.get_nowait()
@@ -73,6 +81,8 @@ class EventBus:
     def __init__(self, recent_size: int = 200) -> None:
         self._recent: collections.deque[GatewayEvent] = collections.deque(maxlen=recent_size)
         self._subscribers: set[asyncio.Queue[Any]] = set()
+        self._subs: set[Subscription] = set()
+        self._closing = False
         self.dropped: int = 0
 
     def publish(self, ev: GatewayEvent) -> None:
@@ -89,8 +99,23 @@ class EventBus:
         if maxsize < 1:
             raise ValueError("maxsize must be >= 1")
         q: asyncio.Queue[Any] = asyncio.Queue(maxsize)
+        sub = Subscription(self, q)
+        if self._closing:
+            sub._closed = True  # the bus is shutting down: the stream ends at once
+            return sub
         self._subscribers.add(q)
-        return Subscription(self, q)
+        self._subs.add(sub)
+        return sub
+
+    def close_all(self) -> None:
+        """End every subscription, and every new one until ``reopen``. Never blocks."""
+        self._closing = True
+        for sub in list(self._subs):
+            sub.close()
+
+    def reopen(self) -> None:
+        """Accept live subscriptions again (after ``close_all``)."""
+        self._closing = False
 
     def subscribe_with_replay(
         self, n: int = 50, maxsize: int = 1000

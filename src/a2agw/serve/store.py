@@ -25,6 +25,7 @@ from sqlalchemy import (
     Table,
     and_,
     delete,
+    event,
     func,
     or_,
     select,
@@ -32,6 +33,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects import sqlite as sqlite_dialect
+from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from a2agw.consult.handles import OUTBOUND_TABLE
@@ -72,8 +74,31 @@ _MODELS: dict[str, tuple[str, type]] = {}
 logger = logging.getLogger(__name__)
 
 
+SQLITE_BUSY_TIMEOUT_MS = 5000
+
+
+def _is_file_sqlite(url: URL) -> bool:
+    db = url.database or ""
+    in_memory = db in ("", ":memory:") or "mode=memory" in db or url.query.get("mode") == "memory"
+    return url.get_backend_name() == "sqlite" and not in_memory
+
+
+def _sqlite_pragmas(dbapi_conn: Any, _record: Any) -> None:
+    """WAL lets readers run alongside the writer; busy_timeout waits out a held lock
+    instead of failing with "database is locked"."""
+    cur = dbapi_conn.cursor()
+    try:
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    finally:
+        cur.close()
+
+
 async def create_engine(url: str = "sqlite+aiosqlite:///a2agw.db") -> AsyncEngine:
-    return create_async_engine(url)
+    engine = create_async_engine(url)
+    if _is_file_sqlite(engine.url):
+        event.listen(engine.sync_engine, "connect", _sqlite_pragmas)
+    return engine
 
 
 def task_store_for(engine: AsyncEngine, agent_id: str) -> DatabaseTaskStore:

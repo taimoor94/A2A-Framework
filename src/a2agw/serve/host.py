@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import AsyncGenerator, AsyncIterator
-from contextlib import asynccontextmanager
+import signal
+import threading
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +56,44 @@ from a2agw.serve.store import (
 )
 
 CARD_PATH = "/.well-known/agent-card.json"
+_EXIT_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+
+
+@contextmanager
+def _on_exit_signal(callback: Callable[[], None]) -> Iterator[None]:
+    """Run ``callback`` on the event loop when SIGINT/SIGTERM arrives, then hand the signal
+    to whatever handler was installed before (uvicorn's, under ``uvicorn.run``).
+
+    Uvicorn waits for open responses to finish *before* the lifespan shutdown runs, so
+    endless streams (admin ``/events``) must be ended as soon as the signal is seen.
+    Only possible in the main thread; elsewhere this does nothing."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    loop = asyncio.get_running_loop()
+    previous: dict[int, Any] = {sig: signal.getsignal(sig) for sig in _EXIT_SIGNALS}
+
+    def handler(sig: int, frame: Any) -> None:
+        loop.call_soon_threadsafe(callback)
+        prev = previous[sig]
+        if callable(prev):
+            prev(sig, frame)
+        elif prev == signal.SIG_DFL and sig == signal.SIGINT:
+            signal.default_int_handler(sig, frame)
+        elif prev == signal.SIG_DFL:
+            signal.signal(sig, signal.SIG_DFL)
+            signal.raise_signal(sig)
+
+    for sig in _EXIT_SIGNALS:
+        signal.signal(sig, handler)
+    try:
+        yield
+    finally:
+        for sig, prev in previous.items():
+            if signal.getsignal(sig) is handler:
+                signal.signal(sig, prev)
+
+
 __all__ = ["ADMIN_PREFIX", "HEALTH_PATH", "AgentHost"]
 
 
@@ -390,6 +431,23 @@ class AgentHost:
         self.specs[spec.id] = spec
 
     async def startup(self) -> None:
+        """Open the engine, load partners, build the agents and run restart recovery.
+
+        If any step fails (e.g. an unreadable partners file), whatever was opened so far is
+        closed again before the error propagates."""
+        try:
+            await self._startup()
+        except BaseException:
+            if self.client is not None:
+                await self.client.aclose()
+                self.client = None
+            if self.engine is not None:
+                await self.engine.dispose()
+                self.engine = None
+            raise
+
+    async def _startup(self) -> None:
+        self.bus.reopen()
         engine = self.engine = await create_engine(self.db_url)
         index = self.index = TaskIndex(engine)
         await index.initialize()
@@ -469,6 +527,9 @@ class AgentHost:
             raise RuntimeError("not canceled")
 
     async def shutdown(self) -> None:
+        # Order matters: end event streams, stop the executors, let the partner client
+        # drain its cancellation cleanups (they need the engine), then dispose the engine.
+        self.bus.close_all()
         for handler in self.handlers.values():
             await handler.aclose()
         if self.client is not None:
@@ -492,7 +553,8 @@ class AgentHost:
         async def lifespan(_: Starlette) -> AsyncIterator[None]:
             await self.startup()
             try:
-                yield
+                with _on_exit_signal(self.bus.close_all):
+                    yield
             finally:
                 await self.shutdown()
 

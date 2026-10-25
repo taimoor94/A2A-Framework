@@ -350,7 +350,16 @@ async def _call(url: str, message: str, api_key: str | None, tier: Tier, timeout
 def call(
     url: str,
     message: str,
-    api_key: Annotated[str | None, typer.Option("--api-key")] = None,
+    api_key: Annotated[
+        str | None,
+        typer.Option(
+            "--api-key",
+            envvar="A2AGW_API_KEY",
+            show_envvar=True,
+            help="API key to send; prefer the A2AGW_API_KEY env var (keeps it out of ps "
+            "and shell history).",
+        ),
+    ] = None,
     tier: Annotated[str, typer.Option("--tier")] = "partner",
     timeout: Annotated[float, typer.Option("--timeout")] = 30.0,
 ) -> None:
