@@ -8,7 +8,7 @@ import json
 import os
 import re
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -29,6 +29,7 @@ from a2agw.consult.netguard import (
     check_url_syntax,
     safe_get,
 )
+from a2agw.consult.tls import TlsClientConfig, build_async_client
 from a2agw.security.cardsign import CardSignatureError, CardVerifier
 
 MAX_CARD_BYTES = 1024 * 1024
@@ -123,27 +124,41 @@ class PartnerRegistry:
         http: httpx.AsyncClient | None = None,
         verifier: CardVerifier | None = None,
         require_signed: frozenset[Tier] = frozenset(),
+        tls: Mapping[str, TlsClientConfig] | None = None,
     ):
         if require_signed and verifier is None:
             raise ValueError("require_signed needs a verifier")
         self.path = path
         self._http = http
+        self.tls: dict[str, TlsClientConfig] = dict(tls or {})
+        for cfg in self.tls.values():  # load certificates now, not on the event loop later
+            cfg.ssl_context()
         self.verifier = verifier
         self.require_signed = frozenset(require_signed)
         self._records: dict[str, PartnerRecord] = {}
         self.on_change: Callable[[PartnerRecord, str], None] | None = None
 
     # -- fetching -------------------------------------------------------
-    async def _fetch(self, card_url: str, tier: Tier) -> dict[str, Any]:
+    async def _fetch(self, card_url: str, tier: Tier, tls_ref: str | None = None) -> dict[str, Any]:
         url = _card_urls(card_url)
+        own: httpx.AsyncClient | None = None
+        http = self._http
+        if tls_ref is not None:  # mTLS partner: never fall back to a plain client
+            cfg = self.tls.get(tls_ref)
+            if cfg is None:
+                raise CardFetchError("tls config missing")
+            own = http = build_async_client(cfg, httpx.Timeout(FETCH_TIMEOUT_S))
         try:
             body = await safe_get(
-                url, tier, max_bytes=MAX_CARD_BYTES, deadline_s=FETCH_TIMEOUT_S, http=self._http
+                url, tier, max_bytes=MAX_CARD_BYTES, deadline_s=FETCH_TIMEOUT_S, http=http
             )
         except UnsafeURL as e:
             raise CardFetchError(f"unsafe card URL: {e}") from None
         except FetchError as e:
             raise CardFetchError(f"card fetch failed: {e}") from None
+        finally:
+            if own is not None:
+                await own.aclose()
         try:
             data = json.loads(body)
         except ValueError:
@@ -184,10 +199,11 @@ class PartnerRegistry:
         *,
         credential_ref: str | None = None,
         tags: Iterable[str] = (),
+        tls_ref: str | None = None,
     ) -> PartnerRecord:
         self._check_new_id(id)
-        raw = await self._fetch(url, tier)
-        return await self._add(id, raw, tier, url, credential_ref, tags)
+        raw = await self._fetch(url, tier, tls_ref)
+        return await self._add(id, raw, tier, url, credential_ref, tags, tls_ref)
 
     async def add_from_card(
         self,
@@ -207,7 +223,7 @@ class PartnerRegistry:
         if id in self._records:
             raise ValueError(f"duplicate partner id: {id!r}")
 
-    async def _add(self, id, raw, tier, url, credential_ref, tags) -> PartnerRecord:
+    async def _add(self, id, raw, tier, url, credential_ref, tags, tls_ref=None) -> PartnerRecord:
         card, proto = _normalize(raw)
         try:
             key_id = await self._verify_signature(proto, tier)
@@ -226,6 +242,7 @@ class PartnerRegistry:
             tags=list(tags),
             fetched_at=time.time(),
             signed_key_id=key_id,
+            tls_ref=tls_ref,
         )
         self._records[id] = rec
         self._changed(rec, "added")
@@ -240,7 +257,7 @@ class PartnerRegistry:
         rec = self.get(id)
         if rec.status == "disabled" or not rec.card_url:
             return "unchanged"
-        raw = await self._fetch(rec.card_url, rec.tier)
+        raw = await self._fetch(rec.card_url, rec.tier, rec.tls_ref)
         card, proto = _normalize(raw)
         signature_ok = True
         try:

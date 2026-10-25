@@ -205,6 +205,11 @@ access = AgentAccess(
 # attach it to an agent: @agent(id="deployer", description="...", access=access)
 ```
 
+### mTLS
+
+Outbound: give `PartnerClient(tls={"ref": TlsClientConfig(cert_file, key_file, ca_file)})` and set `tls_ref` on a partner record; its calls then use a dedicated TLS 1.2+ client that presents that certificate and trusts `ca_file`. An unknown `tls_ref` fails closed (`unavailable`, "tls config missing"). Inbound: `a2agw serve --ssl-certfile F --ssl-keyfile F [--ssl-ca-certs F --require-client-cert]` (or `AgentHost.run(ssl_*=...)`). The client certificate is verified at the TLS layer only; ASGI servers do not expose it, so identity still comes from the API key or JWT.
+Certificates are loaded at startup; rotating them requires a restart.
+
 ## Observability
 
 ```python
@@ -302,7 +307,3 @@ gRPC is not offered today.
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
-
-### mTLS
-
-Outbound: give `PartnerClient(tls={"ref": TlsClientConfig(cert_file, key_file, ca_file)})` and set `tls_ref` on a partner record; its calls then use a dedicated TLS 1.2+ client that presents that certificate and trusts `ca_file`. An unknown `tls_ref` fails closed (`unavailable`, "tls config missing"). Inbound: `a2agw serve --ssl-certfile F --ssl-keyfile F [--ssl-ca-certs F --require-client-cert]` (or `AgentHost.run(ssl_*=...)`). The client certificate is verified at the TLS layer only; ASGI servers do not expose it, so identity still comes from the API key or JWT.

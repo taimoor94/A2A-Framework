@@ -27,6 +27,7 @@ import asyncio
 import inspect
 import logging
 import math
+import ssl
 import threading
 import time
 import uuid
@@ -74,7 +75,7 @@ from a2agw.consult.results import (
     Track,
     build_result,
 )
-from a2agw.consult.tls import TlsClientConfig
+from a2agw.consult.tls import TlsClientConfig, build_async_client
 from a2agw.context.call_context import (
     EXTENSION_URI,
     CallContext,
@@ -194,8 +195,21 @@ def _http_root(exc: BaseException) -> httpx.HTTPError | None:
     return seen if isinstance(seen, httpx.HTTPError) else None
 
 
+def _has_ssl_error(exc: BaseException) -> bool:
+    seen: BaseException | None = exc
+    for _ in range(10):
+        if seen is None:
+            return False
+        if isinstance(seen, ssl.SSLError):
+            return True
+        seen = seen.__cause__ or seen.__context__
+    return False
+
+
 def _kind(exc: BaseException) -> ErrorKind:
     """Classify an SDK/transport error by its httpx root cause."""
+    if _has_ssl_error(exc):  # handshake rejected (TLS 1.3 may surface it on first read)
+        return "connect"
     root = _http_root(exc)
     if isinstance(root, (httpx.ConnectError, httpx.ConnectTimeout)):
         return "connect"
@@ -336,6 +350,8 @@ class PartnerClient:
     ) -> None:
         self.registry = registry
         self.tls: dict[str, TlsClientConfig] = dict(tls or {})
+        for cfg in self.tls.values():  # load certificates now, not on the event loop later
+            cfg.ssl_context()
         self._tls_http: dict[str, httpx.AsyncClient] = {}
         self._tls_lock = threading.Lock()
         self.credentials = credentials
@@ -371,11 +387,7 @@ class PartnerClient:
         with self._tls_lock:  # one client per ref, built on first use
             hc = self._tls_http.get(ref)
             if hc is None:
-                hc = httpx.AsyncClient(
-                    verify=self.tls[ref].ssl_context(),
-                    follow_redirects=False,
-                    timeout=httpx.Timeout(30.0, connect=10.0),
-                )
+                hc = build_async_client(self.tls[ref], httpx.Timeout(30.0, connect=10.0))
                 self._tls_http[ref] = hc
             return hc
 
@@ -471,10 +483,7 @@ class PartnerClient:
             return rec, None, self._unavailable(partner_id, rec, "unsafe endpoint")
         if rec.tls_ref is not None and rec.tls_ref not in self.tls:
             return rec, None, self._unavailable(partner_id, rec, "tls config missing")
-        try:
-            client = self._client_for(rec)
-        except ValueError:  # unreadable/invalid client certificate: fail closed
-            return rec, None, self._unavailable(partner_id, rec, "tls config missing")
+        client = self._client_for(rec)
         if client is None:
             return rec, None, self._unavailable(partner_id, rec, "no supported binding")
         return rec, client, None

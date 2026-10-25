@@ -21,7 +21,7 @@ from typer.testing import CliRunner
 from a2agw import cli
 from a2agw.consult import client as client_mod
 from a2agw.consult.client import PartnerClient
-from a2agw.consult.registry import PartnerRecord, PartnerRegistry
+from a2agw.consult.registry import CardFetchError, PartnerRecord, PartnerRegistry
 from a2agw.consult.tls import TlsClientConfig
 from a2agw.core.events import Done
 from a2agw.serve.agent import AgentSpec, SkillSpec
@@ -181,28 +181,36 @@ async def test_partner_with_client_cert_succeeds(tls_server, pki, tmp_path):
 
 
 async def test_partner_without_client_cert_fails_unavailable(tls_server, pki, tmp_path):
-    host, port = tls_server
-    client, res = await _consult(host, port, tmp_path, partner_tls_ref=None, tls={})
+    host, _port = tls_server
+    registry = PartnerRegistry()
+    await registry.add_from_card("alpha", MessageToDict(host.cards["alpha"]), "internal")
+    # trusts the server's CA but presents no client certificate
+    trusting = httpx.AsyncClient(verify=ssl.create_default_context(cafile=str(pki / "ca.crt")))
+    client = PartnerClient(registry, http=trusting)
     try:
-        assert res.state == "unavailable", res
+        res = await client.consult("alpha", "hi", wait_seconds=5)
+        # TLS 1.3: the server's rejection arrives as a connection reset on first read, with
+        # no ssl.SSLError to classify, so this is the ambiguous-delivery path (never resent).
+        assert (res.state, res.reason) == ("unavailable", "delivery unknown"), res
     finally:
         await client.aclose()
+        await trusting.aclose()
 
 
 async def test_wrong_ca_fails(tls_server, pki, tmp_path):
     host, port = tls_server
-    # trusts the wrong CA for the server, and presents a cert the server's CA did not issue
+    # trusts the wrong CA for the server: server certificate verification fails
     bad = cfg(pki, "rogue", ca="other-ca")
     client, res = await _consult(host, port, tmp_path, partner_tls_ref="p", tls={"p": bad})
     try:
-        assert res.state == "unavailable", res
+        assert (res.state, res.reason) == ("unavailable", "partner unreachable"), res
     finally:
         await client.aclose()
-    # right trust root, client cert from another CA: the server rejects the handshake
+    # right trust root, client cert issued by another CA: the server rejects the handshake
     bad2 = cfg(pki, "rogue", ca="ca")
     client, res = await _consult(host, port, tmp_path, partner_tls_ref="p", tls={"p": bad2})
     try:
-        assert res.state == "unavailable", res
+        assert (res.state, res.reason) == ("unavailable", "delivery unknown"), res
     finally:
         await client.aclose()
 
@@ -307,7 +315,8 @@ def test_require_client_cert_without_ca_raises(tmp_path, monkeypatch):
         _host(tmp_path).run(ssl_certfile="c", ssl_keyfile="k", require_client_cert=True)
 
 
-def test_cli_serve_passes_tls_flags(tmp_path, monkeypatch):
+def test_cli_serve_passes_tls_flags(tmp_path, monkeypatch, pki):
+    c, k, ca = (str(pki / n) for n in ("server.crt", "server.key", "ca.crt"))
     (tmp_path / "a2agw.yaml").write_text("base_url: http://x\nagents: []\n")
     calls = {}
     monkeypatch.setattr(uvicorn, "run", lambda app, **kw: calls.update(kw))
@@ -318,20 +327,20 @@ def test_cli_serve_passes_tls_flags(tmp_path, monkeypatch):
             "-c",
             str(tmp_path / "a2agw.yaml"),
             "--ssl-certfile",
-            "c",
+            c,
             "--ssl-keyfile",
-            "k",
+            k,
             "--ssl-ca-certs",
-            "ca",
+            ca,
             "--require-client-cert",
         ],
     )
     assert r.exit_code == 0, r.output
-    assert calls["ssl_certfile"] == "c" and calls["ssl_ca_certs"] == "ca"
+    assert calls["ssl_certfile"] == c and calls["ssl_ca_certs"] == ca
     assert calls["ssl_cert_reqs"] == ssl.CERT_REQUIRED
 
 
-def test_cli_require_client_cert_without_ca_is_one_line_error(tmp_path):
+def test_cli_require_client_cert_without_ca_is_one_line_error(tmp_path, pki):
     (tmp_path / "a2agw.yaml").write_text("base_url: http://x\nagents: []\n")
     r = CliRunner().invoke(
         cli.app,
@@ -340,8 +349,64 @@ def test_cli_require_client_cert_without_ca_is_one_line_error(tmp_path):
             "-c",
             str(tmp_path / "a2agw.yaml"),
             "--ssl-certfile",
-            "c",
+            str(pki / "server.crt"),
             "--require-client-cert",
         ],
     )
     assert r.exit_code == 1 and "ssl_ca_certs" in r.output
+
+
+def test_cli_missing_ssl_file_is_one_line_error(tmp_path):
+    (tmp_path / "a2agw.yaml").write_text("base_url: http://x\nagents: []\n")
+    r = CliRunner().invoke(
+        cli.app, ["serve", "-c", str(tmp_path / "a2agw.yaml"), "--ssl-certfile", "nope.pem"]
+    )
+    assert r.exit_code == 1 and "nope.pem" in r.output
+
+
+# -- encrypted keys, card fetch --------------------------------------------------------
+
+
+def test_encrypted_key_is_rejected(pki, tmp_path):
+    key = serialization.load_pem_private_key((pki / "client.key").read_bytes(), None)
+    enc = tmp_path / "enc.key"
+    enc.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.BestAvailableEncryption(b"pw"),
+        )
+    )
+    with pytest.raises(ValueError, match="encrypted; passphrase-protected keys are not supported"):
+        TlsClientConfig(pki / "client.crt", enc)
+
+
+def test_key_with_open_permissions_warns(pki, tmp_path, caplog):
+    k = tmp_path / "open.key"
+    k.write_bytes((pki / "client.key").read_bytes())
+    k.chmod(0o644)
+    with caplog.at_level("WARNING"):
+        TlsClientConfig(pki / "client.crt", k)
+    assert "accessible by group/others" in caplog.text
+
+
+async def test_card_fetch_and_refresh_use_mtls(tls_server, pki):
+    _host, port = tls_server
+    url = f"https://localhost:{port}/agents/alpha"
+    reg = PartnerRegistry(tls={"p": cfg(pki)})
+    rec = await reg.add_from_url("alpha", url, "internal", tls_ref="p")
+    assert rec.tls_ref == "p"
+    assert await reg.refresh("alpha") == "unchanged"
+    # no tls_ref: the handshake is refused
+    with pytest.raises(CardFetchError):
+        await PartnerRegistry().add_from_url("beta", url, "internal")
+    # unknown tls_ref: fails closed
+    with pytest.raises(CardFetchError, match="tls config missing"):
+        await PartnerRegistry().add_from_url("gamma", url, "internal", tls_ref="nope")
+
+
+def test_ssl_error_in_cause_chain_is_connect_failure():
+    err = httpx.ReadError("")
+    err.__cause__ = ssl.SSLError("tlsv13 alert certificate required")
+    assert client_mod._kind(err) == "connect"
+    assert client_mod._kind(httpx.ReadError("")) == "transport"

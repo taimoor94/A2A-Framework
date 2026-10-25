@@ -150,6 +150,13 @@ def serve(
     ] = False,
 ) -> None:
     """Run the gateway (HTTPS with --ssl-certfile; identity still comes from API key or JWT)."""
+    for flag, f in (
+        ("--ssl-certfile", ssl_certfile),
+        ("--ssl-keyfile", ssl_keyfile),
+        ("--ssl-ca-certs", ssl_ca_certs),
+    ):
+        if f is not None and not Path(f).is_file():
+            raise ConfigError(f"{flag}: file {f} not found")
     cfg = load_config(config)
     config_dir = config.resolve().parent
     gw = build_host(cfg, config_dir=config_dir)
