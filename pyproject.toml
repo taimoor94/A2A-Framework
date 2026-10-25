@@ -45,6 +45,7 @@ packages = ["src/a2agw"]
 asyncio_mode = "auto"
 addopts = "--import-mode=importlib"
 testpaths = ["tests"]
+pythonpath = ["tests"]  # shared helpers, e.g. streaming_asgi
 
 [tool.ruff]
 line-length = 100

@@ -26,6 +26,7 @@ from a2agw.context.call_context import (
     DeadlineExceeded,
     HopLimitExceeded,
     use_call,
+    use_inbound,
 )
 from a2agw.core.events import ArtifactChunk, Done, Failed, NeedAuth, NeedInput, Status, Usage
 from a2agw.core.spi import InboundContext
@@ -45,6 +46,7 @@ _REASONS: dict[type[CallContextViolation], str] = {
     BudgetExceeded: "budget exceeded",
 }
 _INVALID = "invalid call context"
+_REENTRY = "re-entry"
 _RESUMABLE = {TaskState.TASK_STATE_INPUT_REQUIRED, TaskState.TASK_STATE_AUTH_REQUIRED}
 _TERMINAL = {
     TaskState.TASK_STATE_COMPLETED,
@@ -227,6 +229,14 @@ class AdapterExecutor(AgentExecutor):
             return
         # A resumed turn keeps the origin recorded by the turn that created the task.
         run.origin = None if resumed else cc.origin
+        if not resumed and not self.spec.allow_reentry:
+            # The path check above misses a partner that forwards our origin but rewrites the
+            # path; another live task of this agent in the same chain still shows re-entry.
+            if await self.index.has_active(self.spec.id, cc.origin, updater.task_id):
+                await self._status(run, TaskState.TASK_STATE_REJECTED, _REENTRY)
+                return
+            if run.cancelled:
+                return
 
         inbound = InboundContext.from_message(
             self.spec.id,
@@ -285,7 +295,8 @@ class AdapterExecutor(AgentExecutor):
 
     async def _drive(self, run: _Run, inbound: InboundContext) -> None:
         events: Any = None
-        with use_call(inbound.call):
+        # Outbound calls made by the adapter (partner tools) link to this task and caller.
+        with use_call(inbound.call), use_inbound(inbound.task_id, inbound.principal):
             try:
                 try:
                     await self._status(run, TaskState.TASK_STATE_WORKING)

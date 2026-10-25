@@ -9,7 +9,10 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from a2agw.security.principal import Principal
 
 EXTENSION_URI = "https://a2agw.dev/ext/call-context/v1"
 METADATA_KEY = EXTENSION_URI
@@ -212,3 +215,22 @@ def use_call(cc: CallContext | None) -> Iterator[CallContext | None]:
         yield cc
     finally:
         current_call.reset(token)
+
+
+# Set by the inbound executor while an adapter runs, so outbound calls made by that adapter
+# (e.g. through partner tools) are linked to the inbound task and made on behalf of its caller.
+current_inbound_task: ContextVar[str | None] = ContextVar("a2agw_current_inbound_task", default=None)
+current_principal: ContextVar[Principal | None] = ContextVar(
+    "a2agw_current_principal", default=None
+)
+
+
+@contextmanager
+def use_inbound(task_id: str | None, principal: Principal | None) -> Iterator[None]:
+    task_token = current_inbound_task.set(task_id)
+    principal_token = current_principal.set(principal)
+    try:
+        yield
+    finally:
+        current_principal.reset(principal_token)
+        current_inbound_task.reset(task_token)

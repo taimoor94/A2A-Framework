@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
+import httpx
 from a2a.server.context import ServerCallContext
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.routes import (
@@ -24,6 +26,10 @@ from starlette.responses import JSONResponse
 from starlette.routing import BaseRoute, Mount, get_route_path
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from a2agw.consult.client import PartnerClient
+from a2agw.consult.credentials import CredentialProvider
+from a2agw.consult.handles import OutboundHandleStore
+from a2agw.consult.registry import PartnerRegistry
 from a2agw.ops.admin import ADMIN_PREFIX, HEALTH_PATH, admin_routes
 from a2agw.ops.bus import EventBus
 from a2agw.security.auth import (
@@ -235,6 +241,10 @@ class AgentHost:
         max_parts: int = 64,
         admin: bool = True,
         admin_without_auth: bool = False,
+        partners_path: Path | None = None,
+        credentials: CredentialProvider | None = None,
+        partner_http: httpx.AsyncClient | None = None,
+        default_deadline_s: float = 60.0,
     ) -> None:
         self.base_url = base_url
         self.auth = auth
@@ -252,6 +262,14 @@ class AgentHost:
         self.engine: AsyncEngine | None = None
         self.index: TaskIndex | None = None  # created at startup
         self.last_recovery: RecoveryReport | None = None
+        # Outbound side. The registry exists from construction so operators can register
+        # partners before startup; the handle store and client are created at startup.
+        self.partners = PartnerRegistry(partners_path, http=partner_http)
+        self.credentials = credentials
+        self.partner_http = partner_http
+        self.default_deadline_s = default_deadline_s
+        self.handles: OutboundHandleStore | None = None
+        self.client: PartnerClient | None = None
         self._inner: Starlette | None = None
         self._app_built = False
         self._app: Starlette | None = None
@@ -267,6 +285,18 @@ class AgentHost:
         engine = self.engine = await create_engine(self.db_url)
         index = self.index = TaskIndex(engine)
         await index.initialize()
+        self.partners.load()
+        handles = self.handles = OutboundHandleStore(engine)
+        await handles.initialize()
+        client = self.client = PartnerClient(
+            self.partners,
+            credentials=self.credentials,
+            handles=handles,
+            bus=self.bus,
+            http=self.partner_http,
+            default_deadline_s=self.default_deadline_s,
+            agent_id="host",
+        )
         stores: dict[str, TaskStore] = {}
         routes: list[BaseRoute] = []
         for agent_id, spec in self.specs.items():
@@ -274,6 +304,8 @@ class AgentHost:
             await store.initialize()
             stores[agent_id] = store
             executor = AdapterExecutor(spec, index, self.bus)
+            # Cancelling an inbound task cancels the partner tasks it started.
+            executor.on_cancel = client.cancel_for_inbound
             card = build_card(spec, self.base_url, security=self.auth)
             handler = LimitedRequestHandler(
                 agent_executor=executor,
@@ -310,13 +342,15 @@ class AgentHost:
             index,
             stores,
             durable={i: s.adapter.durable_sessions for i, s in self.specs.items()},
-            handles=None,
-            cancel_outbound=None,
+            handles=handles,
+            cancel_outbound=lambda h: client.cancel(h["partner_id"], h["task_id"]),
         )
 
     async def shutdown(self) -> None:
         for handler in self.handlers.values():
             await handler.aclose()
+        if self.client is not None:
+            await self.client.aclose()
         if self.engine is not None:
             await self.engine.dispose()
             self.engine = None

@@ -266,3 +266,15 @@ async def test_upsert_none_origin_keeps_existing(index):
     await index.upsert("t1", "a1", "key:x", "c", W, "orig-2")
     [row] = await index.by_state({W})
     assert row["origin"] == "orig-2"
+
+
+async def test_has_active_matches_other_non_terminal_task_of_same_agent_and_origin(index):
+    await index.upsert("t1", "a1", "key:x", "c", W, "o1")
+    await index.upsert("t2", "a1", "key:x", "c", "TASK_STATE_COMPLETED", "o2")
+    await index.upsert("t3", "a2", "key:x", "c", IR, "o3")
+    assert await index.has_active("a1", "o1", "t9")
+    assert not await index.has_active("a1", "o1", "t1")  # the task itself never counts
+    assert not await index.has_active("a1", "o2", "t9")  # terminal
+    assert not await index.has_active("a2", "o1", "t9")  # other agent
+    assert await index.has_active("a2", "o3", "t9")  # input-required is still active
+    assert not await index.has_active("a1", "nope", "t9")

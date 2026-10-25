@@ -172,6 +172,23 @@ class TaskIndex:
         async with self._engine.connect() as conn:
             return [dict(r._mapping) for r in (await conn.execute(stmt)).all()]
 
+    async def has_active(self, agent_id: str, origin: str, exclude_task_id: str) -> bool:
+        """Whether ``agent_id`` has a non-terminal task with ``origin`` other than
+        ``exclude_task_id`` (used to detect an agent re-entered within its own call chain)."""
+        t = _index_table
+        stmt = (
+            select(t.c.task_id)
+            .where(
+                t.c.agent_id == agent_id,
+                t.c.origin == origin,
+                t.c.task_id != exclude_task_id,
+                t.c.state.in_(sorted(_ACTIVE_STATES)),
+            )
+            .limit(1)
+        )
+        async with self._engine.connect() as conn:
+            return (await conn.execute(stmt)).first() is not None
+
     async def set_state(self, task_id: str, state: str) -> None:
         stmt = (
             update(_index_table)

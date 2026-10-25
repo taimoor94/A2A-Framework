@@ -68,7 +68,13 @@ from a2agw.consult.results import (
     Track,
     build_result,
 )
-from a2agw.context.call_context import EXTENSION_URI, CallContext, current_call
+from a2agw.context.call_context import (
+    EXTENSION_URI,
+    CallContext,
+    current_call,
+    current_inbound_task,
+    current_principal,
+)
 from a2agw.ops.bus import EventBus, GatewayEvent
 from a2agw.security.principal import Principal
 
@@ -456,8 +462,12 @@ class PartnerClient:
         inbound_task_id: str | None = None,
         caller: Principal | None = None,
     ) -> ToolResult:
+        """Consult a partner. ``inbound_task_id`` and ``caller`` default to the inbound task
+        and principal the executor is currently running an adapter for."""
+        if inbound_task_id is None:
+            inbound_task_id = current_inbound_task.get()
         started = time.monotonic()
-        token = _caller.set(caller)
+        token = _caller.set(caller if caller is not None else current_principal.get())
         try:
             result = await self._consult(
                 partner_id,
@@ -820,7 +830,7 @@ class PartnerClient:
         if not timeout > 0:
             return self._unavailable(partner_id, rec, "deadline exceeded", task_id=task_id)
         track = Track(task_id, None)
-        token = _caller.set(caller)
+        token = _caller.set(caller if caller is not None else current_principal.get())
         try:
             async with self._bulkhead(partner_id).acquire(min(BULKHEAD_WAIT_S, timeout)):
                 probe = self._admit(partner_id)
