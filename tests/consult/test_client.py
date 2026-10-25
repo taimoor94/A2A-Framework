@@ -1296,3 +1296,81 @@ async def test_recovery_cancel_uses_exchange_fallback(env, oauth_env):
         assert (await e.client.check("slow", res.task_id)).state == "canceled"
     finally:
         gated.gate.set()
+
+
+async def test_circuit_open_result_carries_retry_after(env):
+    """Spec 8.1: an open breaker answers ``unavailable`` with the seconds until the partner
+    is tried again, so the agent can pick an alternative or come back later."""
+    e = await env(spec("alpha", Echo()))
+    clk = FakeClock()
+    breaker = CircuitBreaker(clock=clk, reset_after_s=30)
+    for _ in range(5):
+        breaker.record_failure()
+    clk.t += 12
+    e.client._breakers["alpha"] = breaker
+    res = await e.client.consult("alpha", "x", wait_seconds=5)
+    assert res.state == "unavailable" and res.reason == "circuit open"
+    assert res.retry_after_s == 18
+    assert e.transport.requests == []
+    # Results that are not a breaker refusal carry none.
+    clk.t += 18
+    ok = await e.client.consult("alpha", "x", wait_seconds=5)
+    assert ok.state == "completed" and ok.retry_after_s is None
+
+
+@pytest.mark.parametrize("version", ["0.2", "abc"])
+async def test_partner_without_supported_protocol_version_is_unavailable(env, version):
+    """Spec 8.6: no interface at a protocol version we speak gives an explicit result, not
+    an exception and not a call."""
+    e = await env(spec("alpha", Echo()), register=False)
+    card = e.card("alpha")
+    for iface in card["supportedInterfaces"]:
+        iface["protocolVersion"] = version
+    await e.registry.add_from_card("alpha", card, "internal")
+    res = await e.client.consult("alpha", "x", wait_seconds=5)
+    assert res.state == "unavailable"
+    assert res.reason == "no supported protocol version"
+    assert e.transport.requests == []
+
+
+async def test_binding_with_supported_version_preferred(env):
+    """JSON-RPC at an unsupported version, REST at 1.0: the REST interface is used."""
+    e = await env(spec("alpha", Echo()), register=False)
+    card = e.card("alpha")
+    for iface in card["supportedInterfaces"]:
+        if iface["protocolBinding"] == "JSONRPC":
+            iface["protocolVersion"] = "0.2"
+    await e.registry.add_from_card("alpha", card, "internal")
+    res = await e.client.consult("alpha", "x", wait_seconds=5)
+    assert res.state == "completed" and res.text == "echo: x"
+    assert all("/rest/" in path for _, path, _ in e.transport.requests)
+
+
+async def test_v03_partner_gets_its_own_protocol_version_header(env):
+    """Spec 8.13: a 0.3-only partner is called through the SDK's compatibility transport, and
+    the request declares 0.3 (a fixed ``A2A-Version: 1.0`` would make a version-checking 0.3
+    server reject every call)."""
+    e = await env(spec("alpha", Echo(), streaming=False), register=False)
+    card = {
+        "name": "Legacy",
+        "description": "0.3 only",
+        "version": "1.0",
+        "url": "http://t/agents/alpha/",
+        "preferredTransport": "JSONRPC",
+        "protocolVersion": "0.3.0",
+        "capabilities": {"streaming": False},
+        "defaultInputModes": ["text/plain"],
+        "defaultOutputModes": ["text/plain"],
+        "skills": [{"id": "s", "name": "S", "description": "d", "tags": ["s"]}],
+    }
+    await e.registry.add_from_card("legacy", card, "internal")
+    seen: list[list[str]] = []
+
+    async def hook(request: httpx.Request) -> None:
+        seen.append(request.headers.get_list("a2a-version"))
+
+    e.hc.event_hooks["request"].append(hook)
+    res = await e.client.consult("legacy", "hello", wait_seconds=5)
+    assert res.state == "completed" and res.text == "echo: hello"
+    assert seen and all(v == ["0.3"] for v in seen)
+    assert rpc_methods(e.transport)[0] == "message/send"

@@ -36,6 +36,25 @@ logger = logging.getLogger(__name__)
 _PROPAGATOR = TraceContextTextMapPropagator()
 
 
+# Libraries whose DEBUG records carry request data: the a2a SDK logs request bodies, request
+# headers (credentials) and whole events (message text); aiosqlite logs every statement with
+# its parameters (task contents, push configs).
+QUIET_LIBRARY_LOGGERS = ("a2a", "aiosqlite")
+
+
+def cap_library_logging() -> None:
+    """Set each ``QUIET_LIBRARY_LOGGERS`` logger to INFO unless the application has already
+    set its level. Enabling DEBUG on the root logger then does not put message text or
+    credentials in the logs; setting one of these loggers to DEBUG explicitly still does."""
+    for name in QUIET_LIBRARY_LOGGERS:
+        lib = logging.getLogger(name)
+        if lib.level == logging.NOTSET:
+            lib.setLevel(logging.INFO)
+
+
+cap_library_logging()
+
+
 def get_tracer() -> trace.Tracer:
     """Fetched at call time so a provider installed later still applies."""
     return trace.get_tracer("a2agw")

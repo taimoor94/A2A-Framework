@@ -62,6 +62,9 @@ class ToolResult(BaseModel):
     reason: str | None = None
     truncated: bool = False
     provenance: dict[str, Any] = Field(default_factory=dict)
+    # ``unavailable`` because the partner's circuit breaker is open: seconds until it is
+    # tried again. None otherwise.
+    retry_after_s: float | None = None
 
 
 class ProtocolViolation(Exception):

@@ -119,6 +119,9 @@ _AMBIGUOUS_STATUS = {502, 503, 504}  # the partner (or a proxy) may have accepte
 PROTOCOL_ERROR = "partner protocol error"
 AUTH_REJECTED = "partner rejected credentials"  # HTTP 401 to the send, after any resend
 UNSAFE_ADDRESS = "unsafe partner address"  # the guard refused every address of the host
+CIRCUIT_OPEN = "circuit open"  # the result then carries ``retry_after_s``
+NO_BINDING = "no supported binding"
+NO_VERSION = "no supported protocol version"
 
 _STRICTNESS: dict[Tier, int] = {"internal": 0, "partner": 1, "public": 2}
 
@@ -463,18 +466,23 @@ class PartnerClient:
             return cached
         card = rec.agent_card
         offered = {i.protocol_binding for i in card.supported_interfaces}
-        binding = next((b for b in BINDINGS if b in offered), None)
-        if binding is None:
-            return None
-        config = ClientConfig(
-            httpx_client=self._http_for(rec),
-            streaming=card.capabilities.streaming,
-            supported_protocol_bindings=[binding],
-        )
         interceptors: list[ClientCallInterceptor] = []
         if self.credentials is not None:
             interceptors.append(_CallerCredentials(self.credentials, rec))
-        client = ClientFactory(config).create(card, interceptors)
+        client: Client | None = None
+        for binding in (b for b in BINDINGS if b in offered):
+            config = ClientConfig(
+                httpx_client=self._http_for(rec),
+                streaming=card.capabilities.streaming,
+                supported_protocol_bindings=[binding],
+            )
+            try:
+                client = ClientFactory(config).create(card, interceptors)
+            except ValueError:  # no interface of this binding at a version the SDK speaks
+                continue
+            break
+        if client is None:
+            return None
         # Drop clients built for an older card of this partner (they share our httpx client).
         for old in [k for k in self._clients if k[0] == rec.id]:
             del self._clients[old]
@@ -485,7 +493,13 @@ class PartnerClient:
     def _ctx(timeout: float) -> ClientCallContext:
         return ClientCallContext(
             timeout=max(timeout, 0.0) + 1.0,  # our own asyncio deadline fires first
-            service_parameters={VERSION_HEADER: "1.0", HTTP_EXTENSION_HEADER: EXTENSION_URI},
+            # Lower-case version key: the SDK's 0.3 compatibility transports set
+            # "a2a-version: 0.3" under that key, which then replaces ours (a differently
+            # cased key would send both headers, and a 0.3 server would see 1.0).
+            service_parameters={
+                VERSION_HEADER.lower(): "1.0",
+                HTTP_EXTENSION_HEADER: EXTENSION_URI,
+            },
         )
 
     @staticmethod
@@ -506,6 +520,9 @@ class PartnerClient:
         task_id: str | None = None,
         context_id: str | None = None,
     ) -> ToolResult:
+        retry_after = None
+        if reason == CIRCUIT_OPEN:
+            retry_after = self._breaker(partner_id).retry_after()
         return ToolResult(
             partner=partner_id,
             task_id=task_id,
@@ -513,6 +530,7 @@ class PartnerClient:
             state="unavailable",
             reason=reason,
             provenance=self._provenance(partner_id, rec),
+            retry_after_s=retry_after,
         )
 
     def _failed(
@@ -550,7 +568,11 @@ class PartnerClient:
             return rec, None, self._unavailable(partner_id, rec, "tls config missing")
         client = self._client_for(rec)
         if client is None:
-            return rec, None, self._unavailable(partner_id, rec, "no supported binding")
+            offered = {i.protocol_binding for i in rec.agent_card.supported_interfaces}
+            # Version negotiation is explicit (spec 8.6): an interface at a protocol version
+            # the SDK does not speak is never tried with another version.
+            reason = NO_VERSION if offered & set(BINDINGS) else NO_BINDING
+            return rec, None, self._unavailable(partner_id, rec, reason)
         return rec, client, None
 
     def _reauth(self, rec: PartnerRecord) -> Reauth | None:
@@ -954,7 +976,7 @@ class PartnerClient:
             async with self._bulkhead(partner_id).acquire(min(BULKHEAD_WAIT_S, timeout)):
                 probe = self._admit(partner_id)
                 if probe is None:
-                    return self._unavailable(partner_id, rec, "circuit open")
+                    return self._unavailable(partner_id, rec, CIRCUIT_OPEN)
                 try:
                     outcome = await self._drive(
                         client,
@@ -1454,7 +1476,7 @@ class PartnerClient:
             async with self._bulkhead(partner_id).acquire(min(BULKHEAD_WAIT_S, timeout)):
                 probe = self._admit(partner_id)
                 if probe is None:
-                    return self._unavailable(partner_id, rec, "circuit open", task_id=task_id)
+                    return self._unavailable(partner_id, rec, CIRCUIT_OPEN, task_id=task_id)
                 try:
                     async with asyncio.timeout(timeout):
                         task = await self._fetch_reauth(client, rec, task_id, timeout, cancel)

@@ -254,3 +254,36 @@ def test_setup_twice_adds_no_duplicate_handler(spans):
         root.handlers[:] = before
         for h, fmt in formatters.items():
             h.setFormatter(fmt)
+
+
+async def test_sdk_debug_logs_never_carry_request_data(env, caplog):
+    """The a2a SDK logs request bodies, headers and events at DEBUG, aiosqlite every SQL
+    statement with its parameters. The gateway caps those loggers at INFO (unless the
+    application set their level), so root DEBUG logging puts no message text in the logs."""
+    caplog.set_level(logging.DEBUG)
+
+    async def run(ctx):
+        yield Done(text="reply-text-77c1")
+
+    e = await env(spec("a", Fn(run)))
+    await e.send("a", "secret-text-91f2")
+    assert logging.getLogger("a2a").level == logging.getLogger("aiosqlite").level == logging.INFO
+    assert "secret-text-91f2" not in caplog.text and "reply-text-77c1" not in caplog.text
+    quiet = [r for r in caplog.records if r.name.split(".")[0] in ("a2a", "aiosqlite")]
+    assert not [r for r in quiet if r.levelno < logging.INFO]
+
+
+def test_library_logger_level_set_by_the_application_is_kept():
+    from a2agw.ops.telemetry import cap_library_logging
+
+    lg = logging.getLogger("a2a")
+    before = lg.level
+    try:
+        lg.setLevel(logging.DEBUG)  # an explicit opt-in to SDK debug logs
+        cap_library_logging()
+        assert lg.level == logging.DEBUG
+        lg.setLevel(logging.NOTSET)
+        cap_library_logging()
+        assert lg.level == logging.INFO
+    finally:
+        lg.setLevel(before)

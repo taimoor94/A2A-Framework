@@ -43,6 +43,12 @@ class CircuitBreaker:
             return "half_open"
         return "open"
 
+    def retry_after(self) -> float | None:
+        """Seconds until an open breaker lets a probe through; None unless it is open."""
+        if self.state != "open" or self._opened_at is None:
+            return None
+        return max(self.reset_after_s - (self._clock() - self._opened_at), 0.0)
+
     def allow(self) -> bool:
         s = self.state
         if s == "closed":

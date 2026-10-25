@@ -223,10 +223,19 @@ def partners_list(
 ) -> None:
     """List partners."""
     reg = _registry(config, partners_file)
-    rows = [("ID", "TIER", "STATUS", "HASH", "PENDING")]
+    rows = [("ID", "TIER", "STATUS", "HASH", "PENDING", "PROTOCOL")]
     for r in reg.all():
-        rows.append((r.id, r.tier, r.status, r.card_hash[:12], "pending" if r.pending_card else ""))
-    widths = [max(len(row[i]) for row in rows) for i in range(5)]
+        rows.append(
+            (
+                r.id,
+                r.tier,
+                r.status,
+                r.card_hash[:12],
+                "pending" if r.pending_card else "",
+                "a2a-0.3" if r.v03_only else "",
+            )
+        )
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
     for row in rows:
         typer.echo("  ".join(c.ljust(w) for c, w in zip(row, widths, strict=True)).rstrip())
 

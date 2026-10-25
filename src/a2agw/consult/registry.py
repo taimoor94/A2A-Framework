@@ -94,8 +94,28 @@ class PartnerRecord(BaseModel):
         return v
 
     @property
+    def v03_only(self) -> bool:
+        """True when every interface of the card is at A2A protocol 0.3: the partner is
+        consulted through the SDK's 0.3 compatibility mode (spec 8.13). Derived from the
+        card, so it is never stored."""
+        versions = [
+            i.get("protocolVersion") for i in self.card.get("supportedInterfaces", []) or []
+        ]
+        return bool(versions) and all(_major_minor(v) == (0, 3) for v in versions)
+
+    @property
     def agent_card(self) -> AgentCard:
         return parse_agent_card(copy.deepcopy(self.card))
+
+
+def _major_minor(version: Any) -> tuple[int, int] | None:
+    if not isinstance(version, str):
+        return None
+    parts = version.strip().split(".")
+    try:
+        return int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        return None
 
 
 def _normalize(card: dict[str, Any]) -> tuple[dict[str, Any], AgentCard]:

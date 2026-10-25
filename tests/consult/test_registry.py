@@ -765,3 +765,37 @@ async def test_apply_reload_refuses_stale_plan(tmp_path):
     with pytest.raises(RuntimeError, match="changed"):
         reg.apply_reload(plan)
     assert {r.id for r in reg.all()} == {"one", "two"}
+
+
+V03_CARD = {
+    "name": "Legacy",
+    "description": "speaks A2A 0.3 only",
+    "version": "1.0",
+    "url": "https://partner.example.com/rpc",
+    "preferredTransport": "JSONRPC",
+    "protocolVersion": "0.3.0",
+    "capabilities": {},
+    "defaultInputModes": ["text/plain"],
+    "defaultOutputModes": ["text/plain"],
+    "skills": [{"id": "s1", "name": "S1", "description": "d", "tags": ["a"]}],
+}
+
+
+async def test_v03_only_partner_is_flagged():
+    """Spec 8.13: a partner offering no interface at 1.x is flagged (it is consulted through
+    the SDK's 0.3 compatibility mode). The flag is derived from the card, never stored."""
+    reg = PartnerRegistry()
+    legacy = await reg.add_from_card("legacy", V03_CARD, "partner")
+    assert legacy.v03_only is True
+    assert {i["protocolVersion"] for i in legacy.card["supportedInterfaces"]} == {"0.3.0"}
+    assert (await reg.add_from_card("current", CARD, "partner")).v03_only is False
+    mixed = variant()
+    mixed["supportedInterfaces"].append(
+        {
+            "url": "https://partner.example.com/v03",
+            "protocolBinding": "JSONRPC",
+            "protocolVersion": "0.3",
+        }
+    )
+    assert (await reg.add_from_card("mixed", mixed, "partner")).v03_only is False
+    assert "v03_only" not in legacy.model_dump()

@@ -329,3 +329,25 @@ def test_call_reads_api_key_from_env(monkeypatch):
     assert r.exit_code == 0, r.output
     assert seen == ["env-key-456", "flag-key-789"]
     assert "env-key-456" not in r.output
+
+
+@respx.mock
+def test_partners_list_flags_v03_only_partners(pf):
+    legacy = {k: v for k, v in CARD.items() if k != "supportedInterfaces"}
+    legacy.update(
+        url="https://partner.example.com/rpc", preferredTransport="JSONRPC", protocolVersion="0.3.0"
+    )
+    respx.get(URL + "/.well-known/agent-card.json").respond(200, json=legacy)
+    assert (
+        run("partners", "add", "old", URL, "--tier", "partner", "--partners-file", pf).exit_code
+        == 0
+    )
+    respx.get(URL + "/.well-known/agent-card.json").respond(200, json=CARD)
+    assert (
+        run("partners", "add", "new", URL, "--tier", "partner", "--partners-file", pf).exit_code
+        == 0
+    )
+    out = run("partners", "list", "--partners-file", pf).output
+    old = next(ln for ln in out.splitlines() if ln.startswith("old"))
+    new = next(ln for ln in out.splitlines() if ln.startswith("new"))
+    assert "a2a-0.3" in old and "a2a-0.3" not in new

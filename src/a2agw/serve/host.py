@@ -245,7 +245,8 @@ def _guard_handler_method(fn: Callable[..., Any]) -> Callable[..., Any]:
 
 
 class LimitedRequestHandler(DefaultRequestHandler):
-    """DefaultRequestHandler that rejects messages with too many parts."""
+    """DefaultRequestHandler that rejects messages with too many parts, or with a part that
+    carries no content (empty, or only fields the parser does not know and dropped)."""
 
     def __init__(self, *args: Any, max_parts: int, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -254,6 +255,8 @@ class LimitedRequestHandler(DefaultRequestHandler):
     def _check_parts(self, params: SendMessageRequest) -> None:
         if len(params.message.parts) > self._max_parts:
             raise InvalidParamsError(message="too many parts")
+        if any(p.WhichOneof("content") is None for p in params.message.parts):
+            raise InvalidParamsError(message="unsupported part")
 
     async def on_message_send(self, params: SendMessageRequest, context: ServerCallContext):  # type: ignore[override]
         self._check_parts(params)
@@ -785,6 +788,18 @@ class AgentHost:
             ]
             sub_routes += create_jsonrpc_routes(
                 handler, rpc_url="/", context_builder=builder, enable_v0_3_compat=True
+            )
+            # REST under "/rest": the card's interface URL is ".../rest" with its ``tenant``
+            # field, so SDK clients call ".../rest/{tenant}/...". The SDK's own "/{tenant}"
+            # mount inside this one serves that; the routes after it keep the earlier
+            # "/{tenant}/rest/..." form working.
+            sub_routes.append(
+                Mount(
+                    "/rest",
+                    routes=create_rest_routes(
+                        handler, context_builder=builder, enable_v0_3_compat=True
+                    ),
+                )
             )
             sub_routes += create_rest_routes(
                 handler, context_builder=builder, enable_v0_3_compat=True, path_prefix="/rest"

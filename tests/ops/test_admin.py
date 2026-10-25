@@ -156,6 +156,7 @@ async def test_partners_hides_credentials(make):
         "card_url": rec.card_url,
         "breaker_state": "open",
         "in_flight": 0,
+        "v03_only": False,
     }
     assert client.partner_stats("unknown") == {"breaker_state": "closed", "in_flight": 0}
     assert "unknown" not in client._breakers  # reading stats creates no state

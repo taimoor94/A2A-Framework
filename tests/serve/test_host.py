@@ -652,3 +652,53 @@ async def test_no_proxy_warning_without_env_proxies(tmp_path, monkeypatch, caplo
         await host.startup()
         await host.shutdown()
     assert "prox" not in caplog.text
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_part_without_content_invalid_params(env, streaming):
+    """Spec 8.8: a part with none of text/raw/url/data (empty, or only an unknown field the
+    parser dropped) is rejected before the agent runs."""
+    e = await env(spec("alpha"))
+    client = e.client("alpha", streaming=streaming)
+    bad = Message(message_id=uuid.uuid4().hex, role=Role.ROLE_USER, parts=[Part(text="x"), Part()])
+    with pytest.raises(InvalidParamsError, match="unsupported part"):
+        await send_one(client, bad)
+    rows, _ = await e.host.index.list(agent_id="alpha")
+    assert rows == []
+    r = await e.http(**{"A2A-Version": "1.0"}).post(
+        "/agents/alpha/rest/message:send",
+        json={"message": {"messageId": "m1", "role": "ROLE_USER", "parts": [{"video": "x"}]}},
+    )
+    assert r.status_code == 400
+
+
+async def test_rest_tenant_path_from_the_card_is_served(env):
+    """Spec 8.12: the card's REST interface is ``.../rest`` with ``tenant``; SDK clients call
+    ``.../rest/{tenant}/...``, which must reach the agent (as must the bare ``.../rest``)."""
+    e = await env(spec("alpha", tenant="acme"))
+    card = e.host.cards["alpha"]
+    rest_only = type(card)()
+    rest_only.CopyFrom(card)
+    del rest_only.supported_interfaces[:]
+    rest_only.supported_interfaces.extend(
+        [i for i in card.supported_interfaces if i.protocol_binding == "HTTP+JSON"]
+    )
+    paths: list[str] = []
+
+    async def hook(request: httpx.Request) -> None:
+        paths.append(request.url.path)
+
+    hc = e.http()
+    hc.event_hooks["request"].append(hook)
+    config = ClientConfig(
+        httpx_client=hc, streaming=False, supported_protocol_bindings=["HTTP+JSON"]
+    )
+    client = ClientFactory(config).create(rest_only)
+    events = await send_one(client, msg())
+    assert events[0].task.status.state == TaskState.TASK_STATE_COMPLETED
+    assert paths == ["/agents/alpha/rest/acme/message:send"]
+    body = {"message": {"messageId": "m2", "role": "ROLE_USER", "parts": [{"text": "x"}]}}
+    plain = await e.http(**{"A2A-Version": "1.0"}).post(
+        "/agents/alpha/rest/message:send", json=body
+    )
+    assert plain.status_code == 200

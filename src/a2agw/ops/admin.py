@@ -159,6 +159,7 @@ def admin_routes(host: AgentHost) -> list[Route]:
                     "card_url": rec.card_url,
                     "breaker_state": stats.get("breaker_state", "closed"),
                     "in_flight": stats.get("in_flight", 0),
+                    "v03_only": rec.v03_only,
                 }
             )
         return JSONResponse(out)
