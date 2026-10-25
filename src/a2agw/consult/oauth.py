@@ -3,8 +3,13 @@
 Both providers fetch tokens from a ``token_url`` that must pass ``check_url(..., "public")``,
 with no redirects, a 64 KiB response cap and a 10 s deadline. They authenticate as the client
 with HTTP Basic (the secret is read from an environment variable at fetch time, never kept),
-cache tokens until 30 s before they expire, fetch at most once at a time per cache key, and
-expose ``invalidate(partner)`` so the partner client can refresh once after an HTTP 401.
+cache tokens until 30 s before they expire, fetch at most once at a time per cache key
+(a failed fetch is remembered for 5 s, so callers queued behind it fail fast during an
+identity provider outage), and expose ``invalidate(partner, token)`` so the partner client
+can refresh once after an HTTP 401.
+
+Tokens are only ever sent to partners whose ``credential_ref`` is set and, when ``refs`` is
+given, listed in it. Tokens live in memory only; nothing is persisted.
 
 Secrets (the client secret, issued tokens and the inbound token being exchanged) never
 appear in a repr, a log line or an error message; token endpoint failures never include the
@@ -16,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -28,10 +34,10 @@ from urllib.parse import quote_plus
 import httpx
 import jwt
 
-from a2agw.consult.credentials import CredentialError, MissingCredential
+from a2agw.consult.credentials import CredentialError, CredentialProvider, MissingCredential
 from a2agw.consult.netguard import FetchError, UnsafeURL, check_url_syntax, safe_post
 from a2agw.consult.registry import PartnerRecord
-from a2agw.context.call_context import current_inbound_token
+from a2agw.context.call_context import current_inbound_token, maintenance_call
 from a2agw.security.principal import Principal
 
 __all__ = ["OAuthClientCredentials", "OAuthTokenExchange", "TokenError"]
@@ -41,6 +47,7 @@ TOKEN_DEADLINE_S = 10.0
 EXPIRY_MARGIN_S = 30.0
 MAX_LIFETIME_S = 24 * 3600.0  # an absurd expires_in is capped
 EXCHANGE_CACHE_SIZE = 1024
+NEGATIVE_CACHE_S = 5.0  # a failed fetch is reported to callers for this long
 
 TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
 JWT_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:jwt"
@@ -57,6 +64,7 @@ class TokenError(CredentialError):
     def __init__(self, ref: str | None, reason: str) -> None:
         super().__init__(f"credential {ref!r}: token endpoint {reason}")
         self.ref = ref
+        self.reason = reason
 
 
 @dataclass
@@ -85,6 +93,7 @@ class _OAuthProvider:
         self._http = http
         self._cache_size = cache_size
         self._cache: OrderedDict[Hashable, tuple[str, float]] = OrderedDict()
+        self._failed: dict[Hashable, tuple[str, float]] = {}  # key -> (safe message, until)
         self._locks: dict[Hashable, _Lock] = {}
 
     def __repr__(self) -> str:
@@ -95,7 +104,8 @@ class _OAuthProvider:
         )
 
     def _applies(self, partner: PartnerRecord) -> bool:
-        return self.refs is None or partner.credential_ref in self.refs
+        ref = partner.credential_ref
+        return ref is not None and (self.refs is None or ref in self.refs)
 
     def _cached(self, key: Hashable) -> str | None:
         hit = self._cache.get(key)
@@ -108,8 +118,22 @@ class _OAuthProvider:
         self._cache.move_to_end(key)
         return token
 
-    def _drop(self, key: Hashable) -> None:
-        self._cache.pop(key, None)
+    def _drop(self, key: Hashable, token: str | None) -> None:
+        """Drop the cached token for ``key``; with ``token``, only if it is that token (a
+        newer one fetched meanwhile by another call is kept)."""
+        hit = self._cache.get(key)
+        if hit is not None and (token is None or hit[0] == token):
+            del self._cache[key]
+
+    def _recent_failure(self, key: Hashable, ref: str | None) -> None:
+        failed = self._failed.get(key)
+        if failed is None:
+            return
+        message, until = failed
+        if _now() >= until:
+            del self._failed[key]
+            return
+        raise TokenError(ref, f"{message} (recent failure, not retried yet)")
 
     async def _token(
         self, key: Hashable, ref: str | None, form: Callable[[], dict[str, str]]
@@ -125,7 +149,15 @@ class _OAuthProvider:
                 token = self._cached(key)  # fetched by whoever held the lock before us
                 if token is not None:
                     return token
-                token, lifetime = await self._fetch(ref, form())
+                self._recent_failure(key, ref)
+                try:
+                    token, lifetime = await self._fetch(ref, form())
+                except TokenError as e:
+                    self._failed[key] = (e.reason, _now() + NEGATIVE_CACHE_S)
+                    while len(self._failed) > self._cache_size:
+                        self._failed.pop(next(iter(self._failed)))
+                    raise
+                self._failed.pop(key, None)
                 if lifetime > EXPIRY_MARGIN_S:
                     self._cache[key] = (token, _now() + lifetime - EXPIRY_MARGIN_S)
                     self._cache.move_to_end(key)
@@ -182,6 +214,11 @@ def _parse(ref: str | None, body: bytes) -> tuple[str, float]:
         raise TokenError(ref, "response token_type is not Bearer")
     lifetime = 0.0
     expires_in = doc.get("expires_in")
+    if isinstance(expires_in, str):  # some servers send a numeric string
+        try:
+            expires_in = float(expires_in.strip())
+        except ValueError:
+            expires_in = None
     if isinstance(expires_in, (int, float)) and not isinstance(expires_in, bool):
         lifetime = float(expires_in)
     elif token.count(".") == 2:
@@ -197,8 +234,9 @@ def _parse(ref: str | None, body: bytes) -> tuple[str, float]:
 
 
 class OAuthClientCredentials(_OAuthProvider):
-    """OAuth2 client credentials grant: one gateway token for every partner it applies to
-    (those whose ``credential_ref`` is in ``refs``, or all partners when ``refs`` is None)."""
+    """OAuth2 client credentials grant: one gateway token for every partner it applies to:
+    those whose ``credential_ref`` is in ``refs`` or, when ``refs`` is None, every partner
+    whose ``credential_ref`` is set. Partners without a ``credential_ref`` get nothing."""
 
     def __init__(
         self,
@@ -228,17 +266,29 @@ class OAuthClientCredentials(_OAuthProvider):
         token = await self._token("client", partner.credential_ref, self._form)
         return {"Authorization": f"Bearer {token}"}
 
-    def invalidate(self, partner: PartnerRecord) -> None:
-        if self._applies(partner):
-            self._drop("client")
+    def invalidate(self, partner: PartnerRecord, token: str | None = None) -> bool:
+        """Drop the cached token (only if it is ``token``, when given). Returns whether this
+        provider applies to ``partner``, i.e. whether a resend would carry a fresh token."""
+        if not self._applies(partner):
+            return False
+        self._drop("client", token)
+        return True
 
 
 class OAuthTokenExchange(_OAuthProvider):
     """RFC 8693 token exchange: the inbound caller's JWT (``current_inbound_token``) is
     exchanged for a token for ``audience``, so the partner sees a token issued for the
-    original caller. Tokens are cached per (caller token, audience), at most 1024 of them.
-    Raises MissingCredential when the current call has no inbound JWT (e.g. an API-key
-    caller, or a call made outside an inbound request)."""
+    original caller. Tokens are cached in memory per (caller token, audience), at most 1024.
+
+    ``refs`` is required and must be non-empty: an exchanged token lets its holder act as the
+    user, so it is only sent to partners whose ``credential_ref`` is listed.
+
+    With no inbound JWT (an API-key caller, or a call outside an inbound request) this
+    raises MissingCredential, except during gateway maintenance calls (``maintenance_call``:
+    cascade cancels, cleanup of cancelled calls, restart recovery), where ``fallback`` (e.g.
+    an ``OAuthClientCredentials`` for the gateway's own service principal) is used instead
+    if given. Partners must grant that service principal the right to cancel tasks started
+    on behalf of their users, or such cancels fail and the partner work is left running."""
 
     def __init__(
         self,
@@ -249,14 +299,18 @@ class OAuthTokenExchange(_OAuthProvider):
         refs: set[str] | None = None,
         *,
         http: httpx.AsyncClient | None = None,
+        fallback: CredentialProvider | None = None,
     ) -> None:
+        if not refs:
+            raise ValueError("OAuthTokenExchange requires a non-empty refs set")
+        self.fallback = fallback
         super().__init__(
             token_url, client_id, client_secret_env, refs, http, cache_size=EXCHANGE_CACHE_SIZE
         )
         self.audience = audience
 
     def __repr__(self) -> str:
-        return f"{super().__repr__()[:-1]}, audience={self.audience!r})"
+        return f"{super().__repr__()[:-1]}, audience={self.audience!r}, fallback={self.fallback!r})"
 
     def _key(self, subject: str) -> tuple[str, str]:
         return hashlib.sha256(subject.encode()).hexdigest(), self.audience
@@ -266,6 +320,8 @@ class OAuthTokenExchange(_OAuthProvider):
             return {}
         subject = current_inbound_token.get()
         if not subject:
+            if self.fallback is not None and maintenance_call.get():
+                return await self.fallback.headers(partner, caller)
             raise MissingCredential(
                 partner.credential_ref, reason="no inbound caller token to exchange"
             )
@@ -282,7 +338,16 @@ class OAuthTokenExchange(_OAuthProvider):
         token = await self._token(self._key(subject), partner.credential_ref, form)
         return {"Authorization": f"Bearer {token}"}
 
-    def invalidate(self, partner: PartnerRecord) -> None:
+    def invalidate(self, partner: PartnerRecord, token: str | None = None) -> bool:
+        """Drop the token cached for the current caller (only if it is ``token``, when
+        given). Returns whether a resend would carry a fresh token."""
+        if not self._applies(partner):
+            return False
         subject = current_inbound_token.get()
-        if subject and self._applies(partner):
-            self._drop(self._key(subject))
+        if subject:
+            self._drop(self._key(subject), token)
+            return True
+        inv = getattr(self.fallback, "invalidate", None)
+        if maintenance_call.get() and callable(inv) and not inspect.iscoroutinefunction(inv):
+            return bool(inv(partner, token))  # a fallback's invalidate must be synchronous
+        return False

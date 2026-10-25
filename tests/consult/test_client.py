@@ -37,7 +37,7 @@ from a2agw.consult import results as results_mod
 from a2agw.consult.client import PartnerClient, ToolResult
 from a2agw.consult.credentials import ChainCredentials, StaticCredentials
 from a2agw.consult.handles import OutboundHandleStore
-from a2agw.consult.oauth import OAuthClientCredentials
+from a2agw.consult.oauth import OAuthClientCredentials, OAuthTokenExchange
 from a2agw.consult.registry import PartnerRegistry
 from a2agw.consult.resilience import CircuitBreaker
 from a2agw.context.call_context import EXTENSION_URI, CallContext, use_call, use_inbound
@@ -1167,7 +1167,16 @@ async def test_cascade_cancel_uses_original_caller(env):
 
 
 async def test_handles_migration_adds_caller_id(tmp_path):
-    engine = await create_engine(f"sqlite+aiosqlite:///{tmp_path / 'old.db'}")
+    await _check_caller_id_migration(f"sqlite+aiosqlite:///{tmp_path / 'old.db'}")
+
+
+@pytest.mark.postgres
+async def test_handles_migration_adds_caller_id_postgres(pg_url):
+    await _check_caller_id_migration(pg_url)
+
+
+async def _check_caller_id_migration(url: str) -> None:
+    engine = await create_engine(url)
     try:
         async with engine.begin() as conn:  # the Phase 1 schema, with one row
             await conn.exec_driver_sql(
@@ -1191,3 +1200,104 @@ async def test_handles_migration_adds_caller_id(tmp_path):
         assert row["state"] == "TASK_STATE_COMPLETED"
     finally:
         await engine.dispose()
+
+
+async def test_migration_tolerates_column_added_concurrently(tmp_path):
+    engine = await create_engine(f"sqlite+aiosqlite:///{tmp_path / 'race.db'}")
+    try:
+        store = OutboundHandleStore(engine)
+        await store.initialize()  # the column exists now
+        async with engine.begin() as conn:  # a second startup that inspected before the first
+            await OutboundHandleStore._add_caller_id(conn)  # "duplicate column": tolerated
+    finally:
+        await engine.dispose()
+
+
+async def test_401_on_check_and_cancel_resends_once(env, oauth_env):
+    gated = Gated()
+    partner_auth = AuthConfig(api_keys={_sha("tok-good"): ApiKeyEntry(principal_id="gw")})
+    e = await env(spec("slow", gated), register=False, auth=partner_auth)
+    await e.registry.add_from_card("slow", e.card("slow"), "internal", credential_ref="o")
+    creds = OAuthClientCredentials(TOKEN_URL, "gw", "OAUTH_SECRET", refs={"o"})
+    client = PartnerClient(e.registry, credentials=creds, handles=e.handles, http=e.hc)
+    try:
+        with respx.mock as rx:
+            route = rx.post(TOKEN_URL).mock(return_value=_token("tok-good"))
+            res = await client.consult("slow", "go", wait_seconds=0.2)
+            assert res.state == "working"
+            # The token is rotated: the cached one is now rejected.
+            partner_auth.api_keys.clear()
+            partner_auth.api_keys[_sha("tok-new")] = ApiKeyEntry(principal_id="gw")
+            route.mock(side_effect=[_token("tok-new"), _token("tok-newer")])
+            checked = await client.check("slow", res.task_id)
+            assert checked.state == "working" and route.call_count == 2
+            partner_auth.api_keys.clear()
+            partner_auth.api_keys[_sha("tok-newer")] = ApiKeyEntry(principal_id="gw")
+            cancelled = await client.cancel("slow", res.task_id)
+            assert cancelled.state == "canceled" and route.call_count == 3
+            partner_auth.api_keys.clear()  # nothing is accepted any more
+            route.mock(return_value=_token("tok-x"))
+            again = await client.check("slow", res.task_id)
+            assert again.state == "auth_required"
+            assert again.reason == "partner rejected credentials"
+    finally:
+        gated.gate.set()
+        await client.aclose()
+
+
+async def test_token_error_is_credential_error_and_spares_breaker(env, oauth_env, caplog):
+    e = await env(spec("alpha", Echo()), register=False)
+    await e.registry.add_from_card("alpha", e.card("alpha"), "internal", credential_ref="o")
+    creds = OAuthClientCredentials(TOKEN_URL, "gw", "OAUTH_SECRET", refs={"o"})
+    client = PartnerClient(e.registry, credentials=creds, http=e.hc)
+    breaker = half_open_breaker(e, "alpha")
+    client._breakers["alpha"] = breaker
+    try:
+        with respx.mock as rx, caplog.at_level("WARNING", logger="a2agw.consult.client"):
+            rx.post(TOKEN_URL).mock(return_value=httpx.Response(500, text="client-secret"))
+            res = await client.consult("alpha", "x", wait_seconds=5)
+        assert res.state == "unavailable" and res.reason == "credential error"
+        assert breaker.state == "half_open"  # neither success nor failure was recorded
+        assert any(
+            "token endpoint" in r.getMessage() and "'o'" in r.getMessage() for r in caplog.records
+        )
+        assert "client-secret" not in caplog.text
+        assert all(b"SendStreamingMessage" not in body for _, _, body in e.transport.requests)
+    finally:
+        await client.aclose()
+
+
+async def test_recovery_cancel_uses_exchange_fallback(env, oauth_env):
+    gated = Gated()
+    e = await env(spec("slow", gated))
+    res = await e.client.consult("slow", "go", wait_seconds=0.2, inbound_task_id="in-r")
+    assert res.state == "working"
+    calls: list = []
+
+    class Service:
+        async def headers(self, partner, caller):
+            calls.append(caller)
+            return {"X-Service": "gw"}
+
+    exchange = OAuthTokenExchange(
+        TOKEN_URL, "gw", "OAUTH_SECRET", "aud", refs={"r"}, fallback=Service()
+    )
+    host = e.host
+    assert host.client is not None
+    await host.partners.add_from_card("slow", e.card("slow"), "internal", credential_ref="r")
+    host.client.credentials = exchange
+    host.client.http = e.hc  # reach the partner over the in-process transport
+    host.client._clients.clear()
+    try:
+        # An ordinary call with no inbound token is refused.
+        checked = await host.client.check("slow", res.task_id)
+        assert checked.state == "unavailable" and checked.reason == "credential error"
+        assert calls == []
+        # Restart recovery is a maintenance call: the service fallback is used.
+        await host._cancel_outbound(
+            {"partner_id": "slow", "task_id": res.task_id, "caller_id": "jwt:alice"}
+        )
+        assert calls and calls[0] == Principal.from_id("jwt:alice")
+        assert (await e.client.check("slow", res.task_id)).state == "canceled"
+    finally:
+        gated.gate.set()

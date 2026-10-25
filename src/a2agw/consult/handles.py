@@ -23,7 +23,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects import sqlite as sqlite_dialect
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 _metadata = MetaData()
 _outbound = Table(
@@ -55,11 +56,25 @@ class OutboundHandleStore:
                 lambda sync: {c["name"] for c in inspect(sync).get_columns(_outbound.name)}
             )
             if "caller_id" not in columns:
-                # postgres: IF NOT EXISTS tolerates a concurrent startup doing the same.
-                guard = "IF NOT EXISTS " if conn.dialect.name == "postgresql" else ""
-                await conn.execute(
-                    text(f"ALTER TABLE a2agw_outbound ADD COLUMN {guard}caller_id VARCHAR")
-                )
+                await self._add_caller_id(conn)
+
+    @staticmethod
+    async def _add_caller_id(conn: AsyncConnection) -> None:
+        # postgres: IF NOT EXISTS tolerates a concurrent startup doing the same. sqlite has
+        # no such clause: a concurrent startup shows up as a "duplicate column" error.
+        guard = "IF NOT EXISTS " if conn.dialect.name == "postgresql" else ""
+        try:
+            await conn.execute(
+                text(f"ALTER TABLE a2agw_outbound ADD COLUMN {guard}caller_id VARCHAR")
+            )
+        except OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                raise
+            columns = await conn.run_sync(
+                lambda sync: {c["name"] for c in inspect(sync).get_columns(_outbound.name)}
+            )
+            if "caller_id" not in columns:
+                raise
 
     async def record(
         self,

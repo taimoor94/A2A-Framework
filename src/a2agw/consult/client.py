@@ -79,6 +79,8 @@ from a2agw.context.call_context import (
     current_call,
     current_inbound_task,
     current_principal,
+    maintenance_call,
+    use_maintenance,
 )
 from a2agw.ops.bus import EventBus, GatewayEvent
 from a2agw.ops.telemetry import get_tracer, with_current_traceparent
@@ -106,6 +108,10 @@ AUTH_REJECTED = "partner rejected credentials"  # HTTP 401 to the send, after an
 
 # The inbound caller whose credentials apply to the current outbound call.
 _caller: ContextVar[Principal | None] = ContextVar("a2agw_outbound_caller", default=None)
+# Per call: the Authorization value the credential interceptor last sent, so a 401 only
+# invalidates that token (never a newer one fetched meanwhile by another call). In memory,
+# for the duration of one call only.
+_sent_auth: ContextVar[dict[str, str] | None] = ContextVar("a2agw_sent_auth", default=None)
 
 
 class _CallerCredentials(ClientCallInterceptor):
@@ -117,9 +123,33 @@ class _CallerCredentials(ClientCallInterceptor):
 
     async def before(self, args: BeforeArgs) -> None:
         await CredentialInterceptor(self._provider, self._partner, _caller.get()).before(args)
+        sent = _sent_auth.get()
+        if sent is not None:
+            sent.clear()
+            params = args.context.service_parameters if args.context is not None else None
+            for name, value in (params or {}).items():
+                if name.lower() == "authorization":
+                    sent["authorization"] = value
 
     async def after(self, args: AfterArgs) -> None:
         return None
+
+
+def _sent_token() -> str | None:
+    """The bearer token sent by the current call, if any."""
+    value = (_sent_auth.get() or {}).get("authorization")
+    if value is None:
+        return None
+    scheme, _, token = value.partition(" ")
+    return token.strip() if scheme.lower() == "bearer" and token.strip() else value
+
+
+def _credential_error(partner_id: str | None, exc: CredentialError) -> None:
+    # Credential error messages name the credential ref and never contain secret values.
+    if partner_id is None:
+        logger.warning("credential error on partner send: %s", exc)
+    else:
+        logger.warning("credential error for partner %s: %s", partner_id, exc)
 
 
 Reauth = Callable[[], Awaitable[bool]]
@@ -427,15 +457,19 @@ class PartnerClient:
             return None
 
         async def reauth() -> bool:
+            """Whether some provider dropped (or had already replaced) the rejected token."""
+            token = _sent_token()
+            fresh = False
             try:
                 for inv in invalidators:
-                    res = inv(rec)
+                    res = inv(rec, token)
                     if inspect.isawaitable(res):
-                        await res
+                        res = await res
+                    fresh = fresh or res is True
             except Exception:  # no fresh credentials: do not resend
                 logger.exception("credential invalidation for partner %s failed", rec.id)
                 return False
-            return True
+            return fresh
 
         return reauth
 
@@ -618,6 +652,7 @@ class PartnerClient:
                 await self._record_handle(partner_id, track, inbound_task_id, cc.origin)
 
         deadline = asyncio.get_running_loop().time() + timeout
+        sent = _sent_auth.set({})
         try:
             outcome = await self._send_admitted(
                 partner_id,
@@ -644,6 +679,8 @@ class PartnerClient:
                 partner_id, client, track, generated_context, inbound_task_id, cc.origin, inflight
             )
             raise
+        finally:
+            _sent_auth.reset(sent)
 
     async def _send_admitted(
         self,
@@ -771,6 +808,7 @@ class PartnerClient:
         origin: str | None,
         inflight: InFlight,
     ) -> None:
+        maintenance_call.set(True)  # this cleanup runs in its own task (its own context)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + CANCEL_CLEANUP_S
         try:
@@ -955,7 +993,8 @@ class PartnerClient:
             except _ConnectFailed:
                 probe.failure()
                 return "partner unreachable"
-            except CredentialError:
+            except CredentialError as e:
+                _credential_error(None, e)
                 return "credential error"
             except TimeoutError:
                 await _drop_inflight(inflight)
@@ -1158,17 +1197,27 @@ class PartnerClient:
                     return self._unavailable(partner_id, rec, "circuit open", task_id=task_id)
                 try:
                     async with asyncio.timeout(timeout):
-                        task = await self._fetch(client, task_id, timeout, cancel=cancel)
+                        task = await self._fetch_reauth(client, rec, task_id, timeout, cancel)
                     probe.success()
                     track.set_task(task)
                 except TimeoutError:
                     probe.failure()
                     return self._unavailable(partner_id, rec, "timed out", task_id=task_id)
-                except CredentialError:
+                except CredentialError as e:
+                    _credential_error(partner_id, e)
                     return self._unavailable(partner_id, rec, "credential error", task_id=task_id)
                 except Exception as e:  # noqa: BLE001 - classified; internal errors re-raised
                     kind = _kind(e)
                     _reraise_other(e, kind)
+                    if _status(e) == 401:
+                        probe.success()  # the partner answered: it is up
+                        return ToolResult(
+                            partner=partner_id,
+                            task_id=task_id,
+                            state="auth_required",
+                            reason=AUTH_REJECTED,
+                            provenance=self._provenance(partner_id, rec),
+                        )
                     probe.kind(kind)
                     if kind == "protocol":
                         return self._failed(partner_id, rec, _protocol_reason(e), task_id=task_id)
@@ -1182,6 +1231,23 @@ class PartnerClient:
             _caller.reset(token)
         await self._update_handle(partner_id, track)
         return build_result(partner_id, self._provenance(partner_id, rec), track)
+
+    async def _fetch_reauth(
+        self, client: Client, rec: PartnerRecord, task_id: str, timeout: float, cancel: bool
+    ) -> Task:
+        """``_fetch``, resent once after an HTTP 401 if fresh credentials can be had (get and
+        cancel are idempotent, so a resend is always safe)."""
+        reauth = self._reauth(rec)
+        sent = _sent_auth.set({})
+        try:
+            try:
+                return await self._fetch(client, task_id, timeout, cancel=cancel)
+            except Exception as e:
+                if _status(e) != 401 or reauth is None or not await reauth():
+                    raise
+            return await self._fetch(client, task_id, timeout, cancel=cancel)
+        finally:
+            _sent_auth.reset(sent)
 
     async def _fetch(self, client: Client, task_id: str, timeout: float, *, cancel: bool) -> Task:
         if cancel:
@@ -1210,7 +1276,14 @@ class PartnerClient:
 
     async def cancel_for_inbound(self, inbound_task_id: str) -> int:
         """Cancel every non-terminal partner task started for an inbound task, concurrently,
-        within ``default_deadline_s`` overall. Returns how many reached ``canceled``."""
+        within ``default_deadline_s`` overall. Returns how many reached ``canceled``.
+
+        Runs as a maintenance call (``maintenance_call``): with no inbound caller token,
+        credential providers may fall back to the gateway's service credentials."""
+        with use_maintenance():
+            return await self._cancel_for_inbound(inbound_task_id)
+
+    async def _cancel_for_inbound(self, inbound_task_id: str) -> int:
         if self.handles is None:
             return 0
         rows = [

@@ -22,6 +22,7 @@ from starlette.routing import Route
 
 from a2agw.security import auth as auth_mod
 from a2agw.security.auth import (
+    BEARER_STATE_KEY,
     AgentAccess,
     ApiKeyEntry,
     AuthConfig,
@@ -76,6 +77,8 @@ def make_client(config: AuthConfig) -> AsyncClient:
                 "auth": request.auth.scopes,
                 "ctx_user": ctx.user.user_name,
                 "authenticated": ctx.user.is_authenticated,
+                "bearer": ctx.state.get(BEARER_STATE_KEY),
+                "headers": sorted(ctx.state["headers"]),
             }
         )
 
@@ -418,3 +421,23 @@ def test_config_validation(pub_pem):
             api_keys={h: ApiKeyEntry(principal_id="a"), h.upper(): ApiKeyEntry(principal_id="b")}
         )
     assert list(AuthConfig(api_keys={h.upper(): ApiKeyEntry(principal_id="a")}).api_keys) == [h]
+
+
+async def test_jwt_bearer_kept_for_exchange_api_keys_never(pub_pem, priv_pem):
+    config = AuthConfig(
+        api_keys={_sha("s3cret"): ApiKeyEntry(principal_id="svc")},
+        jwt=JwtConfig(issuer=ISS, audience=AUD, public_key_pem=pub_pem),
+    )
+    tok = token(priv_pem)
+    async with make_client(config) as c:
+        r = await c.get("/", headers={"Authorization": f"Bearer {tok}"})
+        assert r.json()["kind"] == "jwt"
+        assert r.json()["bearer"] == tok
+        for headers in ({"Authorization": "Bearer s3cret"}, {"X-API-Key": "s3cret"}):
+            r = await c.get("/", headers={**headers, "X-Other": "1"})
+            body = r.json()
+            assert body["kind"] == "api_key" and body["bearer"] is None
+            # The SDK's copy of the request headers no longer holds credentials.
+            assert "authorization" not in body["headers"]
+            assert "x-api-key" not in body["headers"]
+            assert "x-other" in body["headers"]

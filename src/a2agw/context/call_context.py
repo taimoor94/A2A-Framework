@@ -238,9 +238,15 @@ def use_inbound(task_id: str | None, principal: Principal | None) -> Iterator[No
         current_inbound_task.reset(task_token)
 
 
-# The inbound caller's raw bearer JWT, set by the executor while an adapter runs so that an
-# RFC 8693 token exchange (a2agw.consult.oauth.OAuthTokenExchange) can act on the caller's
-# behalf. Only JWT callers have one. A secret: never log it or put it in a repr or a span.
+# The inbound caller's raw bearer JWT, set by the executor while an adapter runs (and while a
+# cancel request's cascade runs) so that an RFC 8693 token exchange
+# (a2agw.consult.oauth.OAuthTokenExchange) can act on the caller's behalf. Only JWT callers
+# have one. A secret: never log it or put it in a repr or a span.
+#
+# Adapter authors: a task created inside an adapter run inherits a copy of this value. A
+# long-lived worker task started from a request (a pool, a background poller) would keep
+# that request's caller token and could later make partner calls as that caller. Start such
+# workers outside a request, or run them under ``use_inbound_token(None)``.
 current_inbound_token: ContextVar[str | None] = ContextVar(
     "a2agw_current_inbound_token", default=None
 )
@@ -253,3 +259,18 @@ def use_inbound_token(token: str | None) -> Iterator[None]:
         yield
     finally:
         current_inbound_token.reset(reset)
+
+
+# True while the gateway makes partner calls on its own account rather than for a live
+# request: cascade cancels, cleanup of cancelled calls and restart recovery. Credential
+# providers may then use a service fallback when no inbound caller token is available.
+maintenance_call: ContextVar[bool] = ContextVar("a2agw_maintenance_call", default=False)
+
+
+@contextmanager
+def use_maintenance() -> Iterator[None]:
+    reset = maintenance_call.set(True)
+    try:
+        yield
+    finally:
+        maintenance_call.reset(reset)

@@ -7,6 +7,7 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from postgres_support import _pg_server, pg_url  # noqa: F401 - shared fixtures
 from streaming_asgi import StreamingASGITransport
 
 from a2agw.consult import client as client_mod

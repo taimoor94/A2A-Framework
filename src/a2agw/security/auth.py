@@ -31,6 +31,7 @@ ALLOWED_JWT_ALGORITHMS = ["RS256", "ES256", "EdDSA"]
 # Key, in the ASGI scope state and the SDK's ServerCallContext.state, of the raw bearer JWT of
 # a JWT-authenticated caller (never an API key). It is a secret: never log it.
 BEARER_STATE_KEY = "a2agw_bearer"
+_CREDENTIAL_HEADERS = frozenset({"authorization", "x-api-key"})
 JWT_LEEWAY_SECONDS = 30
 
 
@@ -202,6 +203,12 @@ def on_auth_error(conn: HTTPConnection, exc: Exception) -> JSONResponse:
 class GatewayCallContextBuilder(DefaultServerCallContextBuilder):
     def build(self, request: Request) -> ServerCallContext:
         ctx = super().build(request)
+        # The SDK copies every request header into the state: drop the caller's credentials.
+        headers = ctx.state.get("headers")
+        if isinstance(headers, dict):
+            ctx.state["headers"] = {
+                k: v for k, v in headers.items() if k.lower() not in _CREDENTIAL_HEADERS
+            }
         token = (request.scope.get("state") or {}).get(BEARER_STATE_KEY)
         if isinstance(token, str) and token:
             ctx.state[BEARER_STATE_KEY] = token

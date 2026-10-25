@@ -37,6 +37,7 @@ dev = [
     "ruff",
     "mypy",
     "langgraph-checkpoint-sqlite>=3.1.2",
+    "asyncpg>=0.32.0",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -47,6 +48,9 @@ asyncio_mode = "auto"
 addopts = "--import-mode=importlib"
 testpaths = ["tests"]
 pythonpath = ["tests", "."]  # shared helpers (streaming_asgi) and examples/
+markers = [
+    "postgres: needs a throwaway PostgreSQL 16 (tests/postgres_support.py); skipped without one",
+]
 
 [tool.ruff]
 line-length = 100

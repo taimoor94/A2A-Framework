@@ -550,6 +550,8 @@ class AdapterExecutor(AgentExecutor):
         )
         if self.on_cancel is not None:
             try:
-                await self.on_cancel(task_id)
+                # The cascade acts for the canceller (the task's owner): its token, if any.
+                with use_inbound_token(_inbound_token(context)):
+                    await self.on_cancel(task_id)
             except Exception:
                 logger.exception("on_cancel hook failed for task %s", task_id)

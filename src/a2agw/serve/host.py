@@ -34,6 +34,7 @@ from a2agw.consult.client import PartnerClient
 from a2agw.consult.credentials import CredentialProvider
 from a2agw.consult.handles import OutboundHandleStore
 from a2agw.consult.registry import PartnerRegistry
+from a2agw.context.call_context import use_maintenance
 from a2agw.ops.admin import ADMIN_PREFIX, HEALTH_PATH, admin_routes
 from a2agw.ops.bus import EventBus
 from a2agw.security.auth import (
@@ -531,7 +532,10 @@ class AgentHost:
         assert self.client is not None
         caller_id = handle.get("caller_id")
         caller = Principal.from_id(caller_id) if caller_id else None
-        result = await self.client.cancel(handle["partner_id"], handle["task_id"], caller=caller)
+        with use_maintenance():
+            result = await self.client.cancel(
+                handle["partner_id"], handle["task_id"], caller=caller
+            )
         if result.state != "canceled":
             raise RuntimeError("not canceled")
 
