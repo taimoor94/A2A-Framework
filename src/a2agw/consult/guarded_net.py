@@ -9,6 +9,12 @@ host's tier, and opens the TCP connection to a vetted IP address only. TLS still
 sends SNI for, the hostname from the URL (httpcore passes it to ``start_tls`` separately), and
 the ``Host`` header is unchanged.
 
+Logging: httpx logs every request URL at INFO (and httpcore the host at DEBUG); webhook and
+partner URLs can carry credentials. Requests sent by a guarded client run with a context flag
+set, and a ``logging.Filter`` on the httpx/httpcore loggers drops the records emitted under
+it. Nothing else changes: other clients in the process log as configured, and no logger level
+is touched.
+
 ``guarded_async_client`` builds an ``httpx.AsyncClient`` around it; redirects are never
 followed. httpx 0.28 does not let a transport take a network backend, so the client's
 transport gets an ``httpcore.AsyncConnectionPool`` built with the backend (``_swap_pool``, the
@@ -26,21 +32,93 @@ import logging
 import time
 import typing
 from collections.abc import Callable, Iterable
+from contextvars import ContextVar
 
 import anyio
+import anyio.abc
 import httpcore
 import httpx
 
 from a2agw.consult.netguard import Resolver, Tier, Unresolvable, UnsafeURL, resolve_and_vet
 
-__all__ = ["GuardedBackend", "fixed_tier", "guarded_async_client"]
+__all__ = [
+    "GuardedBackend",
+    "UnsafeAddress",
+    "fixed_tier",
+    "guarded_async_client",
+    "is_unsafe_address",
+]
 
 logger = logging.getLogger(__name__)
 
 TierForHost = Callable[[str], Tier]
 
 DEFAULT_TIMEOUT = httpx.Timeout(5.0)  # httpx's own default
+HAPPY_EYEBALLS_DELAY_S = 0.25  # RFC 8305 connection attempt delay
 _REFUSED_KWARGS = ("follow_redirects", "transport", "mounts", "proxy", "app")
+
+
+class UnsafeAddress(httpcore.ConnectError):
+    """The host resolves to an address its tier does not allow. Permanent: retrying cannot
+    help. httpx surfaces it as an ``httpx.ConnectError`` caused by this exception (see
+    ``is_unsafe_address``). The message never names the host or an address."""
+
+
+def is_unsafe_address(exc: BaseException) -> bool:
+    """True if `exc` is, or was caused by, an ``UnsafeAddress`` refusal."""
+    seen: BaseException | None = exc
+    for _ in range(10):
+        if seen is None:
+            return False
+        if isinstance(seen, UnsafeAddress):
+            return True
+        seen = seen.__cause__ or seen.__context__
+    return False
+
+
+# Set while a guarded client sends a request: httpx/httpcore records emitted then are dropped.
+_quiet: ContextVar[bool] = ContextVar("a2agw_quiet_http", default=False)
+_HTTP_LOGGERS = (
+    "httpx",
+    "httpcore",
+    "httpcore.connection",
+    "httpcore.http11",
+    "httpcore.http2",
+    "httpcore.proxy",
+    "httpcore.socks",
+)
+
+
+class _QuietFilter(logging.Filter):
+    """Drops records emitted while a guarded client sends (``_quiet`` set); passes the rest."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not _quiet.get()
+
+
+_QUIET_FILTER = _QuietFilter()
+
+
+def _install_quiet_filter() -> None:
+    # Logger filters are not inherited, so every logger httpx/httpcore emit on gets one.
+    for name in _HTTP_LOGGERS:
+        lg = logging.getLogger(name)
+        if not any(isinstance(f, _QuietFilter) for f in lg.filters):
+            lg.addFilter(_QUIET_FILTER)
+
+
+_install_quiet_filter()
+
+
+class _GuardedClient(httpx.AsyncClient):
+    """``httpx.AsyncClient`` whose requests are not logged by httpx/httpcore (see above)."""
+
+    async def send(self, request: httpx.Request, **kwargs: typing.Any) -> httpx.Response:
+        token = _quiet.set(True)
+        try:
+            return await super().send(request, **kwargs)
+        finally:
+            _quiet.reset(token)
 
 
 def fixed_tier(tier: Tier) -> TierForHost:
@@ -54,7 +132,7 @@ class GuardedBackend(httpcore.AsyncNetworkBackend):
     (default ``httpcore.AnyIOBackend()``).
 
     Errors never name the host or an address: a refused host gives
-    ``httpcore.ConnectError("unsafe address")``."""
+    ``UnsafeAddress("unsafe address")`` (an ``httpcore.ConnectError``)."""
 
     def __init__(
         self,
@@ -77,10 +155,10 @@ class GuardedBackend(httpcore.AsyncNetworkBackend):
         except Unresolvable:
             raise httpcore.ConnectError("host could not be resolved") from None
         except UnsafeURL:
-            raise httpcore.ConnectError("unsafe address") from None
+            raise UnsafeAddress("unsafe address") from None
         except Exception as exc:  # noqa: BLE001 - fail closed: never connect unvetted
             logger.warning("outbound address check failed: %s", type(exc).__name__)
-            raise httpcore.ConnectError("unsafe address") from None
+            raise UnsafeAddress("unsafe address") from None
 
     async def connect_tcp(
         self,
@@ -90,27 +168,55 @@ class GuardedBackend(httpcore.AsyncNetworkBackend):
         local_address: str | None = None,
         socket_options: Iterable[httpcore.SOCKET_OPTION] | None = None,
     ) -> httpcore.AsyncNetworkStream:
-        """Resolve and vet `host`, then connect to the first vetted address that accepts,
-        within one `timeout` for the lookup and all connection attempts together."""
+        """Resolve and vet `host`, then race connections to the vetted addresses (happy
+        eyeballs, RFC 8305): a new attempt starts every ``HAPPY_EYEBALLS_DELAY_S`` or as soon
+        as the previous one fails; the first to connect wins and the others are cancelled
+        (a late loser's stream is closed). One `timeout` covers the lookup and all attempts."""
         deadline = None if timeout is None else time.monotonic() + timeout
         addrs = await self._vetted(host, timeout)
-        last: Exception | None = None
-        for ip in addrs:
+        winner: list[httpcore.AsyncNetworkStream] = []
+        errors: list[Exception] = []
+
+        async def attempt(
+            tg: anyio.abc.TaskGroup, index: int, previous_failed: anyio.Event | None
+        ) -> None:
+            if previous_failed is not None:
+                with anyio.move_on_after(HAPPY_EYEBALLS_DELAY_S):
+                    await previous_failed.wait()
+            failed = anyio.Event()
+            if index + 1 < len(addrs):
+                tg.start_soon(attempt, tg, index + 1, failed)
             remaining = None if deadline is None else deadline - time.monotonic()
-            if remaining is not None and remaining <= 0:
-                raise httpcore.ConnectTimeout("timed out connecting")
             try:
-                return await self._inner.connect_tcp(
-                    ip,
+                if remaining is not None and remaining <= 0:
+                    raise httpcore.ConnectTimeout("timed out connecting")
+                stream = await self._inner.connect_tcp(
+                    addrs[index],
                     port,
                     timeout=remaining,
                     local_address=local_address,
                     socket_options=socket_options,
                 )
-            except (httpcore.ConnectError, httpcore.ConnectTimeout) as exc:
-                last = exc
-        assert last is not None  # resolve_and_vet never returns an empty list
-        raise last
+            except Exception as exc:  # noqa: BLE001 - recorded; the last one is raised
+                errors.append(exc)
+                failed.set()
+                return
+            if winner:  # lost the race by a hair: close it
+                with anyio.CancelScope(shield=True):
+                    await stream.aclose()
+                return
+            winner.append(stream)
+            tg.cancel_scope.cancel()
+
+        left = None if deadline is None else max(deadline - time.monotonic(), 0.0)
+        with anyio.move_on_after(left):
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(attempt, tg, 0, None)
+        if winner:
+            return winner[0]
+        if not errors:  # the overall deadline passed with attempts still pending
+            raise httpcore.ConnectTimeout("timed out connecting")
+        raise errors[-1]
 
     async def connect_unix_socket(
         self,
@@ -172,4 +278,4 @@ def guarded_async_client(
         network_backend=GuardedBackend(tier_for_host, resolver=resolver, inner=inner),
     )
     _swap_pool(transport, pool)
-    return httpx.AsyncClient(transport=transport, timeout=timeout, follow_redirects=False, **kw)
+    return _GuardedClient(transport=transport, timeout=timeout, follow_redirects=False, **kw)

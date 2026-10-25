@@ -33,6 +33,21 @@ async def _resolve(host: str) -> list[str]:
     return [str(info[4][0]) for info in infos]
 
 
+def _is_metadata(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """A cloud metadata endpoint (also as an IPv4-mapped IPv6 address). Refused on every
+    tier, ``internal`` included: no partner, card, key or webhook legitimately lives there."""
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    return addr in _METADATA_IPS
+
+
+def _parse_ip(text: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(text.split("%", 1)[0])
+    except ValueError:
+        return None
+
+
 def _is_public(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     if isinstance(addr, ipaddress.IPv6Address):
         mapped = addr.ipv4_mapped
@@ -81,8 +96,9 @@ async def resolve_and_vet(host: str, tier: Tier, *, resolver: Resolver | None = 
     """The addresses `host` may be connected to for `tier`, in resolver order, de-duplicated.
 
     An IP literal is vetted as is (no lookup). For the ``internal`` tier the addresses are
-    not checked (R2); for any other tier every address must be public, otherwise the whole
-    answer is refused (UnsafeURL). Raises Unresolvable when there is no address. This is the
+    not checked (R2) except that cloud metadata addresses are refused on every tier; for any
+    other tier every address must be public, otherwise the whole answer is refused
+    (UnsafeURL). Raises Unresolvable when there is no address. This is the
     one implementation shared by ``check_url`` and the guarded network backend
     (``a2agw.consult.guarded_net``), which connects only to the addresses returned here."""
     try:
@@ -97,6 +113,8 @@ async def resolve_and_vet(host: str, tier: Tier, *, resolver: Resolver | None = 
         if not resolved:
             raise Unresolvable("host could not be resolved")
     if tier == "internal":
+        if any((a := _parse_ip(r)) is not None and _is_metadata(a) for r in resolved):
+            raise UnsafeURL("host resolves to a metadata address")
         return resolved
     try:
         addrs = [ipaddress.ip_address(a.split("%", 1)[0]) for a in resolved]
@@ -115,7 +133,12 @@ async def check_url(url: str, tier: Tier) -> None:
     address, so a DNS answer that changes after this check cannot redirect the connection."""
     scheme, host = check_url_syntax(url)
     if tier == "internal":
-        return  # R2: no IP checks, unresolvable hosts allowed
+        # R2: no lookup, unresolvable hosts allowed. A metadata IP literal is still refused
+        # here; a name resolving to one is refused at connect time (resolve_and_vet).
+        addr = _parse_ip(host.strip("[]"))
+        if addr is not None and _is_metadata(addr):
+            raise UnsafeURL("metadata address is not allowed")
+        return
     if scheme != "https" and os.environ.get("A2AGW_DEV") != "1":
         raise UnsafeURL("https is required")
     await resolve_and_vet(host, tier)

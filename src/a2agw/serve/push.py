@@ -17,8 +17,8 @@ the config is created. ``GuardedPushSender`` then POSTs each task update to the 
   terminal update has been delivered.
 
 Logs name the agent and task only: webhook URLs can carry credentials and are never logged.
-Importing this module sets the ``httpx`` and ``httpcore`` loggers to WARNING (when nobody has
-set their level), because httpx logs every request URL at INFO.
+The webhook client is a guarded client, whose requests httpx/httpcore do not log either (a
+filter scoped to those requests; no logger level is changed).
 
 Ownership: configs are owner-scoped by the principal id. Without ``AuthConfig`` every caller
 is the same ``anonymous`` owner, so anyone who knows a task id can read, replace or delete its
@@ -58,6 +58,7 @@ import re
 import time
 import uuid
 import warnings
+import weakref
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -78,7 +79,7 @@ from google.protobuf.json_format import MessageToDict
 from sqlalchemy import and_, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from a2agw.consult.guarded_net import fixed_tier, guarded_async_client
+from a2agw.consult.guarded_net import fixed_tier, guarded_async_client, is_unsafe_address
 from a2agw.consult.netguard import Tier, UnsafeURL, check_url
 from a2agw.security.cardsign import CardSigner
 
@@ -95,11 +96,6 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
-
-# httpx logs "HTTP Request: POST <url> ..." at INFO; webhook URLs may carry credentials.
-for _name in ("httpx", "httpcore"):
-    if logging.getLogger(_name).level == logging.NOTSET:
-        logging.getLogger(_name).setLevel(logging.WARNING)
 
 BACKOFF_BASE_S = 0.5
 BACKOFF_CAP_S = 4.0
@@ -233,6 +229,21 @@ class GatewayPushConfigStore(DatabasePushNotificationConfigStore):
 
     max_configs_per_task: int = 10
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # One lock per task with a create in progress, so concurrent creates cannot all pass
+        # the count before any inserts. Entries vanish once no create holds them. The lock
+        # is per process: gateways sharing one database can still race each other.
+        self._task_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
+
+    def _lock_for(self, task_id: str) -> asyncio.Lock:
+        lock = self._task_locks.get(task_id)
+        if lock is None:
+            lock = self._task_locks[task_id] = asyncio.Lock()
+        return lock
+
     async def set_info(
         self,
         task_id: str,
@@ -243,15 +254,16 @@ class GatewayPushConfigStore(DatabasePushNotificationConfigStore):
         _check_ids(task_id, config_id)
         await self._ensure_initialized()
         model = self.config_model
-        async with self.async_session_maker() as session:
-            others = await session.scalar(
-                select(func.count()).where(
-                    and_(model.task_id == task_id, model.config_id != config_id)
+        async with self._lock_for(task_id):
+            async with self.async_session_maker() as session:
+                others = await session.scalar(
+                    select(func.count()).where(
+                        and_(model.task_id == task_id, model.config_id != config_id)
+                    )
                 )
-            )
-        if (others or 0) >= self.max_configs_per_task:
-            raise InvalidParamsError(message="too many push configs for task")
-        return await super().set_info(task_id, notification_config, context)
+            if (others or 0) >= self.max_configs_per_task:
+                raise InvalidParamsError(message="too many push configs for task")
+            return await super().set_info(task_id, notification_config, context)
 
     async def delete_info(
         self, task_id: str, context: ServerCallContext, config_id: str | None = None
@@ -558,6 +570,15 @@ class GuardedPushSender(PushNotificationSender):
             try:
                 status = await self._post(config.url, body, headers)
             except (httpx.ConnectError, httpx.TimeoutException, TimeoutError) as exc:
+                if is_unsafe_address(exc):
+                    # Refused at connect time (DNS now points somewhere unsafe): permanent.
+                    self.stats["skipped_unsafe"] += 1
+                    logger.warning(
+                        "push: webhook address refused, delivery skipped (agent=%s task=%s)",
+                        self.agent_id,
+                        task_id,
+                    )
+                    return
                 retryable, outcome = True, type(exc).__name__
             except Exception as exc:  # noqa: BLE001 - any other failure is final
                 outcome = type(exc).__name__

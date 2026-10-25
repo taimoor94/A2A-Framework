@@ -11,6 +11,8 @@ from typing import Literal, TypeVar
 
 import httpx
 
+from a2agw.consult.guarded_net import is_unsafe_address
+
 T = TypeVar("T")
 State = Literal["closed", "open", "half_open"]
 
@@ -115,12 +117,15 @@ async def with_retry(
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     rand: Callable[[], float] = random.random,
 ) -> T:
+    """Call ``fn``, retrying ``retry_on`` errors with jittered backoff. A refusal of an unsafe
+    address (``guarded_net.UnsafeAddress``, also as the cause) is never retried: it is
+    permanent, even though it is a connect error."""
     n = 1
     while True:
         try:
             return await fn()
-        except retry_on:
-            if n >= attempts:
+        except retry_on as exc:
+            if n >= attempts or is_unsafe_address(exc):
                 raise
         n += 1
         await sleep(min(cap, base * 2 ** (n - 2)) * (0.5 + rand() / 2))

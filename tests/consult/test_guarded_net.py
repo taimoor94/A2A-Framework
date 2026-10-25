@@ -564,3 +564,208 @@ async def test_injected_clients_bypass_the_guard(recorded):
     await reg.add_from_url("p", "https://card.p.example", "partner")
     await hc.aclose()
     assert recorded == []
+
+
+# -- Task 10: metadata on every tier, happy eyeballs, UnsafeAddress ----------------------
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [[METADATA_IP], ["fd00:ec2::254"], ["::ffff:169.254.169.254"], ["10.0.0.1", METADATA_IP]],
+)
+async def test_metadata_ip_refused_on_internal_tier(answer):
+    with pytest.raises(UnsafeURL, match="metadata"):
+        await netguard.resolve_and_vet("meta.internal", "internal", resolver=resolver(answer))
+    inner = RecordingInner({a: 1 for a in answer})
+    backend = GuardedBackend(fixed_tier("internal"), resolver=resolver(answer), inner=inner)
+    with pytest.raises(guarded_net.UnsafeAddress, match="^unsafe address$"):
+        await backend.connect_tcp("meta.internal", 80)
+    assert inner.ips == []
+
+
+@pytest.mark.parametrize(
+    "url", [f"http://{METADATA_IP}/latest", "http://[fd00:ec2::254]/", "http://100.100.100.200/"]
+)
+async def test_check_url_refuses_metadata_literal_on_internal_tier(url):
+    with pytest.raises(UnsafeURL, match="metadata"):
+        await netguard.check_url(url, "internal")
+
+
+async def test_check_url_internal_still_allows_private_and_unresolvable():
+    await netguard.check_url("http://10.0.0.1/", "internal")
+    await netguard.check_url("http://169.254.1.1/", "internal")  # link-local, not metadata
+    await netguard.check_url("http://no-such-host.invalid/", "internal")
+
+
+class _Stream(httpcore.AsyncNetworkStream):
+    def __init__(self, ip: str) -> None:
+        self.ip = ip
+        self.closed = False
+
+    async def read(self, max_bytes, timeout=None):  # pragma: no cover - unused
+        return b""
+
+    async def write(self, buffer, timeout=None):  # pragma: no cover - unused
+        return None
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _Scripted(httpcore.AsyncNetworkBackend):
+    """Per-address scripted connects: ("hang",), ("ok", delay) or ("fail", delay)."""
+
+    def __init__(self, script: dict[str, tuple]) -> None:
+        self.script = script
+        self.started: list[tuple[str, float]] = []
+        self.cancelled: list[str] = []
+        self.streams: list[_Stream] = []
+        self.t0 = 0.0
+
+    async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+        loop = asyncio.get_running_loop()
+        self.started.append((host, loop.time() - self.t0))
+        action = self.script[host]
+        try:
+            if action[0] == "hang":
+                await asyncio.sleep(3600)
+            await asyncio.sleep(action[1])
+        except asyncio.CancelledError:
+            self.cancelled.append(host)
+            if action[0] != "stubborn":
+                raise
+            # Connected while being cancelled: the stream is handed back regardless.
+        if action[0] == "fail":
+            raise httpcore.ConnectError("refused")
+        stream = _Stream(host)
+        self.streams.append(stream)
+        return stream
+
+    async def connect_unix_socket(self, path, timeout=None, socket_options=None):
+        raise httpcore.ConnectError("no unix sockets")
+
+    async def sleep(self, seconds: float) -> None:
+        await asyncio.sleep(seconds)
+
+
+async def test_happy_eyeballs_blackholed_first_address_loses_to_second():
+    second = "93.184.216.35"
+    inner = _Scripted({PUBLIC_IP: ("hang",), second: ("ok", 0.01)})
+    backend = GuardedBackend(
+        fixed_tier("public"), resolver=resolver([PUBLIC_IP, second]), inner=inner
+    )
+    loop = asyncio.get_running_loop()
+    inner.t0 = start = loop.time()
+    stream = await asyncio.wait_for(backend.connect_tcp("api.example.com", 443, timeout=5), 3)
+    elapsed = loop.time() - start
+    assert stream.ip == second
+    assert elapsed < 1.0  # not the 5 s timeout of the blackholed address
+    assert [h for h, _ in inner.started] == [PUBLIC_IP, second]
+    assert inner.started[1][1] >= guarded_net.HAPPY_EYEBALLS_DELAY_S * 0.9  # staggered
+    assert inner.cancelled == [PUBLIC_IP]  # the loser was cancelled
+
+
+async def test_happy_eyeballs_through_http_client(http_server):
+    """End to end: the first vetted address blackholes, the second serves the request."""
+    port, _seen = http_server
+
+    class Blackhole(RecordingInner):
+        async def connect_tcp(self, host, port, timeout=None, **kw):
+            self.ips.append(host)
+            if host == PUBLIC_IP:
+                await asyncio.sleep(3600)
+            return await self.real.connect_tcp("127.0.0.1", self.route[host], timeout=timeout)
+
+    inner = Blackhole({"93.184.216.35": port})
+    res = resolver([PUBLIC_IP, "93.184.216.35"])
+    async with guarded_async_client(
+        fixed_tier("public"), resolver=res, inner=inner, timeout=5
+    ) as c:
+        r = await asyncio.wait_for(c.get("http://api.example.com/"), 2)
+    assert r.text == "ok"
+
+
+async def test_happy_eyeballs_late_loser_stream_is_closed():
+    """A losing attempt that still hands back a stream after the winner is chosen (it
+    connected while being cancelled) has that stream closed."""
+    second = "93.184.216.35"
+    inner = _Scripted({PUBLIC_IP: ("stubborn", 3600), second: ("ok", 0.01)})
+    backend = GuardedBackend(
+        fixed_tier("public"), resolver=resolver([PUBLIC_IP, second]), inner=inner
+    )
+    stream = await asyncio.wait_for(backend.connect_tcp("api.example.com", 443, timeout=5), 3)
+    assert stream.ip == second and not stream.closed
+    (loser,) = [s for s in inner.streams if s is not stream]
+    assert loser.ip == PUBLIC_IP and loser.closed
+
+
+async def test_happy_eyeballs_keeps_overall_deadline():
+    inner = _Scripted({PUBLIC_IP: ("hang",), "93.184.216.35": ("hang",)})
+    backend = GuardedBackend(
+        fixed_tier("public"), resolver=resolver([PUBLIC_IP, "93.184.216.35"]), inner=inner
+    )
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    with pytest.raises(httpcore.ConnectTimeout):
+        await asyncio.wait_for(backend.connect_tcp("api.example.com", 443, timeout=0.4), 3)
+    assert loop.time() - start < 1.5
+    assert sorted(inner.cancelled) == sorted([PUBLIC_IP, "93.184.216.35"])
+
+
+async def test_unsafe_address_is_a_connect_error_detectable_through_httpx():
+    assert issubclass(guarded_net.UnsafeAddress, httpcore.ConnectError)
+    async with guarded_async_client(fixed_tier("public"), resolver=resolver(["10.0.0.1"])) as c:
+        with pytest.raises(httpx.ConnectError) as ei:
+            await c.get("http://api.example.com/")
+    assert guarded_net.is_unsafe_address(ei.value)
+    assert not guarded_net.is_unsafe_address(httpx.ConnectError("refused"))
+
+
+# -- UnsafeAddress through the partner client --------------------------------------------
+
+
+async def test_unsafe_partner_address_is_unavailable_and_not_retried(monkeypatch, caplog):
+    """The host passed the endpoint check, then resolves somewhere private at connect time:
+    one attempt (no retry), a breaker failure, an ``unavailable`` result, and a warning that
+    names only the partner id."""
+    calls: list[str] = []
+
+    async def private(host):
+        calls.append(host)
+        return ["10.0.0.5"]
+
+    reg = PartnerRegistry()
+    monkeypatch.setattr(netguard, "_resolve", resolver([PUBLIC_IP]))
+    await reg.add_from_card("p", CARD, "partner")
+    monkeypatch.setattr(netguard, "_resolve", private)
+
+    async def passed(_id):  # the endpoint check passed just before DNS changed
+        return None
+
+    monkeypatch.setattr(reg, "verify_endpoints", passed)
+    client = PartnerClient(reg)
+    try:
+        with caplog.at_level("WARNING"):
+            res = await client.consult("p", "hi", wait_seconds=5)
+        assert res.state == "unavailable" and res.reason == "unsafe partner address"
+        assert calls == ["rpc.p.example"]  # one connect attempt: never retried
+        assert client._breakers["p"]._failures == 1
+        assert "partner p: connection refused, unsafe address" in caplog.text
+        assert "rpc.p.example" not in caplog.text and "10.0.0.5" not in caplog.text
+
+        checked = await client.check("p", "t1")
+        assert checked.state == "unavailable" and checked.reason == "unsafe partner address"
+        assert client._breakers["p"]._failures == 2
+    finally:
+        await client.aclose()
+
+
+def test_kind_classifies_unsafe_address():
+    try:
+        try:
+            raise guarded_net.UnsafeAddress("unsafe address")
+        except guarded_net.UnsafeAddress as inner:
+            raise httpx.ConnectError("unsafe address") from inner
+    except httpx.ConnectError as exc:
+        assert client_mod._kind(exc) == "unsafe"
+    assert client_mod._kind(httpx.ConnectError("refused")) == "connect"

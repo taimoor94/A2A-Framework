@@ -959,16 +959,82 @@ async def test_non_terminal_updates_keep_configs(host_env, receiver):
 
 
 async def test_http_client_logs_never_carry_webhook_urls(tmp_path, receiver, caplog):
-    assert logging.getLogger("httpx").level == logging.WARNING
-    assert logging.getLogger("httpcore").level == logging.WARNING
+    """Push requests are not logged by httpx/httpcore, without touching logger levels: an
+    embedding application's own httpx client still logs its requests at INFO."""
+    assert logging.getLogger("httpx").level == logging.NOTSET  # importing a2agw changed nothing
+    assert logging.getLogger("httpcore").level == logging.NOTSET
     url = receiver.url() + "?sig=supersecret"
     sender, _, engine = await _sender(tmp_path, url)
+    await sender.http.aclose()
+    sender.http = push_mod.push_http_client(sender.settings, slots=4)  # what AgentHost uses
     try:
         with caplog.at_level(logging.DEBUG):  # root at DEBUG, below INFO even
             await sender.send_notification("t1", _task("t1"))
             await sender.drain(5)
+            async with httpx.AsyncClient() as app_client:  # the embedding app's own client
+                r = await app_client.post(receiver.url("/app") + "?mine=1", json={})
+            assert r.status_code == 200
         assert sender.stats["delivered"] == 1
-        assert "supersecret" not in caplog.text and str(receiver.port) not in caplog.text
+        assert "supersecret" not in caplog.text
+        app_lines = [
+            rec for rec in caplog.records if rec.name == "httpx" and rec.levelno == logging.INFO
+        ]
+        assert len(app_lines) == 1 and "mine=1" in app_lines[0].getMessage()
+        assert any(rec.name.startswith("httpcore") for rec in caplog.records)  # app's, DEBUG
+    finally:
+        await sender.http.aclose()
+        await engine.dispose()
+
+
+async def test_concurrent_config_creates_respect_the_limit(tmp_path):
+    from a2a.server.context import ServerCallContext
+
+    engine = await create_engine(f"sqlite+aiosqlite:///{tmp_path / 'lim.db'}")
+    try:
+        store = push_config_store_for(engine, "alpha", max_configs_per_task=10)
+        await store.initialize()
+        ctx = ServerCallContext()
+        results = await asyncio.gather(
+            *(
+                store.set_info(
+                    "t1", TaskPushNotificationConfig(id=f"c{i}", url="https://h.example/"), ctx
+                )
+                for i in range(20)
+            ),
+            return_exceptions=True,
+        )
+        errors = [r for r in results if isinstance(r, Exception)]
+        assert len(errors) == 10 and all(isinstance(e, InvalidParamsError) for e in errors)
+        assert len(await store.get_info_for_dispatch("t1")) == 10
+        assert len(store._task_locks) == 0  # no lock kept once the creates are done
+    finally:
+        await engine.dispose()
+
+
+async def test_metadata_webhook_refused_even_with_allow_private(tmp_path, monkeypatch):
+    """Ruling: cloud metadata addresses are refused on every tier, ``internal`` included."""
+    from a2agw.consult import netguard
+
+    validator = make_push_url_validator(True)
+    assert not await validator("http://169.254.169.254/latest/meta-data")
+    assert not await validator("http://[fd00:ec2::254]/")
+    assert await validator("http://10.0.0.5/hook")  # private is still allowed
+
+    async def to_metadata(host):
+        return ["169.254.169.254"]
+
+    monkeypatch.setattr(netguard, "_resolve", to_metadata)
+    url = "http://meta.internal/hook"  # passes the config-time check (no lookup on internal)
+    assert await validator(url)
+    sender, _, engine = await _sender(tmp_path, url, max_attempts=3)
+    await sender.http.aclose()
+    sender.http = push_mod.push_http_client(sender.settings, slots=4)
+    try:
+        await sender.send_notification("t1", _task("t1"))
+        await sender.drain(5)
+        # Refused at connect time (UnsafeAddress): permanent, so no retry.
+        assert sender.stats["skipped_unsafe"] == 1
+        assert sender.stats["retries"] == 0 and sender.stats["failed"] == 0
     finally:
         await sender.http.aclose()
         await engine.dispose()

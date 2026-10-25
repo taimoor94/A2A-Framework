@@ -67,7 +67,7 @@ from a2agw.consult.credentials import (
     CredentialInterceptor,
     CredentialProvider,
 )
-from a2agw.consult.guarded_net import guarded_async_client
+from a2agw.consult.guarded_net import guarded_async_client, is_unsafe_address
 from a2agw.consult.handles import OutboundHandleStore
 from a2agw.consult.netguard import Tier, UnsafeURL, check_url_syntax
 from a2agw.consult.registry import CardFetchError, PartnerRecord, PartnerRegistry
@@ -118,6 +118,7 @@ BINDINGS = ("JSONRPC", "HTTP+JSON")  # in order of preference
 _AMBIGUOUS_STATUS = {502, 503, 504}  # the partner (or a proxy) may have accepted the message
 PROTOCOL_ERROR = "partner protocol error"
 AUTH_REJECTED = "partner rejected credentials"  # HTTP 401 to the send, after any resend
+UNSAFE_ADDRESS = "unsafe partner address"  # the guard refused every address of the host
 
 _STRICTNESS: dict[Tier, int] = {"internal": 0, "partner": 1, "public": 2}
 
@@ -167,6 +168,11 @@ def _credential_error(partner_id: str | None, exc: CredentialError) -> None:
         logger.warning("credential error for partner %s: %s", partner_id, exc)
 
 
+def _unsafe_warning(partner_id: str) -> None:
+    # Names the partner only: never the host or the refused address.
+    logger.warning("partner %s: connection refused, unsafe address", partner_id)
+
+
 Reauth = Callable[[], Awaitable[bool]]
 
 
@@ -186,11 +192,15 @@ class _ConnectFailed(Exception):
     """Connection-level failure before any response (safe to retry)."""
 
 
+class _UnsafeFailed(Exception):
+    """The guarded client refused the partner's address (permanent: never retried)."""
+
+
 class _PartnerFault(Exception):
     """An SDK call raised something unexpected (e.g. a malformed body): a partner fault."""
 
 
-ErrorKind = Literal["connect", "server", "transport", "protocol", "other"]
+ErrorKind = Literal["connect", "unsafe", "server", "transport", "protocol", "other"]
 
 
 def _caller_id() -> str | None:
@@ -227,7 +237,10 @@ def _has_ssl_error(exc: BaseException) -> bool:
 
 
 def _kind(exc: BaseException) -> ErrorKind:
-    """Classify an SDK/transport error by its httpx root cause."""
+    """Classify an SDK/transport error by its httpx root cause. ``unsafe``: the guarded
+    client refused the address (``UnsafeAddress``); unlike ``connect`` it is not retried."""
+    if is_unsafe_address(exc):
+        return "unsafe"
     if _has_ssl_error(exc):  # handshake rejected (TLS 1.3 may surface it on first read)
         return "connect"
     root = _http_root(exc)
@@ -310,7 +323,7 @@ class _Probe:
         self.recorded = True
 
     def kind(self, kind: ErrorKind) -> None:
-        if kind in ("connect", "server", "transport"):
+        if kind in ("connect", "unsafe", "server", "transport"):
             self.failure()
         elif kind == "protocol":
             self.success()
@@ -977,6 +990,8 @@ class PartnerClient:
     ) -> ToolResult:
         if outcome == PROTOCOL_ERROR:
             return self._failed(partner_id, rec, outcome, task_id=task_id, context_id=ctx_id)
+        if outcome == UNSAFE_ADDRESS:
+            _unsafe_warning(partner_id)
         if outcome == AUTH_REJECTED:
             return ToolResult(
                 partner=partner_id,
@@ -1204,6 +1219,8 @@ class PartnerClient:
             except BaseException as e:
                 inflight.remove(slot)
                 await _aclose(agen)
+                if isinstance(e, Exception) and _kind(e) == "unsafe":
+                    raise _UnsafeFailed from e
                 if isinstance(e, Exception) and _kind(e) == "connect":
                     raise _ConnectFailed from e
                 raise
@@ -1233,6 +1250,9 @@ class PartnerClient:
             except _ConnectFailed:
                 probe.failure()
                 return "partner unreachable"
+            except _UnsafeFailed:
+                probe.failure()
+                return UNSAFE_ADDRESS
             except CredentialError as e:
                 _credential_error(None, e)
                 return "credential error"
@@ -1461,7 +1481,11 @@ class PartnerClient:
                     probe.kind(kind)
                     if kind == "protocol":
                         return self._failed(partner_id, rec, _protocol_reason(e), task_id=task_id)
-                    reason = "partner unreachable" if kind == "connect" else "partner error"
+                    if kind == "unsafe":
+                        _unsafe_warning(partner_id)
+                    reason = {"connect": "partner unreachable", "unsafe": UNSAFE_ADDRESS}.get(
+                        kind, "partner error"
+                    )
                     return self._unavailable(partner_id, rec, reason, task_id=task_id)
                 finally:
                     probe.close()

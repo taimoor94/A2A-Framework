@@ -180,3 +180,24 @@ def test_release_probe_lets_next_caller_probe():
     assert b.state == "closed"
     b.release_probe()  # no-op when closed
     assert b.state == "closed" and b.allow()
+
+
+async def test_retry_never_retries_unsafe_address():
+    from a2agw.consult.guarded_net import UnsafeAddress
+
+    calls = 0
+
+    async def fn():
+        nonlocal calls
+        calls += 1
+        try:
+            raise UnsafeAddress("unsafe address")
+        except UnsafeAddress as e:
+            raise httpx.ConnectError("unsafe address") from e
+
+    async def nosleep(_):
+        raise AssertionError("must not sleep")
+
+    with pytest.raises(httpx.ConnectError):
+        await with_retry(fn, sleep=nosleep)
+    assert calls == 1
