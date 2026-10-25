@@ -9,6 +9,7 @@ Secrets (credential refs, headers) are never part of any response.
 Audit: every admitted admin request appends one ``admin.read`` event (the path category in
 ``detail.reason``); a request refused for lack of the admin scope appends ``authz.deny``.
 ``/audit`` lists audit events (newest first) and ``/audit/verify`` checks the hash chain.
+``/push`` reports per-agent push delivery counters (no URLs, task ids or config contents).
 """
 
 from __future__ import annotations
@@ -236,6 +237,15 @@ def admin_routes(host: AgentHost) -> list[Route]:
             return JSONResponse({"ok": True})
         return JSONResponse({"ok": False, "first_bad_seq": bad})
 
+    async def push(_: Request) -> Response:
+        senders = getattr(host, "push_senders", {})
+        return JSONResponse(
+            {
+                "enabled": getattr(host, "push", None) is not None,
+                "agents": {agent_id: s.counters() for agent_id, s in senders.items()},
+            }
+        )
+
     def route(name: str, fn: Handler) -> Route:
         return Route(f"{ADMIN_PREFIX}/{name}", guarded(name.replace("/", "."), fn), methods=["GET"])
 
@@ -247,6 +257,7 @@ def admin_routes(host: AgentHost) -> list[Route]:
         route("events", events),
         route("audit", audit_list),
         route("audit/verify", audit_verify),
+        route("push", push),
     ]
 
 

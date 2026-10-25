@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import socket
 import time
@@ -79,6 +80,7 @@ class Receiver:
     status: int = 200
     redirect_to: str | None = None
     gate: asyncio.Event | None = None  # when set, requests wait for it
+    gate_paths: set[str] | None = None  # None: the gate holds every path
 
     def url(self, path: str = "/hook") -> str:
         return f"http://127.0.0.1:{self.port}{path}"
@@ -87,7 +89,9 @@ class Receiver:
         async def handle(request: Request) -> Response:
             body = await request.json()
             self.hits.append(Hit(request.url.path, dict(request.headers), body))
-            if self.gate is not None:
+            if self.gate is not None and (
+                self.gate_paths is None or request.url.path in self.gate_paths
+            ):
                 await self.gate.wait()
             if request.url.path == "/hook":
                 if self.fail_first > 0:
@@ -348,6 +352,9 @@ async def test_jwt_signer_adds_gateway_jwt(host_env, receiver, tmp_path):
         assert claims["iss"] == "https://gw.example"
         assert claims["task_id"] == tid
         assert claims["exp"] - claims["iat"] == 300
+        assert claims["delivery_id"] == hit.headers["x-a2agw-delivery-id"]
+        raw = json.dumps(hit.body, separators=(",", ":")).encode()
+        assert claims["body_sha256"] == hashlib.sha256(raw).hexdigest()
         jtis.add(claims["jti"])
     assert len(jtis) == len(receiver.hits)  # a fresh jti per delivery
 
@@ -372,19 +379,24 @@ async def test_jwt_moves_to_own_header_when_config_has_authentication(host_env, 
 
 async def test_receiver_down_at_first_is_retried(host_env, receiver):
     receiver.fail_first = 2
-    host, client = await host_env(push=PushSettings(allow_private=True, max_retries=3))
+    host, client = await host_env(push=PushSettings(allow_private=True, max_attempts=3))
     await send(client(), msg(), TaskPushNotificationConfig(id="c1", url=receiver.url()))
     await receiver.wait_for(_completed)
     # The first update took three attempts (503, 503, 200); every update got through.
     first = receiver.hits[0].body
     assert [h.body for h in receiver.hits[:3]] == [first, first, first]
+    ids = [h.headers["x-a2agw-delivery-id"] for h in receiver.hits]
+    assert len(set(ids[:3])) == 1  # one delivery id for every attempt of one update
+    assert len(set(ids)) == len(ids) - 2  # and a new one per update
     stats = host.push_stats("alpha")
     assert stats["retries"] == 2 and stats["failed"] == 0
 
 
 async def test_connection_refused_is_retried_then_given_up(tmp_path):
     port = _free_port()  # nothing listens here
-    sender, _store, engine = await _sender(tmp_path, f"http://127.0.0.1:{port}/hook", max_retries=3)
+    sender, _store, engine = await _sender(
+        tmp_path, f"http://127.0.0.1:{port}/hook", max_attempts=3
+    )
     try:
         await sender.send_notification("t1", _task("t1"))
         await sender.drain(5)
@@ -460,13 +472,18 @@ def _task(task_id: str, state: TaskState = TaskState.TASK_STATE_WORKING) -> Task
     return Task(id=task_id, context_id="ctx", status=TaskStatus(state=state))
 
 
-async def _sender(tmp_path, url: str, *, validator=None, **settings):
+async def _sender(tmp_path, url: str, *, validator=None, configs=None, **settings):
+    """A sender on a fresh store. ``configs`` maps task id -> webhook URLs (default: t1 -> url)."""
     from a2a.server.context import ServerCallContext
 
     engine = await create_engine(f"sqlite+aiosqlite:///{tmp_path / 's.db'}")
     store = push_config_store_for(engine, "alpha")
     await store.initialize()
-    await store.set_info("t1", TaskPushNotificationConfig(id="c1", url=url), ServerCallContext())
+    for task_id, urls in (configs or {"t1": [url]}).items():
+        for i, u in enumerate(urls):
+            await store.set_info(
+                task_id, TaskPushNotificationConfig(id=f"c{i}", url=u), ServerCallContext()
+            )
     ps = PushSettings(allow_private=True, **settings)
     http = httpx.AsyncClient(follow_redirects=False, timeout=ps.timeout_s)
     sender = GuardedPushSender(
@@ -598,7 +615,7 @@ async def test_store_tables_per_agent_and_reusable_across_engines(tmp_path):
             await engine.dispose()
 
 
-async def test_configs_encrypted_at_rest_when_key_configured(tmp_path, monkeypatch, receiver):
+async def test_configs_encrypted_at_rest_when_key_configured(tmp_path, monkeypatch):
     from cryptography.fernet import Fernet
     from sqlalchemy import text
 
@@ -610,20 +627,57 @@ async def test_configs_encrypted_at_rest_when_key_configured(tmp_path, monkeypat
     )
     host.add(spec())
     await host.startup()
+    hc = httpx.AsyncClient(transport=httpx.ASGITransport(app=host.app()), base_url="http://t")
     try:
-        hc = httpx.AsyncClient(transport=httpx.ASGITransport(app=host.app()), base_url="http://t")
         c = ClientFactory(ClientConfig(httpx_client=hc, streaming=False)).create(
             host.cards["alpha"]
         )
-        await send(c, msg(), TaskPushNotificationConfig(id="c1", url=receiver.url(), token="tk-9"))
-        await receiver.wait_for(_completed)
-        assert receiver.hits[0].headers["x-a2a-notification-token"] == "tk-9"
+        tid = (await send(c, msg()))[0].task.id
+        url = "https://hook.example/x?sig=abc"
+        await c.create_task_push_notification_config(
+            TaskPushNotificationConfig(task_id=tid, id="c1", url=url, token="tk-9")
+        )
+        got = await c.get_task_push_notification_config(
+            GetTaskPushNotificationConfigRequest(task_id=tid, id="c1")
+        )
+        assert (got.url, got.token) == (url, "tk-9")
         async with host.engine.connect() as conn:
             raw = (await conn.execute(text("SELECT config_data FROM push_configs_alpha"))).scalar()
-        assert b"tk-9" not in raw and receiver.url().encode() not in raw
-        await hc.aclose()
+        assert b"tk-9" not in raw and b"hook.example" not in raw
     finally:
+        await hc.aclose()
         await host.shutdown()
+
+
+async def test_encryption_key_rotation_and_wrong_key(tmp_path, monkeypatch):
+    from a2a.server.context import ServerCallContext
+    from cryptography.fernet import Fernet
+
+    old, new = Fernet.generate_key().decode(), Fernet.generate_key().decode()
+    ctx = ServerCallContext()
+    engine = await create_engine(f"sqlite+aiosqlite:///{tmp_path / 'rot.db'}")
+
+    def store_with(keys: str):
+        monkeypatch.setenv("PUSH_KEYS", keys)
+        fernet = PushSettings(encryption_key_env="PUSH_KEYS").fernet()
+        return push_config_store_for(engine, "rot", fernet=fernet)
+
+    try:
+        before = store_with(old)
+        await before.initialize()
+        await before.set_info("t", TaskPushNotificationConfig(id="a", url="https://x/a"), ctx)
+        rotated = store_with(f"{new}, {old}")  # new key first: it encrypts, both decrypt
+        assert [c.id for c in await rotated.get_info_for_dispatch("t")] == ["a"]
+        await rotated.set_info("t", TaskPushNotificationConfig(id="b", url="https://x/b"), ctx)
+        assert {c.id for c in await rotated.get_info_for_dispatch("t")} == {"a", "b"}
+        # The old key alone cannot read the row the new key wrote: that config is skipped.
+        assert [c.id for c in await store_with(old).get_info_for_dispatch("t")] == ["a"]
+        monkeypatch.setenv("PUSH_KEYS", "not-a-key")
+        with pytest.raises(ValueError, match="PUSH_KEYS") as exc:
+            PushSettings(encryption_key_env="PUSH_KEYS").fernet()
+        assert "not-a-key" not in str(exc.value)
+    finally:
+        await engine.dispose()
 
 
 async def test_missing_encryption_key_fails_startup(tmp_path, monkeypatch):
@@ -695,11 +749,13 @@ async def test_other_principal_cannot_read_or_delete_config(host_env):
 @pytest.mark.postgres
 async def test_store_on_postgres_with_encryption(pg_url):
     from a2a.server.context import ServerCallContext
-    from cryptography.fernet import Fernet
+    from cryptography.fernet import Fernet, MultiFernet
 
     engine = await create_engine(pg_url)
     try:
-        store = push_config_store_for(engine, "pg-agent", encryption_key=Fernet.generate_key())
+        store = push_config_store_for(
+            engine, "pg-agent", fernet=MultiFernet([Fernet(Fernet.generate_key())])
+        )
         await store.initialize()
         ctx = ServerCallContext()
         cfg = TaskPushNotificationConfig(id="c", url="https://x.example/h", token="tok")
@@ -715,7 +771,7 @@ async def test_store_on_postgres_with_encryption(pg_url):
 
 async def test_hanging_webhook_times_out_and_is_retried(tmp_path, receiver):
     receiver.gate = asyncio.Event()  # never answers
-    sender, _, engine = await _sender(tmp_path, receiver.url(), timeout_s=0.2, max_retries=2)
+    sender, _, engine = await _sender(tmp_path, receiver.url(), timeout_s=0.2, max_attempts=2)
     try:
         started = time.monotonic()
         await sender.send_notification("t1", _task("t1"))
@@ -727,3 +783,224 @@ async def test_hanging_webhook_times_out_and_is_retried(tmp_path, receiver):
         receiver.gate.set()
         await sender.http.aclose()
         await engine.dispose()
+
+
+# -- fix round 1: bounds, re-check timeout, cleanup, ids, logging, admin ---------------
+
+
+class AskOnce:
+    """First turn asks for input; the follow-up completes."""
+
+    durable_sessions = False
+
+    async def run(self, ctx):
+        from a2agw.core.events import NeedInput
+
+        if ctx.text == "first":
+            yield NeedInput("more?")
+        else:
+            yield Done(text="ok")
+
+
+async def test_config_limit_per_task_on_both_paths(host_env):
+    _, client = await host_env(
+        spec("alpha", AskOnce()), push=PushSettings(allow_private=True, max_configs_per_task=3)
+    )
+    c = client()
+    events = await send(c, msg("first"))
+    tid = events[0].task.id
+    assert events[0].task.status.state == TaskState.TASK_STATE_INPUT_REQUIRED
+    for i in range(3):
+        await c.create_task_push_notification_config(
+            TaskPushNotificationConfig(task_id=tid, id=f"c{i}", url=f"https://h.example/{i}")
+        )
+    with pytest.raises(InvalidParamsError, match="too many push configs"):
+        await c.create_task_push_notification_config(
+            TaskPushNotificationConfig(task_id=tid, id="c3", url="https://h.example/3")
+        )
+    # Replacing an existing config is not a new one.
+    await c.create_task_push_notification_config(
+        TaskPushNotificationConfig(task_id=tid, id="c1", url="https://h.example/1b")
+    )
+    # Inline with SendMessage: the same limit.
+    follow = msg("second")
+    follow.task_id = tid
+    with pytest.raises(InvalidParamsError, match="too many push configs"):
+        await send(c, follow, TaskPushNotificationConfig(id="c9", url="https://h.example/9"))
+
+
+async def test_overlong_ids_rejected_before_the_database(host_env, tmp_path):
+    from a2a.server.context import ServerCallContext
+
+    host, client = await host_env(push=PushSettings(allow_private=True))
+    c = client()
+    tid = (await send(c, msg()))[0].task.id
+    with pytest.raises(InvalidParamsError, match="config id too long"):
+        await c.create_task_push_notification_config(
+            TaskPushNotificationConfig(task_id=tid, id="x" * 256, url="https://h.example/")
+        )
+    store = host.push_stores["alpha"]
+    with pytest.raises(InvalidParamsError, match="task id too long"):
+        await store.set_info(
+            "t" * 37, TaskPushNotificationConfig(id="c", url="https://h/"), ServerCallContext()
+        )
+    with pytest.raises(InvalidParamsError):
+        await store.delete_info("t", ServerCallContext(), "x" * 256)
+
+
+async def test_slow_webhooks_of_one_task_do_not_starve_another(tmp_path, receiver):
+    receiver.gate = asyncio.Event()
+    receiver.gate_paths = {"/slow"}
+    slow = [receiver.url("/slow") + f"?n={i}" for i in range(10)]
+    sender, _, engine = await _sender(
+        tmp_path,
+        "",
+        configs={"t1": slow, "t2": [receiver.url("/hook")]},
+        max_concurrent_deliveries=4,
+    )
+    try:
+        await sender.send_notification("t1", _task("t1"))
+        await receiver.wait_for(lambda hits: len(hits) >= 2)
+        started = time.monotonic()
+        await sender.send_notification("t2", _task("t2"))
+        await receiver.wait_for(lambda hits: any(h.path == "/hook" for h in hits), timeout=1.0)
+        assert time.monotonic() - started < 1.0
+        # t1 holds only its share (half of the 4 slots) while its webhooks hang.
+        assert sum(h.path == "/slow" for h in receiver.hits) == 2
+        receiver.gate.set()
+        await sender.drain(5)
+        assert sender.stats["delivered"] == 11
+    finally:
+        receiver.gate.set()
+        await sender.http.aclose()
+        await engine.dispose()
+
+
+async def test_pending_tasks_cap_drops_new_tasks(tmp_path, receiver, caplog):
+    receiver.gate = asyncio.Event()
+    url = receiver.url()
+    sender, _, engine = await _sender(
+        tmp_path, url, configs={"t1": [url], "t2": [url], "t3": [url]}, max_pending_tasks=2
+    )
+    try:
+        await sender.send_notification("t1", _task("t1"))
+        await sender.send_notification("t2", _task("t2"))
+        with caplog.at_level(logging.WARNING):
+            started = time.monotonic()
+            await sender.send_notification("t3", _task("t3"))
+            await sender.send_notification("t3", _task("t3"))
+            assert time.monotonic() - started < 0.5  # dropped, never waited for
+        assert sender.stats["dropped"] == 2
+        assert caplog.text.count("too many tasks with pending updates") == 1
+        await sender.send_notification("t1", _task("t1"))  # a known task still queues
+        receiver.gate.set()
+        await sender.drain(5)
+        assert sender.stats["delivered"] == 3
+        assert {h.body["task"]["id"] for h in receiver.hits} == {"t1", "t2"}
+    finally:
+        receiver.gate.set()
+        await sender.http.aclose()
+        await engine.dispose()
+
+
+async def test_slow_dns_recheck_counts_as_unsafe(tmp_path, monkeypatch, receiver):
+    from a2agw.consult import netguard
+
+    async def slow_resolve(host):
+        await asyncio.sleep(10)
+        return ["93.184.216.34"]
+
+    monkeypatch.delenv("A2AGW_DEV", raising=False)
+    monkeypatch.setattr(netguard, "_resolve", slow_resolve)
+    sender, _, engine = await _sender(
+        tmp_path,
+        "https://hook.example/x",
+        validator=make_push_url_validator(False),
+        timeout_s=0.2,
+    )
+    try:
+        started = time.monotonic()
+        await sender.send_notification("t1", _task("t1"))
+        await sender.drain(5)
+        assert time.monotonic() - started < 1.5
+        assert sender.stats["skipped_unsafe"] == 1 and sender.stats["delivered"] == 0
+    finally:
+        await sender.http.aclose()
+        await engine.dispose()
+
+
+async def test_configs_deleted_after_terminal_update(host_env, receiver):
+    host, client = await host_env(push=PushSettings(allow_private=True))
+    tid = (await send(client(), msg(), TaskPushNotificationConfig(id="c1", url=receiver.url())))[
+        0
+    ].task.id
+    await receiver.wait_for(_completed)
+    await host.push_senders["alpha"].drain(5)
+    assert await host.push_stores["alpha"].get_info_for_dispatch(tid) == []
+
+
+async def test_non_terminal_updates_keep_configs(host_env, receiver):
+    host, client = await host_env(spec("alpha", AskOnce()), push=PushSettings(allow_private=True))
+    tid = (
+        await send(client(), msg("first"), TaskPushNotificationConfig(id="c1", url=receiver.url()))
+    )[0].task.id
+    await receiver.wait_for(
+        lambda hits: any(_state(h.body) == "TASK_STATE_INPUT_REQUIRED" for h in hits)
+    )
+    await host.push_senders["alpha"].drain(5)
+    assert len(await host.push_stores["alpha"].get_info_for_dispatch(tid)) == 1
+
+
+async def test_http_client_logs_never_carry_webhook_urls(tmp_path, receiver, caplog):
+    assert logging.getLogger("httpx").level == logging.WARNING
+    assert logging.getLogger("httpcore").level == logging.WARNING
+    url = receiver.url() + "?sig=supersecret"
+    sender, _, engine = await _sender(tmp_path, url)
+    try:
+        with caplog.at_level(logging.DEBUG):  # root at DEBUG, below INFO even
+            await sender.send_notification("t1", _task("t1"))
+            await sender.drain(5)
+        assert sender.stats["delivered"] == 1
+        assert "supersecret" not in caplog.text and str(receiver.port) not in caplog.text
+    finally:
+        await sender.http.aclose()
+        await engine.dispose()
+
+
+async def test_admin_push_counters(host_env, receiver):
+    auth = AuthConfig(
+        api_keys={
+            hashlib.sha256(b"adm").hexdigest(): ApiKeyEntry(
+                principal_id="ops", scopes=["a2agw:admin"]
+            ),
+            hashlib.sha256(b"usr").hexdigest(): ApiKeyEntry(principal_id="u"),
+        }
+    )
+    host, client = await host_env(push=PushSettings(allow_private=True), auth=auth)
+    await send(
+        client(**{"X-API-Key": "usr"}),
+        msg(),
+        TaskPushNotificationConfig(id="c1", url=receiver.url()),
+    )
+    await receiver.wait_for(_completed)
+    await host.push_senders["alpha"].drain(5)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=host.app()), base_url="http://t"
+    ) as hc:
+        denied = await hc.get("/a2agw/admin/push", headers={"X-API-Key": "usr"})
+        assert denied.status_code == 403
+        r = await hc.get("/a2agw/admin/push", headers={"X-API-Key": "adm"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["enabled"] is True
+    counters = body["agents"]["alpha"]
+    assert counters["delivered"] == len(receiver.hits) and counters["pending"] == 0
+    assert set(counters) == {
+        "delivered",
+        "failed",
+        "retries",
+        "skipped_unsafe",
+        "dropped",
+        "pending",
+    }
+    assert str(receiver.port) not in r.text

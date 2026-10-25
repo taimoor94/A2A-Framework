@@ -5,18 +5,51 @@ A client registers a webhook for one of its tasks (inline in ``SendMessage`` or 
 caller by the store's owner resolver, and checks the URL with ``make_push_url_validator`` when
 the config is created. ``GuardedPushSender`` then POSTs each task update to the webhooks:
 
-- the URL is checked again before every delivery (DNS may have changed since);
+- the URL is checked again before every delivery (DNS may have changed since), within
+  ``timeout_s``; a check that times out counts as unsafe;
 - redirects are never followed, the response body is never read, and each request has a
   total timeout;
 - 5xx answers and connect/timeout errors are retried with jittered backoff, 4xx is final;
-- deliveries run in the background, in order, on one worker per task, with a bounded backlog.
+- deliveries run in the background, in order, on one worker per task, with a bounded backlog
+  per task, a bounded number of tasks with pending updates, a global cap on concurrent POSTs
+  and a per-task share of it (so one task's slow webhooks cannot take every slot);
+- a task has at most ``max_configs_per_task`` webhooks, and its configs are deleted once its
+  terminal update has been delivered.
 
 Logs name the agent and task only: webhook URLs can carry credentials and are never logged.
+Importing this module sets the ``httpx`` and ``httpcore`` loggers to WARNING (when nobody has
+set their level), because httpx logs every request URL at INFO.
+
+Ownership: configs are owner-scoped by the principal id. Without ``AuthConfig`` every caller
+is the same ``anonymous`` owner, so anyone who knows a task id can read, replace or delete its
+configs; run with auth whenever push is exposed beyond a trusted network.
+
+Receivers. Each request carries:
+
+- ``X-A2A-Notification-Token``: the config's ``token`` (A2A), when set;
+- ``Authorization``: the config's ``authentication`` (A2A), when set;
+- ``X-A2AGW-Delivery-Id``: one id per update per webhook, the same on every retry attempt.
+  Receivers should de-duplicate on it: a retry after a lost 2xx delivers the update twice.
+- with ``jwt_signer``: a JWT signed with the gateway key, in ``Authorization: Bearer`` or, when
+  the config's ``authentication`` uses that header, in ``X-A2AGW-Push-JWT``. Claims: ``iss``
+  (the host's base URL), ``aud`` (the exact webhook URL, query string included), ``iat``,
+  ``exp`` (``iat`` + 300 s), ``task_id``, ``delivery_id``, ``body_sha256`` (hex SHA-256 of the
+  exact request body) and ``jti`` (unique per attempt). A receiver should verify the signature
+  against the gateway's published key, check ``aud`` equals the URL it is served at, check
+  ``exp``, compare ``body_sha256`` with the body it received, and reject a ``jti`` it has seen
+  within the token's lifetime (replay).
+
+Encryption at rest (``encryption_key_env``): the env var holds one Fernet key or a comma-
+separated list; the first key encrypts and every key decrypts (``MultiFernet``), so keys can be
+rotated by prepending the new one. Rows written before encryption was turned on stay readable
+but stay plaintext until rewritten. A row no listed key can decrypt (wrong or retired key) is
+skipped: its webhook gets no deliveries, and the SDK logs the config id (not its contents).
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -28,25 +61,31 @@ import warnings
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
+from a2a.server.context import ServerCallContext
 from a2a.server.models import create_push_notification_config_model
 from a2a.server.tasks import (
     DatabasePushNotificationConfigStore,
-    PushNotificationConfigStore,
     PushNotificationEvent,
     PushNotificationSender,
 )
 from a2a.types import TaskPushNotificationConfig
+from a2a.utils.errors import InvalidParamsError
 from a2a.utils.proto_utils import to_stream_response
 from google.protobuf.json_format import MessageToDict
+from sqlalchemy import and_, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from a2agw.consult.netguard import UnsafeURL, check_url
 from a2agw.security.cardsign import CardSigner
 
+if TYPE_CHECKING:
+    from cryptography.fernet import MultiFernet
+
 __all__ = [
+    "GatewayPushConfigStore",
     "GuardedPushSender",
     "PushSettings",
     "make_push_url_validator",
@@ -55,6 +94,11 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
+# httpx logs "HTTP Request: POST <url> ..." at INFO; webhook URLs may carry credentials.
+for _name in ("httpx", "httpcore"):
+    if logging.getLogger(_name).level == logging.NOTSET:
+        logging.getLogger(_name).setLevel(logging.WARNING)
+
 BACKOFF_BASE_S = 0.5
 BACKOFF_CAP_S = 4.0
 MAX_BACKLOG = 100  # queued updates per task; on overflow the oldest is dropped
@@ -62,6 +106,12 @@ DRAIN_TIMEOUT_S = 5.0  # host shutdown waits this long for pending deliveries
 JWT_TTL_S = 300
 # Carries the gateway JWT when the config's own `authentication` already uses Authorization.
 JWT_HEADER = "X-A2AGW-Push-JWT"
+DELIVERY_ID_HEADER = "X-A2AGW-Delivery-Id"
+MAX_TASK_ID_LEN = 36  # the SDK's task_id column is String(36)
+MAX_CONFIG_ID_LEN = 255  # and config_id String(255)
+_TERMINAL_STATES = frozenset(
+    {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED", "TASK_STATE_REJECTED"}
+)
 
 _AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 # table name -> (agent id, model). The SDK registers generated models on a process-global
@@ -77,41 +127,62 @@ class PushSettings:
 
     - ``allow_private``: accept webhooks on private/loopback addresses and plain http (the
       ``internal`` netguard tier). Off by default: only public https webhooks are accepted.
-    - ``timeout_s``: per-request timeout. ``max_retries``: attempts in total per delivery.
+    - ``timeout_s``: bounds each request and each per-delivery URL re-check.
+    - ``max_attempts``: attempts in total per delivery (1 = no retry).
     - ``jwt_signer``: also send a short-lived JWT signed with the gateway key, so receivers
-      can tell the update came from this gateway.
-    - ``encryption_key_env``: name of an env var holding a Fernet key; when set, stored
-      configs (which hold the client's token and webhook credentials) are encrypted at rest.
+      can tell the update came from this gateway (see the module docstring for the claims).
+    - ``encryption_key_env``: name of an env var holding a Fernet key, or a comma-separated
+      list of keys (the first encrypts). When set, stored configs, which hold the client's
+      token and webhook credentials, are encrypted at rest.
+    - ``max_configs_per_task``: webhooks one task may have; one more is InvalidParams.
+    - ``max_concurrent_deliveries``: POSTs in flight at once, per agent. One task may use at
+      most half of them.
+    - ``max_pending_tasks``: tasks with queued updates, per agent. Beyond it, updates for
+      further tasks are dropped (counted and logged), never waited for.
     """
 
     allow_private: bool = False
     timeout_s: float = 10.0
-    max_retries: int = 3
+    max_attempts: int = 3
     jwt_signer: CardSigner | None = None
     encryption_key_env: str | None = None
+    max_configs_per_task: int = 10
+    max_concurrent_deliveries: int = 32
+    max_pending_tasks: int = 1000
 
     def __post_init__(self) -> None:
         if self.timeout_s <= 0:
             raise ValueError("timeout_s must be positive")
-        if self.max_retries < 1:
-            raise ValueError("max_retries must be at least 1")
+        for name in (
+            "max_attempts",
+            "max_configs_per_task",
+            "max_concurrent_deliveries",
+            "max_pending_tasks",
+        ):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name} must be at least 1")
 
-    def encryption_key(self) -> bytes | None:
-        """The Fernet key from ``encryption_key_env``; ValueError if it is unset or invalid."""
+    @property
+    def per_task_concurrency(self) -> int:
+        return max(1, self.max_concurrent_deliveries // 2)
+
+    def fernet(self) -> MultiFernet | None:
+        """The keys from ``encryption_key_env``; ValueError if it is unset or a key is invalid.
+        The error names the variable, never a key."""
         if self.encryption_key_env is None:
             return None
-        raw = os.environ.get(self.encryption_key_env)
-        if not raw:
+        raw = os.environ.get(self.encryption_key_env, "")
+        keys = [k.strip() for k in raw.split(",") if k.strip()]
+        if not keys:
             raise ValueError(f"push encryption key env var {self.encryption_key_env} is not set")
-        from cryptography.fernet import Fernet
+        from cryptography.fernet import Fernet, MultiFernet
 
         try:
-            Fernet(raw.encode())
+            return MultiFernet([Fernet(k.encode()) for k in keys])
         except (ValueError, TypeError):
             raise ValueError(
-                f"push encryption key in {self.encryption_key_env} is not a valid Fernet key"
+                f"push encryption keys in {self.encryption_key_env} are not valid Fernet keys"
             ) from None
-        return raw.encode()
 
 
 def make_push_url_validator(allow_private: bool) -> UrlValidator:
@@ -129,9 +200,66 @@ def make_push_url_validator(allow_private: bool) -> UrlValidator:
     return validate
 
 
+def _check_ids(task_id: str, config_id: str | None) -> None:
+    if len(task_id) > MAX_TASK_ID_LEN:
+        raise InvalidParamsError(message="task id too long")
+    if config_id is not None and len(config_id) > MAX_CONFIG_ID_LEN:
+        raise InvalidParamsError(message="push config id too long")
+
+
+class GatewayPushConfigStore(DatabasePushNotificationConfigStore):
+    """The SDK's database store plus a per-task config limit, id length checks and an
+    owner-independent delete used to clean up after a task ends.
+
+    The handler calls ``set_info`` both for ``CreateTaskPushNotificationConfig`` and for a
+    config sent inline with ``SendMessage``, so the limit covers both paths."""
+
+    max_configs_per_task: int = 10
+
+    async def set_info(
+        self,
+        task_id: str,
+        notification_config: TaskPushNotificationConfig,
+        context: ServerCallContext,
+    ) -> TaskPushNotificationConfig:
+        config_id = notification_config.id or task_id
+        _check_ids(task_id, config_id)
+        await self._ensure_initialized()
+        model = self.config_model
+        async with self.async_session_maker() as session:
+            others = await session.scalar(
+                select(func.count()).where(
+                    and_(model.task_id == task_id, model.config_id != config_id)
+                )
+            )
+        if (others or 0) >= self.max_configs_per_task:
+            raise InvalidParamsError(message="too many push configs for task")
+        return await super().set_info(task_id, notification_config, context)
+
+    async def delete_info(
+        self, task_id: str, context: ServerCallContext, config_id: str | None = None
+    ) -> None:
+        _check_ids(task_id, config_id)
+        await super().delete_info(task_id, context, config_id)
+
+    async def delete_for_task(self, task_id: str) -> int:
+        """Delete every config of a task, whoever owns it (the SDK's ``delete_info`` is
+        owner-scoped, and the dispatch path has no caller). Returns the rows deleted."""
+        await self._ensure_initialized()
+        async with self.async_session_maker.begin() as session:
+            result = await session.execute(
+                delete(self.config_model).where(self.config_model.task_id == task_id)
+            )
+        return int(result.rowcount or 0)  # type: ignore[attr-defined]
+
+
 def push_config_store_for(
-    engine: AsyncEngine, agent_id: str, *, encryption_key: bytes | None = None
-) -> DatabasePushNotificationConfigStore:
+    engine: AsyncEngine,
+    agent_id: str,
+    *,
+    fernet: MultiFernet | None = None,
+    max_configs_per_task: int = 10,
+) -> GatewayPushConfigStore:
     """A push config store backed by this agent's own table, ``push_configs_<agent>``.
 
     Like ``task_store_for``: each table's model is built once per process and reused on any
@@ -152,11 +280,25 @@ def push_config_store_for(
             model = create_push_notification_config_model(table_name)
         cached = _MODELS[table_name] = (agent_id, model)
     # The default table name makes the SDK reuse its built-in model; we then swap in ours.
-    store = DatabasePushNotificationConfigStore(
-        engine, create_table=True, encryption_key=encryption_key
-    )
+    store = GatewayPushConfigStore(engine, create_table=True)
     store.config_model = cached[1]
+    # MultiFernet has the Fernet encrypt/decrypt interface the SDK store uses.
+    store._fernet = fernet  # type: ignore[assignment]
+    store.max_configs_per_task = max_configs_per_task
     return store
+
+
+@dataclass
+class _Update:
+    payload: dict[str, Any]
+    terminal: bool
+
+
+def _is_terminal(payload: dict[str, Any]) -> bool:
+    for key in ("task", "statusUpdate"):
+        if key in payload:
+            return payload[key].get("status", {}).get("state") in _TERMINAL_STATES
+    return False
 
 
 class GuardedPushSender(PushNotificationSender):
@@ -170,7 +312,7 @@ class GuardedPushSender(PushNotificationSender):
     def __init__(
         self,
         http: httpx.AsyncClient,
-        config_store: PushNotificationConfigStore,
+        config_store: GatewayPushConfigStore,
         *,
         settings: PushSettings,
         agent_id: str,
@@ -190,9 +332,11 @@ class GuardedPushSender(PushNotificationSender):
             "skipped_unsafe": 0,
             "dropped": 0,
         }
-        self._queues: dict[str, deque[dict[str, Any]]] = {}
+        self._slots = asyncio.Semaphore(settings.max_concurrent_deliveries)
+        self._queues: dict[str, deque[_Update]] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
         self._overflowing: set[str] = set()
+        self._saturated = False  # max_pending_tasks reached (logged once per episode)
         self._closed = False
 
     # -- queueing ----------------------------------------------------------------------
@@ -205,9 +349,23 @@ class GuardedPushSender(PushNotificationSender):
                 "push: sender closed, update dropped (agent=%s task=%s)", self.agent_id, task_id
             )
             return
+        queue = self._queues.get(task_id)
+        if queue is None:
+            if len(self._queues) >= self.settings.max_pending_tasks:
+                self.stats["dropped"] += 1
+                if not self._saturated:
+                    self._saturated = True
+                    logger.warning(
+                        "push: too many tasks with pending updates, update dropped "
+                        "(agent=%s task=%s)",
+                        self.agent_id,
+                        task_id,
+                    )
+                return
+            self._saturated = False
+            queue = self._queues[task_id] = deque()
         # Serialized now, so later changes to the event object cannot alter what is sent.
         payload = MessageToDict(to_stream_response(event))
-        queue = self._queues.setdefault(task_id, deque())
         if len(queue) >= MAX_BACKLOG:
             queue.popleft()
             self.stats["dropped"] += 1
@@ -218,16 +376,19 @@ class GuardedPushSender(PushNotificationSender):
                     self.agent_id,
                     task_id,
                 )
-        queue.append(payload)
+        queue.append(_Update(payload, _is_terminal(payload)))
         if task_id not in self._workers:
             self._workers[task_id] = asyncio.create_task(self._run(task_id, queue))
 
-    async def _run(self, task_id: str, queue: deque[dict[str, Any]]) -> None:
+    async def _run(self, task_id: str, queue: deque[_Update]) -> None:
         try:
             while queue:
-                payload = queue.popleft()
+                update = queue.popleft()
                 try:
-                    await self._deliver_all(task_id, payload)
+                    await self._deliver_all(task_id, update.payload)
+                    if update.terminal:
+                        # The task is over: its webhooks get nothing more.
+                        await self.store.delete_for_task(task_id)
                 except Exception as exc:  # noqa: BLE001 - one bad update must not stop the rest
                     self.stats["failed"] += 1
                     logger.warning(
@@ -255,6 +416,10 @@ class GuardedPushSender(PushNotificationSender):
     def pending(self) -> int:
         """Updates queued or in flight."""
         return sum(len(q) for q in self._queues.values()) + len(self._workers)
+
+    def counters(self) -> dict[str, int]:
+        """Delivery counters plus the current backlog, for the admin API."""
+        return {**self.stats, "pending": self.pending()}
 
     async def drain(self, timeout: float = DRAIN_TIMEOUT_S) -> None:
         """Wait up to ``timeout`` for every queued update; cancel whatever is left."""
@@ -285,18 +450,29 @@ class GuardedPushSender(PushNotificationSender):
                 task_id,
             )
             return
-        if configs:
-            body = json.dumps(payload, separators=(",", ":")).encode()
-            await asyncio.gather(*(self._deliver(task_id, c, body) for c in configs))
+        if not configs:
+            return
+        body = json.dumps(payload, separators=(",", ":")).encode()
+        digest = hashlib.sha256(body).hexdigest()
+        share = asyncio.Semaphore(self.settings.per_task_concurrency)
+
+        async def one(config: TaskPushNotificationConfig) -> None:
+            async with share:
+                await self._deliver(task_id, config, body, digest)
+
+        await asyncio.gather(*(one(c) for c in configs))
 
     async def _url_allowed(self, url: str) -> bool:
         try:
-            return bool(await self.validator(url))
-        except Exception:  # noqa: BLE001 - fail closed
+            async with asyncio.timeout(self.settings.timeout_s):
+                return bool(await self.validator(url))
+        except Exception:  # noqa: BLE001 - fail closed, a slow resolver included
             return False
 
-    def _headers(self, task_id: str, config: TaskPushNotificationConfig) -> dict[str, str]:
-        headers = {"Content-Type": "application/json"}
+    def _headers(
+        self, task_id: str, config: TaskPushNotificationConfig, delivery_id: str, digest: str
+    ) -> dict[str, str]:
+        headers = {"Content-Type": "application/json", DELIVERY_ID_HEADER: delivery_id}
         if config.token:
             headers["X-A2A-Notification-Token"] = config.token
         auth = config.authentication
@@ -313,6 +489,8 @@ class GuardedPushSender(PushNotificationSender):
                     "iat": iat,
                     "exp": iat + JWT_TTL_S,
                     "task_id": task_id,
+                    "delivery_id": delivery_id,
+                    "body_sha256": digest,
                     "jti": uuid.uuid4().hex,
                 }
             )
@@ -325,18 +503,23 @@ class GuardedPushSender(PushNotificationSender):
     async def _post(self, url: str, body: bytes, headers: dict[str, str]) -> int:
         """POST once and return the status. The response body is never read (a webhook cannot
         make us buffer anything), and ``timeout_s`` bounds the whole request."""
-        async with asyncio.timeout(self.settings.timeout_s):
-            async with self.http.stream(
+        async with (
+            self._slots,
+            asyncio.timeout(self.settings.timeout_s),
+            self.http.stream(
                 "POST",
                 url,
                 content=body,
                 headers=headers,
                 follow_redirects=False,
                 timeout=self.settings.timeout_s,
-            ) as resp:
-                return resp.status_code
+            ) as resp,
+        ):
+            return resp.status_code
 
-    async def _deliver(self, task_id: str, config: TaskPushNotificationConfig, body: bytes) -> None:
+    async def _deliver(
+        self, task_id: str, config: TaskPushNotificationConfig, body: bytes, digest: str
+    ) -> None:
         if not await self._url_allowed(config.url):
             self.stats["skipped_unsafe"] += 1
             logger.warning(
@@ -345,12 +528,14 @@ class GuardedPushSender(PushNotificationSender):
                 task_id,
             )
             return
-        attempts = self.settings.max_retries
+        delivery_id = uuid.uuid4().hex  # the same on every attempt of this delivery
+        attempts = self.settings.max_attempts
         outcome = "failed"
         for attempt in range(attempts):
             retryable = False
+            headers = self._headers(task_id, config, delivery_id, digest)
             try:
-                status = await self._post(config.url, body, self._headers(task_id, config))
+                status = await self._post(config.url, body, headers)
             except (httpx.ConnectError, httpx.TimeoutException, TimeoutError) as exc:
                 retryable, outcome = True, type(exc).__name__
             except Exception as exc:  # noqa: BLE001 - any other failure is final

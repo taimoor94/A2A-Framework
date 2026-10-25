@@ -20,7 +20,7 @@ from a2a.server.routes import (
     create_jsonrpc_routes,
     create_rest_routes,
 )
-from a2a.server.tasks import DatabasePushNotificationConfigStore, TaskStore
+from a2a.server.tasks import TaskStore
 from a2a.types import AgentCard, SendMessageRequest
 from a2a.utils.errors import InvalidParamsError
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -55,6 +55,7 @@ from a2agw.serve.agent import AgentSpec, build_card
 from a2agw.serve.executor import AdapterExecutor
 from a2agw.serve.push import (
     DRAIN_TIMEOUT_S,
+    GatewayPushConfigStore,
     GuardedPushSender,
     PushSettings,
     make_push_url_validator,
@@ -465,7 +466,7 @@ class AgentHost:
         self.push = push
         self.push_http: httpx.AsyncClient | None = None  # created at startup when push is set
         self.push_senders: dict[str, GuardedPushSender] = {}
-        self.push_stores: dict[str, DatabasePushNotificationConfigStore] = {}
+        self.push_stores: dict[str, GatewayPushConfigStore] = {}
         # Authz (authorizer and executor), egress (partner client) and routing (tools).
         self.policy = policy
         # audit=False disables the audit log entirely (no table, no events).
@@ -533,7 +534,7 @@ class AgentHost:
 
     async def _startup(self) -> None:
         push = self.push
-        push_key = push.encryption_key() if push is not None else None  # fail before opening
+        push_fernet = push.fernet() if push is not None else None  # fail before opening
         self.bus.reopen()
         engine = self.engine = await create_engine(self.db_url)
         index = self.index = TaskIndex(engine)
@@ -563,7 +564,14 @@ class AgentHost:
         push_validator = None
         if push is not None:
             push_validator = make_push_url_validator(push.allow_private)
-            self.push_http = httpx.AsyncClient(follow_redirects=False, timeout=push.timeout_s)
+            # Each agent's sender caps its POSTs at max_concurrent_deliveries; size the pool so
+            # one agent's slow webhooks cannot exhaust the connections of the others.
+            slots = push.max_concurrent_deliveries * max(1, len(self.specs))
+            self.push_http = httpx.AsyncClient(
+                follow_redirects=False,
+                timeout=push.timeout_s,
+                limits=httpx.Limits(max_connections=slots, max_keepalive_connections=slots),
+            )
         for agent_id, spec in self.specs.items():
             store = task_store_for(engine, agent_id)
             await store.initialize()
@@ -577,7 +585,12 @@ class AgentHost:
             push_kwargs: dict[str, Any] = {}
             if push is not None:
                 assert self.push_http is not None
-                push_store = push_config_store_for(engine, agent_id, encryption_key=push_key)
+                push_store = push_config_store_for(
+                    engine,
+                    agent_id,
+                    fernet=push_fernet,
+                    max_configs_per_task=push.max_configs_per_task,
+                )
                 await push_store.initialize()
                 sender = GuardedPushSender(
                     self.push_http,
@@ -697,8 +710,9 @@ class AgentHost:
             raise RuntimeError("not canceled")
 
     def push_stats(self, agent_id: str) -> dict[str, int]:
-        """Delivery counters of one agent's push sender (delivered, failed, retries, ...)."""
-        return dict(self.push_senders[agent_id].stats)
+        """Delivery counters of one agent's push sender (delivered, failed, retries,
+        skipped_unsafe, dropped, pending)."""
+        return self.push_senders[agent_id].counters()
 
     async def shutdown(self) -> None:
         # Order matters: end event streams, stop the executors, flush pending push
