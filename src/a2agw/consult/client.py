@@ -368,6 +368,15 @@ class PartnerClient:
     def _bulkhead(self, partner_id: str) -> Bulkhead:
         return self._bulkheads.setdefault(partner_id, Bulkhead())
 
+    def partner_stats(self, partner_id: str) -> dict[str, Any]:
+        """Read-only resilience snapshot for the admin API; creates no per-partner state."""
+        breaker = self._breakers.get(partner_id)
+        bulkhead = self._bulkheads.get(partner_id)
+        return {
+            "breaker_state": breaker.state if breaker is not None else "closed",
+            "in_flight": bulkhead.in_use if bulkhead is not None else 0,
+        }
+
     def _admit(self, partner_id: str) -> _Probe | None:
         breaker = self._breaker(partner_id)
         probing = breaker.state == "half_open"

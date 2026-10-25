@@ -24,6 +24,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import BaseRoute, Mount, get_route_path
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from a2agw.ops.admin import ADMIN_PREFIX, HEALTH_PATH, admin_routes
 from a2agw.ops.bus import EventBus
 from a2agw.security.auth import (
     AuthConfig,
@@ -45,7 +46,7 @@ from a2agw.serve.store import (
 )
 
 CARD_PATH = "/.well-known/agent-card.json"
-HEALTH_PATH = "/a2agw/admin/healthz"
+__all__ = ["ADMIN_PREFIX", "HEALTH_PATH", "AgentHost"]
 
 
 class LimitedRequestHandler(DefaultRequestHandler):
@@ -232,12 +233,16 @@ class AgentHost:
         db_url: str = "sqlite+aiosqlite:///a2agw.db",
         max_body_bytes: int = 10 * 1024 * 1024,
         max_parts: int = 64,
+        admin: bool = True,
+        admin_without_auth: bool = False,
     ) -> None:
         self.base_url = base_url
         self.auth = auth
         self.db_url = db_url
         self.max_body_bytes = max_body_bytes
         self.max_parts = max_parts
+        self.admin = admin
+        self.admin_without_auth = admin_without_auth  # dev only: open admin when auth is None
         self.bus = EventBus()
         self.specs: dict[str, AgentSpec] = {}
         self.executors: dict[str, AdapterExecutor] = {}
@@ -336,7 +341,12 @@ class AgentHost:
                 await self.shutdown()
 
         app = Starlette(
-            routes=[*self.extra_routes, Mount("/", app=self._delegate)], lifespan=lifespan
+            routes=[
+                *self.extra_routes,
+                *(admin_routes(self) if self.admin else []),
+                Mount("/", app=self._delegate),
+            ],
+            lifespan=lifespan,
         )
         # add_middleware prepends, so the last one added is outermost.
         if self.auth is not None:
