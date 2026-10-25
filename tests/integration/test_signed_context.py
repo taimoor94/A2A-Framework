@@ -57,6 +57,8 @@ def gw_keys(tmp_path):
         "a": CallContextSigner(a_priv, "gw-a", "ES256", "https://a.example"),
         "b": CallContextSigner(b_priv, "gw-b", "ES256", "https://b.example"),
         "verifier": CallContextVerifier(trusted),
+        "trusts_a": CallContextVerifier({"gw-a": trusted["gw-a"]}),
+        "trusts_b": CallContextVerifier({"gw-b": trusted["gw-b"]}),
     }
 
 
@@ -271,8 +273,9 @@ async def test_two_gateway_loop(two_gateways, gw_keys, signed):
 
     a_kw = b_kw = {}
     if signed:
-        a_kw = {"context_signer": gw_keys["a"], "context_verifier": gw_keys["verifier"]}
-        b_kw = {"context_signer": gw_keys["b"], "context_verifier": gw_keys["verifier"]}
+        # Each gateway trusts only the other's issuer: the host adds its own key itself.
+        a_kw = {"context_signer": gw_keys["a"], "context_verifier": gw_keys["trusts_b"]}
+        b_kw = {"context_signer": gw_keys["b"], "context_verifier": gw_keys["trusts_a"]}
     host_a, host_b, b_hc = await two_gateways(
         [spec("a", Fn(a_run))], [spec("b", Fn(b_run))], a_kw=a_kw, b_kw=b_kw
     )
@@ -311,3 +314,29 @@ async def test_signing_failure_fails_closed(env, gw_keys, monkeypatch):
     assert (res.state, res.reason) == ("unavailable", "signing failed")
     assert ran == []
     assert len(e.partner_hc._transport.requests) == sent_before
+
+
+def test_host_adds_own_key_to_verifier(tmp_path, gw_keys):
+    trusts_b = gw_keys["trusts_b"]
+    host = AgentHost(
+        "http://a", context_signer=gw_keys["a"], context_verifier=trusts_b, audit=False
+    )
+    assert set(host.context_verifier.trusted) == {"gw-a", "gw-b"}
+    assert host.context_verifier.trusted["gw-a"][0] == "https://a.example"
+    assert set(trusts_b.trusted) == {"gw-b"}  # the caller's verifier is not mutated
+    cc = CallContext(origin="o", root_agent="a", path=("a",))
+    assert host.context_verifier.verify(gw_keys["a"].sign(cc)) == cc
+    # Already trusted with the same issuer and key: accepted as is.
+    both = AgentHost("http://a", context_signer=gw_keys["a"], context_verifier=gw_keys["verifier"])
+    assert set(both.context_verifier.trusted) == {"gw-a", "gw-b"}
+    # Only a verifier, or only a signer: nothing to add.
+    assert AgentHost("http://a", context_verifier=trusts_b).context_verifier is trusts_b
+
+
+def test_host_rejects_conflicting_own_kid(gw_keys):
+    clash = CallContextVerifier({"gw-a": ("https://a.example", gw_keys["b"].public_jwk())})
+    with pytest.raises(ValueError, match="gw-a"):
+        AgentHost("http://a", context_signer=gw_keys["a"], context_verifier=clash)
+    clash = CallContextVerifier({"gw-a": ("https://evil.example", gw_keys["a"].public_jwk())})
+    with pytest.raises(ValueError, match="gw-a"):
+        AgentHost("http://a", context_signer=gw_keys["a"], context_verifier=clash)

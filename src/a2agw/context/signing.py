@@ -23,7 +23,13 @@ Inbound rule:
 
 Token: header ``{"alg", "kid", "typ": "a2agw-cc+jwt"}``; claims ``cc`` (the call-context
 object), ``iss``, ``iat``, ``nbf`` = ``iat``, ``exp`` = the context deadline (truncated) but
-at most ``iat`` + 600 s, and a random ``jti``. Allowed algorithms: ES256, RS256, EdDSA.
+at most ``iat`` + 600 s, and a random ``jti``. Allowed algorithms: ES256, RS256, EdDSA. The
+verifier enforces that bound too: it refuses ``exp - iat > 600`` and an ``iat`` older than
+600 s plus the 30 s leeway, whatever the signer put in ``exp``.
+
+``AgentHost`` with both a signer and a verifier trusts its own signing key automatically
+(``CallContextVerifier.with_trusted``), so a token it signed and a partner forwarded back
+verifies, and the loop shows as a cycle.
 
 A verified token is a bearer assertion until it expires: a partner may replay it, unchanged,
 for up to ten minutes. Signing never weakens Phase 1: a partner that drops the token falls
@@ -42,6 +48,7 @@ from typing import Any
 
 import jwt
 from jwt import PyJWK
+from jwt.algorithms import get_default_algorithms
 
 from a2agw.context.call_context import (
     EXTENSION_URI,
@@ -49,7 +56,13 @@ from a2agw.context.call_context import (
     CallContext,
     CallContextViolation,
 )
-from a2agw.security.cardsign import ALGORITHMS, Alg, _check_bound_alg, load_private_key
+from a2agw.security.cardsign import (
+    ALGORITHMS,
+    Alg,
+    check_bound_alg,
+    jwk_thumbprint,
+    load_private_key,
+)
 
 JWS_METADATA_KEY = f"{EXTENSION_URI}#jws"
 TYP = "a2agw-cc+jwt"
@@ -76,6 +89,12 @@ class CallContextSigner:
         self.alg = alg
         self.issuer = issuer
         self._key = key
+
+    def public_jwk(self) -> PyJWK:
+        """The public half of this signer's key, for a verifier's trusted map."""
+        alg = get_default_algorithms()[self.alg]
+        data = alg.to_jwk(self._key.key.public_key(), as_dict=True)
+        return PyJWK(data, algorithm=self.alg)
 
     def sign(self, cc: CallContext) -> str:
         """A compact JWS over ``cc``; ``exp`` never exceeds ``cc.deadline``."""
@@ -104,10 +123,21 @@ class CallContextVerifier:
             if not kid or not isinstance(issuer, str) or not issuer:
                 raise ValueError("every trusted key needs a non-empty kid and issuer")
             try:
-                _check_bound_alg(key)
+                check_bound_alg(key)
             except ValueError:
                 raise ValueError(f"trusted key {kid!r} is not an allowed key/algorithm") from None
             self.trusted[kid] = (issuer, key)
+
+    def with_trusted(self, kid: str, issuer: str, key: PyJWK) -> CallContextVerifier:
+        """A new verifier that also trusts ``kid`` -> (issuer, key); this one is unchanged.
+
+        ValueError if ``kid`` is already trusted with a different issuer or key."""
+        known = self.trusted.get(kid)
+        if known is not None:
+            if known[0] != issuer or jwk_thumbprint(known[1]) != jwk_thumbprint(key):
+                raise ValueError(f"kid {kid!r} is already trusted with a different issuer or key")
+            return self
+        return CallContextVerifier({**self.trusted, kid: (issuer, key)})
 
     def verify(self, token: Any) -> CallContext:
         """The signed CallContext, or ``CallContextViolation("bad signature")``."""
@@ -136,6 +166,13 @@ class CallContextVerifier:
             leeway=LEEWAY_S,
             options={"require": ["exp", "iat", "iss"], "verify_aud": False},
         )
+        # Bound the lifetime ourselves: a trusted signer's long-lived or long-ago token is
+        # still refused (exp - iat <= 600 s, and iat no older than that plus leeway).
+        iat, exp = claims["iat"], claims["exp"]
+        if not isinstance(iat, int | float) or not isinstance(exp, int | float):
+            raise TypeError
+        if exp - iat > MAX_LIFETIME_S or iat < time.time() - MAX_LIFETIME_S - LEEWAY_S:
+            raise ValueError
         raw = claims.get("cc")
         if not isinstance(raw, Mapping):
             raise TypeError

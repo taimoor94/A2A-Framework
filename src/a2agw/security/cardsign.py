@@ -159,14 +159,14 @@ def _parse_jwks(body: bytes, reserved_kids: frozenset[str]) -> dict[str, PyJWK]:
             continue  # symmetric or private material is never a verification key
         try:
             jwk = PyJWK(item)
-            _check_bound_alg(jwk)
+            check_bound_alg(jwk)
         except (PyJWKError, ValueError, TypeError):
             continue
         out[item["kid"]] = jwk
     return out
 
 
-def _check_bound_alg(jwk: PyJWK) -> None:
+def check_bound_alg(jwk: PyJWK) -> None:
     """ValueError unless the key's type passes the key rules and matches its bound algorithm."""
     if jwk.algorithm_name not in ALGORITHMS or _alg_for(jwk.key) != jwk.algorithm_name:
         raise ValueError("key type does not match its algorithm")
@@ -224,7 +224,7 @@ class CardVerifier:
         self.trusted = dict(trusted or {})
         for kid, key in self.trusted.items():
             try:
-                _check_bound_alg(key)
+                check_bound_alg(key)
             except ValueError:
                 raise ValueError(f"trusted key {kid!r} is not an allowed key/algorithm") from None
         for url in jwks_urls:

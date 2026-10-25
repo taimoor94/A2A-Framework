@@ -29,7 +29,7 @@ from a2agw.context.signing import (
     CallContextSigner,
     CallContextVerifier,
 )
-from a2agw.security.cardsign import load_public_key
+from a2agw.security.cardsign import jwk_thumbprint, load_public_key
 from a2agw.serve.agent import AgentSpec, SkillSpec
 from a2agw.serve.executor import AdapterExecutor
 
@@ -373,3 +373,50 @@ def test_admit_no_jws_unchanged_with_verifier(ec_pair):
     assert reason == "" and cc is not None and cc.path == ("x",)
     cc, reason = _executor(verifier)._admit(_message(_cc(path=("a",))))
     assert (cc, reason) == (None, "cycle detected")
+
+
+def test_lifetime_over_cap_rejected(ec_pair):
+    """A long-lived token (expiry ten years out) is refused even though it has not expired."""
+    _, verifier, priv = ec_pair
+    now = int(time.time())
+    _bad(verifier, _forge(priv, _claims(_cc(), exp=now + 10 * 365 * 86_400)))
+    _bad(verifier, _forge(priv, _claims(_cc(), exp=now + 601)))
+    cc = _cc()
+    assert verifier.verify(_forge(priv, _claims(cc, exp=now + 600))) == cc
+
+
+def test_old_iat_rejected(ec_pair):
+    """A token issued a year ago is refused, whatever its exp says."""
+    _, verifier, priv = ec_pair
+    now = int(time.time())
+    old = now - 365 * 86_400
+    _bad(verifier, _forge(priv, _claims(_cc(), iat=old, nbf=old, exp=now + 60)))
+    edge = now - 600 - 30 - 5
+    _bad(verifier, _forge(priv, _claims(_cc(), iat=edge, nbf=edge, exp=now + 10)))
+
+
+def test_public_jwk_verifies_own_tokens(keys):
+    for alg, (priv, pub) in keys.items():
+        signer = CallContextSigner(priv, "k", alg, "gw")
+        jwk = signer.public_jwk()
+        assert jwk.algorithm_name == alg
+        assert not hasattr(jwk.key, "private_bytes")  # public half only
+        assert jwk_thumbprint(jwk) == jwk_thumbprint(load_public_key(pub))
+        cc = _cc()
+        assert CallContextVerifier({"k": ("gw", jwk)}).verify(signer.sign(cc)) == cc
+
+
+def test_with_trusted(ec_pair, keys):
+    signer, verifier, _ = ec_pair
+    own = signer.public_jwk()
+    # Same kid, issuer and key: no change, no error.
+    same = verifier.with_trusted("gw-a", "https://a.example", own)
+    assert set(same.trusted) == {"gw-a"}
+    # A new kid is added to a copy; the original verifier is untouched.
+    more = verifier.with_trusted("gw-z", "https://z.example", own)
+    assert set(more.trusted) == {"gw-a", "gw-z"} and set(verifier.trusted) == {"gw-a"}
+    with pytest.raises(ValueError, match="different issuer or key"):
+        verifier.with_trusted("gw-a", "https://other.example", own)
+    other = load_public_key(keys["RS256"][1])
+    with pytest.raises(ValueError, match="different issuer or key"):
+        verifier.with_trusted("gw-a", "https://a.example", other)

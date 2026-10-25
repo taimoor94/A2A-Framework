@@ -556,6 +556,12 @@ class AgentHost:
         self.base_url = base_url
         # Signed call contexts between gateways (a2agw.context.signing): the signer signs the
         # call context of every outbound consult; the verifier lets agents trust a signed one.
+        # With both set, the host trusts its own key: a token it signed and a partner forwarded
+        # back must verify for the loop to show as a cycle. ValueError on a kid conflict.
+        if context_signer is not None and context_verifier is not None:
+            context_verifier = context_verifier.with_trusted(
+                context_signer.kid, context_signer.issuer, context_signer.public_jwk()
+            )
         self.context_signer = context_signer
         self.context_verifier = context_verifier
         # Push notifications (A2A webhooks). None: not offered, and the card says so.
