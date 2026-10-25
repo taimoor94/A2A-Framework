@@ -96,7 +96,7 @@ def _size_label(n: int) -> str:
     return f"{n // mib} MiB" if n % mib == 0 else f"{n} bytes"
 
 
-async def _safe_get(
+async def safe_get(
     url: str,
     tier: Tier,
     *,

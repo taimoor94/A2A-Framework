@@ -19,15 +19,15 @@ from a2a.client.card_resolver import parse_agent_card
 from a2a.types import AgentCard
 from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH
 from google.protobuf.json_format import MessageToDict
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from a2agw.consult.netguard import (
     FetchError,
     Tier,
     UnsafeURL,
-    _safe_get,
     check_url,
     check_url_syntax,
+    safe_get,
 )
 from a2agw.security.cardsign import CardSignatureError, CardVerifier
 
@@ -37,7 +37,7 @@ _ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 # Everything except these top-level fields is significant (name/description reach LLM tool text).
 COSMETIC_FIELDS = frozenset({"version", "documentationUrl", "iconUrl", "provider"})
 # Signature bytes are not content (ECDSA re-signs differ every time); a change of signing key
-# is judged separately, by the verified kid.
+# is judged separately, by the verified key id.
 _NOT_COMPARED = COSMETIC_FIELDS | {"signatures"}
 
 Status = Literal["active", "quarantined", "disabled"]
@@ -66,10 +66,20 @@ class PartnerRecord(BaseModel):
     fetched_at: float = 0.0
     ttl_s: int = 3600
     pending_card: dict[str, Any] | None = None
-    # kid of the key that verified `card` / `pending_card` (None when the tier is not
-    # signature-checked). Both default to None so Phase 1 partner files still load.
-    signed_kid: str | None = None
-    pending_kid: str | None = None
+    # VerifiedKey.id ("source#kid#thumbprint") of the key that verified `card` /
+    # `pending_card`; None when the tier is not signature-checked. Both default to None so
+    # Phase 1 partner files still load.
+    signed_key_id: str | None = None
+    pending_key_id: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_legacy_kid_fields(cls, data: Any) -> Any:
+        # Early Phase 2 files pinned a bare kid, which is not a key identity. Drop it: the
+        # partner re-pins (via quarantine + approve) on its first verified refresh.
+        if isinstance(data, dict) and ("signed_kid" in data or "pending_kid" in data):
+            data = {k: v for k, v in data.items() if k not in ("signed_kid", "pending_kid")}
+        return data
 
     @field_validator("id")
     @classmethod
@@ -125,7 +135,7 @@ class PartnerRegistry:
     async def _fetch(self, card_url: str, tier: Tier) -> dict[str, Any]:
         url = _card_urls(card_url)
         try:
-            body = await _safe_get(
+            body = await safe_get(
                 url, tier, max_bytes=MAX_CARD_BYTES, deadline_s=FETCH_TIMEOUT_S, http=self._http
             )
         except UnsafeURL as e:
@@ -141,7 +151,7 @@ class PartnerRegistry:
         return data
 
     async def _verify_signature(self, proto: AgentCard, tier: Tier) -> str | None:
-        """The verified kid when `tier` requires signed cards, else None (not checked).
+        """The verified key id when `tier` requires signed cards, else None (not checked).
 
         Raises CardSignatureError when a required signature does not verify. Any other
         error inside the verifier is reported the same way: verification fails closed."""
@@ -150,7 +160,7 @@ class PartnerRegistry:
         if self.verifier is None:  # unreachable via __init__; never treat as verified
             raise CardSignatureError("no card verifier configured")
         try:
-            return await self.verifier.verify(proto)
+            return (await self.verifier.verify(proto)).id
         except CardSignatureError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -198,7 +208,7 @@ class PartnerRegistry:
     async def _add(self, id, raw, tier, url, credential_ref, tags) -> PartnerRecord:
         card, proto = _normalize(raw)
         try:
-            kid = await self._verify_signature(proto, tier)
+            key_id = await self._verify_signature(proto, tier)
         except CardSignatureError:
             raise CardFetchError("card signature invalid") from None
         await self._check_endpoints(proto, tier)
@@ -213,7 +223,7 @@ class PartnerRegistry:
             credential_ref=credential_ref,
             tags=list(tags),
             fetched_at=time.time(),
-            signed_kid=kid,
+            signed_key_id=key_id,
         )
         self._records[id] = rec
         self._changed(rec, "added")
@@ -232,9 +242,9 @@ class PartnerRegistry:
         card, proto = _normalize(raw)
         signature_ok = True
         try:
-            kid = await self._verify_signature(proto, rec.tier)
+            key_id = await self._verify_signature(proto, rec.tier)
         except CardSignatureError:
-            signature_ok, kid = False, None
+            signature_ok, key_id = False, None
         if signature_ok:
             await self._check_endpoints(proto, rec.tier)
         if self._records.get(id) is not rec or rec.status == "disabled":
@@ -242,21 +252,26 @@ class PartnerRegistry:
         rec.fetched_at = time.time()
         if not signature_ok:
             # Fail closed, and never stage an unverified card for approval.
-            rec.pending_card = rec.pending_kid = None
+            rec.pending_card = rec.pending_key_id = None
             rec.status = "quarantined"
             self._changed(rec, "quarantined")
             return "quarantined"
         new_hash = card_hash(card)
-        key_changed = rec.tier in self.require_signed and kid != rec.signed_kid
+        # Any change of key identity (source, kid or key material) is significant.
+        key_changed = rec.tier in self.require_signed and key_id != rec.signed_key_id
         if key_changed or _significant_differs(rec.card, card):
-            rec.pending_card, rec.pending_kid = card, kid
+            rec.pending_card, rec.pending_key_id = card, key_id
             rec.status = "quarantined"
             self._changed(rec, "quarantined")
             return "quarantined"
         # Same significant content (and key) as the approved card: apply cosmetics, lift quarantine.
         changed = new_hash != rec.card_hash or rec.status == "quarantined"
+        if rec.tier not in self.require_signed and rec.signed_key_id is not None:
+            # Not verified this time: drop the stale pin so it cannot silently match later.
+            rec.signed_key_id = None
+            changed = True
         rec.card, rec.card_hash = card, new_hash
-        rec.pending_card = rec.pending_kid = None
+        rec.pending_card = rec.pending_key_id = None
         rec.status = "active"
         if changed:
             self._changed(rec, "updated")
@@ -273,8 +288,8 @@ class PartnerRegistry:
                 raise ValueError("pending card changed since it was reviewed")
             rec.card = rec.pending_card
             rec.card_hash = card_hash(rec.card)
-            rec.signed_kid = rec.pending_kid
-            rec.pending_card = rec.pending_kid = None
+            rec.signed_key_id = rec.pending_key_id
+            rec.pending_card = rec.pending_key_id = None
         elif expected_hash is not None and expected_hash != rec.card_hash:
             raise ValueError("card changed since it was reviewed")
         rec.status = "active"

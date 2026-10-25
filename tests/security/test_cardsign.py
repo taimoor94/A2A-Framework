@@ -106,7 +106,7 @@ async def test_sign_then_verify_roundtrip_es256_and_eddsa(keys, name):
     assert len(signed.signatures) == 1
     header = json.loads(base64url_decode(signed.signatures[0].protected))
     assert header["kid"] == "k1" and header["alg"] == keys[name][2] and "jku" not in header
-    assert await CardVerifier(trusted(keys, name)).verify(signed) == "k1"
+    assert (await CardVerifier(trusted(keys, name)).verify(signed)).kid == "k1"
 
 
 async def test_sign_does_not_mutate_input(keys):
@@ -167,7 +167,7 @@ async def test_verify_rejects_alg_none_and_hs256(keys):
 async def test_verify_accepts_if_any_signature_is_valid(keys):
     c = signer(keys, "ed", kid="untrusted").sign(card())
     c = signer(keys, "ec", kid="k1").sign(c)
-    assert await CardVerifier(trusted(keys, "ec")).verify(c) == "k1"
+    assert (await CardVerifier(trusted(keys, "ec")).verify(c)).kid == "k1"
 
 
 def _jwks(keys, name, kid):
@@ -182,8 +182,8 @@ async def test_jwks_from_allowlisted_jku_verifies_and_is_cached(keys):
     route = respx.get(JKU).respond(200, json=_jwks(keys, "ec", "k7"))
     verifier = CardVerifier(jwks_urls=[JKU])
     signed = signer(keys, "ec", kid="k7", jku=JKU).sign(card())
-    assert await verifier.verify(signed) == "k7"
-    assert await verifier.verify(signed) == "k7"
+    assert (await verifier.verify(signed)).kid == "k7"
+    assert (await verifier.verify(signed)).kid == "k7"
     assert route.call_count == 1
 
 
@@ -305,5 +305,123 @@ async def test_host_serves_signed_card(env, keys):
         assert r.headers["cache-control"] == "public, max-age=300"
         body = r.json()
         assert len(body["signatures"]) == 1
-        assert await verifier.verify(parse_agent_card(body)) == "k1"
+        assert (await verifier.verify(parse_agent_card(body))).kid == "k1"
     assert len(e.host.cards["alpha"].signatures) == 1
+
+
+# -- key identity, JWKS refetch and look-alikes (review fix round 1) -----------
+
+RFC7638_N = (
+    "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECP"
+    "ebWKRXjBZCiFV4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6Cf0h4QyQ5v-65YGjQR0_FDW2Qvzq"
+    "Y368QQMicAtaSqzs8KJZgnYb9c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTWhAI4vMQFh6WeZu0"
+    "fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1jF44-csFCur-kEgU8awapJzKnqDKgw"
+)
+
+
+def test_thumbprint_matches_rfc7638_example():
+    from jwt import PyJWK
+
+    from a2agw.security.cardsign import jwk_thumbprint
+
+    jwk = PyJWK({"kty": "RSA", "n": RFC7638_N, "e": "AQAB", "alg": "RS256", "kid": "2011-04-29"})
+    assert jwk_thumbprint(jwk) == "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs"
+
+
+@respx.mock
+async def test_verified_key_is_source_qualified(keys):
+    from a2agw.security.cardsign import jwk_thumbprint
+
+    pinned = await CardVerifier(trusted(keys, "ec")).verify(signer(keys, "ec").sign(card()))
+    thumb = jwk_thumbprint(load_public_key(keys["ec"][1]))
+    assert (pinned.kid, pinned.source, pinned.thumbprint) == ("k1", "trusted", thumb)
+    assert pinned.id == f"trusted#k1#{thumb}"
+    respx.get(JKU).respond(200, json=_jwks(keys, "ec", "k1"))
+    via_jwks = await CardVerifier(jwks_urls=[JKU]).verify(signer(keys, "ec", jku=JKU).sign(card()))
+    assert via_jwks.source == JKU and via_jwks.thumbprint == thumb
+    assert via_jwks.id != pinned.id
+
+
+@respx.mock
+async def test_jwks_key_cannot_shadow_trusted_kid(keys):
+    respx.get(JKU).respond(200, json=_jwks(keys, "ed", "k1"))
+    signed = signer(keys, "ed", kid="k1", jku=JKU).sign(card())
+    with pytest.raises(CardSignatureError):
+        await CardVerifier(trusted(keys, "ec"), jwks_urls=[JKU]).verify(signed)
+
+
+@respx.mock
+async def test_unknown_kid_forces_rate_limited_refetch(keys):
+    import time
+
+    route = respx.get(JKU).respond(200, json=_jwks(keys, "ec", "old"))
+    verifier = CardVerifier(jwks_urls=[JKU])
+    await verifier.verify(signer(keys, "ec", kid="old", jku=JKU).sign(card()))
+    # The partner rotates: the JWKS now publishes the new kid.
+    route.respond(200, json=_jwks(keys, "rsa", "new"))
+    rotated = signer(keys, "rsa", kid="new", jku=JKU).sign(card())
+    # Fetched moments ago: no bypass yet (at most once per JWKS_REFETCH_MIN_S).
+    with pytest.raises(CardSignatureError):
+        await verifier.verify(rotated)
+    assert route.call_count == 1
+    # 61 s later (well inside the 300 s TTL) an unknown kid bypasses the cache once.
+    _fetched_at, cached = verifier._jwks[JKU]
+    verifier._jwks[JKU] = (time.monotonic() - 61, cached)
+    assert (await verifier.verify(rotated)).kid == "new"
+    assert route.call_count == 2
+    # A known kid inside the TTL never refetches.
+    assert (await verifier.verify(rotated)).kid == "new"
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_failed_jwks_fetch_remembered_within_one_verify(keys):
+    route = respx.get(JKU).respond(500)
+    c = card()
+    for i in range(8):
+        c = signer(keys, "ec", kid=f"k{i}", jku=JKU).sign(c)
+    with pytest.raises(CardSignatureError, match="jwks fetch failed"):
+        await CardVerifier(jwks_urls=[JKU]).verify(c)
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_jwks_redirect_not_followed(keys):
+    route = respx.get(JKU).respond(302, headers={"location": "https://169.254.169.254/"})
+    signed = signer(keys, "ec", kid="k7", jku=JKU).sign(card())
+    with pytest.raises(CardSignatureError, match="redirect"):
+        await CardVerifier(jwks_urls=[JKU]).verify(signed)
+    assert route.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "jku",
+    [
+        "https://keys.example.com.evil.com/jwks.json",
+        JKU + "?x=1",
+        JKU + "/",
+        "https://keys.example.com/jwks.json#frag",
+        "HTTPS://keys.example.com/jwks.json",
+    ],
+)
+async def test_lookalike_jku_ignored(keys, jku):
+    with respx.mock(assert_all_called=False) as router:
+        route = router.route().respond(200, json=_jwks(keys, "ec", "k7"))
+        signed = signer(keys, "ec", kid="k7", jku=jku).sign(card())
+        with pytest.raises(CardSignatureError):
+            await CardVerifier(jwks_urls=[JKU]).verify(signed)
+    assert not route.called
+
+
+def test_trusted_keys_checked_like_jwks_keys(tmp_path):
+    from jwt import PyJWK
+    from jwt.algorithms import ECAlgorithm, RSAAlgorithm
+
+    small_rsa = rsa.generate_private_key(public_exponent=65537, key_size=1024).public_key()
+    weak = PyJWK(RSAAlgorithm.to_jwk(small_rsa, as_dict=True), algorithm="RS256")
+    with pytest.raises(ValueError):
+        CardVerifier({"k1": weak})
+    p384 = ec.generate_private_key(ec.SECP384R1()).public_key()
+    mislabeled = PyJWK(ECAlgorithm.to_jwk(p384, as_dict=True), algorithm="ES256")
+    with pytest.raises(ValueError):
+        CardVerifier({"k1": mislabeled})

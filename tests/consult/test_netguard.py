@@ -94,3 +94,20 @@ async def test_unresolvable_rejected_for_non_internal(monkeypatch):
 async def test_internal_allows_private_http():
     await check_url("http://10.0.0.5:8080/", "internal")
     await check_url("http://t", "internal")
+
+
+async def test_safe_get_deadline_covers_dns(monkeypatch):
+    import asyncio as _asyncio
+    import time as _time
+
+    async def slow(host):
+        await _asyncio.sleep(5)
+        return ["93.184.216.34"]
+
+    monkeypatch.setattr(netguard, "_resolve", slow)
+    t = _time.monotonic()
+    with pytest.raises(netguard.FetchError, match="timed out"):
+        await netguard.safe_get(
+            "https://slow.example.com/x", "public", max_bytes=10, deadline_s=0.2
+        )
+    assert _time.monotonic() - t < 1.0

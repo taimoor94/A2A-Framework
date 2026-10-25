@@ -457,6 +457,13 @@ def signing(tmp_path):
     return verifier, sign
 
 
+def pinned(key_id):
+    """The kid of a key id pinned from a trusted (not JWKS) key."""
+    source, kid, thumbprint = key_id.split("#")
+    assert source == "trusted" and len(thumbprint) == 43
+    return kid
+
+
 def signed_registry(verifier, path=None):
     return PartnerRegistry(path, verifier=verifier, require_signed=frozenset({"public"}))
 
@@ -480,11 +487,11 @@ async def test_registry_requires_signature_for_public_tier(signing):
         await reg.add_from_card("p1", tampered, "public")
     assert reg.all() == []
     rec = await reg.add_from_card("p1", sign(CARD), "public")
-    assert rec.signed_kid == "k1" and rec.status == "active"
+    assert pinned(rec.signed_key_id) == "k1" and rec.status == "active"
     # Tiers outside require_signed are not verified.
-    assert (await reg.add_from_card("p2", CARD, "partner")).signed_kid is None
+    assert (await reg.add_from_card("p2", CARD, "partner")).signed_key_id is None
     respx.get(CARD_URL).respond(200, json=sign(CARD, "k2"))
-    assert (await reg.add_from_url("p3", URL, "public")).signed_kid == "k2"
+    assert pinned((await reg.add_from_url("p3", URL, "public")).signed_key_id) == "k2"
 
 
 @respx.mock
@@ -503,12 +510,12 @@ async def test_refresh_with_new_kid_quarantines(signing):
     route.respond(200, json=sign(CARD, "k2"))
     assert await reg.refresh("p1") == "quarantined"
     rec = reg.get("p1")
-    assert rec.status == "quarantined" and rec.signed_kid == "k1"
-    assert rec.pending_kid == "k2" and rec.pending_card is not None
+    assert rec.status == "quarantined" and pinned(rec.signed_key_id) == "k1"
+    assert pinned(rec.pending_key_id) == "k2" and rec.pending_card is not None
     assert events[-1] == "quarantined"
     reg.approve("p1", card_hash(rec.pending_card))
-    assert rec.status == "active" and rec.signed_kid == "k2"
-    assert rec.pending_kid is None and rec.pending_card is None
+    assert rec.status == "active" and pinned(rec.signed_key_id) == "k2"
+    assert rec.pending_key_id is None and rec.pending_card is None
     assert await reg.refresh("p1") == "unchanged"
     assert rec.status == "active"
 
@@ -523,23 +530,23 @@ async def test_refresh_with_bad_signature_quarantines(signing):
         route.respond(200, json=bad)
         assert await reg.refresh("p1") == "quarantined"
         rec = reg.get("p1")
-        assert rec.status == "quarantined" and rec.signed_kid == "k1"
+        assert rec.status == "quarantined" and pinned(rec.signed_key_id) == "k1"
         # An unverified card is never staged for approval.
-        assert rec.pending_card is None and rec.pending_kid is None
+        assert rec.pending_card is None and rec.pending_key_id is None
     # A good signature with the known key and the approved content lifts the quarantine.
     route.respond(200, json=sign(CARD))
     assert await reg.refresh("p1") == "unchanged"
     assert reg.get("p1").status == "active"
 
 
-async def test_signed_kid_persists(tmp_path, signing):
+async def test_signed_key_id_persists(tmp_path, signing):
     verifier, sign = signing
     p = tmp_path / "partners.yaml"
     reg = signed_registry(verifier, p)
     await reg.add_from_card("p1", sign(CARD), "public")
     reg2 = signed_registry(verifier, p)
     reg2.load()
-    assert reg2.get("p1").signed_kid == "k1"
+    assert pinned(reg2.get("p1").signed_key_id) == "k1"
     assert reg2.get("p1") == reg.get("p1")
 
 
@@ -572,7 +579,7 @@ def test_load_phase1_yaml_without_signed_kid(tmp_path):
     reg = PartnerRegistry(p)
     reg.load()
     rec = reg.get("p1")
-    assert rec.signed_kid is None and rec.pending_kid is None
+    assert rec.signed_key_id is None and rec.pending_key_id is None
     assert rec.status == "quarantined"
 
 
@@ -592,3 +599,95 @@ async def test_verifier_crash_fails_closed(signing):
     route.respond(200, json=sign(CARD))
     assert await reg.refresh("p1") == "quarantined"
     assert reg.get("p1").pending_card is None
+
+
+# -- source-qualified key identity (review fix round 1) ------------------------
+
+
+def _jwks_for(pub, kid):
+    from a2agw.security.cardsign import load_public_key
+
+    data = dict(load_public_key(pub)._jwk_data)
+    data["kid"] = kid
+    return {"keys": [data]}
+
+
+@respx.mock
+async def test_cross_partner_same_kid_quarantines(tmp_path):
+    """Regression (review probe): a kid string alone is not a key identity.
+
+    Partner A's key, published as "key-1" in A's allowlisted JWKS, signs a card served at
+    B's URL. B's pinned key is also "key-1", but from B's JWKS: this must quarantine."""
+    from a2a.client.card_resolver import parse_agent_card
+    from google.protobuf.json_format import MessageToDict
+
+    from a2agw.security.cardsign import CardSigner, CardVerifier
+
+    ja, jb = "https://a.example.com/jwks.json", "https://b.example.com/jwks.json"
+    (pa, qa), (pb, qb) = _keypair(tmp_path, "a"), _keypair(tmp_path, "b")
+    respx.get(ja).respond(200, json=_jwks_for(qa, "key-1"))
+    respx.get(jb).respond(200, json=_jwks_for(qb, "key-1"))
+
+    def signed_by(priv, jku):
+        signer = CardSigner(priv, "key-1", "ES256", jku=jku)
+        return MessageToDict(signer.sign(parse_agent_card(copy.deepcopy(CARD))))
+
+    route = respx.get(CARD_URL).respond(200, json=signed_by(pb, jb))
+    reg = PartnerRegistry(
+        verifier=CardVerifier(jwks_urls=[ja, jb]), require_signed=frozenset({"public"})
+    )
+    rec = await reg.add_from_url("b", URL, "public")
+    assert rec.signed_key_id.startswith(f"{jb}#key-1#")
+    route.respond(200, json=signed_by(pa, ja))
+    assert await reg.refresh("b") == "quarantined"
+    assert rec.status == "quarantined" and rec.signed_key_id.startswith(f"{jb}#key-1#")
+    assert rec.pending_key_id.startswith(f"{ja}#key-1#")
+    # Same kid and source but different key material is also a key change.
+    reg.approve("b")
+    (pc, qc) = _keypair(tmp_path, "c")
+    respx.get(ja).respond(200, json=_jwks_for(qc, "key-1"))
+    reg.verifier._jwks.clear()
+    route.respond(200, json=signed_by(pc, ja))
+    assert await reg.refresh("b") == "quarantined"
+    assert rec.pending_key_id.split("#")[:2] == rec.signed_key_id.split("#")[:2]
+
+
+async def test_legacy_signed_kid_dropped_and_repinned(tmp_path, signing):
+    verifier, sign = signing
+    p = tmp_path / "partners.yaml"
+    reg = signed_registry(verifier, p)
+    await reg.add_from_card("p1", sign(CARD), "public")
+    item = yaml.safe_load(p.read_text())["partners"][0]
+    del item["signed_key_id"], item["pending_key_id"]
+    item.update(signed_kid="k1", pending_kid=None, card_url=URL)
+    _write(p, [item])
+    reg2 = signed_registry(verifier, p)
+    reg2.load()
+    rec = reg2.get("p1")
+    assert rec.signed_key_id is None and rec.pending_key_id is None
+    assert "signed_kid" not in yaml.safe_dump(rec.model_dump(mode="json"))
+    # First verified refresh re-pins through quarantine + approve.
+    with respx.mock:
+        respx.get(CARD_URL).respond(200, json=sign(CARD))
+        assert await reg2.refresh("p1") == "quarantined"
+    reg2.approve("p1")
+    assert pinned(rec.signed_key_id) == "k1" and rec.status == "active"
+
+
+@respx.mock
+async def test_unverified_refresh_clears_stale_pin(tmp_path, signing):
+    verifier, sign = signing
+    p = tmp_path / "partners.yaml"
+    respx.get(CARD_URL).respond(200, json=sign(CARD))
+    reg = signed_registry(verifier, p)
+    await reg.add_from_url("p1", URL, "public")
+    assert reg.get("p1").signed_key_id is not None
+    # The same file, now served by a registry that does not check the public tier.
+    reg2 = PartnerRegistry(p)
+    reg2.load()
+    assert await reg2.refresh("p1") == "unchanged"
+    assert reg2.get("p1").signed_key_id is None
+    reg3 = signed_registry(verifier, p)
+    reg3.load()
+    assert reg3.get("p1").signed_key_id is None
+    assert await reg3.refresh("p1") == "quarantined"  # re-pin needs approval

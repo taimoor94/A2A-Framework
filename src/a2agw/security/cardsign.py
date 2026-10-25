@@ -7,9 +7,11 @@ module adds key loading, a fixed algorithm allowlist, key selection by `kid` (pi
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, get_args
 
@@ -26,15 +28,16 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
 from jwt import PyJWK
 from jwt.algorithms import ECAlgorithm, OKPAlgorithm, RSAAlgorithm
 from jwt.exceptions import PyJWKError
-from jwt.utils import base64url_decode
+from jwt.utils import base64url_decode, base64url_encode
 
-from a2agw.consult.netguard import FetchError, UnsafeURL, _safe_get, check_url_syntax
+from a2agw.consult.netguard import FetchError, UnsafeURL, check_url_syntax, safe_get
 
 Alg = Literal["ES256", "RS256", "EdDSA"]
 ALGORITHMS: tuple[str, ...] = get_args(Alg)
 JWKS_MAX_BYTES = 1024 * 1024
 JWKS_DEADLINE_S = 10.0
 JWKS_TTL_S = 300.0
+JWKS_REFETCH_MIN_S = 60.0  # unknown-kid cache bypass, at most once per URL per this
 MAX_SIGNATURES = 8  # signatures examined per card; more is a DoS lever, not a use case
 MIN_RSA_BITS = 2048
 
@@ -127,8 +130,11 @@ def _protected_header(sig: AgentCardSignature) -> dict[str, Any] | None:
     return header if isinstance(header, dict) else None
 
 
-def _parse_jwks(body: bytes) -> dict[str, PyJWK]:
-    """kid -> key for every usable asymmetric key in an allowed algorithm; the rest is dropped."""
+def _parse_jwks(body: bytes, reserved_kids: frozenset[str]) -> dict[str, PyJWK]:
+    """kid -> key for every usable asymmetric key in an allowed algorithm; the rest is dropped.
+
+    A key whose kid shadows a pinned (trusted) kid is dropped too: pinned kids always resolve
+    to the pinned key, so a JWKS can never stand in for one."""
     try:
         data = json.loads(body)
     except ValueError:
@@ -139,16 +145,54 @@ def _parse_jwks(body: bytes) -> dict[str, PyJWK]:
     for item in data["keys"]:
         if not isinstance(item, dict) or not isinstance(item.get("kid"), str):
             continue
+        if item["kid"] in reserved_kids:
+            continue
         if item.get("kty") not in ("EC", "RSA", "OKP") or "d" in item:
             continue  # symmetric or private material is never a verification key
         try:
             jwk = PyJWK(item)
-            _alg_for(jwk.key)
+            _check_bound_alg(jwk)
         except (PyJWKError, ValueError, TypeError):
             continue
-        if jwk.algorithm_name in ALGORITHMS:
-            out[item["kid"]] = jwk
+        out[item["kid"]] = jwk
     return out
+
+
+def _check_bound_alg(jwk: PyJWK) -> None:
+    """ValueError unless the key's type passes the key rules and matches its bound algorithm."""
+    if jwk.algorithm_name not in ALGORITHMS or _alg_for(jwk.key) != jwk.algorithm_name:
+        raise ValueError("key type does not match its algorithm")
+
+
+_THUMBPRINT_MEMBERS = {
+    "EC": ("crv", "kty", "x", "y"),
+    "RSA": ("e", "kty", "n"),
+    "OKP": ("crv", "kty", "x"),
+}
+
+
+def jwk_thumbprint(jwk: PyJWK) -> str:
+    """RFC 7638 SHA-256 thumbprint (base64url) of the public key behind `jwk`."""
+    key = jwk.key
+    if hasattr(key, "public_key"):
+        key = key.public_key()
+    data = _to_pyjwk(key)._jwk_data
+    members = {m: data[m] for m in _THUMBPRINT_MEMBERS[data["kty"]]}
+    canonical = json.dumps(members, sort_keys=True, separators=(",", ":"))
+    return base64url_encode(hashlib.sha256(canonical.encode("utf-8")).digest()).decode("ascii")
+
+
+@dataclass(frozen=True)
+class VerifiedKey:
+    """The key that verified a card. `source` is "trusted" (pinned) or the exact jku URL."""
+
+    kid: str
+    source: str
+    thumbprint: str
+
+    @property
+    def id(self) -> str:
+        return f"{self.source}#{self.kid}#{self.thumbprint}"
 
 
 def _fixed_key(key: PyJWK) -> Callable[[str | None, str | None], PyJWK]:
@@ -171,20 +215,19 @@ class CardVerifier:
     ) -> None:
         self.trusted = dict(trusted or {})
         for kid, key in self.trusted.items():
-            if key.algorithm_name not in ALGORITHMS:
-                raise ValueError(f"trusted key {kid!r} uses a disallowed algorithm")
+            try:
+                _check_bound_alg(key)
+            except ValueError:
+                raise ValueError(f"trusted key {kid!r} is not an allowed key/algorithm") from None
         for url in jwks_urls:
             check_url_syntax(url)
         self.jwks_urls = frozenset(jwks_urls)
         self._http = http
         self._jwks: dict[str, tuple[float, dict[str, PyJWK]]] = {}
 
-    async def _jwks_keys(self, url: str) -> dict[str, PyJWK]:
-        cached = self._jwks.get(url)
-        if cached is not None and time.monotonic() - cached[0] < JWKS_TTL_S:
-            return cached[1]
+    async def _fetch_jwks(self, url: str) -> dict[str, PyJWK]:
         try:
-            body = await _safe_get(
+            body = await safe_get(
                 url,
                 "public",
                 max_bytes=JWKS_MAX_BYTES,
@@ -195,21 +238,44 @@ class CardVerifier:
             raise CardSignatureError(f"jwks fetch refused: {e}") from None
         except FetchError as e:
             raise CardSignatureError(f"jwks fetch failed: {e}") from None
-        keys = _parse_jwks(body)
+        keys = _parse_jwks(body, frozenset(self.trusted))
         self._jwks[url] = (time.monotonic(), keys)
         return keys
 
-    async def _key_for(self, kid: str, jku: Any) -> PyJWK | None:
-        if kid in self.trusted:
-            return self.trusted[kid]
-        if isinstance(jku, str) and jku in self.jwks_urls:
-            return (await self._jwks_keys(jku)).get(kid)
-        return None  # a jku outside the allowlist is ignored
+    async def _jwks_key(self, url: str, kid: str) -> PyJWK | None:
+        cached = self._jwks.get(url)
+        if cached is None or time.monotonic() - cached[0] >= JWKS_TTL_S:
+            return (await self._fetch_jwks(url)).get(kid)
+        fetched_at, keys = cached
+        if kid in keys:
+            return keys[kid]
+        # Unknown kid: the partner may have rotated. Bypass the cache, at most once per
+        # JWKS_REFETCH_MIN_S per URL, so unknown kids cannot turn into a fetch flood.
+        if time.monotonic() - fetched_at >= JWKS_REFETCH_MIN_S:
+            return (await self._fetch_jwks(url)).get(kid)
+        return None
 
-    async def verify(self, card: AgentCard) -> str:
-        """Return the kid of the first signature that verifies, else raise CardSignatureError."""
+    async def _key_for(
+        self, kid: str, jku: Any, failed: dict[str, CardSignatureError]
+    ) -> tuple[PyJWK, str] | None:
+        if kid in self.trusted:
+            return self.trusted[kid], "trusted"
+        if not (isinstance(jku, str) and jku in self.jwks_urls):
+            return None  # a jku outside the allowlist is ignored
+        if jku in failed:  # one failed fetch per URL per verify call
+            raise failed[jku]
+        try:
+            key = await self._jwks_key(jku, kid)
+        except CardSignatureError as e:
+            failed[jku] = e
+            raise
+        return (key, jku) if key is not None else None
+
+    async def verify(self, card: AgentCard) -> VerifiedKey:
+        """Return the key of the first signature that verifies, else raise CardSignatureError."""
         if not card.signatures:
             raise CardSignatureError("card is not signed")
+        failed: dict[str, CardSignatureError] = {}
         fetch_error: CardSignatureError | None = None
         for sig in list(card.signatures)[:MAX_SIGNATURES]:
             header = _protected_header(sig)
@@ -219,11 +285,14 @@ class CardVerifier:
             if not isinstance(kid, str) or not kid or alg not in ALGORITHMS:
                 continue
             try:
-                key = await self._key_for(kid, header.get("jku"))
+                found = await self._key_for(kid, header.get("jku"), failed)
             except CardSignatureError as e:
                 fetch_error = fetch_error or e
                 continue
-            if key is None or key.algorithm_name != alg:
+            if found is None:
+                continue
+            key, source = found
+            if key.algorithm_name != alg:
                 continue
             single = AgentCard()
             single.CopyFrom(card)
@@ -234,7 +303,7 @@ class CardVerifier:
                 verifier(single)
             except Exception:  # noqa: BLE001, S112 - any failure means this signature is bad
                 continue
-            return kid
+            return VerifiedKey(kid=kid, source=source, thumbprint=jwk_thumbprint(key))
         if fetch_error is not None:
             raise fetch_error
         raise CardSignatureError("no signature verifies against a trusted key")
