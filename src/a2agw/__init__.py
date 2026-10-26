@@ -1,7 +1,8 @@
 """a2agw: a framework-agnostic A2A (Agent2Agent) gateway.
 
-The core never imports langchain or langgraph; the adapters live in
-``a2agw.adapters.langchain`` and ``a2agw.adapters.langgraph`` behind extras.
+The core never imports an agent framework; the adapters live in
+``a2agw.adapters.langchain``, ``a2agw.adapters.langgraph`` and
+``a2agw.adapters.openai_agents`` behind extras.
 """
 
 from a2agw.adapters.callable import agent

@@ -52,6 +52,8 @@ from starlette.types import Message, Receive, Scope, Send
 
 from a2agw.consult.registry import PartnerRecord
 from a2agw.consult.tools import UNTRUSTED_NOTE, PartnerTool, rejection
+from a2agw.consult.tools import strip_extensions as _strip_x
+from a2agw.consult.tools import with_untrusted_note as _describe
 from a2agw.gateway.auth import (
     AGENT_HEADER,
     MCP_EXTRA_HINT,
@@ -92,40 +94,6 @@ MAX_TRACKED_SESSIONS = 1024  # sessions told about tool list changes (most recen
 NOTIFY_TIMEOUT_S = 5.0
 _ERROR_STATES = frozenset({"failed", "rejected"})
 _NO_STORE = {"Cache-Control": "no-store"}
-
-
-# JSON Schema keywords whose value is a schema, a list of schemas, or a {name: schema} map.
-_SCHEMA = frozenset({"items", "additionalProperties", "not", "contains", "if", "then", "else"})
-_SCHEMAS = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
-_SCHEMA_MAPS = frozenset({"properties", "patternProperties", "$defs", "definitions"})
-
-
-def _strip_x(schema: Any) -> Any:
-    """``schema`` without its ``x-`` keywords (gateway-only limits clients need not know).
-    Only keyword positions are stripped: property names and values (``enum``, ``default``,
-    ...) are kept as they are."""
-    if not isinstance(schema, dict):
-        return schema
-    out: dict[str, Any] = {}
-    for k, v in schema.items():
-        if str(k).startswith("x-"):
-            continue
-        if k in _SCHEMA:
-            out[k] = _strip_x(v)
-        elif k in _SCHEMAS and isinstance(v, list):
-            out[k] = [_strip_x(x) for x in v]
-        elif k in _SCHEMA_MAPS and isinstance(v, dict):
-            out[k] = {name: _strip_x(sub) for name, sub in v.items()}
-        else:
-            out[k] = v
-    return out
-
-
-def _describe(description: str) -> str:
-    """A tool description that ends with ``UNTRUSTED_NOTE`` (exactly once)."""
-    if description.endswith(UNTRUSTED_NOTE):
-        return description
-    return description + "\n\n" + UNTRUSTED_NOTE
 
 
 def _result(envelope: dict[str, Any], *, error: bool | None = None) -> types.CallToolResult:

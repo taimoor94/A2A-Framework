@@ -348,6 +348,42 @@ def partner_tools(
     return tools + _companions()
 
 
+# -- native projections ------------------------------------------------------------------
+
+# JSON Schema keywords whose value is a schema, a list of schemas, or a {name: schema} map.
+_SCHEMA = frozenset({"items", "additionalProperties", "not", "contains", "if", "then", "else"})
+_SCHEMAS = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
+_SCHEMA_MAPS = frozenset({"properties", "patternProperties", "$defs", "definitions"})
+
+
+def strip_extensions(schema: Any) -> Any:
+    """A copy of ``schema`` without its ``x-`` keywords (gateway-only limits clients and LLM
+    providers need not know; ``invoke`` still enforces them). Only keyword positions are
+    stripped: property names and values (``enum``, ``default``, ...) are kept as they are."""
+    if not isinstance(schema, dict):
+        return schema
+    out: dict[str, Any] = {}
+    for k, v in schema.items():
+        if str(k).startswith("x-"):
+            continue
+        if k in _SCHEMA:
+            out[k] = strip_extensions(v)
+        elif k in _SCHEMAS and isinstance(v, list):
+            out[k] = [strip_extensions(x) for x in v]
+        elif k in _SCHEMA_MAPS and isinstance(v, dict):
+            out[k] = {name: strip_extensions(sub) for name, sub in v.items()}
+        else:
+            out[k] = v
+    return out
+
+
+def with_untrusted_note(description: str) -> str:
+    """A tool description that ends with ``UNTRUSTED_NOTE`` (exactly once)."""
+    if description.endswith(UNTRUSTED_NOTE):
+        return description
+    return description + "\n\n" + UNTRUSTED_NOTE
+
+
 # -- ranking -----------------------------------------------------------------------------
 
 

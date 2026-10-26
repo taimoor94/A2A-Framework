@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 import sys
@@ -12,6 +13,15 @@ pytest.importorskip("langchain_core")
 
 from a2a.client import ClientConfig, ClientFactory
 from a2a.types import Message, Part, Role, SendMessageRequest, TaskState
+from adapters.contract import (
+    FakePartnerClient,
+    assert_cancellable,
+    assert_failure_maps,
+    assert_multi_turn,
+    assert_projection,
+    assert_text_stream,
+    drive,
+)
 from google.protobuf.json_format import MessageToDict
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk
@@ -221,3 +231,36 @@ async def test_multi_delta_dict_chain_merged():
     [c] = [e for e in evs if isinstance(e, ArtifactChunk)]
     assert c.name == "result"
     assert MessageToDict(c.parts[0])["data"] == {"a": "x", "b": "y", "c": "z"}
+
+
+async def test_contract_kit():
+    seen: dict[str, list[str]] = {}
+
+    async def remembering(text, config):
+        history = seen.setdefault(config["configurable"]["thread_id"], [])
+        history.append(text)
+        yield "heard: "
+        yield ", ".join(history)
+
+    def boom(text):
+        raise RuntimeError("boom")
+
+    started, stopped = asyncio.Event(), asyncio.Event()
+
+    async def block(text):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    adapter = RunnableAdapter(RunnableLambda(remembering))
+    assert_text_stream(await drive(adapter, "hi"), "heard: hi")
+    await assert_multi_turn(adapter, "apples", "pears", "apples")
+    await assert_failure_maps(RunnableAdapter(RunnableLambda(boom)))
+    await assert_cancellable(
+        RunnableAdapter(RunnableLambda(block)), started=started, stopped=stopped
+    )
+    client = FakePartnerClient()
+    tools = as_langchain_tools(client.tools(), client)
+    await assert_projection(tools, lambda t, args: t.ainvoke(args), client=client)

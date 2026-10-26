@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import types
 import uuid
 from typing import Annotated, Any, TypedDict
@@ -11,6 +12,13 @@ pytest.importorskip("langgraph")
 
 from a2a.client import ClientConfig, ClientFactory
 from a2a.types import Message, Part, Role, SendMessageRequest, TaskState
+from adapters.contract import (
+    assert_cancellable,
+    assert_failure_maps,
+    assert_multi_turn,
+    assert_text_stream,
+    drive,
+)
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
@@ -408,3 +416,34 @@ async def test_durable_checkpointer_survives_restart(tmp_path):
             assert t2.status.state == TaskState.TASK_STATE_COMPLETED
         finally:
             await host2.shutdown()
+
+
+async def test_contract_kit():
+    def remembering(state: State):
+        heard = ", ".join(m.content for m in state["messages"] if m.type == "human")
+        return {"messages": [AIMessage(content=f"heard: {heard}")]}
+
+    def boom(state: State):
+        raise RuntimeError("boom")
+
+    started, stopped = asyncio.Event(), asyncio.Event()
+
+    async def block(state: State):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    def one_node(fn, checkpointer=None):
+        g = StateGraph(State)
+        g.add_node("n", fn)
+        g.add_edge(START, "n")
+        g.add_edge("n", END)
+        return GraphAdapter(g.compile(checkpointer=checkpointer))
+
+    adapter = one_node(remembering, InMemorySaver())
+    assert_text_stream(await drive(adapter, "hi"), "heard: hi")
+    await assert_multi_turn(adapter, "apples", "pears", "apples")
+    await assert_failure_maps(one_node(boom))
+    await assert_cancellable(one_node(block), started=started, stopped=stopped)

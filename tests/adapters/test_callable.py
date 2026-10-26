@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 import httpx
 import pytest
 from a2a.client import ClientConfig, ClientFactory
 from a2a.types import Message, Part, Role, SendMessageRequest, TaskState
+from adapters.contract import (
+    FakePartnerClient,
+    assert_cancellable,
+    assert_failure_maps,
+    assert_multi_turn,
+    assert_projection,
+    assert_text_stream,
+    drive,
+)
 from google.protobuf.json_format import MessageToDict
 from streaming_asgi import StreamingASGITransport
 
@@ -232,3 +242,34 @@ async def test_as_functions_call_partner(tmp_path, monkeypatch):
         await host.shutdown()
         await hc.aclose()
         await partner_hc.aclose()
+
+
+async def test_contract_kit():
+    seen: dict[str, list[str]] = {}
+
+    async def remembering(c):
+        history = seen.setdefault(c.context_id, [])
+        history.append(c.text)
+        yield "heard: "
+        yield ", ".join(history)
+
+    def boom(c):
+        raise RuntimeError("boom")
+
+    started, stopped = asyncio.Event(), asyncio.Event()
+
+    async def block(c):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    adapter = CallableAdapter(remembering)
+    assert_text_stream(await drive(adapter, "hi"), "heard: hi")
+    await assert_multi_turn(adapter, "apples", "pears", "apples")
+    await assert_failure_maps(CallableAdapter(boom))
+    await assert_cancellable(CallableAdapter(block), started=started, stopped=stopped)
+    client = FakePartnerClient()
+    fns = as_functions(client.tools(), client)
+    await assert_projection(fns, lambda fn, args: fn(**args), client=client)

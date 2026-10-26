@@ -25,6 +25,7 @@ Requires Python 3.11+.
 uv add a2a-gateway                 # core: callable agents, partners, CLI
 uv add "a2a-gateway[langchain]"    # adds the LangChain adapter and tools
 uv add "a2a-gateway[langgraph]"    # adds the LangGraph adapter (includes LangChain)
+uv add "a2a-gateway[openai]"       # adds the OpenAI Agents SDK adapter
 ```
 
 `pip install a2a-gateway` works the same way.
@@ -152,6 +153,28 @@ deployer = AgentSpec(
 host = AgentHost("http://localhost:8000")
 host.add(deployer)
 ```
+
+### An OpenAI Agents SDK agent
+
+`OpenAIAgentsAdapter` runs an `agents.Agent` with `Runner.run_streamed`. Each A2A `contextId` gets its own SDK session, so follow-up messages continue the conversation. The default is an in-memory session per context; pass `session_factory=lambda cid: SQLiteSession(cid, "sessions.db")` and `durable_sessions=True` to keep conversations across restarts. Model text streams as the `output` artifact, each tool call shows as a `calling <tool>` status, and token usage is reported. Cancelling the A2A task cancels the run.
+
+```python
+from agents import Agent, RunConfig
+
+from a2agw import AgentSpec, SkillSpec
+from a2agw.adapters.openai_agents import OpenAIAgentsAdapter
+
+agent = Agent(name="assistant", instructions="Answer helpfully.", model="gpt-5-mini")
+assistant = AgentSpec(
+    id="assistant",
+    name="Assistant",
+    description="An OpenAI Agents SDK agent.",
+    skills=[SkillSpec(id="chat", name="Chat", description="Answers questions")],
+    adapter=OpenAIAgentsAdapter(agent, max_turns=10, run_config=RunConfig()),
+)
+```
+
+The SDK exports traces to OpenAI when `OPENAI_API_KEY` is set. Pass `run_config=RunConfig(tracing_disabled=True)` to turn that off for this agent. `as_openai_tools(tools, host.client)` projects partners as `FunctionTool`s that return the JSON envelope as text. Set them once the host has started, for example `agent.tools = as_openai_tools(host.partner_tools("assistant"), host.client)`. The tools use non-strict schemas, because strict mode would make the optional `task_id`, `context_id` and `data` arguments required; the gateway validates every call instead. [examples/adapters/openai_agents_example.py](examples/adapters/openai_agents_example.py) runs offline with a scripted model.
 
 ### An agent that consults partners
 
