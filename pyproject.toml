@@ -28,12 +28,14 @@ langgraph = ["langgraph>=1.2", "langchain-core>=1.7"]
 postgres = ["asyncpg>=0.30"]
 mcp = ["mcp>=2.3,<3"]
 openai = ["openai-agents>=0.24"]
+claude = ["claude-agent-sdk>=0.2.174"]
 all = [
     "langchain-core>=1.7",
     "langgraph>=1.2",
     "asyncpg>=0.30",
     "mcp>=2.3,<3",
     "openai-agents>=0.24",
+    "claude-agent-sdk>=0.2.174",
 ]
 
 [project.scripts]
@@ -52,6 +54,7 @@ dev = [
     "langchain-core>=1.7",
     "langgraph>=1.2",
     "openai-agents>=0.24",
+    "claude-agent-sdk>=0.2.174",
 ]
 
 [tool.hatch.build.targets.wheel]

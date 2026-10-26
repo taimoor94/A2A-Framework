@@ -14,7 +14,15 @@ import pytest
 
 # Real modules, not bare package names: "langgraph" alone is a namespace package that
 # langgraph-checkpoint also provides, so it imports even without langgraph itself.
-DEV_FRAMEWORKS = ["langchain_core", "langgraph.graph", "agents", "mcp"]
+DEV_FRAMEWORKS = [
+    "langchain_core",
+    "langgraph.graph",
+    "langgraph.checkpoint.sqlite",
+    "asyncpg",
+    "agents",
+    "mcp",
+    "claude_agent_sdk",
+]
 
 
 @pytest.mark.parametrize("module", DEV_FRAMEWORKS)

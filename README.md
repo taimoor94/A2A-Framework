@@ -26,6 +26,7 @@ uv add a2a-gateway                 # core: callable agents, partners, CLI
 uv add "a2a-gateway[langchain]"    # adds the LangChain adapter and tools
 uv add "a2a-gateway[langgraph]"    # adds the LangGraph adapter (includes LangChain)
 uv add "a2a-gateway[openai]"       # adds the OpenAI Agents SDK adapter
+uv add "a2a-gateway[claude]"       # adds the Claude Agent SDK adapter
 ```
 
 `pip install a2a-gateway` works the same way.
@@ -175,6 +176,28 @@ assistant = AgentSpec(
 ```
 
 The SDK exports traces to OpenAI when `OPENAI_API_KEY` is set. Pass `run_config=RunConfig(tracing_disabled=True)` to turn that off for this agent. `as_openai_tools(tools, host.client)` projects partners as `FunctionTool`s that return the JSON envelope as text. Set them once the host has started, for example `agent.tools = as_openai_tools(host.partner_tools("assistant"), host.client)`. The tools use non-strict schemas, because strict mode would make the optional `task_id`, `context_id` and `data` arguments required; the gateway validates every call instead. [examples/adapters/openai_agents_example.py](examples/adapters/openai_agents_example.py) runs offline with a scripted model.
+
+### A Claude Agent SDK agent
+
+`ClaudeAgentAdapter` runs each turn with `claude_agent_sdk.query`, which starts the `claude` CLI bundled with the SDK. A real run needs `ANTHROPIC_API_KEY` (or another Claude Code login). Each A2A `contextId` resumes the Claude session its last turn used (`options.resume`), so follow-up messages continue the conversation. That map lives in memory and holds the 10,000 most recently used contexts. To keep it across restarts, pass a persistent `session_store` mapping (context id to session id) with `durable_sessions=True`; without a `session_store`, `durable_sessions=True` is refused. The CLI's transcripts must survive too: they live in `~/.claude/projects`, or in the SDK's own `ClaudeAgentOptions.session_store`. Text streams as the `output` artifact, each tool use shows as a `calling <tool>` status, and tokens and cost are reported. An error result fails the task with `agent error`. Cancelling the A2A task stops the CLI.
+
+```python
+from claude_agent_sdk import ClaudeAgentOptions
+
+from a2agw import AgentSpec, SkillSpec
+from a2agw.adapters.claude_agent import ClaudeAgentAdapter
+
+options = ClaudeAgentOptions(system_prompt="Answer helpfully.", max_turns=10)
+assistant = AgentSpec(
+    id="assistant",
+    name="Assistant",
+    description="A Claude Agent SDK agent.",
+    skills=[SkillSpec(id="chat", name="Chat", description="Answers questions")],
+    adapter=ClaudeAgentAdapter(options),
+)
+```
+
+`as_claude_tools(tools, host.client)` projects partners as an in-process SDK MCP server (no network). Each tool returns the JSON envelope as text. Add it once the host has started: `options.mcp_servers = {"a2a_partners": as_claude_tools(host.partner_tools("assistant"), host.client)}`, and allow its tools with `options.allowed_tools = ["mcp__a2a_partners"]`. [examples/adapters/claude_agent_example.py](examples/adapters/claude_agent_example.py) runs offline with a scripted stand-in for `query`.
 
 ### An agent that consults partners
 
