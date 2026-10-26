@@ -13,7 +13,8 @@ A framework-agnostic gateway for the [A2A (Agent2Agent) protocol](https://a2a-pr
 - API-key and JWT auth with per-agent authorization, an SSRF guard, and an untrusted-text envelope for partner output.
 - OpenTelemetry tracing, JSON logs, and a read-only admin API with an SSE event stream.
 - SQLite or PostgreSQL (`pip install a2a-gateway[postgres]`) task store, with recovery of in-flight tasks on restart. Several gateways can share one PostgreSQL database if each serves different agent ids (one gateway per agent id per database); the audit chain is serialized across them by an advisory lock. SQLite is for a single process.
-- A CLI: `init`, `serve`, `partners`, `card validate`, `call`.
+- Security hardening (all configurable in `a2agw.yaml`): signed Agent Cards (ours signed, partners' verified and quarantined on a key change), OAuth2 client credentials and token exchange, mTLS both ways, a policy engine (authz, egress classification ceilings, routing), a hash-chained audit log, signed call contexts between gateways, and guarded push notifications. See [Security hardening](#security-hardening).
+- A CLI: `init [--secure]`, `serve`, `partners`, `card validate`, `call`, `audit export|verify`, `tasks reap`.
 - **Conformance:** the inbound side passes the A2A TCK at MUST level. See [docs/conformance.md](docs/conformance.md).
 
 ## Install
@@ -48,7 +49,7 @@ Start the gateway:
 cd myagent && a2agw serve          # binds 127.0.0.1:8000 by default
 ```
 
-The scaffold sets `admin_without_auth: true` so you can try the admin API locally. That leaves the admin API open to anyone who can reach the port, so keep the default `--host 127.0.0.1` and configure `auth` (see Configuration) before you bind to `0.0.0.0` with `--host 0.0.0.0`.
+The scaffold sets `admin_without_auth: true` so you can try the admin API locally. That leaves the admin API open to anyone who can reach the port, so keep the default `--host 127.0.0.1` and configure `auth` (see Configuration) before you bind to `0.0.0.0` with `--host 0.0.0.0`. `a2agw init myagent --secure` scaffolds a hardened project instead: API-key auth, signed cards, a policy and the audit log (see [Security hardening](#security-hardening)).
 
 The echo agent is now served at `http://localhost:8000/agents/echo/`, and its card is at `/agents/echo/.well-known/agent-card.json`. In another terminal (the `partners` commands read `a2agw.yaml`, so stay in `myagent`, or pass `-c myagent/a2agw.yaml`), call it. `call` takes the agent's base URL (the one in its card, with the trailing slash). It treats the target as a `partner` by default, which requires https, so for a local `http://` agent pass `--tier internal`:
 
@@ -113,7 +114,7 @@ host.add(booker)
 uvicorn.run(host.app(), port=8000)
 ```
 
-`host.run(port=8000)` is a shortcut for the last line. Like uvicorn and `a2agw serve`, it binds `127.0.0.1` by default; pass `host="0.0.0.0"` to accept remote connections, and configure `auth` first. On SIGINT/SIGTERM both wait at most 10 s for open requests before shutting down (`host.run(graceful_timeout_s=...)`, `a2agw serve --graceful-timeout`).
+`host.run(port=8000)` is a shortcut for the last line. Like uvicorn and `a2agw serve`, it binds `127.0.0.1` by default; pass `host="0.0.0.0"` to accept remote connections, and configure `auth` first. On SIGINT/SIGTERM both wait at most 10 s for open requests before shutting down (`host.run(graceful_timeout_s=...)`, `a2agw serve --graceful-timeout`). After the host stops, the signal handlers that were installed before are restored, with one exception: a handler installed outside Python (`signal.getsignal` returns `None`) cannot be reinstalled, so the gateway's handler stays and a later SIGTERM in the same process is swallowed (SIGINT still raises `KeyboardInterrupt`). If you embed the host and keep the process running afterwards, install your own SIGTERM handler once it has exited.
 
 Events: `Status`, `ArtifactChunk`, `NeedInput`, `NeedAuth`, `Usage`, `Done`, `Failed`, `Reply`.
 
@@ -218,16 +219,108 @@ Every outbound connection the gateway makes itself (partner calls, card and JWKS
 - **Logs.** httpx/httpcore do not log the guarded clients' requests (URLs can carry credentials); other clients in your process log as you configure them.
 - **The inbound JWT JWKS** is vetted with `auth.jwt.jwks_tier` (default `internal`; set `public` for a hosted IdP to require https and a public address). `jwks_url` must be https (plain http only with `A2AGW_DEV=1`). Keys are cached for 5 minutes; an unknown `kid` refetches at most every 30 s after the last attempt, a failed fetch is not retried for 30 s (requests fail fast with 401 meanwhile), and concurrent requests share one fetch.
 
+## Security hardening
+
+Every feature below is off until configured (except the audit log, which is on by default), and each one is a section of `a2agw.yaml`. Secrets never go in the file itself: key material comes from files (`*_file`, relative to the config file), and other secrets from environment variables named in `*_env` fields. An inline secret-looking key (`client_secret`, `password`, `token`, `private_key`, ...) or a literal password in `db_url` stops startup with a hint to use `*_env` or `${VAR}`. Config errors name the file and the field path, never a value or a file's contents.
+
+### Quick start: `a2agw init --secure`
+
+```bash
+a2agw init myagent --secure
+```
+
+```
+wrote myagent/keys/signing.pem (mode 0600)
+wrote myagent/keys/signing.pub.pem (mode 0600)
+wrote myagent/a2agw.yaml
+...
+API key: a2agw_...
+WARNING: this API key is shown only once and is not stored anywhere ...
+```
+
+This scaffolds a project that signs its cards (a fresh Ed25519 key in `keys/`, mode 0600, directory 0700, listed in the scaffolded `.gitignore`), enforces `policy.yaml`, writes the audit log, and requires auth with one admin API key (principal `key:admin`, scope `a2agw:admin`). Only the key's sha256 hash goes into `a2agw.yaml`; the key itself is printed once and never written to disk. Existing key files are never overwritten, not even with `--force`. Publish `keys/signing.pub.pem` (and the `kid` from `a2agw.yaml`) to partners that should verify your cards.
+
+### Signed Agent Cards
+
+```yaml
+signing:                         # our key: signs our cards, push JWTs and call contexts
+  key_file: keys/signing.pem     # PEM: Ed25519, EC P-256 or RSA >= 2048; unencrypted
+  kid: gw-2026-10
+  alg: EdDSA                     # EdDSA | ES256 | RS256 (must match the key)
+  jku: https://gw.example.com/jwks.json   # optional: where partners fetch our keys
+  # issuer: https://gw.example.com       # call-context issuer; default base_url
+
+trust:                           # partner cards and partner call contexts
+  card_keys:                     # pinned partner keys: kid -> PEM public key file
+    acme-1: keys/acme.pub.pem
+  jwks_urls:                     # allowlisted jku URLs (fetched SSRF-guarded, public tier)
+    - https://agents.acme.example/.well-known/jwks.json
+  require_signed: [partner, public]   # tiers whose cards must carry a valid signature
+```
+
+Every card the host serves (per agent and the root card) is signed with JWS over the RFC 8785 canonical card. A partner card is verified on registration and on every refresh against the pinned keys or an allowlisted `jku`; only ES256, RS256 and EdDSA are accepted (`alg: none` and HS256 are refused). On a `require_signed` tier an unsigned, tampered or untrusted card is refused. A refreshed card signed by a different key, or with a signature that no longer verifies, is quarantined like any other significant change until you `a2agw partners approve` its hash. The `partners` commands use the same `trust` and `tls` settings as `serve`.
+
+### Signed call contexts
+
+With `signing` set, every outbound consult also carries a JWS of its call context (hop count, path, deadline, budget), and the host trusts its own key, so a call that loops back through other gateways is still recognised as a cycle. To trust other gateways' contexts:
+
+```yaml
+trust:
+  context_issuers:               # kid -> issuer and public key
+    peer-gw-1: {issuer: https://peer.example.com, key_file: keys/peer.pub.pem}
+```
+
+With `signing` or `context_issuers` set, an inbound call with a context JWS that does not verify is rejected ("invalid call context"); without either, the JWS is ignored. A call without one is admitted on its unsigned context as before, clamped to local limits.
+
+### OAuth2 to partners
+
+```yaml
+oauth:                           # each key is a credential_ref
+  acme:                          # one gateway token for every partner with credential_ref: acme
+    type: client_credentials
+    token_url: https://login.acme.example/oauth/token
+    client_id: my-gateway
+    client_secret_env: ACME_CLIENT_SECRET   # the env var holding the secret
+    scope: a2a                   # optional
+    audience: https://agents.acme.example   # optional
+  acme-obo:                      # RFC 8693: exchange the inbound caller's JWT per call
+    type: token_exchange
+    token_url: https://login.acme.example/oauth/token
+    client_id: my-gateway
+    client_secret_env: ACME_CLIENT_SECRET
+    audience: https://agents.acme.example   # required
+    fallback: acme               # client_credentials token for maintenance calls (cascade cancels, recovery)
+
+partners:
+  - {id: acme, url: "https://agents.acme.example/agents/support/", tier: partner, credential_ref: acme-obo}
+```
+
+A credential ref is either a static `credentials` entry or an `oauth` entry, never both. Token requests go through the SSRF-guarded client (public tier, https). Tokens are cached until shortly before expiry; a partner's 401 before it accepts a send drops the token and resends once with a fresh one. A token exchange needs an inbound JWT: when the caller authenticated with an API key (or there is no inbound call), the consult fails with "credential error" and nothing is sent.
+
 ### mTLS
 
-Outbound: give `PartnerClient(tls={"ref": TlsClientConfig(cert_file, key_file, ca_file)})` and set `tls_ref` on a partner record; its calls then use a dedicated TLS 1.2+ client that presents that certificate and trusts `ca_file`. An unknown `tls_ref` fails closed (`unavailable`, "tls config missing"). Inbound: `a2agw serve --ssl-certfile F --ssl-keyfile F [--ssl-ca-certs F --require-client-cert]` (or `AgentHost.run(ssl_*=...)`). The client certificate is verified at the TLS layer only; ASGI servers do not expose it, so identity still comes from the API key or JWT.
-Certificates are loaded at startup; rotating them requires a restart.
+```yaml
+tls:                             # outbound client certificates, by tls_ref
+  acme: {cert_file: tls/client.crt, key_file: tls/client.key, ca_file: tls/acme-ca.crt}
+partners:
+  - {id: acme, url: "https://agents.acme.example/", tier: partner, tls_ref: acme}
+
+server_tls:                      # inbound HTTPS for `a2agw serve`
+  cert_file: tls/server.crt
+  key_file: tls/server.key
+  ca_file: tls/clients-ca.crt    # needed with require_client_cert
+  require_client_cert: true
+```
+
+One mapping built from `tls:` is shared by the registry (card fetches) and the partner client (calls); a partner with `tls_ref` then uses a dedicated TLS 1.2+ client that presents that certificate and trusts `ca_file`. An unknown `tls_ref` is a config error (and, for records added otherwise, fails closed at call time: `unavailable`, "tls config missing"). `a2agw partners add ... --tls-ref acme` registers a partner over mTLS. In code: `AgentHost(tls={"acme": TlsClientConfig(cert_file, key_file, ca_file)})`.
+
+Inbound: `server_tls`, or the flags `a2agw serve --ssl-certfile F --ssl-keyfile F [--ssl-ca-certs F --require-client-cert]` (the flags win), or `AgentHost.run(ssl_*=...)`. The client certificate is verified at the TLS layer only; ASGI servers do not expose it, so identity still comes from the API key or JWT. Certificates are loaded at startup; rotating them requires a restart. Passphrase-protected keys are refused, and a group- or world-readable key file logs a warning.
 
 Troubleshooting: when a partner rejects our client certificate under TLS 1.3, the result can show "delivery unknown" instead of "partner unreachable", because the platform reports a plain connection reset. The gateway deliberately never resends in that case.
 
 ### Policy and audit
 
-Pass `AgentHost(..., policy=PolicyEngine(load_policy(path)))` to enforce a declarative policy (see `a2agw.security.policy` for the file format). It applies in three places:
+In `a2agw.yaml`: `policy_file: policy.yaml` (validated at startup; any error stops it, naming the file and field path), optionally `classifier: regex_pii` (flags common PII as `confidential`), and `audit: true` (the default; `false` turns the log off). In code: pass `AgentHost(..., policy=PolicyEngine(load_policy(path)))`. The policy is declarative (see `a2agw.security.policy` for the file format) and applies in three places:
 
 - **Authz.** Every agent request except the card is checked after `AgentAccess`; both must allow. A denial is a bare `403 {"error": "forbidden"}`; the reason goes only to the audit log. The policy also applies when no `auth` is configured: every caller is then `anonymous`, which a `principal: "*"` allow rule never matches, so a no-auth development setup needs an explicit `{principal: "anonymous", agents: [...], effect: allow}` rule.
   - *A lone deny rule is a lockdown, not a blocklist.* As soon as any rule mentions an agent, callers without a matching allow rule are denied ("default deny"). `{principal: "key:mallory", agents: [billing], effect: deny}` on its own denies everyone on `billing`; add `{principal: "*", agents: [billing], effect: allow}` to deny only mallory.
@@ -247,6 +340,29 @@ a2agw audit verify -c a2agw.yaml                                          # exit
 ```
 
 The audit log is fail-open for availability: a failed append is logged and counted in `audit_errors` (shown by `/a2agw/admin/healthz`), and the request goes on. Every event is its own committed transaction, so each audited request pays one extra commit (on sqlite in WAL mode, the default here, that is one fsync per event); waiting for the audit lock is capped at 5 s (up to about twice that on PostgreSQL, where there is also a cross-process lock), after which the event is counted as an audit error rather than blocking the request. Denials of anonymous callers are coalesced to one row per agent (or admin category) per 60 s, with `detail.count` holding the number suppressed; authenticated denials are recorded one by one. On PostgreSQL, gateways sharing a database append to one chain, serialized by an advisory lock (waiting is capped like the in-process lock); on SQLite assume a single writer process. Run one gateway per agent id per database: if an agent is moved or removed, the host logs how many open tasks belong to agents it does not serve, and `a2agw tasks reap --agent <id> -c a2agw.yaml` (or `POST /a2agw/admin/tasks/reap?agent=<id>`, admin scope, audited as `task.reap`) fails those tasks and cancels their partner tasks. Reaping is guarded: without `--yes` (CLI) or `confirm=true` (admin) it is a dry run that only counts the tasks and partner tasks it would touch; tasks changed in the last 10 minutes are refused (HTTP 409) unless `--force` / `force=true`; an agent the gateway serves is always refused; every attempt is audited as `task.reap`. `AgentHost(audit=False)` turns the audit log off.
+
+### Push notifications
+
+```yaml
+push:                            # omit to not offer push (the card then says so)
+  allow_private: false           # true: also private/loopback and plain-http webhooks (internal tier)
+  timeout_s: 10                  # per request and per delivery-time URL re-check
+  max_attempts: 3                # attempts per delivery in total (1 = no retry)
+  encryption_key_env: PUSH_KEYS  # Fernet key(s), comma-separated; encrypts stored configs
+  max_configs_per_task: 10
+  max_concurrent_deliveries: 32  # POSTs in flight per agent (one task gets at most half)
+  max_pending_tasks: 1000        # tasks with queued updates per agent; beyond it updates are dropped
+```
+
+Webhook URLs are checked when a config is created and again before every delivery (SSRF guard, connect-time address pinning, no redirects). 5xx and connect errors are retried with jittered backoff; 4xx is final. Each request carries `X-A2AGW-Delivery-Id` (the same on every retry: de-duplicate on it), the config's `token` as `X-A2A-Notification-Token`, and its `authentication` credentials as `Authorization`. With `signing` set, each request also carries a short-lived JWT signed with the gateway key (claims `iss`, `aud` = the webhook URL, `exp`, `task_id`, `delivery_id`, `body_sha256`, `jti`). It goes in `Authorization: Bearer` when the config has no `authentication` credentials; when the config's own credentials take the `Authorization` header, the gateway JWT moves to `X-A2AGW-Push-JWT`. Delivery counters (delivered, failed, retries, skipped_unsafe, dropped, pending) are at `GET /a2agw/admin/push`. Without `auth`, every caller is the same `anonymous` owner of push configs, so run with auth whenever push is exposed beyond a trusted network.
+
+### PostgreSQL
+
+```yaml
+db_url: postgresql+asyncpg://gw:${GW_DB_PASSWORD}@db.internal:5432/gw   # needs a2a-gateway[postgres]
+```
+
+Write the password as `${VAR}` (or the whole URL as `${DB_URL}`): a literal password in `db_url` is refused. The CLI turns database failures (bad URL, connection refused, authentication failed) into one line on stderr with the URL's userinfo shown as `***@`, and `a2agw serve` checks the database before it starts listening.
 
 ## Observability
 
@@ -271,13 +387,15 @@ The read-only admin API is mounted on the host:
 
 ## Configuration
 
-`a2agw.yaml` is read by `a2agw serve` and the `partners` commands. `${VAR}` and `${VAR:-default}` are replaced from the environment in string values only (use `$$` for a literal `$`). Unknown fields are rejected.
+`a2agw.yaml` is read by `a2agw serve`, the `partners` commands, `audit` and `tasks reap`. `${VAR}` and `${VAR:-default}` are replaced from the environment in string values only, after the YAML is parsed, so an environment value can never add structure (use `$$` for a literal `$`). Unknown fields are rejected at every level, and so are wrong types; the error names the field path (`push.timeout_s: Input should be a valid number`) and never the value. Secrets are never inline: use `*_env` fields, `*_file` fields (relative to the config file) or `${VAR}`; see [Security hardening](#security-hardening) for the Phase 2 sections (`signing`, `trust`, `oauth`, `tls`, `server_tls`, `policy_file`, `classifier`, `push`, `audit`).
 
 ```yaml
 base_url: ${A2AGW_BASE_URL:-http://localhost:8000}   # public URL, used in agent cards
 db_url: sqlite+aiosqlite:///a2agw.db                 # task store
 partners_file: partners.yaml                         # partner registry, relative to this file
 admin_without_auth: false                            # true = open admin API (development only)
+outbound_ttl_s: 86400                                # cancel partner tasks still open after this (s)
+audit: true                                          # hash-chained audit log (default true)
 
 auth:                                                # omit for no authentication
   allow_anonymous: false                             # true: no-credential agent calls get 403, not 401
@@ -289,6 +407,7 @@ auth:                                                # omit for no authenticatio
     issuer: https://login.example.com
     audience: a2agw
     jwks_url: https://login.example.com/.well-known/jwks.json   # or public_key_pem: |
+                                                     # https only; http only with A2AGW_DEV=1
     jwks_tier: public                                # SSRF tier for the JWKS host (default internal)
     scopes_claim: scope
 
@@ -299,7 +418,8 @@ partners:                                            # registered at startup if 
   - id: acme
     url: https://agents.acme.example/agents/support/ # or card_file: cards/acme.json
     tier: partner                                    # internal | partner | public
-    credential_ref: acme
+    credential_ref: acme                             # a credentials or oauth entry
+    tls_ref: acme                                    # optional: a tls entry (mTLS)
     tags: [support]
 
 credentials:                                         # credential_ref -> header filled from env
@@ -310,9 +430,24 @@ credentials:                                         # credential_ref -> header 
 telemetry:
   service_name: my-gateway
   otlp_endpoint: ${OTLP_ENDPOINT:-}                  # optional
+
+# Phase 2 sections, each optional (worked examples under Security hardening):
+# signing: {key_file, kid, alg, jku?, issuer?}
+# trust: {card_keys: {kid: pem_file}, jwks_urls: [...], require_signed: [tiers],
+#         context_issuers: {kid: {issuer, key_file}}}
+# oauth: {<credential_ref>: {type: client_credentials | token_exchange, token_url, client_id,
+#         client_secret_env, scope?, audience?, fallback?}}
+# tls: {<tls_ref>: {cert_file, key_file, ca_file?}}
+# server_tls: {cert_file, key_file, ca_file?, require_client_cert?}
+# policy_file: policy.yaml
+# classifier: regex_pii                              # needs policy_file
+# push: {allow_private?, timeout_s?, max_attempts?, encryption_key_env?, max_configs_per_task?,
+#        max_concurrent_deliveries?, max_pending_tasks?}
 ```
 
-Generate an API-key hash with `printf %s "$KEY" | shasum -a 256 | cut -d' ' -f1`.
+Generate an API-key hash with `printf %s "$KEY" | shasum -a 256 | cut -d' ' -f1` (in Python: `a2agw.security.auth.hash_api_key(key)`), or let `a2agw init --secure` generate a key and its hash.
+
+When auth is not configured, every caller is the same principal, `anonymous`: idempotent re-sends (same `messageId` and request) and push config ownership are then shared by all anonymous callers. The `a2a` and `aiosqlite` loggers default to INFO (see Security defaults).
 
 ## Architecture
 
@@ -331,13 +466,12 @@ Generate an API-key hash with `printf %s "$KEY" | shasum -a 256 | cut -d' ' -f1`
                  +-----------------------------------------------+
 ```
 
-The core never imports a framework; adapters live in `a2agw.adapters.<name>` behind extras. See the [design spec](docs/superpowers/specs/2026-10-25-a2a-gateway-framework-design.md) and the [Phase 1 plan](docs/superpowers/plans/2026-10-25-phase1-core.md).
+The core never imports a framework; adapters live in `a2agw.adapters.<name>` behind extras. See the [design spec](docs/superpowers/specs/2026-10-25-a2a-gateway-framework-design.md), the [Phase 1 plan](docs/superpowers/plans/2026-10-25-phase1-core.md) and the [Phase 2 plan](docs/superpowers/plans/2026-10-26-phase2-hardening.md).
 
 ## Roadmap
 
-Phase 1 (this release) is the core described above. Everything below is planned and not implemented yet.
+Phase 1 (the core) and Phase 2 (hardening: signed cards and quarantine, OAuth2 client credentials and token exchange, mTLS, the policy engine with classification, the audit log, push notifications, PostgreSQL, the SSRF guard with DNS-rebinding pinning, signed call contexts, and the boundary/attack test matrix in [docs/boundary-conditions.md](docs/boundary-conditions.md)) are implemented and described above. Everything below is planned and not implemented yet.
 
-- **Phase 2, hardening:** signed cards, OAuth2 client credentials and mTLS, a policy engine, push notifications, a Postgres store, audit log, and fault-injection tests.
 - **Phase 3, gateway:** a sidecar service for agents in any language, an MCP gateway, adapters for CrewAI, OpenAI Agents, Claude Agent SDK, ADK, AG2 and LlamaIndex, and a Docker image.
 - **Phase 4, control plane:** a central registry, and the Console (a web UI to register and approve partners, edit policy, and inspect cross-agent traces), with SSO and RBAC.
 - **Phase 5, clusters and projects:** agent teams (Clusters) with an orchestrator, a project board, and human-in-the-loop in the Console.

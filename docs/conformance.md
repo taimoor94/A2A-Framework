@@ -9,7 +9,7 @@ a2agw's inbound side is checked with the official A2A Technology Compatibility K
 | TCK commit | `d4d6fae7887f88ef607fb461c13e3b0e1802f19b` (2026-10-22) |
 | Spec tested | A2A 1.0 (the TCK's `specification/`, A2A commit `1736957`) |
 | a2a-sdk | 1.2.3 |
-| Date | 2026-10-25 |
+| Date | 2026-10-26 (re-run after Phase 2; first run 2026-10-25) |
 | Transports | JSON-RPC, HTTP+JSON (a2agw does not serve gRPC) |
 | SUT | `examples/tck_sut/sut_agent.py`: one `AgentSpec` + `CallableAdapter` on `AgentHost`, port 9999, no auth, push notifications on (`PushSettings(allow_private=True)`) |
 
@@ -21,6 +21,13 @@ a2agw's inbound side is checked with the official A2A Technology Compatibility K
 |---|---|---|---|
 | tests | 155 | 0 | 80 |
 | requirements | 82 | 0 | 11 skipped, 21 not tested |
+
+Re-run on 2026-10-26 at the end of Phase 2 (signed cards, OAuth2, mTLS, policy, audit, push,
+PostgreSQL, guarded network, signed call contexts): `scripts/run_tck.sh` exits 0 with the same
+numbers, 155 passed, 0 failed, 80 skipped (30 deselected as non-MUST), MUST compatibility 82 of
+114 requirements passing, none failing. The SUT runs with its defaults (no auth, no signing);
+the Phase 2 features are off unless configured, and the audit log, which is on, does not
+change protocol behaviour.
 
 All ten push requirements (`PUSH-CREATE-001/002`, `PUSH-GET-001/002`, `PUSH-LIST-001`, `PUSH-DEL-001/002`, `PUSH-DELIVER-001/002/003`) now run and pass on JSON-RPC and HTTP+JSON. The SUT turns push on with `allow_private=True` because the TCK's webhook receiver listens on `http://localhost`; the `AgentHost` default (`allow_private=False`) accepts only public https webhooks.
 
@@ -48,6 +55,21 @@ Why tests are skipped. All of these are TCK skips, not failures:
 
 - `CARD-CACHE-003`, `test_last_modified_present`: the agent card response has no `Last-Modified` header. The SDK's card route does not set it.
 - Skips: all 3 are for gRPC, which is not offered.
+
+## Known limitations
+
+- **A2A 0.3 streaming error codes.** Inbound 0.3 requests are served by the SDK's 0.3
+  compatibility adapter (`enable_v0_3_compat`). On a 0.3 streaming call
+  (`message/stream`, `tasks/resubscribe`), every error raised once the stream has started is
+  sent as a JSON-RPC `InternalError` (-32603) with the error's message, instead of its
+  specific code (for example -32001 `TaskNotFoundError`): the SDK's
+  `JSONRPC03Adapter` maps every exception in the stream generator to -32603. 1.0 requests,
+  and 0.3 non-streaming calls, get the specific codes. The TCK tests A2A 1.0 only, so this
+  does not show in its results.
+- **Not covered by the TCK.** Card signing, auth, TLS, versioning and binding equivalence
+  (the 21 "not tested" MUST requirements) have no automated TCK test. a2agw's own suite
+  covers its implementation of signing, auth, mTLS and version negotiation
+  (`tests/security`, `tests/consult/test_tls.py`, `tests/integration/test_boundaries.py`).
 
 ## Gaps the TCK found, and what was fixed
 

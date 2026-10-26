@@ -261,9 +261,10 @@ class PartnerRegistry:
         *,
         credential_ref: str | None = None,
         tags: Iterable[str] = (),
+        tls_ref: str | None = None,
     ) -> PartnerRecord:
         self._check_new_id(id)
-        return await self._add(id, card, tier, None, credential_ref, tags)
+        return await self._add(id, card, tier, None, credential_ref, tags, tls_ref)
 
     def _check_new_id(self, id: str) -> None:
         if not _ID_RE.match(id):

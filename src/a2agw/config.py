@@ -3,6 +3,19 @@
 Partner registration: config-listed partners are registered by ``register_partners(host, cfg)``,
 which ``a2agw serve`` awaits before ``uvicorn.run``. Partners already in the registry are not
 overwritten; URL partners are refreshed instead, so a changed card goes through quarantine.
+
+Rules for every section (``extra="forbid"`` at every level):
+
+- Unknown keys and wrong types are rejected with the dotted path of the field
+  (``push.timeout_s: ...``), never with the offending value.
+- Secrets never appear inline. Key material comes from files (``*_file``, resolved relative to
+  the config file's directory); other secrets from environment variables named in ``*_env``
+  fields. An inline secret-looking key (``client_secret``, ``password``, ``token``, ...) or a
+  literal password in ``db_url`` is a ``ConfigError`` with a hint to use ``*_env`` / ``${VAR}``.
+- ``${VAR}`` interpolation applies to string scalars after YAML parsing, so an environment
+  value can never add YAML structure.
+- A key, certificate or policy file that is missing or unreadable is a ``ConfigError`` naming
+  the file, never its contents.
 """
 
 from __future__ import annotations
@@ -19,12 +32,19 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from a2agw.consult.credentials import EnvCredentials
-from a2agw.consult.netguard import UnsafeURL
-from a2agw.consult.registry import CardFetchError
+from a2agw.consult.credentials import ChainCredentials, CredentialProvider, EnvCredentials
+from a2agw.consult.netguard import Tier, UnsafeURL
+from a2agw.consult.oauth import OAuthClientCredentials, OAuthTokenExchange
+from a2agw.consult.registry import CardFetchError, PartnerRegistry
+from a2agw.consult.tls import TlsClientConfig
+from a2agw.context.signing import CallContextSigner, CallContextVerifier
 from a2agw.security.auth import AuthConfig
+from a2agw.security.cardsign import CardSigner, CardVerifier, load_public_key
+from a2agw.security.classify import RegexPiiClassifier
+from a2agw.security.policy import PolicyEngine, PolicyError, load_policy
 from a2agw.serve.agent import AgentSpec
 from a2agw.serve.host import AgentHost
+from a2agw.serve.push import PushSettings
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +72,36 @@ def interpolate(text: str, env: dict[str, str], *, source: str = "config") -> st
     return _VAR.sub(sub, text)
 
 
+_FORBID = ConfigDict(extra="forbid")
+Alg = Literal["ES256", "RS256", "EdDSA"]
+TierName = Literal["internal", "partner", "public"]
+# Keys whose value would be a secret written inline. Each has an ``*_env`` / ``*_file`` form.
+_SECRET_KEYS = frozenset(
+    {
+        "secret",
+        "client_secret",
+        "password",
+        "passwd",
+        "token",
+        "access_token",
+        "refresh_token",
+        "bearer",
+        "api_key",
+        "apikey",
+        "private_key",
+        "encryption_key",
+        "signing_key",
+    }
+)
+# Mappings whose keys are names chosen by the operator (a ref named "token" is fine).
+_NAME_MAPS = frozenset(
+    {"oauth", "credentials", "tls", "trust.card_keys", "trust.context_issuers", "auth.api_keys"}
+)
+# userinfo password in a URL: scheme://user:PASSWORD@host
+_URL_PASSWORD = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://[^/@:]*:([^/@]*)@")
+_WHOLE_VAR = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?::-[^}]*)?\}")
+
+
 class AgentRef(BaseModel):
     model_config = ConfigDict(extra="forbid")
     spec: str = Field(pattern=r"^[A-Za-z_][\w.]*:[A-Za-z_]\w*$")
@@ -64,6 +114,7 @@ class PartnerConfig(BaseModel):
     card_file: str | None = None
     tier: Literal["internal", "partner", "public"]
     credential_ref: str | None = None
+    tls_ref: str | None = None  # a key of the top-level ``tls`` section: mTLS for this partner
     tags: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -85,6 +136,101 @@ class TelemetryConfig(BaseModel):
     otlp_endpoint: str | None = None
 
 
+class SigningConfig(BaseModel):
+    """The gateway's private key: signs its agent cards, push JWTs and call contexts."""
+
+    model_config = _FORBID
+    key_file: str  # PEM private key (EC P-256, RSA >= 2048 or Ed25519), unencrypted
+    kid: str = Field(min_length=1)
+    alg: Alg
+    jku: str | None = None  # JWKS URL advertised in the card signature header
+    issuer: str | None = None  # call-context ``iss``; defaults to base_url
+
+
+class ContextIssuerConfig(BaseModel):
+    model_config = _FORBID
+    issuer: str = Field(min_length=1)
+    key_file: str  # PEM public key
+
+
+class TrustConfig(BaseModel):
+    """Keys trusted for partner card signatures and for signed call contexts."""
+
+    model_config = _FORBID
+    card_keys: dict[str, str] = Field(default_factory=dict)  # kid -> PEM public key file
+    jwks_urls: list[str] = Field(default_factory=list)  # allowlisted jku URLs
+    require_signed: list[TierName] = Field(default_factory=list)
+    context_issuers: dict[str, ContextIssuerConfig] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _keys_for_required(self) -> TrustConfig:
+        if self.require_signed and not (self.card_keys or self.jwks_urls):
+            raise ValueError("require_signed needs card_keys or jwks_urls")
+        return self
+
+
+class OAuthConfig(BaseModel):
+    """An OAuth2 credential for the partners whose ``credential_ref`` is this entry's key."""
+
+    model_config = _FORBID
+    type: Literal["client_credentials", "token_exchange"]
+    token_url: str
+    client_id: str
+    client_secret_env: str  # name of the env var holding the client secret
+    scope: str | None = None
+    audience: str | None = None  # required for token_exchange
+    # token_exchange only: a client_credentials entry used for maintenance calls (cascade
+    # cancels, recovery) when there is no inbound caller token to exchange.
+    fallback: str | None = None
+
+    @model_validator(mode="after")
+    def _shape(self) -> OAuthConfig:
+        if self.type == "token_exchange" and not self.audience:
+            raise ValueError("token_exchange needs audience")
+        if self.type == "client_credentials" and self.fallback is not None:
+            raise ValueError("fallback is only for token_exchange")
+        return self
+
+
+class TlsConfig(BaseModel):
+    """A client certificate for mTLS to partners whose ``tls_ref`` is this entry's key."""
+
+    model_config = _FORBID
+    cert_file: str
+    key_file: str
+    ca_file: str | None = None
+
+
+class PushConfig(BaseModel):
+    """Push notifications (``a2agw.serve.push.PushSettings``). Push JWTs are signed with the
+    ``signing`` key when that section is set."""
+
+    model_config = _FORBID
+    allow_private: bool = False
+    timeout_s: float = Field(default=10.0, gt=0)
+    max_attempts: int = Field(default=3, ge=1)
+    encryption_key_env: str | None = None
+    max_configs_per_task: int = Field(default=10, ge=1)
+    max_concurrent_deliveries: int = Field(default=32, ge=1)
+    max_pending_tasks: int = Field(default=1000, ge=1)
+
+
+class ServerTlsConfig(BaseModel):
+    """HTTPS for ``a2agw serve`` (the ``--ssl-*`` flags override it)."""
+
+    model_config = _FORBID
+    cert_file: str
+    key_file: str
+    ca_file: str | None = None
+    require_client_cert: bool = False
+
+    @model_validator(mode="after")
+    def _ca_for_client_certs(self) -> ServerTlsConfig:
+        if self.require_client_cert and not self.ca_file:
+            raise ValueError("require_client_cert needs ca_file")
+        return self
+
+
 class GatewayConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     base_url: str
@@ -98,12 +244,36 @@ class GatewayConfig(BaseModel):
     telemetry: TelemetryConfig | None = None
     # Spec 8.2: outbound partner tasks still open after this many seconds are cancelled.
     outbound_ttl_s: float = Field(default=86400.0, gt=0)
+    signing: SigningConfig | None = None
+    trust: TrustConfig | None = None
+    oauth: dict[str, OAuthConfig] = Field(default_factory=dict)
+    tls: dict[str, TlsConfig] = Field(default_factory=dict)
+    policy_file: str | None = None
+    classifier: Literal["regex_pii"] | None = None  # egress classifier for the policy
+    push: PushConfig | None = None
+    audit: bool = True
+    server_tls: ServerTlsConfig | None = None
 
     @model_validator(mode="after")
-    def _credential_refs_exist(self) -> GatewayConfig:
+    def _refs_exist(self) -> GatewayConfig:
+        both = sorted(set(self.credentials) & set(self.oauth))
+        if both:
+            raise ValueError(f"refs defined in both credentials and oauth: {', '.join(both)}")
+        for ref, o in self.oauth.items():
+            if o.fallback is not None:
+                fb = self.oauth.get(o.fallback)
+                if fb is None or fb.type != "client_credentials":
+                    raise ValueError(
+                        f"oauth {ref!r}: fallback must name a client_credentials oauth entry"
+                    )
         for p in self.partners:
-            if p.credential_ref is not None and p.credential_ref not in self.credentials:
-                raise ValueError(f"partner {p.id!r}: unknown credential_ref {p.credential_ref!r}")
+            ref = p.credential_ref
+            if ref is not None and ref not in self.credentials and ref not in self.oauth:
+                raise ValueError(f"partner {p.id!r}: unknown credential_ref {ref!r}")
+            if p.tls_ref is not None and p.tls_ref not in self.tls:
+                raise ValueError(f"partner {p.id!r}: unknown tls_ref {p.tls_ref!r}")
+        if self.classifier is not None and self.policy_file is None:
+            raise ValueError("classifier needs policy_file")
         return self
 
 
@@ -117,6 +287,30 @@ def _interpolate_tree(node: Any, env: dict[str, str], source: str) -> Any:
     return node
 
 
+def _reject_inline_secrets(node: Any, source: str, path: str = "") -> None:
+    """Before interpolation: no secret-looking key anywhere, no literal password in db_url."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            key = str(k)
+            where = f"{path}.{key}" if path else key
+            if path not in _NAME_MAPS and key.lower() in _SECRET_KEYS:
+                raise ConfigError(
+                    f"{source}: {where}: inline secrets are not allowed in config; name an "
+                    f"environment variable with {key}_env (or put key material in a *_file)"
+                )
+            _reject_inline_secrets(v, source, where)
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            _reject_inline_secrets(v, source, f"{path}.{i}")
+    if path == "db_url" and isinstance(node, str):
+        m = _URL_PASSWORD.match(node)
+        if m and m.group(1) and not _WHOLE_VAR.fullmatch(m.group(1)):
+            raise ConfigError(
+                f"{source}: db_url: inline database password; use ${{VAR}} for it "
+                "(or for the whole URL)"
+            )
+
+
 def load_config(path: str | Path, env: dict[str, str] | None = None) -> GatewayConfig:
     p = Path(path)
     try:
@@ -127,6 +321,7 @@ def load_config(path: str | Path, env: dict[str, str] | None = None) -> GatewayC
         data = yaml.safe_load(text)
     except yaml.YAMLError:
         raise ConfigError(f"{p}: invalid YAML") from None
+    _reject_inline_secrets(data, str(p))
     # Interpolate string scalars only, after parsing: env values can never add YAML structure.
     data = _interpolate_tree(data, dict(os.environ) if env is None else env, str(p))
     if not isinstance(data, dict):
@@ -136,7 +331,9 @@ def load_config(path: str | Path, env: dict[str, str] | None = None) -> GatewayC
     except ValidationError as e:
         # Field locations and messages only; never echo input values.
         problems = "; ".join(
-            f"{'.'.join(str(x) for x in err['loc'])}: {err['msg']}" for err in e.errors()
+            f"{'.'.join(str(x) for x in err['loc']) or '<root>'}: "
+            f"{err['msg'].removeprefix('Value error, ')}"
+            for err in e.errors(include_input=False, include_url=False)
         )
         raise ConfigError(f"{p}: {problems}") from None
 
@@ -196,19 +393,195 @@ def _setup_telemetry(cfg: TelemetryConfig) -> None:
     setup_telemetry(cfg.service_name, exporter=exporter)
 
 
+def config_file(config_dir: Path, value: str, where: str) -> Path:
+    """``value`` resolved against the config dir; ConfigError (naming the file, never its
+    contents) unless it is a readable regular file."""
+    p = (Path(config_dir) / value).resolve()
+    if not p.is_file() or not os.access(p, os.R_OK):
+        raise ConfigError(f"{where}: file {value} is missing or unreadable")
+    return p
+
+
+def _public_key(config_dir: Path, value: str, where: str) -> Any:
+    p = config_file(config_dir, value, where)
+    try:
+        return load_public_key(p)
+    except (ValueError, OSError):
+        raise ConfigError(f"{where}: cannot load a public key from {value}") from None
+
+
+def tls_configs(cfg: GatewayConfig, config_dir: Path | str) -> dict[str, TlsClientConfig]:
+    """The ``tls`` section as one mapping, shared by the registry and the partner client."""
+    config_dir = Path(config_dir).resolve()
+    out: dict[str, TlsClientConfig] = {}
+    for ref, t in cfg.tls.items():
+        where = f"tls.{ref}"
+        try:
+            out[ref] = TlsClientConfig(
+                config_file(config_dir, t.cert_file, f"{where}.cert_file"),
+                config_file(config_dir, t.key_file, f"{where}.key_file"),
+                config_file(config_dir, t.ca_file, f"{where}.ca_file") if t.ca_file else None,
+            )
+            out[ref].ssl_context()
+        except (ValueError, OSError) as e:
+            # TlsClientConfig's messages name the file and the problem only.
+            raise ConfigError(f"{where}: {type(e).__name__}: {e}") from None
+    return out
+
+
+def card_verifier(cfg: GatewayConfig, config_dir: Path | str) -> CardVerifier | None:
+    """The partner card verifier from ``trust`` (None without card keys or JWKS URLs)."""
+    t = cfg.trust
+    if t is None or not (t.card_keys or t.jwks_urls):
+        return None
+    config_dir = Path(config_dir).resolve()
+    keys = {
+        kid: _public_key(config_dir, f, f"trust.card_keys.{kid}") for kid, f in t.card_keys.items()
+    }
+    try:
+        return CardVerifier(trusted=keys, jwks_urls=list(t.jwks_urls))
+    except (ValueError, UnsafeURL) as e:
+        raise ConfigError(f"trust: {e}") from None
+
+
+def registry_options(cfg: GatewayConfig, config_dir: Path | str) -> dict[str, Any]:
+    """Keyword arguments for a ``PartnerRegistry`` (and ``AgentHost``) from the config:
+    the card verifier, the tiers that require signed cards and the mTLS configs."""
+    require: frozenset[Tier] = frozenset(cfg.trust.require_signed if cfg.trust else ())
+    return {
+        "verifier": card_verifier(cfg, config_dir),
+        "require_signed": require,
+        "tls": tls_configs(cfg, config_dir),
+    }
+
+
+def partner_registry(cfg: GatewayConfig, config_dir: Path | str) -> PartnerRegistry:
+    """The configured partner registry (not loaded), as ``a2agw partners ...`` uses it."""
+    return PartnerRegistry(
+        partners_path(cfg, Path(config_dir).resolve()), **registry_options(cfg, config_dir)
+    )
+
+
+def credentials_provider(cfg: GatewayConfig) -> CredentialProvider:
+    """Static env credentials, then one OAuth provider per ``oauth`` entry (each applies only
+    to partners whose ``credential_ref`` is its key)."""
+    env = EnvCredentials({k: (v.header, v.env) for k, v in cfg.credentials.items()})
+    if not cfg.oauth:
+        return env
+    providers: list[CredentialProvider] = [env]
+    try:
+        for ref, o in cfg.oauth.items():
+            if o.type == "client_credentials":
+                providers.append(_client_credentials(o, ref))
+            else:
+                assert o.audience is not None
+                fallback = None
+                if o.fallback is not None:
+                    fallback = _client_credentials(cfg.oauth[o.fallback], ref)
+                providers.append(
+                    OAuthTokenExchange(
+                        o.token_url,
+                        o.client_id,
+                        o.client_secret_env,
+                        o.audience,
+                        {ref},
+                        fallback=fallback,
+                    )
+                )
+    except (ValueError, UnsafeURL) as e:
+        raise ConfigError(f"oauth: {e}") from None
+    return ChainCredentials(*providers)
+
+
+def _client_credentials(o: OAuthConfig, ref: str) -> OAuthClientCredentials:
+    return OAuthClientCredentials(
+        o.token_url,
+        o.client_id,
+        o.client_secret_env,
+        scope=o.scope,
+        audience=o.audience,
+        refs={ref},
+    )
+
+
+def _signers(
+    cfg: GatewayConfig, config_dir: Path
+) -> tuple[CardSigner | None, CallContextSigner | None]:
+    s = cfg.signing
+    if s is None:
+        return None, None
+    key = config_file(config_dir, s.key_file, "signing.key_file")
+    try:
+        card = CardSigner(key, s.kid, s.alg, s.jku)
+        context = CallContextSigner(key, s.kid, s.alg, s.issuer or cfg.base_url)
+    except (ValueError, UnsafeURL) as e:
+        # Messages name the key file and the problem, never key material.
+        raise ConfigError(f"signing: {e}") from None
+    return card, context
+
+
+def _context_verifier(
+    cfg: GatewayConfig, config_dir: Path, signer: CallContextSigner | None
+) -> CallContextVerifier | None:
+    issuers = cfg.trust.context_issuers if cfg.trust is not None else {}
+    if not issuers and signer is None:
+        return None
+    trusted = {
+        kid: (c.issuer, _public_key(config_dir, c.key_file, f"trust.context_issuers.{kid}"))
+        for kid, c in issuers.items()
+    }
+    try:
+        # With a signer, AgentHost adds its own key, so a loop back to us verifies.
+        return CallContextVerifier(trusted)
+    except ValueError as e:
+        raise ConfigError(f"trust.context_issuers: {e}") from None
+
+
+def _policy(cfg: GatewayConfig, config_dir: Path) -> PolicyEngine | None:
+    if cfg.policy_file is None:
+        return None
+    path = config_file(config_dir, cfg.policy_file, "policy_file")
+    try:
+        policy = load_policy(path)
+    except PolicyError as e:
+        raise ConfigError(f"policy_file: {e}") from None
+    classifier = RegexPiiClassifier() if cfg.classifier == "regex_pii" else None
+    return PolicyEngine(policy, classifier=classifier)
+
+
 def build_host(cfg: GatewayConfig, *, config_dir: Path | str = ".") -> AgentHost:
     config_dir = Path(config_dir).resolve()
+    card_signer, context_signer = _signers(cfg, config_dir)
+    reg = registry_options(cfg, config_dir)
+    push = None
+    if cfg.push is not None:
+        push = PushSettings(**cfg.push.model_dump(), jwt_signer=card_signer)
+    policy = _policy(cfg, config_dir)
+    context_verifier = _context_verifier(cfg, config_dir, context_signer)
+    credentials = credentials_provider(cfg)
     if cfg.telemetry is not None:
         _setup_telemetry(cfg.telemetry)
-    host = AgentHost(
-        cfg.base_url,
-        auth=cfg.auth,
-        db_url=cfg.db_url,
-        partners_path=partners_path(cfg, config_dir),
-        credentials=EnvCredentials({k: (v.header, v.env) for k, v in cfg.credentials.items()}),
-        admin_without_auth=cfg.admin_without_auth,
-        outbound_ttl_s=cfg.outbound_ttl_s,
-    )
+    try:
+        host = AgentHost(
+            cfg.base_url,
+            auth=cfg.auth,
+            db_url=cfg.db_url,
+            partners_path=partners_path(cfg, config_dir),
+            credentials=credentials,
+            admin_without_auth=cfg.admin_without_auth,
+            outbound_ttl_s=cfg.outbound_ttl_s,
+            card_signer=card_signer,
+            context_signer=context_signer,
+            context_verifier=context_verifier,
+            card_verifier=reg["verifier"],
+            require_signed=reg["require_signed"],
+            tls=reg["tls"],
+            policy=policy,
+            push=push,
+            audit=cfg.audit,
+        )
+    except ValueError as e:  # e.g. a trusted context kid that clashes with the signing kid
+        raise ConfigError(str(e)) from None
     for ref in cfg.agents:
         host.add(_load_agent(ref.spec, config_dir))
     return host
@@ -248,7 +621,12 @@ async def register_partners(
         if p.url is not None:
             try:
                 await reg.add_from_url(
-                    p.id, p.url, p.tier, credential_ref=p.credential_ref, tags=p.tags
+                    p.id,
+                    p.url,
+                    p.tier,
+                    credential_ref=p.credential_ref,
+                    tags=p.tags,
+                    tls_ref=p.tls_ref,
                 )
             except (CardFetchError, UnsafeURL) as e:
                 logger.warning("partner %s: not registered (%s); continuing", p.id, e)
@@ -256,7 +634,12 @@ async def register_partners(
             assert p.card_file is not None
             card = _read_card(config_dir / p.card_file)
             await reg.add_from_card(
-                p.id, card, p.tier, credential_ref=p.credential_ref, tags=p.tags
+                p.id,
+                card,
+                p.tier,
+                credential_ref=p.credential_ref,
+                tags=p.tags,
+                tls_ref=p.tls_ref,
             )
 
 
@@ -264,8 +647,14 @@ __all__ = [
     "ConfigError",
     "GatewayConfig",
     "build_host",
+    "card_verifier",
+    "config_file",
+    "credentials_provider",
     "interpolate",
     "load_config",
+    "partner_registry",
     "partners_path",
     "register_partners",
+    "registry_options",
+    "tls_configs",
 ]

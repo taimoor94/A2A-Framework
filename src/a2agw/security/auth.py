@@ -16,7 +16,7 @@ import jwt
 from a2a.auth.user import UnauthenticatedUser, User
 from a2a.server.context import ServerCallContext
 from a2a.server.routes.common import DefaultServerCallContextBuilder
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from starlette.authentication import (
     AuthCredentials,
     AuthenticationBackend,
@@ -48,12 +48,19 @@ class PermissionDenied(Exception):
     """The authenticated principal may not access the agent."""
 
 
+def hash_api_key(key: str) -> str:
+    """The form ``AuthConfig.api_keys`` stores an API key in: its sha256 hex digest."""
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
 class ApiKeyEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     principal_id: str
     scopes: list[str] = Field(default_factory=list)
 
 
 class JwtConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     issuer: str
     audience: str
     jwks_url: str | None = None
@@ -76,6 +83,7 @@ class JwtConfig(BaseModel):
 
 
 class AuthConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     api_keys: dict[str, ApiKeyEntry] = Field(default_factory=dict)  # sha256 hex -> entry
     jwt: JwtConfig | None = None
     allow_anonymous: bool = False
@@ -236,7 +244,7 @@ class GatewayAuthBackend(AuthenticationBackend):
         return AuthCredentials(sorted(principal.scopes)), PrincipalUser(principal)
 
     def _check_api_key(self, key: str) -> Principal:
-        digest = hashlib.sha256(key.encode()).hexdigest()
+        digest = hash_api_key(key)
         match: ApiKeyEntry | None = None
         for stored, entry in self._config.api_keys.items():  # scan all: no early exit
             if hmac.compare_digest(stored.encode(), digest.encode()):

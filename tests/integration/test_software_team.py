@@ -26,7 +26,10 @@ async def test_pm_delegates_handles_input_and_long_task(tmp_path, fast, spans, m
     transport = StreamingASGITransport({})
     partner_hc = httpx.AsyncClient(transport=transport, base_url="http://t")
     host = await build_team(
-        "http://t", db_url=f"sqlite+aiosqlite:///{tmp_path / 'team.db'}", partner_http=partner_hc
+        "http://t",
+        db_url=f"sqlite+aiosqlite:///{tmp_path / 'team.db'}",
+        partner_http=partner_hc,
+        signing_dir=tmp_path / "keys",
     )
     transport.apps["t"] = host.app()
     await host.startup()
@@ -80,6 +83,23 @@ async def test_pm_delegates_handles_input_and_long_task(tmp_path, fast, spans, m
         }
         assert len({s.context.trace_id for s in a2a_spans}) == 1
 
+        # Signing: every served card is signed, the partners were registered from signed
+        # cards (internal tier requires it here), and calls carried signed call contexts.
+        assert all(card.signatures for card in host.cards.values())
+        for pid in ("architect", "security"):
+            assert host.partners.get(pid).signed_key_id
+        assert host.partners.require_signed == frozenset({"internal"})
+
+        # Audit: partner calls and signed inbound admissions, on an intact chain.
+        rows, _ = await host.audit.query({}, 500, None)
+        actions = {r["action"] for r in rows}
+        assert {"partner.call", "inbound.admit"} <= actions, actions
+        assert any(
+            r["action"] == "inbound.admit" and (r.get("detail") or {}).get("context") == "signed"
+            for r in rows
+        )
+        assert await host.audit.verify_chain() is None
+
         # The task index holds tasks for every agent.
         for agent_id in ("pm", "architect", "security"):
             rows, _ = await host.index.list(agent_id=agent_id)
@@ -103,3 +123,4 @@ def test_run_demo_smoke(capsys, monkeypatch):
     assert code == 0
     assert "COMPLETED" in out
     assert "## Security review" in out
+    assert "signed cards: 3" in out and "audit chain: ok" in out

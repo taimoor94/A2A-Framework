@@ -1,5 +1,8 @@
 """Run the software-team demo: serve the three agents and ask pm to build a todo API.
 
+Runs signed (cards, partner cards and call contexts, with a throwaway Ed25519 key) and with
+the audit log on; prints the signing key id and the audit chain check at the end.
+
 uv run python examples/software_team/run_demo.py [--port 8765] [--no-trace]
 """
 
@@ -7,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import json
 import sys
 import tempfile
 import uuid
@@ -71,6 +76,17 @@ def _text(task) -> str:
     return "".join(p.text for a in task.artifacts for p in a.parts if p.text)
 
 
+def _kids(host) -> set[str]:
+    kids = set()
+    for card in host.cards.values():
+        for sig in card.signatures:
+            header = json.loads(
+                base64.urlsafe_b64decode(sig.protected + "=" * (-len(sig.protected) % 4))
+            )
+            kids.add(header.get("kid", "?"))
+    return kids
+
+
 def _timeline(host) -> list[str]:
     lines = []
     t0 = None
@@ -89,7 +105,11 @@ async def _run(args: argparse.Namespace) -> int:
         provider, memory = _tracing()
     base = f"http://127.0.0.1:{args.port}"
     with tempfile.TemporaryDirectory() as tmp:
-        host = await build_team(base, db_url=f"sqlite+aiosqlite:///{Path(tmp) / 'demo.db'}")
+        host = await build_team(
+            base,
+            db_url=f"sqlite+aiosqlite:///{Path(tmp) / 'demo.db'}",
+            signing_dir=Path(tmp) / "keys",
+        )
         config = uvicorn.Config(host.app(), host="127.0.0.1", port=args.port, log_level="warning")
         server = uvicorn.Server(config)
         serving = await _serve_until_started(server)
@@ -103,6 +123,9 @@ async def _run(args: argparse.Namespace) -> int:
                 events = [
                     ev async for ev in client.send_message(SendMessageRequest(message=message))
                 ]
+            assert host.audit is not None
+            audit_rows, _ = await host.audit.query({}, 1000, None)
+            chain_ok = await host.audit.verify_chain() is None
         finally:
             server.should_exit = True
             await serving
@@ -115,6 +138,10 @@ async def _run(args: argparse.Namespace) -> int:
     print(_text(task))
     print("\n=== timeline ===")
     print("\n".join(_timeline(host)))
+    print("\n=== security ===")
+    signed = sum(1 for card in host.cards.values() if card.signatures)
+    print(f"signed cards: {signed} (kid {', '.join(sorted(_kids(host)))})")
+    print(f"audit rows: {len(audit_rows)}; audit chain: {'ok' if chain_ok else 'BROKEN'}")
     if memory is not None:
         spans = [s for s in memory.get_finished_spans() if s.name.startswith("a2agw.")]
         root = next(
@@ -131,7 +158,8 @@ async def _run(args: argparse.Namespace) -> int:
                 f"\ntrace id: {root.context.trace_id:032x} "
                 f"({len(spans)} a2agw spans in {len(traces)} trace(s))"
             )
-    return 0 if task.status.state == TaskState.TASK_STATE_COMPLETED else 1
+    ok = task.status.state == TaskState.TASK_STATE_COMPLETED and chain_ok
+    return 0 if ok else 1
 
 
 def main(argv: list[str] | None = None) -> int:

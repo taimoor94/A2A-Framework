@@ -11,7 +11,7 @@ import os
 import re
 import signal
 import threading
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterable, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any
@@ -59,7 +59,9 @@ from a2agw._ddl import retry_ddl
 from a2agw.consult.client import PartnerClient
 from a2agw.consult.credentials import CredentialProvider
 from a2agw.consult.handles import OutboundHandleStore
+from a2agw.consult.netguard import Tier
 from a2agw.consult.registry import PartnerRecord, PartnerRegistry
+from a2agw.consult.tls import TlsClientConfig
 from a2agw.consult.tools import PartnerTool, partner_tools
 from a2agw.context.signing import CallContextSigner, CallContextVerifier
 from a2agw.ops.admin import ADMIN_PREFIX, HEALTH_PATH, admin_routes
@@ -73,7 +75,7 @@ from a2agw.security.auth import (
     authorize,
     on_auth_error,
 )
-from a2agw.security.cardsign import CardSigner
+from a2agw.security.cardsign import CardSigner, CardVerifier
 from a2agw.security.policy import PolicyEngine
 from a2agw.security.principal import Principal, PrincipalUser
 from a2agw.serve.agent import AgentSpec, build_card
@@ -131,7 +133,13 @@ def _on_exit_signal(callback: Callable[[], None]) -> Iterator[None]:
 
     Uvicorn waits for open responses to finish *before* the lifespan shutdown runs, so
     endless streams (admin ``/events``) must be ended as soon as the signal is seen.
-    Only possible in the main thread; elsewhere this does nothing."""
+    Only possible in the main thread; elsewhere this does nothing.
+
+    After the host stops, each signal's previous handler is restored, except a ``None``
+    previous handler (one installed outside Python), which cannot be reinstalled: our handler
+    stays and emulates it. SIGINT then still raises ``KeyboardInterrupt``, but SIGTERM is
+    swallowed (it no longer terminates the process). Embedders in that situation should
+    install their own SIGTERM handler after the host exits."""
     if threading.current_thread() is not threading.main_thread():
         yield
         return
@@ -902,6 +910,9 @@ class AgentHost:
         context_verifier: CallContextVerifier | None = None,
         outbound_ttl_s: float = OUTBOUND_TTL_S,
         maintenance_interval_s: float = 300.0,
+        card_verifier: CardVerifier | None = None,
+        require_signed: Iterable[Tier] = (),
+        tls: Mapping[str, TlsClientConfig] | None = None,
     ) -> None:
         self.base_url = base_url
         # Spec 8.2: outbound partner tasks still open after this long are cancelled by the
@@ -954,8 +965,16 @@ class AgentHost:
         self.last_recovery: RecoveryReport | None = None
         # Outbound side. The registry exists from construction so operators can register
         # partners before startup; the handle store and client are created at startup.
+        # Partner card signatures (``card_verifier``, ``require_signed`` tiers) and per-partner
+        # mTLS client configs (``tls``, by ``tls_ref``): one mapping, shared by the registry
+        # (card fetches) and the partner client (calls).
+        self.tls: dict[str, TlsClientConfig] = dict(tls or {})
         self.partners = PartnerRegistry(
-            Path(partners_path) if partners_path is not None else None, http=partner_http
+            Path(partners_path) if partners_path is not None else None,
+            http=partner_http,
+            verifier=card_verifier,
+            require_signed=frozenset(require_signed),
+            tls=self.tls,
         )
         self.credentials = credentials
         # Injected for tests: used as given, bypassing the guarded outbound clients.
@@ -1021,6 +1040,7 @@ class AgentHost:
             http=self.partner_http,
             default_deadline_s=self.default_deadline_s,
             agent_id="host",
+            tls=self.tls,
             policy=self.policy,
             audit=audit,
             context_signer=self.context_signer,
@@ -1359,7 +1379,9 @@ class AgentHost:
         """Serve the app with uvicorn.
 
         On shutdown uvicorn waits at most ``graceful_timeout_s`` seconds for open requests
-        (``None``: no bound) before the lifespan shutdown runs.
+        (``None``: no bound) before the lifespan shutdown runs. Signal handling after the
+        host exits: see ``_on_exit_signal`` (a SIGTERM handler that was installed outside
+        Python cannot be restored, so later SIGTERMs are swallowed).
 
         Binds ``127.0.0.1`` (this machine only) by default. Pass ``host="0.0.0.0"`` to accept
         connections from other machines, and configure ``auth`` before doing so.

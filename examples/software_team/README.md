@@ -9,6 +9,11 @@ Three agents, each built with a different framework, cooperate over A2A from one
   gets a `working` handle back and calls `a2a_wait` until the review is done.
 - **One distributed trace.** Every `a2agw.inbound` and `a2agw.partner_call` span in the run
   shares one trace id. The trace context travels in the call-context extension.
+- **Signing and audit.** The run generates a throwaway Ed25519 key. Every card the host serves
+  is signed, `architect` and `security` are registered from signed cards and verified against
+  that key (the `internal` tier requires signatures here), and pm's partner calls carry signed
+  call contexts that the agents verify. The audit log records the admissions and partner
+  calls; the script prints the signing key id, the number of audit rows and the chain check.
 
 ## Run it
 
@@ -19,11 +24,12 @@ uv run python examples/software_team/run_demo.py --port 9000
 ```
 
 The script serves the agents with uvicorn on `127.0.0.1` and uses a temporary SQLite
-database. It registers `architect` and `security` as `internal` partners from their cards,
+database. It registers `architect` and `security` as `internal` partners from their signed cards,
 then sends "Build a todo API" to `pm` with the a2a-sdk client. It prints:
 
 - the final PM state and report;
 - the event timeline from the host's event bus (`kind`, agent, state);
+- the signed-card count and key id, the audit row count and the audit chain check;
 - the trace id.
 
 The console exporter prints only the `a2agw.*` spans. The a2a-sdk's own internal spans are
@@ -55,8 +61,9 @@ like any external partner, so the same code works with agents on other hosts.
 | `architect` | LangChain `RunnableLambda` with per-thread message history (`thread_id` = A2A `contextId`) | `CallableAdapter` | Input-required. `RunnableAdapter` has no input-required path for plain runnables, so the agent's callable wrapper yields `NeedInput("Which database?")` on the first turn. On the resumed turn it calls the runnable with the answer. |
 | `security` | A plain async generator function | `CallableAdapter` (`@agent`) | A long task: three `Status` updates about 0.7 s apart, then `Done(...)`. |
 
-`team.py` has `build_team(base_url, *, db_url, partner_http=None)`. The demo and
-`tests/integration/test_software_team.py` both use it.
+`team.py` has `build_team(base_url, *, db_url, partner_http=None, signing_dir=None)`; with
+`signing_dir` it generates the key there and runs signed. The demo and
+`tests/integration/test_software_team.py` both use it with signing on.
 
 ## Real LLM (optional)
 
