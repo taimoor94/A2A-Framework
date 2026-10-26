@@ -1,6 +1,6 @@
 # a2a-gateway
 
-A framework-agnostic gateway for the [A2A (Agent2Agent) protocol](https://a2a-protocol.org). It works in both directions. **Inbound**, it serves any agent (a plain function, a LangChain runnable, a LangGraph graph) as a standards-compliant A2A server. **Outbound**, it keeps a registry of partner agents, each registered from its Agent Card, and makes them available to your agent as tools (when the agent's code uses `partner_tools`), so the agent's own reasoning decides which partner to consult. It is built on the official `a2a-sdk` and treats every remote party as untrusted by default.
+A framework-agnostic gateway for the [A2A (Agent2Agent) protocol](https://a2a-protocol.org). It works in both directions. **Inbound**, it serves any agent (a plain function, a LangChain runnable, a LangGraph graph) as a standards-compliant A2A server. **Outbound**, it keeps a registry of partner agents, each registered from its Agent Card, and makes them available to your agent as tools (when the agent's code uses `host.partner_tools`), so the agent's own reasoning decides which partner to consult. It is built on the official `a2a-sdk` and treats every remote party as untrusted by default.
 
 ## Features
 
@@ -78,7 +78,7 @@ ID    TIER      STATUS  HASH          PENDING
 echo  internal  active  da7686314f77
 ```
 
-A running `a2agw serve` picks up the new partner after `curl -X POST -H "X-API-Key: $ADMIN_KEY" localhost:8000/a2agw/admin/partners/reload` (admin scope, audited as `partner.reload`; it re-reads `partners.yaml`; an invalid file is a 400 and changes nothing; removing a partner that still has open outbound tasks is a 409 unless `?force=true`), or on its next start. Partners are registered gateway-wide, but an agent only gets them as tools if its code builds them with `partner_tools` / `as_langchain_tools` (see below); the echo agent does not. Open `agent.py` and edit the function: it is a normal Python function.
+A running `a2agw serve` picks up the new partner after `curl -X POST -H "X-API-Key: $ADMIN_KEY" localhost:8000/a2agw/admin/partners/reload` (admin scope, audited as `partner.reload`; it re-reads `partners.yaml`; an invalid file is a 400 and changes nothing; removing a partner that still has open outbound tasks is a 409 unless `?force=true`), or on its next start. Partners are registered gateway-wide, but an agent only gets them as tools if its code builds them with `host.partner_tools` / `as_langchain_tools` (see below); the echo agent does not. Open `agent.py` and edit the function: it is a normal Python function.
 
 ```python
 from a2agw.adapters.callable import agent
@@ -155,19 +155,19 @@ host.add(deployer)
 
 ### An agent that consults partners
 
-`partner_tools(host.partners)` projects the active partners as tools. `as_langchain_tools(tools, host.client)` turns them into LangChain `StructuredTool`s, and each tool returns a JSON string. `host.client` exists once the host has started, so build the tools inside the agent run, as the demo does.
+`host.partner_tools(agent_id)` projects the active partners as tools for one of the host's agents, filtered by the host's routing policy (a `forbid`den partner is not offered, and `consult` refuses it anyway with `unavailable` "forbidden by policy"). `as_langchain_tools(tools, host.client)` turns them into LangChain `StructuredTool`s, and each tool returns a JSON string. `host.client` exists once the host has started, so build the tools inside the agent run, as the demo does.
 
 ```python
 from pathlib import Path
 
-from a2agw import AgentHost, partner_tools
+from a2agw import AgentHost
 from a2agw.adapters.langchain import as_langchain_tools
 
 host = AgentHost("http://localhost:8000", partners_path=Path("partners.yaml"))
 
 
 def tools_for_this_run():
-    return as_langchain_tools(partner_tools(host.partners), host.client)
+    return as_langchain_tools(host.partner_tools("my-agent"), host.client)
 ```
 
 Give those tools to a tool-calling model, a LangGraph `ToolNode`, or call them directly. A partner call that outlasts `wait_seconds` returns a `working` result with a task handle; poll it with `a2a_check_task` or `a2a_wait`. If a partner needs input, the result has state `input_required` and a `question`; answer by calling the same tool again with that `task_id` and `context_id`. Without LangChain, `a2agw.adapters.callable.as_functions(tools, client)` gives plain async functions.
@@ -191,6 +191,7 @@ Give those tools to a tool-calling model, a LangGraph `ToolNode`, or call them d
 - **Untrusted partner text.** Text from partners is capped at 64 KiB, and results carry `provenance.untrusted = true`. `UNTRUSTED_NOTE` is appended to the partner tools' descriptions so the model treats partner output as data, not instructions. Binary artifacts are never inlined.
 - **Call-context limits.** Every call carries a call context: at most 8 hops by default, an absolute deadline (the default inbound ceiling is 1 hour; it is checked when a call is admitted, not enforced mid-run), an optional call budget (`max_calls`), and the path of agents already involved. A call that comes back to an agent already on its path is rejected unless that agent sets `allow_reentry`. Limits only ever tighten as the context travels. Cancelling an inbound task cancels the partner tasks it started.
 - **Inbound limits.** Request bodies up to 10 MiB and 64 parts per message.
+- **Per-caller caps.** One principal may have at most `limits.max_concurrent_tasks_per_caller` (default 32) agent turns running at once on a host, across all its agents; a turn waiting for input does not count. A send over the cap fails with the A2A `InvalidRequestError` (JSON-RPC `-32600`, HTTP 400 on REST; A2A has no dedicated rate-limit error) and is audited as `limit.exceeded`. All unauthenticated callers share the one `anonymous` count. One inbound task may start at most `limits.max_consults_per_task` (default 16) new partner tasks (replies to a partner task it already started do not count); beyond that a consult returns `unavailable` ("fan-out limit reached for this task") and is audited as `limit.exceeded`. In code: `AgentHost(max_concurrent_tasks_per_caller=..., max_consults_per_task=...)`.
 - **Admin.** The admin API needs a principal with the `a2agw:admin` scope. With no `auth` configured it is closed, unless you set `admin_without_auth: true` (development only).
 - **Secrets.** By design, secrets are kept out of logs, traces, the admin API, and error messages, and credentials are read from the environment at call time. Treat that as the intent, not a guarantee, and review your own agent code and exporters.
 - **Library debug logs.** The a2a SDK logs whole request bodies, request headers (including `Authorization`) and events at DEBUG, and aiosqlite logs every SQL statement with its parameters. Importing a2agw therefore sets the `a2a` and `aiosqlite` loggers to INFO, unless your application has already set their level. Root-level DEBUG logging then carries no message text or credentials from them. To see them anyway (never in production), set those loggers to DEBUG explicitly.
@@ -325,8 +326,8 @@ In `a2agw.yaml`: `policy_file: policy.yaml` (validated at startup; any error sto
 - **Authz.** Every agent request except the card is checked after `AgentAccess`; both must allow. A denial is a bare `403 {"error": "forbidden"}`; the reason goes only to the audit log. The policy also applies when no `auth` is configured: every caller is then `anonymous`, which a `principal: "*"` allow rule never matches, so a no-auth development setup needs an explicit `{principal: "anonymous", agents: [...], effect: allow}` rule.
   - *A lone deny rule is a lockdown, not a blocklist.* As soon as any rule mentions an agent, callers without a matching allow rule are denied ("default deny"). `{principal: "key:mallory", agents: [billing], effect: deny}` on its own denies everyone on `billing`; add `{principal: "*", agents: [billing], effect: allow}` to deny only mallory.
   - *Deny rules match conservatively when the skill is unknown.* Requests are checked with no skill id (there is no skill routing yet), so a deny rule matches whatever its `skills` list says, while an allow rule matches only with `skills: "*"`.
-- **Egress.** `PartnerClient.consult(..., classification=...)` (and the `classification` argument of the `ask_*` tools) labels outbound data `public`, `internal`, `confidential` or `restricted`. Labels only ever raise the level, never lower it: the effective level is the highest of the explicit label (if given), the calling agent's `defaults.agent_classification` (or, if the agent has none, `defaults.unknown_classification`) and the optional classifier's result. So a label chosen by an LLM through a tool argument can never take data below the operator's floor. The classifier sees the message text and `data`, not file attachments. It must not exceed the partner's ceiling: `egress.partner_ceilings[id]`, else `egress.tier_ceilings[tier]` (defaults: internal=restricted, partner=confidential, public=public). A call above the ceiling returns `rejected` ("egress policy: ...") and sends nothing. The calling agent is the one whose adapter is running; outside an inbound run (e.g. a direct `host.client.consult(...)` from your own code) it is the client's `agent_id`, `"host"` for the host's client.
-- **Routing.** `host.partner_tools(agent_id)` (or `partner_tools(registry, policy=..., agent_id=...)`) hides `forbid`den partners, lists `prefer`red ones first and marks forced and preferred ones "Required for this agent." / "Preferred.". A routing evaluation error offers no partner tools at all (fail closed). Routing rules that name unknown partner ids are logged once at startup. Routing only shapes the tool list the LLM is offered (what it sees and is nudged towards); it is not an enforcement boundary. Code that calls `PartnerClient.consult` directly bypasses it, so the enforcement boundary is authz plus the egress ceilings.
+- **Egress.** `PartnerClient.consult(..., classification=...)` (and the `classification` argument of the `ask_*` tools) labels outbound data `public`, `internal`, `confidential` or `restricted`. Labels only ever raise the level, never lower it: the effective level is the highest of the explicit label (if given), the calling agent's `defaults.agent_classification` (or, if the agent has none, `defaults.unknown_classification`) and the optional classifier's result. So a label chosen by an LLM through a tool argument can never take data below the operator's floor. The classifier sees the message text and `data`, not file attachments, so when a classifier is configured a call that carries files is at least `confidential` (a file can never go to a partner whose ceiling is `public`); without a classifier, files are judged by the labels alone. It must not exceed the partner's ceiling: `egress.partner_ceilings[id]`, else `egress.tier_ceilings[tier]` (defaults: internal=restricted, partner=confidential, public=public). A call above the ceiling returns `rejected` ("egress policy: ...") and sends nothing. The calling agent is the one whose adapter is running; outside an inbound run (e.g. a direct `host.client.consult(...)` from your own code) it is the client's `agent_id`, `"host"` for the host's client.
+- **Routing.** `host.partner_tools(agent_id)` (or `partner_tools(registry, policy=..., agent_id=...)`) hides `forbid`den partners, lists `prefer`red ones first and marks forced and preferred ones "Required for this agent." / "Preferred.". A routing evaluation error offers no partner tools at all (fail closed). Routing rules that name unknown partner ids are logged once at startup. `forbid` is also enforced: `PartnerClient.consult` refuses a partner forbidden for the agent whose run makes the call (`unavailable`, "forbidden by policy"; also on a routing evaluation error), so code that calls `consult` directly cannot bypass it. `prefer` and `force` only shape the tool list the LLM is offered.
 
 Any policy evaluation error denies.
 
@@ -395,6 +396,10 @@ db_url: sqlite+aiosqlite:///a2agw.db                 # task store
 partners_file: partners.yaml                         # partner registry, relative to this file
 admin_without_auth: false                            # true = open admin API (development only)
 outbound_ttl_s: 86400                                # cancel partner tasks still open after this (s)
+maintenance_interval_s: 300                          # TTL expiry, message-id purge, card refresh (s)
+limits:
+  max_concurrent_tasks_per_caller: 32                # agent turns running at once per principal
+  max_consults_per_task: 16                          # new partner tasks per inbound task
 audit: true                                          # hash-chained audit log (default true)
 
 auth:                                                # omit for no authentication

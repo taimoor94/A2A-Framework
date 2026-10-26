@@ -22,7 +22,6 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
 from a2agw.adapters.langgraph import GraphAdapter, as_langchain_tools
-from a2agw.consult.tools import partner_tools
 from a2agw.core.spi import InboundContext
 from a2agw.serve.agent import AgentSpec, SkillSpec
 from a2agw.serve.host import AgentHost
@@ -48,7 +47,9 @@ class PartnerError(RuntimeError):
 def _tools(host: AgentHost) -> dict[str, BaseTool]:
     # host.client exists only after startup, so the tools are built per run.
     assert host.client is not None
-    return {t.name: t for t in as_langchain_tools(partner_tools(host.partners), host.client)}
+    # host.partner_tools applies the host's routing policy for this agent (forbidden partners
+    # are hidden, and consult refuses them anyway).
+    return {t.name: t for t in as_langchain_tools(host.partner_tools("pm"), host.client)}
 
 
 async def _call(tool: BaseTool, args: dict[str, Any]) -> dict[str, Any]:

@@ -53,6 +53,7 @@ from a2agw.security.auth import BEARER_STATE_KEY
 from a2agw.security.policy import PolicyEngine
 from a2agw.security.principal import Principal, PrincipalUser
 from a2agw.serve.agent import AgentSpec
+from a2agw.serve.limits import current_slot
 from a2agw.serve.store import TaskIndex
 
 logger = logging.getLogger(__name__)
@@ -300,9 +301,16 @@ class AdapterExecutor(AgentExecutor):
             return
         # Registered before any await, so a concurrent cancel() always finds this run.
         self._active[task_id] = run
+        # The caller's concurrency slot (a2agw.serve.limits), reserved by the request
+        # handler: held while this turn runs.
+        slot = current_slot.get()
+        if slot is not None:
+            slot.adopt()
         try:
             await self._execute(run, context, message, principal)
         finally:
+            if slot is not None:
+                slot.release()
             if self._active.get(task_id) is run:
                 del self._active[task_id]
 

@@ -215,6 +215,15 @@ class PushConfig(BaseModel):
     max_pending_tasks: int = Field(default=1000, ge=1)
 
 
+class LimitsConfig(BaseModel):
+    """Per-caller caps (spec 7.2, 11a.4): agent turns running at once per principal, and
+    new partner tasks one inbound task may start."""
+
+    model_config = _FORBID
+    max_concurrent_tasks_per_caller: int = Field(default=32, ge=1)
+    max_consults_per_task: int = Field(default=16, ge=1)
+
+
 class ServerTlsConfig(BaseModel):
     """HTTPS for ``a2agw serve`` (the ``--ssl-*`` flags override it)."""
 
@@ -244,6 +253,9 @@ class GatewayConfig(BaseModel):
     telemetry: TelemetryConfig | None = None
     # Spec 8.2: outbound partner tasks still open after this many seconds are cancelled.
     outbound_ttl_s: float = Field(default=86400.0, gt=0)
+    # How often the maintenance pass runs (TTL expiry, message-id purge, card refresh).
+    maintenance_interval_s: float = Field(default=300.0, gt=0)
+    limits: LimitsConfig = Field(default_factory=LimitsConfig)
     signing: SigningConfig | None = None
     trust: TrustConfig | None = None
     oauth: dict[str, OAuthConfig] = Field(default_factory=dict)
@@ -570,6 +582,9 @@ def build_host(cfg: GatewayConfig, *, config_dir: Path | str = ".") -> AgentHost
             credentials=credentials,
             admin_without_auth=cfg.admin_without_auth,
             outbound_ttl_s=cfg.outbound_ttl_s,
+            maintenance_interval_s=cfg.maintenance_interval_s,
+            max_concurrent_tasks_per_caller=cfg.limits.max_concurrent_tasks_per_caller,
+            max_consults_per_task=cfg.limits.max_consults_per_task,
             card_signer=card_signer,
             context_signer=context_signer,
             context_verifier=context_verifier,

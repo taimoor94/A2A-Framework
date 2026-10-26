@@ -444,3 +444,30 @@ def test_operator_chosen_names_are_not_mistaken_for_secrets(proj):
         """,
     )
     assert "token" in cfg.credentials
+
+
+def test_limits_and_maintenance_interval_reach_the_host(tmp_path):
+    from a2agw.config import build_host, load_config
+
+    cfg_file = tmp_path / "a2agw.yaml"
+    cfg_file.write_text(
+        "base_url: http://localhost\n"
+        "maintenance_interval_s: 42\n"
+        "limits: {max_concurrent_tasks_per_caller: 3, max_consults_per_task: 5}\n"
+    )
+    host = build_host(load_config(cfg_file), config_dir=tmp_path)
+    assert host.maintenance_interval_s == 42
+    assert host.caller_limiter.max_per_caller == 3 and host.max_consults_per_task == 5
+    defaults = build_host(
+        load_config_text(tmp_path, "base_url: http://localhost\n"), config_dir=tmp_path
+    )
+    assert defaults.caller_limiter.max_per_caller == 32 and defaults.max_consults_per_task == 16
+    assert defaults.maintenance_interval_s == 300
+
+
+def load_config_text(tmp_path, text):
+    from a2agw.config import load_config
+
+    p = tmp_path / "other.yaml"
+    p.write_text(text)
+    return load_config(p)

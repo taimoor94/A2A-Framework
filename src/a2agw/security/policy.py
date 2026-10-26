@@ -38,13 +38,16 @@ authorize(principal, agent_id, skill_id)
     (e.g. ``principal: "*"``) to deny only mallory.
     ``Decision.rule`` is the rule's ``id`` or ``authz[i]``; ids must be unique.
 
-egress(agent_id, partner, classification, text, data)
+egress(agent_id, partner, classification, text, data, *, has_files=False)
     effective = max(explicit classification if given,
     ``defaults.agent_classification[agent]`` if set else ``defaults.unknown_classification``,
     classifier result if a classifier is configured). Labels only ever raise the level: an
     explicit label (which may come from an LLM tool argument) can never go below the agent
     default or ``unknown_classification``, and neither can the classifier. The classifier
-    sees the message text and ``data``, not file attachments. ceiling = ``egress.partner_ceilings[partner.id]`` if set,
+    sees the message text and ``data``, not file attachments: so when a classifier is
+    configured and the call carries files (``has_files``), the effective level is at least
+    CONFIDENTIAL (content the classifier cannot inspect is never treated as public). Without
+    a classifier, files are judged by the labels alone. ceiling = ``egress.partner_ceilings[partner.id]`` if set,
     else ``egress.tier_ceilings[partner.tier]`` (missing tiers keep their defaults).
     Allowed iff effective <= ceiling. ``Decision.classification`` is the effective value.
 
@@ -287,9 +290,11 @@ class PolicyEngine:
         classification: Classification | None,
         text: str,
         data: dict[str, Any] | None,
+        *,
+        has_files: bool = False,
     ) -> Decision:
         try:
-            return self._egress(agent_id, partner, classification, text, data)
+            return self._egress(agent_id, partner, classification, text, data, has_files)
         except Exception as exc:  # noqa: BLE001 - fail closed
             return _failed("egress", exc)
 
@@ -300,6 +305,7 @@ class PolicyEngine:
         classification: Classification | None,
         text: str,
         data: dict[str, Any] | None,
+        has_files: bool = False,
     ) -> Decision:
         defaults = self.policy.defaults
         # Raise-only: the floor is the agent default, else unknown_classification.
@@ -308,6 +314,8 @@ class PolicyEngine:
             eff = max(eff, Classification(classification))
         if self.classifier is not None:
             eff = max(eff, Classification(self.classifier.classify(text, data)))
+            if has_files:  # the classifier cannot see attachments: never below confidential
+                eff = max(eff, Classification.CONFIDENTIAL)
 
         egress = self.policy.egress
         if partner.id in egress.partner_ceilings:

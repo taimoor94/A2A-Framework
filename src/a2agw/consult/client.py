@@ -33,6 +33,7 @@ import ssl
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextvars import ContextVar
 from typing import Any, Literal
@@ -122,6 +123,10 @@ UNSAFE_ADDRESS = "unsafe partner address"  # the guard refused every address of 
 CIRCUIT_OPEN = "circuit open"  # the result then carries ``retry_after_s``
 NO_BINDING = "no supported binding"
 NO_VERSION = "no supported protocol version"
+FORBIDDEN = "forbidden by policy"  # a routing ``forbid`` rule for the current agent
+FANOUT_LIMIT = "fan-out limit reached for this task"
+MAX_CONSULTS_PER_TASK = 16
+_FANOUT_TRACKED = 10_000  # inbound tasks whose fan-out is counted (oldest dropped beyond)
 
 _STRICTNESS: dict[Tier, int] = {"internal": 0, "partner": 1, "public": 2}
 
@@ -386,8 +391,14 @@ class PartnerClient:
         policy: PolicyEngine | None = None,
         audit: AuditLog | None = None,
         context_signer: CallContextSigner | None = None,
+        max_consults_per_task: int | None = MAX_CONSULTS_PER_TASK,
     ) -> None:
+        if max_consults_per_task is not None and max_consults_per_task < 1:
+            raise ValueError("max_consults_per_task must be at least 1")
         self.registry = registry
+        # Spec 11a.4 fan-out cap: new partner tasks per inbound task (None: no cap).
+        self.max_consults_per_task = max_consults_per_task
+        self._fanout: OrderedDict[str, int] = OrderedDict()
         self.context_signer = context_signer  # signs the call context of every consult
         self.policy = policy  # egress checks in consult(), before any network activity
         self.audit = audit
@@ -715,6 +726,7 @@ class PartnerClient:
         denial returns ``rejected`` ("egress policy: <reason>") and sends nothing."""
         if inbound_task_id is None:
             inbound_task_id = current_inbound_task.get()
+        files = list(files)  # iterated more than once (egress check, request)
         started = time.monotonic()
         principal = caller if caller is not None else current_principal.get()
         agent_id = current_agent.get() or self.agent_id
@@ -727,7 +739,30 @@ class PartnerClient:
                 span.set_attribute("a2agw.partner_id", partner_id)
                 if task_id:
                     span.set_attribute("a2a.task_id", task_id)
-                denied, decision = self._egress(partner_id, agent_id, message, data, classification)
+                if self._forbidden(partner_id, agent_id):
+                    # Routing ``forbid`` is enforced here, not only by hiding the tool.
+                    result = self._unavailable(
+                        partner_id, self._record_or_none(partner_id), FORBIDDEN
+                    )
+                    span.set_attribute("a2agw.result_state", result.state)
+                    self._publish(result, started)
+                    if self.audit is not None:
+                        await self.audit.emit(
+                            self._call_event(
+                                principal,
+                                agent_id,
+                                partner_id,
+                                inbound_task_id,
+                                None,
+                                classification,
+                                result.state,
+                                (result.provenance or {}).get("tier"),
+                            )
+                        )
+                    return result
+                denied, decision = self._egress(
+                    partner_id, agent_id, message, data, classification, has_files=bool(files)
+                )
                 if denied is not None:
                     span.set_attribute("a2agw.result_state", denied.state)
                     await self._audit_egress_deny(
@@ -735,6 +770,12 @@ class PartnerClient:
                     )
                     self._publish(denied, started)
                     return denied
+                capped = self._take_fanout(partner_id, inbound_task_id, task_id)
+                if capped is not None:
+                    span.set_attribute("a2agw.result_state", capped.state)
+                    await self._audit_limit(principal, agent_id, partner_id, inbound_task_id)
+                    self._publish(capped, started)
+                    return capped
                 try:
                     result = await self._consult(
                         partner_id,
@@ -810,6 +851,56 @@ class PartnerClient:
             detail={"state": outcome, "tier": tier},
         )
 
+    def _forbidden(self, partner_id: str, agent_id: str) -> bool:
+        """Whether the policy's routing rules forbid ``partner_id`` for ``agent_id`` (the
+        same ``route`` evaluation that hides the tool; an evaluation error forbids)."""
+        if self.policy is None:
+            return False
+        rec = self._record_or_none(partner_id)
+        if rec is None:
+            return False  # _consult answers "unknown partner"
+        return partner_id not in self.policy.route(agent_id, [rec]).visible
+
+    def _take_fanout(
+        self, partner_id: str, inbound_task_id: str | None, task_id: str | None
+    ) -> ToolResult | None:
+        """Spec 11a.4: count one more new partner task for the inbound task, or the
+        ``unavailable`` result when its ``max_consults_per_task`` is used up. Replies to an
+        existing partner task (``task_id``) and calls outside an inbound task are not
+        counted. The count is dropped when the inbound task ends (``cancel_for_inbound``)."""
+        cap = self.max_consults_per_task
+        if cap is None or inbound_task_id is None or task_id:
+            return None
+        used = self._fanout.get(inbound_task_id, 0)
+        if used >= cap:
+            return self._unavailable(partner_id, self._record_or_none(partner_id), FANOUT_LIMIT)
+        self._fanout[inbound_task_id] = used + 1
+        self._fanout.move_to_end(inbound_task_id)
+        while len(self._fanout) > _FANOUT_TRACKED:
+            self._fanout.popitem(last=False)
+        return None
+
+    async def _audit_limit(
+        self,
+        principal: Principal | None,
+        agent_id: str,
+        partner_id: str,
+        inbound_task_id: str | None,
+    ) -> None:
+        if self.audit is None:
+            return
+        await self.audit.emit(
+            AuditEvent(
+                actor=principal.id if principal is not None else "system",
+                action="limit.exceeded",
+                agent_id=agent_id,
+                partner_id=partner_id,
+                task_id=inbound_task_id,
+                outcome="unavailable",
+                detail={"limit": "max_consults_per_task", "count": self.max_consults_per_task},
+            )
+        )
+
     def _egress(
         self,
         partner_id: str,
@@ -817,6 +908,8 @@ class PartnerClient:
         text: str,
         data: dict[str, Any] | None,
         classification: Classification | str | None,
+        *,
+        has_files: bool = False,
     ) -> tuple[ToolResult | None, Decision | None]:
         """(rejected result, decision) on a denial; (None, decision or None) otherwise."""
         label: Classification | None
@@ -838,7 +931,7 @@ class PartnerClient:
         rec = self._record_or_none(partner_id)
         if rec is None:
             return None, None  # _consult answers "unknown partner"
-        decision = self.policy.egress(agent_id, rec, label, text, data)
+        decision = self.policy.egress(agent_id, rec, label, text, data, has_files=has_files)
         if decision.allowed:
             return None, decision
         return ToolResult(
@@ -1573,7 +1666,11 @@ class PartnerClient:
         within ``default_deadline_s`` overall. Returns how many reached ``canceled``.
 
         Runs as a maintenance call (``maintenance_call``): with no inbound caller token,
-        credential providers may fall back to the gateway's service credentials."""
+        credential providers may fall back to the gateway's service credentials.
+
+        The inbound task's fan-out count (``max_consults_per_task``) is dropped: the executor
+        calls this when the task ends."""
+        self._fanout.pop(inbound_task_id, None)
         with use_maintenance():
             return await self._cancel_for_inbound(inbound_task_id)
 

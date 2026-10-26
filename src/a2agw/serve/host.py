@@ -43,6 +43,7 @@ from a2a.utils.errors import (
     ContentTypeNotSupportedError,
     InternalError,
     InvalidParamsError,
+    InvalidRequestError,
     TaskNotFoundError,
     UnsupportedOperationError,
 )
@@ -57,7 +58,7 @@ from starlette.routing import BaseRoute, Mount, get_route_path
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from a2agw._ddl import retry_ddl
-from a2agw.consult.client import PartnerClient
+from a2agw.consult.client import MAX_CONSULTS_PER_TASK, PartnerClient
 from a2agw.consult.credentials import CredentialProvider
 from a2agw.consult.handles import OutboundHandleStore
 from a2agw.consult.netguard import Tier, UnsafeURL
@@ -81,6 +82,12 @@ from a2agw.security.policy import PolicyEngine
 from a2agw.security.principal import Principal, PrincipalUser
 from a2agw.serve.agent import AgentSpec, build_card
 from a2agw.serve.executor import AdapterExecutor
+from a2agw.serve.limits import (
+    DEFAULT_MAX_CONCURRENT_TASKS_PER_CALLER,
+    CallerLimiter,
+    CallerSlot,
+    current_slot,
+)
 from a2agw.serve.push import (
     DRAIN_TIMEOUT_S,
     GatewayPushConfigStore,
@@ -375,6 +382,8 @@ class LimitedRequestHandler(DefaultRequestHandler):
         input_modes: list[str] | None = None,
         ledger: MessageLedger | None = None,
         agent_id: str = "",
+        caller_limiter: CallerLimiter | None = None,
+        audit: AuditLog | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -382,6 +391,8 @@ class LimitedRequestHandler(DefaultRequestHandler):
         self._input_modes = input_modes
         self._ledger = ledger
         self._agent_id = agent_id
+        self._limiter = caller_limiter
+        self._audit = audit
         # Each send being set up, by id() of its params: its ledger key and its request
         # fingerprint, taken before the SDK fills in ids (read by ``_setup_active_task``).
         self._pending: dict[int, tuple[MessageKey, str]] = {}
@@ -462,18 +473,64 @@ class LimitedRequestHandler(DefaultRequestHandler):
                     return None
             await asyncio.sleep(0.05)
 
+    async def _reserve(self, context: ServerCallContext) -> CallerSlot | None:
+        """The caller's concurrency slot for a send that will run the agent (spec 7.2):
+        ``InvalidRequestError`` (JSON-RPC -32600, HTTP 400) and a ``limit.exceeded`` audit
+        row when the principal already has ``max_concurrent_tasks_per_caller`` running."""
+        if self._limiter is None:
+            return None
+        owner = _owner_of(context)
+        slot = self._limiter.reserve(owner)
+        if slot is not None:
+            return slot
+        if self._audit is not None:
+            ev = AuditEvent(
+                actor=owner,
+                action="limit.exceeded",
+                agent_id=self._agent_id,
+                outcome="rejected",
+                detail={
+                    "limit": "max_concurrent_tasks_per_caller",
+                    "count": self._limiter.max_per_caller,
+                },
+            )
+            if owner == "anonymous":
+                await self._audit.emit_coalesced(ev, f"limit:{self._agent_id}")
+            else:
+                await self._audit.emit(ev)
+        raise InvalidRequestError(message="too many concurrent tasks for this caller")
+
+    @asynccontextmanager
+    async def _slot(self, context: ServerCallContext) -> AsyncIterator[None]:
+        """Hold the caller's slot for the agent turn this send starts; the executor adopts
+        it (see ``a2agw.serve.limits``). Always sets the context variable, so a turn started
+        from inside another turn never adopts the outer turn's slot."""
+        slot = await self._reserve(context)
+        token = current_slot.set(slot)
+        try:
+            yield
+        finally:
+            try:
+                current_slot.reset(token)
+            except ValueError:  # a stream resumed in another context than it started in
+                current_slot.set(None)
+            if slot is not None and not slot.adopted:
+                slot.release()
+
     async def on_message_send(self, params: SendMessageRequest, context: ServerCallContext):  # type: ignore[override]
         self._check_parts(params)
         key = self._key(params, context)
         if key is None:
-            return await super().on_message_send(params, context)
+            async with self._slot(context):
+                return await super().on_message_send(params, context)
         fingerprint = _fingerprint(params)
         task = await self._resolve(key, fingerprint, context)
         if task is not None:
             return task
         self._pending[id(params)] = (key, fingerprint)
         try:
-            result = await super().on_message_send(params, context)
+            async with self._slot(context):
+                result = await super().on_message_send(params, context)
         except BaseException:
             await self._ledger.release(key, fingerprint=fingerprint)  # type: ignore[union-attr]
             raise
@@ -491,8 +548,9 @@ class LimitedRequestHandler(DefaultRequestHandler):
         self._check_parts(params)
         key = self._key(params, context)
         if key is None:
-            async for event in super().on_message_send_stream(params, context):
-                yield event
+            async with self._slot(context):
+                async for event in super().on_message_send_stream(params, context):
+                    yield event
             return
         fingerprint = _fingerprint(params)
         task = await self._resolve(key, fingerprint, context)
@@ -515,14 +573,15 @@ class LimitedRequestHandler(DefaultRequestHandler):
         self._pending[id(params)] = (key, fingerprint)
         task_seen = False
         try:
-            async for event in super().on_message_send_stream(params, context):
-                if isinstance(event, A2AMessage) and not task_seen:
-                    await self._ledger.release(  # type: ignore[union-attr]
-                        key, only_unfilled=False, fingerprint=fingerprint
-                    )
-                else:
-                    task_seen = True
-                yield event
+            async with self._slot(context):
+                async for event in super().on_message_send_stream(params, context):
+                    if isinstance(event, A2AMessage) and not task_seen:
+                        await self._ledger.release(  # type: ignore[union-attr]
+                            key, only_unfilled=False, fingerprint=fingerprint
+                        )
+                    else:
+                        task_seen = True
+                    yield event
         except BaseException:
             if not task_seen:
                 await self._ledger.release(key, fingerprint=fingerprint)  # type: ignore[union-attr]
@@ -908,8 +967,18 @@ class AgentHost:
         card_verifier: CardVerifier | None = None,
         require_signed: Iterable[Tier] = (),
         tls: Mapping[str, TlsClientConfig] | None = None,
+        max_concurrent_tasks_per_caller: int = DEFAULT_MAX_CONCURRENT_TASKS_PER_CALLER,
+        max_consults_per_task: int = MAX_CONSULTS_PER_TASK,
     ) -> None:
         self.base_url = base_url
+        # Spec 7.2 / 11a.4 per-caller caps: agent turns running at once per principal
+        # (across all agents; over it a send is InvalidRequestError, audited
+        # ``limit.exceeded``) and new partner tasks per inbound task (over it a consult is
+        # ``unavailable``).
+        self.caller_limiter = CallerLimiter(max_concurrent_tasks_per_caller)
+        if max_consults_per_task < 1:
+            raise ValueError("max_consults_per_task must be at least 1")
+        self.max_consults_per_task = max_consults_per_task
         # Spec 8.2: outbound partner tasks still open after this long are cancelled by the
         # maintenance loop (every ``maintenance_interval_s``), which also forgets inbound
         # message ids past their retention (spec 8.5). See ``maintain``.
@@ -1046,6 +1115,7 @@ class AgentHost:
             policy=self.policy,
             audit=audit,
             context_signer=self.context_signer,
+            max_consults_per_task=self.max_consults_per_task,
         )
         stores: dict[str, TaskStore] = {}
         routes: list[BaseRoute] = []
@@ -1108,6 +1178,8 @@ class AgentHost:
                 input_modes=accepted_input_modes(spec),
                 ledger=ledger,
                 agent_id=agent_id,
+                caller_limiter=self.caller_limiter,
+                audit=audit,
                 **push_kwargs,
             )
             self.executors[agent_id] = executor
