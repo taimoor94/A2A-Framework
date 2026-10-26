@@ -10,6 +10,7 @@ audit row (``outcome`` reaped / refused / failed, ``detail.count``, ``detail.rea
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass
@@ -251,6 +252,20 @@ async def expire_outbound(
                     await handles.mark_end_reason(
                         h["partner_id"], h["task_id"], TTL_REASON, CANCEL_FAILED_REASON, attempt
                     )
+                except BaseException:
+                    # The pass itself was cancelled (host shutdown) mid-cancel: record the
+                    # attempt as failed so a later pass retries it (within the cap).
+                    with contextlib.suppress(Exception):
+                        await asyncio.shield(
+                            handles.mark_end_reason(
+                                h["partner_id"],
+                                h["task_id"],
+                                TTL_REASON,
+                                CANCEL_FAILED_REASON,
+                                attempt,
+                            )
+                        )
+                    raise
         if audit is not None:
             await audit.emit(
                 AuditEvent(

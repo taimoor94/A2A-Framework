@@ -276,6 +276,7 @@ A2AGW_BASE_URL=http://localhost:8000
 GITIGNORE_TEMPLATE = """\
 keys/
 .env
+*.yaml.lock
 *.db
 *.db-shm
 *.db-wal

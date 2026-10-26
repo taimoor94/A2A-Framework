@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import os
 import re
 import time
@@ -35,6 +36,7 @@ from a2agw.consult.netguard import (
 from a2agw.consult.tls import TlsClientConfig, build_async_client
 from a2agw.security.cardsign import CardSignatureError, CardVerifier
 
+logger = logging.getLogger(__name__)
 MAX_CARD_BYTES = 1024 * 1024
 FETCH_TIMEOUT_S = 10.0
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
@@ -50,6 +52,24 @@ _SETTINGS = ("tier", "credential_ref", "tls_ref", "tags")
 # Quarantine reasons of the require_signed invariant (see ``PartnerRegistry.signed_violation``).
 UNSIGNED = "unsigned card"
 KEY_UNTRUSTED = "signing key no longer trusted"
+
+
+@contextmanager
+def _file_lock(path: Path) -> Iterator[None]:
+    """Exclusive lock on ``<path>.lock`` (POSIX ``fcntl.flock``; elsewhere no lock), held
+    while a registry re-reads and rewrites the partners file."""
+    lock_path = path.with_name(path.name + ".lock")
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - not POSIX
+        yield
+        return
+    with open(lock_path, "a") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 class CardFetchError(Exception):
@@ -159,6 +179,7 @@ class ReloadPlan:
     version: int
     # Records of the file that break the require_signed invariant, quarantined in the plan.
     quarantined: dict[str, str] = field(default_factory=dict)
+    raw: dict[str, Any] = field(default_factory=dict)  # each entry as read from the file
 
     def changes(self) -> dict[str, list[str]]:
         return {"added": self.added, "updated": self.updated, "removed": self.removed}
@@ -189,6 +210,10 @@ class PartnerRegistry:
         self.verifier = verifier
         self.require_signed = frozenset(require_signed)
         self._records: dict[str, PartnerRecord] = {}
+        # Persistence (see ``save``): each record as this registry last read it from, or
+        # wrote it to, the partners file, and the records changed since the last save.
+        self._disk: dict[str, Any] = {}
+        self._dirty: set[str] = set()
         self._version = 0  # bumped by every change (reload plans are checked against it)
         self.on_change: Callable[[PartnerRecord, str], None] | None = None
         # Extra detail of the change being reported, readable from inside ``on_change``
@@ -356,8 +381,8 @@ class PartnerRegistry:
         rec.status = "active"
         if changed:
             self._changed(rec, "updated")
-        elif self.path is not None:
-            self.save()
+        # Unchanged: nothing is written (fetched_at is kept in memory only), so a refresh
+        # never touches the file another process may be editing.
         return "unchanged"
 
     def approve(self, id: str, expected_hash: str | None = None) -> PartnerRecord:
@@ -521,8 +546,9 @@ class PartnerRegistry:
 
     def _changed(self, rec: PartnerRecord, event: str, **info: Any) -> None:
         self._version += 1
+        self._dirty.add(rec.id)
         if self.path is not None:
-            self.save()
+            self._save_dirty()
         self._notify(rec, event, info)
 
     def add_listener(self, fn: Callable[[PartnerRecord, str], None]) -> None:
@@ -545,18 +571,82 @@ class PartnerRegistry:
             self.change_info = None
 
     def save(self) -> None:
-        if self.path is None:
+        """Write every in-memory record to the partners file, merge-safe (see
+        ``_save_dirty``): records only on disk stay, and a record changed on disk since this
+        registry read or wrote it keeps its disk version (WARNING)."""
+        self._dirty.update(self._records)
+        self._dirty.update(set(self._disk) - set(self._records))  # removed here: removed there
+        self._save_dirty()
+
+    def _save_dirty(self) -> None:
+        """Write the records changed since the last save, and nothing else.
+
+        Under an exclusive lock on the sidecar ``<file>.lock`` (taken by every registry
+        that saves, the host's and the CLI's), the current file is re-read; each changed
+        record replaces its entry (new ones are appended) unless that entry was changed on
+        disk since this registry last read or wrote it. Then the entry on disk wins, this
+        registry's change to it is not written, and a WARNING asks for a reload. Every
+        other entry is written back exactly as it was read. The file is replaced
+        atomically (temporary file, then ``os.replace``). An unreadable file is never
+        overwritten: the save is skipped with a WARNING."""
+        if self.path is None or not self._dirty:
             return
-        data = {"partners": [r.model_dump(mode="json") for r in self._records.values()]}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(yaml.safe_dump(data, sort_keys=False))
-        os.replace(tmp, self.path)
+        path = self.path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _file_lock(path):
+            try:
+                entries = self._read_raw(path) if path.exists() else []
+            except ValueError as e:
+                logger.warning("partners file not saved: %s; fix the file, then reload", e)
+                return
+            index = {e["id"]: i for i, e in enumerate(entries) if isinstance(e, dict)}
+            written: list[str] = []
+            order = list(self._records)
+            removed: set[str] = set()
+            for pid in sorted(self._dirty, key=lambda i: order.index(i) if i in order else -1):
+                rec = self._records.get(pid)
+                on_disk = entries[index[pid]] if pid in index else None
+                if rec is None and pid not in self._disk:
+                    continue
+                if on_disk != self._disk.get(pid):
+                    logger.warning(
+                        "partner %s was changed in %s by another process; its change here "
+                        "was not written (reload the partners file to see the current one)",
+                        pid,
+                        path.name,
+                    )
+                    continue
+                if rec is None:  # gone from this registry: drop the unchanged disk entry
+                    if pid in index:
+                        removed.add(pid)
+                    self._disk.pop(pid, None)
+                    written.append(pid)
+                    continue
+                dump = rec.model_dump(mode="json")
+                if pid in index:
+                    entries[index[pid]] = dump
+                else:
+                    index[pid] = len(entries)
+                    entries.append(dump)
+                written.append(pid)
+            self._dirty.clear()
+            if not written:
+                return
+            entries = [e for e in entries if not (isinstance(e, dict) and e.get("id") in removed)]
+            text = yaml.safe_dump({"partners": entries}, sort_keys=False)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(text)
+            os.replace(tmp, path)
+            reread = {e["id"]: e for e in yaml.safe_load(text)["partners"]}
+            for pid in written:
+                if pid in reread:
+                    self._disk[pid] = reread[pid]
 
     def load(self) -> None:
         if self.path is None or not self.path.exists():
             return
-        self._records = self._read_file(self.path)
+        self._records, self._disk = self._read_file_and_raw(self.path)
+        self._dirty.clear()
         self._version += 1
         # The invariant holds however a record got into the file (written before
         # require_signed was turned on, a key since removed from the trust config, an edit).
@@ -568,7 +658,7 @@ class PartnerRegistry:
         missing file counts as empty). Apply the plan with ``apply_reload``."""
         if self.path is None:
             raise ValueError("registry has no partners file")
-        fresh = self._read_file(self.path) if self.path.exists() else {}
+        fresh, raw = self._read_file_and_raw(self.path) if self.path.exists() else ({}, {})
         quarantined = self._quarantine_fresh(fresh)
         old = self._records
         updated = [
@@ -583,6 +673,7 @@ class PartnerRegistry:
             removed=[i for i in old if i not in fresh],
             version=self._version,
             quarantined=quarantined,
+            raw=raw,
         )
 
     def apply_reload(self, plan: ReloadPlan) -> dict[str, list[str]]:
@@ -595,6 +686,9 @@ class PartnerRegistry:
         old = self._records
         keep = set(old) - set(plan.updated)
         self._records = {i: old[i] if i in keep else r for i, r in plan.fresh.items()}
+        # The file now is what was read: the base for later merge-safe saves.
+        self._disk = dict(plan.raw)
+        self._dirty &= set(self._records)
         self._version += 1
         if self.on_change is not None or self._listeners:
             for event, ids, source in (
@@ -626,6 +720,11 @@ class PartnerRegistry:
         return self.apply_reload(self.prepare_reload())
 
     def _read_file(self, path: Path) -> dict[str, PartnerRecord]:
+        return self._read_file_and_raw(path)[0]
+
+    @staticmethod
+    def _read_raw(path: Path) -> list[Any]:
+        """The file's ``partners`` entries as parsed (ValueError if it is not valid)."""
         try:
             data = yaml.safe_load(path.read_text(encoding="utf-8"))
         except (yaml.YAMLError, UnicodeDecodeError) as e:
@@ -633,13 +732,19 @@ class PartnerRegistry:
             raise ValueError(f"partner file is not valid YAML ({type(e).__name__})") from None
         if not isinstance(data, dict) or not isinstance(data.get("partners"), list):
             raise ValueError("partner file must be a mapping with a 'partners' list")  # noqa: TRY004
+        return data["partners"]
+
+    def _read_file_and_raw(self, path: Path) -> tuple[dict[str, PartnerRecord], dict[str, Any]]:
         records: dict[str, PartnerRecord] = {}
-        for item in data["partners"]:
+        raw: dict[str, Any] = {}
+        for item in self._read_raw(path):
+            snapshot = copy.deepcopy(item)
             rec = self._validate_loaded(item)
             if rec.id in records:
                 raise ValueError(f"duplicate partner id in file: {rec.id!r}")
             records[rec.id] = rec
-        return records
+            raw[rec.id] = snapshot
+        return records, raw
 
     @staticmethod
     def _validate_loaded(item: Any) -> PartnerRecord:

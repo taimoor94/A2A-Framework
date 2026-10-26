@@ -239,3 +239,29 @@ async def test_older_databases_gain_the_attempts_column(db_url, phase):
         assert (await stores[1].get("p", "old"))["cancel_attempts"] == 1
     finally:
         await eng.dispose()
+
+
+async def test_cancel_interrupted_by_shutdown_stays_retryable(store):
+    """N2: a pass cancelled mid-cancel (host shutdown) records the attempt as failed."""
+    eng, handles, _audit = store
+    await _old(eng, handles, "t1")
+    started = asyncio.Event()
+
+    async def hang(h):
+        started.set()
+        await asyncio.sleep(30)
+
+    pass_ = asyncio.create_task(expire_outbound(handles, hang, None, ttl_s=86400))
+    await asyncio.wait_for(started.wait(), 5)
+    pass_.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pass_
+    row = await handles.get("p", "t1")
+    assert (row["end_reason"], row["cancel_attempts"]) == (CANCEL_FAILED_REASON, 1)
+    calls: list[str] = []
+
+    async def ok(h):
+        calls.append(h["task_id"])
+
+    assert (await expire_outbound(handles, ok, None, ttl_s=86400)).expired == 1
+    assert calls == ["t1"]

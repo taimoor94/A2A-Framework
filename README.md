@@ -78,7 +78,7 @@ ID    TIER      STATUS  HASH          PENDING
 echo  internal  active  da7686314f77
 ```
 
-A running `a2agw serve` picks up the new partner after `curl -X POST -H "X-API-Key: $ADMIN_KEY" -H "X-A2AGW-Admin: 1" localhost:8000/a2agw/admin/partners/reload` (admin scope, the `X-A2AGW-Admin: 1` header is required on every admin POST, audited as `partner.reload`; it re-reads `partners.yaml`; an invalid file is a 400 and changes nothing; removing a partner that still has open outbound tasks is a 409 unless `?force=true`), or on its next start. Partners are registered gateway-wide, but an agent only gets them as tools if its code builds them with `host.partner_tools` / `as_langchain_tools` (see below); the echo agent does not. Open `agent.py` and edit the function: it is a normal Python function.
+The host and the CLI share `partners.yaml` safely: each writes only the partner entries it changed, under a lock on `partners.yaml.lock`, and never overwrites an entry another process changed since it read the file (it logs a warning asking for a reload instead). A running `a2agw serve` picks up the new partner after `curl -X POST -H "X-API-Key: $ADMIN_KEY" -H "X-A2AGW-Admin: 1" localhost:8000/a2agw/admin/partners/reload` (admin scope, the `X-A2AGW-Admin: 1` header is required on every admin POST, audited as `partner.reload`; it re-reads `partners.yaml`; an invalid file is a 400 and changes nothing; removing a partner that still has open outbound tasks is a 409 unless `?force=true`), or on its next start. Partners are registered gateway-wide, but an agent only gets them as tools if its code builds them with `host.partner_tools` / `as_langchain_tools` (see below); the echo agent does not. Open `agent.py` and edit the function: it is a normal Python function.
 
 ```python
 from a2agw.adapters.callable import agent
@@ -494,6 +494,10 @@ The core never imports a framework; adapters live in `a2agw.adapters.<name>` beh
 - Some negative tests still wait a fixed time ("nothing happened within N ms").
 - SIGTERM is swallowed after the host exits when the process had no Python-level SIGTERM handler before (see `AgentHost.run`).
 - The per-caller cap is per host process, and all unauthenticated callers share one count. A send answered before its turn starts (`return_immediately`) can let a caller briefly exceed the cap by the sends racing it.
+- Partner cards of `require_signed` tiers have their signature verified again (locally, against the pinned key) on every consult.
+- `limit.exceeded` audit rows of authenticated callers are written one per refusal (only anonymous ones are coalesced).
+- Cancel-only calls (cascade, TTL, recovery) to a partner that has since been quarantined are refused like any other call, so its open partner tasks keep running until the partner ends them.
+- Reaping an agent creates its (empty) `push_configs_<agent>` table when push is configured and the table does not exist yet.
 - TTL expiry only covers partner tasks started for an inbound task of one of the host's agents; a partner task started by code outside any inbound task (a direct `host.client.consult(...)`) is not expired by any host.
 
 ## Roadmap
