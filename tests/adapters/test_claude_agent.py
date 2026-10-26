@@ -31,6 +31,7 @@ from claude_agent_sdk import (
     SystemMessage,
     TextBlock,
     ToolUseBlock,
+    Transport,
 )
 from mcp.client import Client
 
@@ -352,6 +353,29 @@ def test_durable_sessions_need_a_session_store():
     assert adapter.durable_sessions is True
 
 
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("continue_conversation", True),
+        ("session_id", "fixed-session"),
+        ("fork_session", True),
+        ("resume", "some-session"),
+        ("resume_session_at", "msg-uuid"),
+    ],
+)
+def test_options_that_pick_the_session_are_refused(field, value):
+    # Each would make turns of different A2A contexts continue, fork or share one session
+    # (the adapter picks the session per context with ``resume``): a cross-context leak.
+    options = ClaudeAgentOptions(**{field: value})
+    with pytest.raises(ValueError, match=field):
+        ClaudeAgentAdapter(options, query=FakeClaude())
+
+
+def test_session_options_left_at_their_defaults_are_accepted():
+    options = ClaudeAgentOptions(continue_conversation=False, fork_session=False)
+    assert ClaudeAgentAdapter(options, query=FakeClaude()).options is options
+
+
 def test_default_query_is_the_sdks():
     import claude_agent_sdk
 
@@ -436,6 +460,120 @@ async def test_tool_calls_run_under_the_inbound_task():
     with use_inbound("inbound-1", None):
         await call_tool(server, "ask_pinger", {"message": "hi"})
     assert seen == ["inbound-1"]
+
+
+class ScriptedCLI(Transport):
+    """A stand-in for the CLI on the other end of the SDK's control protocol: the real
+    ``claude_agent_sdk.query`` runs against it (no subprocess). It answers ``initialize``,
+    and on the user's message calls ``tool`` on SDK MCP server ``server`` through
+    ``mcp_message`` control requests (MCP handshake, then ``tools/call``), as the CLI does,
+    then streams the tool's text back as the answer."""
+
+    def __init__(self, server: str, tool: str, args: dict[str, Any]) -> None:
+        self.server, self.tool, self.args = server, tool, args
+        self.out: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        self.mcp: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self.driver: asyncio.Task[None] | None = None
+        self.ready = False
+
+    async def connect(self) -> None:
+        self.ready = True
+
+    def is_ready(self) -> bool:
+        return self.ready
+
+    async def write(self, data: str) -> None:
+        msg = json.loads(data)
+        if msg["type"] == "control_request" and msg["request"]["subtype"] == "initialize":
+            ok = {"subtype": "success", "request_id": msg["request_id"], "response": {}}
+            await self.out.put({"type": "control_response", "response": ok})
+        elif msg["type"] == "user":
+            self.driver = asyncio.create_task(self._turn())
+        elif msg["type"] == "control_response":
+            await self.mcp.put(msg["response"])
+
+    async def _rpc(self, n: int, message: dict[str, Any]) -> dict[str, Any]:
+        request = {"subtype": "mcp_message", "server_name": self.server, "message": message}
+        await self.out.put(
+            {"type": "control_request", "request_id": f"cli-{n}", "request": request}
+        )
+        response = await self.mcp.get()
+        assert response["subtype"] == "success" and response["request_id"] == f"cli-{n}"
+        return response["response"]["mcp_response"]
+
+    async def _turn(self) -> None:
+        from mcp.types import LATEST_PROTOCOL_VERSION
+
+        await self.out.put({"type": "system", "subtype": "init", "session_id": "s-cli"})
+        init_params = {
+            "protocolVersion": LATEST_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "scripted-cli", "version": "0"},
+        }
+        await self._rpc(
+            1, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": init_params}
+        )
+        await self._rpc(2, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+        call = {"name": self.tool, "arguments": self.args}
+        res = await self._rpc(
+            3, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": call}
+        )
+        text = res["result"]["content"][0]["text"]
+        message = {"content": [{"type": "text", "text": text}], "model": "claude-fake"}
+        await self.out.put({"type": "assistant", "message": message, "parent_tool_use_id": None})
+        await self.out.put(
+            {
+                "type": "result",
+                "subtype": "success",
+                "duration_ms": 1,
+                "duration_api_ms": 1,
+                "is_error": False,
+                "num_turns": 1,
+                "session_id": "s-cli",
+                "result": text,
+            }
+        )
+
+    async def read_messages(self) -> AsyncIterator[dict[str, Any]]:
+        while (msg := await self.out.get()) is not None:
+            yield msg
+
+    async def end_input(self) -> None:
+        await self.out.put(None)  # the CLI exits once its stdin closes after the result
+
+    async def close(self) -> None:
+        self.ready = False
+        if self.driver is not None:
+            self.driver.cancel()
+
+
+async def test_real_query_serves_partner_tools_under_the_inbound_task():
+    # The real SDK ``query`` (control protocol, SDK MCP bridge, in-process MCP server) between
+    # a scripted CLI and the projected tool: the tool runs in tasks the SDK starts, and must
+    # still see the inbound task's contextvars. Pins that propagation against SDK upgrades.
+    import functools
+
+    import claude_agent_sdk
+
+    seen: list[str | None] = []
+
+    class Recording(FakePartnerClient):
+        async def consult(self, partner_id: str, message: str, **kwargs: Any) -> Any:
+            seen.append(current_inbound_task.get())
+            return await super().consult(partner_id, message, **kwargs)
+
+    client = Recording()
+    options = ClaudeAgentOptions(
+        mcp_servers={"a2a_partners": as_claude_tools(client.tools(), client)}
+    )
+    cli = ScriptedCLI("a2a_partners", "ask_pinger", {"message": "hi"})
+    query = functools.partial(claude_agent_sdk.query, transport=cli)
+    with use_inbound("inbound-1", None):
+        evs = await asyncio.wait_for(drive(ClaudeAgentAdapter(options, query=query), "go"), 10)
+    assert seen == ["inbound-1"]
+    envelope = json.loads(output_text(evs))
+    assert (envelope["state"], envelope["text"]) == ("completed", "pong:hi")
+    assert isinstance(evs[-1], Done)
 
 
 async def test_contract_kit():

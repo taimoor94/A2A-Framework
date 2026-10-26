@@ -15,15 +15,13 @@ persistent ``session_store`` for the map, and the CLI's transcripts (its local
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import dataclasses
 import json
 import logging
-from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, MutableMapping
 from contextlib import aclosing
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 CLAUDE_EXTRA_HINT = (
@@ -48,6 +46,7 @@ try:
 except ImportError as e:  # pragma: no cover - exercised by a test that hides the package
     raise ImportError(CLAUDE_EXTRA_HINT) from e
 
+from a2agw.adapters._contexts import ContextRegistry
 from a2agw.adapters._stream import stream_events
 from a2agw.consult.client import PartnerClient
 from a2agw.consult.tools import PartnerTool, invoke, strip_extensions, with_untrusted_note
@@ -61,13 +60,22 @@ DEFAULT_MAX_SESSIONS = 10_000
 MAX_SESSIONS = DEFAULT_MAX_SESSIONS  # contexts tracked per adapter (least recently used idle go)
 AGENT_ERROR = "agent error"  # the failure an error result maps to (details are logged)
 
+# Options that choose the session a run continues. The adapter picks it per A2A context
+# (``resume``), so any of these set would continue, fork or pin one session across contexts.
+# Checked when the installed SDK has the field.
+_SESSION_OPTIONS = (
+    "continue_conversation",
+    "session_id",
+    "fork_session",
+    "resume",
+    "resume_session_at",
+)
+
 
 @dataclass
 class _Context:
-    """Per-context state: the lock serialising its turns, and (without a ``session_store``)
-    the id of the SDK session to resume."""
+    """Per-context state: (without a ``session_store``) the id of the SDK session to resume."""
 
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     session_id: str | None = None
 
 
@@ -76,8 +84,10 @@ class ClaudeAgentAdapter:
 
     ``options`` (default ``ClaudeAgentOptions()``) is copied for every turn with ``resume``
     set to the context's SDK session (None on its first turn) and
-    ``include_partial_messages=True``; the caller's object is never changed. Turns on the
-    same context are serialised. ``query`` defaults to ``claude_agent_sdk.query``.
+    ``include_partial_messages=True``; the caller's object is never changed. Options that
+    choose the session themselves (``continue_conversation``, ``session_id``,
+    ``fork_session``, ``resume``, ``resume_session_at``) are refused with ``ValueError``: they
+    would carry one conversation across contexts. Turns on the same context are serialised. ``query`` defaults to ``claude_agent_sdk.query``.
 
     ``session_store`` holds the ``context_id -> session_id`` map instead of the in-memory LRU
     (``MAX_SESSIONS`` contexts); pass a persistent mapping with ``durable_sessions=True`` (it
@@ -106,25 +116,20 @@ class ClaudeAgentAdapter:
                 "(context id -> Claude session id)"
             )
         self.options = options if options is not None else ClaudeAgentOptions()
+        for name in _SESSION_OPTIONS:
+            if getattr(self.options, name, None):
+                raise ValueError(
+                    f"ClaudeAgentOptions.{name} is not supported: the adapter resumes one "
+                    "Claude session per A2A context itself"
+                )
         self.query = query if query is not None else claude_agent_sdk.query
         self.durable_sessions = durable_sessions
         self.session_store = session_store
-        self._contexts: OrderedDict[str, _Context] = OrderedDict()
-
-    def _context(self, context_id: str) -> _Context:
-        """The context's state, most recently used last. Past ``MAX_SESSIONS`` the least
-        recently used idle contexts are dropped with their lock and session id (a context
-        with a turn in flight is never dropped)."""
-        entry = self._contexts.get(context_id)
-        if entry is None:
-            entry = self._contexts[context_id] = _Context()
-        self._contexts.move_to_end(context_id)
-        excess = len(self._contexts) - MAX_SESSIONS
-        if excess > 0:
-            idle = [k for k, e in self._contexts.items() if not e.lock.locked() and e is not entry]
-            for k in idle[:excess]:
-                del self._contexts[k]
-        return entry
+        # The ``MAX_SESSIONS`` most recently used contexts: a context with a turn in flight
+        # is never dropped; an idle one goes with its session id.
+        self._contexts: ContextRegistry[str, _Context] = ContextRegistry(
+            lambda _cid: _Context(), max_size=MAX_SESSIONS
+        )
 
     def _session(self, context_id: str, entry: _Context) -> str | None:
         if self.session_store is not None:
@@ -139,9 +144,11 @@ class ClaudeAgentAdapter:
             entry.session_id = session_id
 
     async def run(self, ctx: InboundContext) -> AsyncIterator[AgentEvent]:
-        entry = self._context(ctx.context_id)
         # Turns on one context run one at a time: each resumes the session the last one used.
-        async with entry.lock, aclosing(self._turn(ctx, entry)) as turn:
+        async with (
+            self._contexts.turn(ctx.context_id) as entry,
+            aclosing(self._turn(ctx, entry)) as turn,
+        ):
             # ``aclosing``: closing this stream runs ``_turn``'s cleanup now, not at GC.
             async for ev in turn:
                 yield ev

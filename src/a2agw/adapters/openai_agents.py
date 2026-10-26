@@ -12,13 +12,11 @@ they mean. ``invoke`` validates every call against the full schema instead.
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import json
-from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
 from contextlib import aclosing
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 OPENAI_EXTRA_HINT = (
@@ -35,6 +33,7 @@ try:
 except ImportError as e:  # pragma: no cover - exercised by a test that hides the package
     raise ImportError(OPENAI_EXTRA_HINT) from e
 
+from a2agw.adapters._contexts import ContextRegistry
 from a2agw.adapters._stream import stream_events
 from a2agw.consult.client import PartnerClient
 from a2agw.consult.tools import PartnerTool, invoke, strip_extensions, with_untrusted_note
@@ -85,9 +84,8 @@ def _is_user(item: Any) -> bool:
 
 @dataclass
 class _Context:
-    """Per-context state: the lock serialising its turns, and its default session."""
+    """Per-context state: its default session (None with a ``session_factory``)."""
 
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     session: MemorySession | None = None
 
 
@@ -136,29 +134,21 @@ class OpenAIAgentsAdapter:
         self.durable_sessions = durable_sessions
         self.max_turns = max_turns
         self.run_config = run_config
-        self._contexts: OrderedDict[str, _Context] = OrderedDict()
+        # The ``MAX_SESSIONS`` most recently used contexts: a context with a turn in flight
+        # is never dropped; an idle one goes with its default session.
+        self._contexts: ContextRegistry[str, _Context] = ContextRegistry(
+            self._new_context, max_size=MAX_SESSIONS
+        )
 
-    def _context(self, context_id: str) -> _Context:
-        """The context's state, most recently used last. Past ``MAX_SESSIONS`` the least
-        recently used idle contexts are dropped with their lock and default session (a
-        context with a turn in flight is never dropped)."""
-        entry = self._contexts.get(context_id)
-        if entry is None:
-            entry = self._contexts[context_id] = _Context()
-            if self.session_factory is None:
-                entry.session = MemorySession(context_id)
-        self._contexts.move_to_end(context_id)
-        excess = len(self._contexts) - MAX_SESSIONS
-        if excess > 0:
-            idle = [k for k, e in self._contexts.items() if not e.lock.locked() and e is not entry]
-            for k in idle[:excess]:
-                del self._contexts[k]
-        return entry
+    def _new_context(self, context_id: str) -> _Context:
+        return _Context(MemorySession(context_id) if self.session_factory is None else None)
 
     async def run(self, ctx: InboundContext) -> AsyncIterator[AgentEvent]:
-        entry = self._context(ctx.context_id)
         # Turns on one context run one at a time: each sees the history the last one saved.
-        async with entry.lock, aclosing(self._turn(ctx, entry)) as turn:
+        async with (
+            self._contexts.turn(ctx.context_id) as entry,
+            aclosing(self._turn(ctx, entry)) as turn,
+        ):
             # ``aclosing``: closing this stream runs ``_turn``'s cleanup now, not at GC.
             async for ev in turn:
                 yield ev

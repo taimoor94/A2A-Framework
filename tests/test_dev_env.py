@@ -22,6 +22,7 @@ DEV_FRAMEWORKS = [
     "agents",
     "mcp",
     "claude_agent_sdk",
+    "google.adk",
 ]
 
 
