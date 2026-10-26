@@ -235,6 +235,23 @@ async def test_oversized_line_fails(agent):
     assert await collect(adapter(agent)) == [Failed("agent protocol error")]
 
 
+async def test_max_line_with_cr_split_across_chunks(agent):
+    prefix, suffix = '{"type":"status","text":"', '"}'
+    fits = prefix + "a" * (MAX_LINE_BYTES - len(prefix) - len(suffix)) + suffix
+
+    async def h(_req):  # the "\r" arrives before its "\n": the line still fits
+        async def gen():
+            yield (fits + "\r").encode()
+            await asyncio.sleep(0)
+            yield b"\n"
+
+        return StreamingResponse(gen(), media_type=NDJSON)
+
+    agent.handler = h
+    events = await collect(adapter(agent))
+    assert len(events) == 2 and isinstance(events[0], Status) and events[1] == Done()
+
+
 async def test_response_and_event_limits(agent, monkeypatch):
     monkeypatch.setattr(webhook_mod, "MAX_EVENTS", 3)
     agent.ndjson(*[{"type": "status", "text": str(i)} for i in range(4)])

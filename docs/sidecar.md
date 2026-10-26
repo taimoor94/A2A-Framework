@@ -213,7 +213,12 @@ after it for that run. Unlike a webhook response, there is no "end of stream": a
 run with a terminal event, or it fails when its deadline passes.
 
 Stdout carries the protocol only: write logs to stderr. The gateway forwards stderr to the
-logger `a2agw.agent.<agent id>` at INFO, one record per line, capped at 4 KiB a line.
+logger `a2agw.agent.<agent id>` at INFO, one record per line. Each line is capped at 4 KiB
+and has ANSI escapes and control characters removed. At most 100 lines a second are
+forwarded; the rest are counted and reported in a "suppressed N lines" WARNING.
+
+Everything the agent writes to stderr ends up in the gateway's logs. That includes any
+environment value it prints (an `env_from` secret, for example), so don't print them.
 
 A minimal agent in Python:
 
@@ -233,13 +238,20 @@ for raw in sys.stdin:
 ### Supervision
 
 - The process starts with the host (or on the first turn). The gateway never uses a shell.
-- When it exits, every run in flight fails with `agent process exited`, and the gateway starts
-  it again after a back-off of 1, 2, 4 ... up to 30 seconds. The back-off starts again at 1
-  second once a process has stayed up for 60 seconds.
+- The process runs in its own process group (a new session), and the gateway always signals
+  that whole group. Anything the agent starts (the real agent behind a wrapper such as `npx`
+  or `sh -c`, or a tool server) is killed with it, unless it moves itself into another
+  session. Don't rely on children outliving the agent.
+- The gateway watches the process itself, not its stdout. When it exits, the rest of its
+  group is killed (children may still hold its pipes open), every run in flight fails with
+  `agent process exited`, and the gateway starts it again after a back-off of 1, 2, 4 ... up
+  to 30 seconds. The back-off starts again at 1 second once a process has stayed up for 60
+  seconds.
 - A turn that arrives while the process is down waits for it, up to the turn's deadline, then
   fails with `agent unavailable`.
-- At shutdown the gateway sends `shutdown` and closes stdin, waits 5 seconds, sends SIGTERM,
-  waits 2 more seconds, then kills the process.
+- At shutdown the gateway sends `shutdown` and closes stdin, waits 5 seconds, sends SIGTERM
+  to the group, waits 2 more seconds, then sends SIGKILL to the group. Whatever is left of the
+  group once the agent has exited is killed too.
 
 ### Failures
 
@@ -255,9 +267,11 @@ detail (an error class or a protocol rule, never a value) at WARNING on
 | The gateway could not prepare the consult grant | `agent consult setup failed` |
 | `timeout_s` passed (including a wait for a free slot under `max_concurrency`) | `agent timed out` |
 
-A line that breaks the protocol fails only the run it names, and that run is sent `cancel`. A
-line that names no run (invalid JSON, no `id`, longer than 1 MiB) is logged and ignored: the
-run it was meant for then ends at its deadline. Lines for a run that has ended are ignored.
+A line that breaks the protocol fails only the run it names, and that run is sent `cancel`.
+A line longer than 1 MiB names its run only if it starts with `{"id":"<run id>"`, so write
+`id` first. A line that names no run (invalid JSON, no `id`, or a too-long line that does not
+start with its id) is logged and ignored, and the run it was meant for ends at its deadline.
+Lines for a run that has ended are ignored.
 
 ### Limits
 

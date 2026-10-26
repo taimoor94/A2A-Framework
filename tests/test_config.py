@@ -410,6 +410,8 @@ def test_stdio_config_validation(tmp_path):
         _ext(stdio={"command": ["a"], "timeout_s": 0}),
         _ext(stdio={"command": ["a"], "env_from": {"BAD=NAME": "X"}}),
         _ext(stdio={"command": ["a"], "env_from": {"OK": "not a var"}}),
+        _ext(stdio={"command": ["a"], "env_from": {"FOO\n": "X"}}),
+        _ext(stdio={"command": ["a"], "env_from": {"FOO": "X\n"}}),
         _ext(stdio={"command": ["a"]}, webhook={"url": "http://x/"}),  # two transports
     ):
         with pytest.raises(ValueError):

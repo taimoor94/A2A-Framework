@@ -12,20 +12,28 @@ Modes (the whole process):
   behave as ``serve``.
 - ``stubborn``: as ``serve``, but ignores the shutdown op, stdin EOF and SIGTERM.
 - ``exit``: exits with code 1 at once.
+- ``grandchild``: as ``serve``, after starting ``sleep 60``, which inherits stdin, stdout and
+  stderr (as a wrapper's child or a tool server would); its pid is appended to
+  ``<record>.gc``.
 
 Per-invoke ``text`` in ``serve``: ``block`` streams a status and never ends; ``env`` reports
-the environment; ``stderr`` writes a long and a short stderr line; ``malformed`` sends an
-invalid event; ``garbage`` sends unparseable lines first; anything else is echoed.
+the environment; ``stderr`` writes a long and a short stderr line; ``noisy`` writes 300
+stderr lines with ANSI escapes and control characters; ``malformed`` sends an invalid event;
+``garbage`` sends unparseable lines first; ``big`` sends a status line of exactly
+MAX_LINE_BYTES, then ``\r\n``, in two writes; ``huge`` sends a line over MAX_LINE_BYTES;
+``crash`` exits with code 3; anything else is echoed.
 """
 
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 
 MODE = sys.argv[1]
 RECORD = sys.argv[2] if len(sys.argv) > 2 else None
+MAX_LINE_BYTES = 1 << 20  # a2agw.gateway.protocol.MAX_LINE_BYTES
 
 
 def record(op):
@@ -58,6 +66,34 @@ def answer(rid, req):
         sys.stderr.flush()
         emit(rid, {"type": "done"})
         return
+    if text == "noisy":
+        for i in range(300):
+            sys.stderr.write(f"\x1b[31mred\x1b[0m\x07 line {i}\n")
+        sys.stderr.flush()
+        emit(rid, {"type": "done"})
+        return
+    if text == "crash":
+        os._exit(3)
+    if text == "big":
+        empty = json.dumps({"id": rid, "event": {"type": "status", "text": ""}})
+        line = json.dumps(
+            {"id": rid, "event": {"type": "status", "text": "a" * (MAX_LINE_BYTES - len(empty))}}
+        )
+        assert len(line) == MAX_LINE_BYTES
+        sys.stdout.write(line + "\r")
+        sys.stdout.flush()
+        time.sleep(0.05)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        emit(rid, {"type": "done"})
+        return
+    if text == "huge":
+        sys.stdout.write(
+            json.dumps({"id": rid, "event": {"type": "status", "text": "a" * MAX_LINE_BYTES}})
+            + "\n"
+        )
+        sys.stdout.flush()
+        return
     if text == "malformed":
         emit(rid, {"type": "bogus"})
         return
@@ -82,6 +118,10 @@ def main():
         if not os.path.exists(marker):
             open(marker, "w").close()
             crashing = True
+    if mode == "grandchild":
+        gc = subprocess.Popen(["sleep", "60"])
+        with open(RECORD + ".gc", "a") as f:
+            f.write(f"{gc.pid}\n")
     if mode == "stubborn":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
     held = []

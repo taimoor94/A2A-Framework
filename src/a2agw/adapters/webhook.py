@@ -35,12 +35,17 @@ from typing import Any
 import httpx
 
 from a2agw.adapters._sidecar import (
+    CONNECTION_LOST,
+    PROTOCOL_ERROR,
+    TIMED_OUT,
+    UNREACHABLE,
     ConsultFn,
     TurnDeadline,
     TurnFailure,
     check_line,
     consult_grant,
     loads,
+    partial_line_too_long,
     run_turn,
 )
 from a2agw.consult.guarded_net import fixed_tier, guarded_async_client, is_unsafe_address
@@ -49,7 +54,6 @@ from a2agw.core.events import AgentEvent, Done, Failed
 from a2agw.core.spi import InboundContext
 from a2agw.gateway.protocol import (
     MAX_EVENTS,
-    MAX_LINE_BYTES,
     MAX_RESPONSE_BYTES,
     PROTOCOL,
     TERMINAL,
@@ -154,17 +158,17 @@ class WebhookAdapter:
                             if isinstance(item, TERMINAL):
                                 return
         except (TimeoutError, httpx.TimeoutException):
-            log.warning("agent timed out after %ss", self.timeout_s)
-            failure = "agent timed out"
+            log.warning("%s after %ss", TIMED_OUT, self.timeout_s)
+            failure = TIMED_OUT
         except ProtocolError as e:
-            log.warning("agent protocol error: %s", e)
-            failure = "agent protocol error"
+            log.warning("%s: %s", PROTOCOL_ERROR, e)
+            failure = PROTOCOL_ERROR
         except httpx.DecodingError as e:  # e.g. a Content-Encoding the body does not match
-            log.warning("agent protocol error: %s", type(e).__name__)
-            failure = "agent protocol error"
+            log.warning("%s: %s", PROTOCOL_ERROR, type(e).__name__)
+            failure = PROTOCOL_ERROR
         except httpx.RequestError as e:  # TransportError, or any other request failure
             reason = "unsafe address" if is_unsafe_address(e) else type(e).__name__
-            failure = "agent connection lost" if connected else "agent unreachable"
+            failure = CONNECTION_LOST if connected else UNREACHABLE
             log.warning("%s: %s", failure, reason)
         if failure is not None:
             yield Failed(failure)
@@ -209,7 +213,7 @@ class WebhookAdapter:
                     del buf[: i + 1]
                     if line.strip():
                         yield event(loads(check_line(line)))
-                if len(buf) > MAX_LINE_BYTES:
+                if partial_line_too_long(buf):
                     raise ProtocolError("line longer than MAX_LINE_BYTES")
             if buf.strip():  # a last line without its newline
                 yield event(loads(check_line(bytes(buf))))

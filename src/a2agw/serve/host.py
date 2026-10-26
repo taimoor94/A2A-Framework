@@ -1511,14 +1511,14 @@ class AgentHost:
             self.engine = None
 
     async def _stop_adapters(self) -> None:
-        """Stop the adapters started at startup, last first. One that fails to stop is
-        logged (its error class) and the others are still stopped."""
+        """Stop the adapters started at startup, concurrently (one slow shutdown does not
+        hold up the others). One that fails to stop is logged (its error class only)."""
         started, self._started_adapters = self._started_adapters, []
-        for agent_id, adapter in reversed(started):
-            try:
-                await adapter.stop()
-            except Exception as e:  # noqa: BLE001 - keep stopping the others
-                logger.error("agent %s: adapter stop failed: %s", agent_id, type(e).__name__)
+        started.reverse()
+        results = await asyncio.gather(*(a.stop() for _, a in started), return_exceptions=True)
+        for (agent_id, _), result in zip(started, results, strict=True):
+            if isinstance(result, BaseException):
+                logger.error("agent %s: adapter stop failed: %s", agent_id, type(result).__name__)
 
     async def _delegate(self, scope: Scope, receive: Receive, send: Send) -> None:
         if self._inner is None:

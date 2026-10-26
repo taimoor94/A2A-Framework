@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
 import types
@@ -19,7 +20,7 @@ from a2agw.adapters import stdio as stdio_mod
 from a2agw.adapters.stdio import StdioAdapter
 from a2agw.core.events import ArtifactChunk, Done, Failed, Status, Usage
 from a2agw.core.spi import InboundContext, LifecycleAdapter
-from a2agw.gateway.protocol import PROTOCOL, ConsultGrant
+from a2agw.gateway.protocol import MAX_LINE_BYTES, PROTOCOL, ConsultGrant
 
 AGENT = str(Path(__file__).with_name("stdio_agent.py"))
 LOGGER = "a2agw.agent.coder"
@@ -72,6 +73,21 @@ def ops(path: Path) -> list[dict]:
     if not path.exists():
         return []
     return [json.loads(line) for line in path.read_text().splitlines() if line]
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def grandchildren(rec: Path) -> list[int]:
+    path = Path(f"{rec}.gc")
+    return [int(x) for x in path.read_text().split()] if path.exists() else []
 
 
 async def until(pred, timeout: float = 5.0):
@@ -334,3 +350,67 @@ def test_constructor_validates():
         StdioAdapter(["a"], timeout_s=0)
     with pytest.raises(ValueError):
         StdioAdapter(["a"], env={"BAD=NAME": "x"})
+
+
+async def test_crash_with_live_grandchild_fails_promptly_and_restarts(make, tmp_path, monkeypatch):
+    # The grandchild holds the agent's pipes open: the exit is still seen at once, the rest
+    # of the process group is killed, and the agent is restarted.
+    monkeypatch.setattr(stdio_mod, "BACKOFF_MIN_S", 0.05)
+    rec = tmp_path / "ops.jsonl"
+    a = make("grandchild", str(rec), timeout_s=30)
+    assert await collect(a) == echo("hello")
+    [gc] = grandchildren(rec)
+    assert alive(gc)
+    start = time.monotonic()
+    assert await collect(a, "crash") == [Failed("agent process exited")]
+    assert time.monotonic() - start < 5.0  # not the 30 s deadline
+    await until(lambda: not alive(gc))
+    assert await asyncio.wait_for(collect(a), 10.0) == echo("hello")  # restarted
+    assert len(grandchildren(rec)) == 2
+
+
+async def test_stop_leaves_no_descendant(make, tmp_path):
+    rec = tmp_path / "ops.jsonl"
+    a = make("grandchild", str(rec))
+    await a.start()
+    [gc] = await until(lambda: grandchildren(rec))
+    pid = a.pid
+    assert pid is not None
+    start = time.monotonic()
+    await a.stop()
+    assert time.monotonic() - start < 3.0
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    await until(lambda: not alive(gc))  # killed with the group, not orphaned
+
+
+async def test_oversized_line_fails_its_run_promptly(make, tmp_path):
+    rec = tmp_path / "ops.jsonl"
+    a = make("serve", str(rec), timeout_s=30)
+    start = time.monotonic()
+    assert await collect(a, "huge") == [Failed("agent protocol error")]
+    assert time.monotonic() - start < 5.0  # its run id was read from the line's start
+    await until(lambda: any(o["op"] == "cancel" for o in ops(rec)))
+    # Exactly MAX_LINE_BYTES plus "\r\n", the "\r" arriving before the "\n": accepted.
+    status, done = await collect(a, "big")
+    assert isinstance(status, Status) and done == Done()
+    assert len(status.text) > MAX_LINE_BYTES - 100
+
+
+async def test_stderr_sanitized_and_rate_limited(make, caplog):
+    a = make("serve")
+    with caplog.at_level(logging.INFO, logger=LOGGER):
+        assert await collect(a, "noisy") == [Done()]
+        await a.stop()  # the end of stderr reports what was suppressed
+    msgs = [r.getMessage() for r in caplog.records if r.name == LOGGER]
+    lines = [m for m in msgs if m.startswith("red")]
+    assert lines[0] == "red line 0"  # no escapes, no control characters
+    assert all(re.fullmatch(r"red line \d+", m) for m in lines)
+    [note] = [m for m in msgs if "suppressed" in m]
+    suppressed = int(re.search(r"suppressed (\d+) lines", note).group(1))
+    assert 100 <= len(lines) <= 200 and len(lines) + suppressed == 300
+
+
+def test_env_names_must_match_fully():
+    with pytest.raises(ValueError):
+        StdioAdapter(["a"], env={"FOO\n": "x"})

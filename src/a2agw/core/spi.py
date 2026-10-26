@@ -70,7 +70,8 @@ class LifecycleAdapter(Protocol):
 
     Duck-typed and additive: ``AgentHost`` calls ``start()`` at startup, once the stores are
     ready, and ``stop()`` at shutdown, before the database engine is disposed, for every
-    adapter that has both methods. ``stop()`` must be safe to call when ``start()`` was not."""
+    adapter that has both methods. Both must be coroutine functions (``async def``): the host
+    awaits them. ``stop()`` must be safe to call when ``start()`` was not, or failed."""
 
     async def start(self) -> None: ...
 

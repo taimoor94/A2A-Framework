@@ -19,6 +19,16 @@ from a2agw.core.spi import InboundContext
 from a2agw.gateway.protocol import MAX_LINE_BYTES, TERMINAL, ConsultGrant, ProtocolError
 
 T = TypeVar("T")
+
+# Failure reasons the A2A caller sees (``Failed.error``), one wording for every transport.
+TIMED_OUT = "agent timed out"
+PROTOCOL_ERROR = "agent protocol error"
+CONSULT_FAILED = "agent consult setup failed"
+UNREACHABLE = "agent unreachable"
+CONNECTION_LOST = "agent connection lost"
+EXITED = "agent process exited"
+UNAVAILABLE = "agent unavailable"
+
 ConsultFn = Callable[[InboundContext], Awaitable[ConsultGrant | None]]
 
 
@@ -56,11 +66,11 @@ async def consult_grant(
     try:
         return await deadline.within(consult(ctx))
     except TimeoutError:
-        log.warning("agent timed out after %ss (consult setup)", deadline.timeout_s)
-        raise TurnFailure("agent timed out") from None
+        log.warning("%s after %ss (consult setup)", TIMED_OUT, deadline.timeout_s)
+        raise TurnFailure(TIMED_OUT) from None
     except Exception as e:  # noqa: BLE001 - any failure of the grant callable
-        log.warning("agent consult setup failed: %s", type(e).__name__)
-        raise TurnFailure("agent consult setup failed") from None
+        log.warning("%s: %s", CONSULT_FAILED, type(e).__name__)
+        raise TurnFailure(CONSULT_FAILED) from None
 
 
 def check_line(line: bytes) -> bytes:
@@ -69,6 +79,13 @@ def check_line(line: bytes) -> bytes:
     if len(line) > MAX_LINE_BYTES:
         raise ProtocolError("line longer than MAX_LINE_BYTES")
     return line
+
+
+def partial_line_too_long(buf: bytes | bytearray) -> bool:
+    """For a line whose newline has not arrived yet: True once it can no longer pass
+    ``check_line`` (one trailing ``\r`` does not count against MAX_LINE_BYTES)."""
+    n = len(buf)
+    return n > MAX_LINE_BYTES + 1 or (n == MAX_LINE_BYTES + 1 and not buf.endswith(b"\r"))
 
 
 def loads(data: bytes) -> Any:

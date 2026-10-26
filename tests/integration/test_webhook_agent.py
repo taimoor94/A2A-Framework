@@ -218,6 +218,28 @@ async def test_host_starts_and_stops_lifecycle_adapters(tmp_path, caplog):
     assert host.engine is None
 
 
+async def test_host_stops_lifecycle_adapters_concurrently(tmp_path):
+    calls: list[str] = []
+    one_stopping = asyncio.Event()
+
+    class WaitsForOne(_Lifecycle):  # stopped first; finishes only once "one" is stopping
+        async def stop(self) -> None:
+            await super().stop()
+            await one_stopping.wait()
+
+    class One(_Lifecycle):
+        async def stop(self) -> None:
+            await super().stop()
+            one_stopping.set()
+
+    host = AgentHost("http://gw", db_url=f"sqlite+aiosqlite:///{tmp_path / 'gw.db'}")
+    host.add(_spec("one", One("one", calls)))
+    host.add(_spec("two", WaitsForOne("two", calls)))
+    await host.startup()
+    await asyncio.wait_for(host.shutdown(), 5.0)
+    assert sorted(calls[2:]) == ["stop one", "stop two"]
+
+
 async def test_failed_startup_stops_started_adapters(tmp_path, monkeypatch):
     calls: list[str] = []
 
