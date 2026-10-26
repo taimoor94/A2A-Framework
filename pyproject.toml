@@ -37,7 +37,6 @@ all = [
     "mcp>=2.3,<3",
     "openai-agents>=0.24",
     "claude-agent-sdk>=0.2.174",
-    "google-adk>=2.13",
 ]
 
 [project.scripts]

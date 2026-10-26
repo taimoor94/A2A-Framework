@@ -49,3 +49,27 @@ async def test_failure_maps_match():
         await assert_failure_maps(CallableAdapter(boom), match="unrelated")
     with pytest.raises(AssertionError):
         await assert_failure_maps(CallableAdapter(fails), match="unrelated")
+
+
+async def test_isolated_callers_catches_memory_keyed_on_context_alone():
+    from adapters.contract import assert_isolated_callers
+
+    from a2agw.adapters._contexts import context_key
+
+    def remembering(key):
+        seen: dict[str, list[str]] = {}
+
+        def fn(c):
+            history = seen.setdefault(key(c), [])
+            history.append(c.text)
+            return "heard: " + ", ".join(history)
+
+        return CallableAdapter(fn)
+
+    await assert_isolated_callers(remembering(context_key), "apples", "pears", "apples")
+    with pytest.raises(AssertionError, match="leaked across callers"):
+        leaky = remembering(lambda c: c.context_id)
+        await assert_isolated_callers(leaky, "apples", "pears", "apples")
+    with pytest.raises(AssertionError):  # no memory at all proves nothing
+        forgetful = CallableAdapter(lambda c: f"heard: {c.text}")
+        await assert_isolated_callers(forgetful, "apples", "pears", "apples")

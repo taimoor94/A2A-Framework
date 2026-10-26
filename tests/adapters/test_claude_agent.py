@@ -16,6 +16,7 @@ from adapters.contract import (
     FakePartnerClient,
     assert_cancellable,
     assert_failure_maps,
+    assert_isolated_callers,
     assert_multi_turn,
     assert_projection,
     assert_text_stream,
@@ -323,7 +324,7 @@ async def test_idle_contexts_evicted_with_their_session(monkeypatch):
     for cid in ("c-1", "c-2", "c-3"):
         await drive(adapter, "x", context_id=cid)
     # The in-flight context is kept; the oldest idle ones went, lock and session id together.
-    assert list(adapter._contexts) == ["c-busy", "c-3"]
+    assert list(adapter._contexts) == ["anonymous\x1fc-busy", "anonymous\x1fc-3"]
     busy.cancel()
     await asyncio.wait({busy})
     evs = await drive(adapter, "again", context_id="c-1")
@@ -336,7 +337,7 @@ async def test_session_store_keeps_the_map():
     store: dict[str, str] = {}
     fake = FakeClaude()
     await drive(ClaudeAgentAdapter(query=fake, session_store=store), "a1", context_id="c-a")
-    assert store == {"c-a": "s-0"}
+    assert store == {"anonymous\x1fc-a": "s-0"}  # keyed by caller and context
     # A new adapter (e.g. after a restart) with the same store resumes the session.
     adapter = ClaudeAgentAdapter(query=fake, durable_sessions=True, session_store=store)
     evs = await drive(adapter, "a2", context_id="c-a")
@@ -369,6 +370,16 @@ def test_options_that_pick_the_session_are_refused(field, value):
     options = ClaudeAgentOptions(**{field: value})
     with pytest.raises(ValueError, match=field):
         ClaudeAgentAdapter(options, query=FakeClaude())
+
+
+async def test_session_options_set_after_construction_are_refused():
+    options = ClaudeAgentOptions()
+    fake = FakeClaude()
+    adapter = ClaudeAgentAdapter(options, query=fake)
+    options.continue_conversation = True  # changed on the caller's object later
+    with pytest.raises(ValueError, match="continue_conversation"):
+        await drive(adapter, "hi")
+    assert fake.calls == []  # refused before the CLI would have started
 
 
 def test_session_options_left_at_their_defaults_are_accepted():
@@ -660,3 +671,10 @@ async def test_example_runs():
     from examples.adapters import claude_agent_example
 
     assert await claude_agent_example.main() == "echo: hello from A2A"
+
+
+async def test_isolated_callers():
+    # Another caller sending the same contextId does not resume this one's Claude session.
+    await assert_isolated_callers(
+        ClaudeAgentAdapter(query=FakeClaude()), "apples", "pears", "apples"
+    )

@@ -33,7 +33,7 @@ try:
 except ImportError as e:  # pragma: no cover - exercised by a test that hides the package
     raise ImportError(OPENAI_EXTRA_HINT) from e
 
-from a2agw.adapters._contexts import ContextRegistry
+from a2agw.adapters._contexts import ContextRegistry, context_key
 from a2agw.adapters._stream import stream_events
 from a2agw.consult.client import PartnerClient
 from a2agw.consult.tools import PartnerTool, invoke, strip_extensions, with_untrusted_note
@@ -43,7 +43,7 @@ from a2agw.security.principal import Principal
 
 __all__ = ["MemorySession", "OpenAIAgentsAdapter", "as_openai_tools"]
 
-MAX_SESSIONS = 1024  # contexts tracked per adapter (least recently used idle ones go)
+MAX_SESSIONS = 1024  # (caller, context) keys tracked per adapter (least recently used idle go)
 MAX_SESSION_ITEMS = 200  # conversation items a default in-memory session keeps per context
 
 
@@ -100,13 +100,17 @@ def _final_text(output: Any) -> str | None:
 class OpenAIAgentsAdapter:
     """Wraps an OpenAI Agents SDK ``Agent``.
 
-    Each turn is ``Runner.run_streamed(agent, ctx.text, session=..., max_turns=...)``. The
-    session is ``session_factory(ctx.context_id)``; by default a ``MemorySession`` per
-    context, so a follow-up message on the same A2A context continues the conversation (the
-    ``MAX_SESSIONS`` most recently used contexts are kept, each with its last
-    ``MAX_SESSION_ITEMS`` items). Turns on the same context are serialised. Pass a factory returning a
-    persistent session (e.g. ``agents.SQLiteSession(context_id, "sessions.db")``) and
-    ``durable_sessions=True`` to keep conversations across restarts.
+    Each turn is ``Runner.run_streamed(agent, ctx.text, session=..., max_turns=...)``.
+    Conversations belong to the caller and the A2A context together: the session key is
+    ``"<principal id or anonymous>\\x1f<context id>"`` (``_contexts.context_key``), so a
+    follow-up message from the same caller on the same context continues the conversation,
+    and another caller sending that ``contextId`` does not. The session is
+    ``session_factory(key)``; by default a ``MemorySession`` per key (the ``MAX_SESSIONS``
+    most recently used keys are kept, each with its last ``MAX_SESSION_ITEMS`` items;
+    ``MAX_SESSIONS`` is read when the adapter is constructed). Turns on the same key are
+    serialised. Pass a factory returning a persistent session (e.g.
+    ``lambda key: agents.SQLiteSession(key, "sessions.db")``) and ``durable_sessions=True``
+    to keep conversations across restarts.
 
     Text deltas from the model stream as the artifact "output" (final chunk marked ``last``);
     each tool call is reported as ``Status("calling <tool>")``. Token usage summed over the
@@ -134,19 +138,19 @@ class OpenAIAgentsAdapter:
         self.durable_sessions = durable_sessions
         self.max_turns = max_turns
         self.run_config = run_config
-        # The ``MAX_SESSIONS`` most recently used contexts: a context with a turn in flight
-        # is never dropped; an idle one goes with its default session.
+        # The ``MAX_SESSIONS`` most recently used (caller, context) keys: a key with a turn in
+        # flight is never dropped; an idle one goes with its default session.
         self._contexts: ContextRegistry[str, _Context] = ContextRegistry(
             self._new_context, max_size=MAX_SESSIONS
         )
 
-    def _new_context(self, context_id: str) -> _Context:
-        return _Context(MemorySession(context_id) if self.session_factory is None else None)
+    def _new_context(self, key: str) -> _Context:
+        return _Context(MemorySession(key) if self.session_factory is None else None)
 
     async def run(self, ctx: InboundContext) -> AsyncIterator[AgentEvent]:
         # Turns on one context run one at a time: each sees the history the last one saved.
         async with (
-            self._contexts.turn(ctx.context_id) as entry,
+            self._contexts.turn(context_key(ctx)) as entry,
             aclosing(self._turn(ctx, entry)) as turn,
         ):
             # ``aclosing``: closing this stream runs ``_turn``'s cleanup now, not at GC.
@@ -157,7 +161,7 @@ class OpenAIAgentsAdapter:
         session = entry.session
         if session is None:
             assert self.session_factory is not None  # no default session only with a factory
-            session = self.session_factory(ctx.context_id)
+            session = self.session_factory(context_key(ctx))
         # The run loop is a task the SDK creates here, so it inherits the inbound contextvars
         # (partner calls from tools are linked to this inbound task).
         result = Runner.run_streamed(

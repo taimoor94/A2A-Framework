@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import logging
 import socket
 import subprocess
 import sys
@@ -17,9 +18,11 @@ from adapters.contract import (
     FakePartnerClient,
     assert_cancellable,
     assert_failure_maps,
+    assert_isolated_callers,
     assert_multi_turn,
     assert_projection,
     assert_text_stream,
+    caller,
     drive,
     make_ctx,
     output_text,
@@ -39,6 +42,13 @@ from a2agw.consult.tools import UNTRUSTED_NOTE
 from a2agw.context.call_context import current_inbound_task, use_inbound
 from a2agw.core.events import ArtifactChunk, Done, Failed, Status, Usage
 from a2agw.security.principal import Principal
+
+
+@pytest.fixture(autouse=True)
+def _quiet_adk(caplog):
+    """ADK logs routine info and warnings (cancelled root nodes, missing usage metadata) at
+    every turn; keep them out of the test output."""
+    caplog.set_level(logging.ERROR, logger="google_adk")
 
 
 @pytest.fixture(autouse=True)
@@ -301,6 +311,22 @@ async def test_a_given_session_service_is_never_pruned(monkeypatch):
     assert output_text(evs) == "heard: x, y"
 
 
+async def test_eviction_drops_a_users_state_with_their_last_session(monkeypatch):
+    monkeypatch.setattr(adk_mod, "MAX_SESSIONS", 1)
+    adapter = AdkAdapter(make_agent(FakeLlm()))
+    service = adapter.session_service
+    # Alice's session carries user-scoped state (``user:`` keys live per app and user).
+    await service.create_session(
+        app_name="a2agw", user_id="key:alice", session_id="c-1", state={"user:lang": "en"}
+    )
+    await drive(adapter, "x", context_id="c-1", principal=caller("key:alice"))
+    assert service.user_state["a2agw"]["key:alice"] == {"lang": "en"}
+    await drive(adapter, "y", context_id="c-2")  # evicts alice's only session
+    assert "key:alice" not in service.sessions["a2agw"]
+    assert "key:alice" not in service.user_state.get("a2agw", {})
+    assert set(service.sessions["a2agw"]["anonymous"]) == {"c-2"}
+
+
 def test_durable_sessions_need_a_session_service():
     agent = make_agent(FakeLlm())
     assert AdkAdapter(agent).durable_sessions is False
@@ -331,6 +357,23 @@ async def test_function_call_reaches_partner_client():
         if p.function_response
     ]
     assert (response["state"], response["text"]) == ("completed", "pong:hi")
+
+
+async def test_declarations_reach_the_model():
+    # What the model is actually given, not only what ``_get_declaration`` returns: a future
+    # ADK that ignored the override (and derived a schema from the function) fails here.
+    from a2agw.consult.tools import strip_extensions
+
+    client = FakePartnerClient()
+    ptools = client.tools()
+    model = FakeLlm(text("ok"))
+    await drive(AdkAdapter(make_agent(model, as_adk_tools(ptools, client))), "hi")
+    decls = [d for t in model.requests[0].config.tools or [] for d in t.function_declarations or []]
+    assert [d.name for d in decls] == [p.name for p in ptools]
+    for d, p in zip(decls, ptools, strict=True):
+        assert d.description.endswith(UNTRUSTED_NOTE)
+        assert d.parameters_json_schema == strip_extensions(p.parameters)
+        assert d.parameters is None
 
 
 async def test_usage_reported():
@@ -529,3 +572,7 @@ async def test_example_runs():
     from examples.adapters import adk_example
 
     assert await adk_example.main() == "echo: hello from A2A"
+
+
+async def test_isolated_callers():
+    await assert_isolated_callers(AdkAdapter(make_agent(FakeLlm())), "apples", "pears", "apples")

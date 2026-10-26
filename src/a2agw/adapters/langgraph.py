@@ -1,6 +1,9 @@
 """LangGraph adapter: any compiled graph becomes an A2A agent.
 
-The A2A ``contextId`` is the LangGraph ``thread_id``. A LangGraph ``interrupt()`` becomes the
+The LangGraph ``thread_id`` is the caller and the A2A ``contextId`` together
+(``"<principal id or anonymous>\\x1f<context id>"``, ``_contexts.context_key``): another caller
+sending the same ``contextId`` gets its own thread. Checkpoints saved before this change
+(``thread_id`` = bare ``contextId``) are not resumed. A LangGraph ``interrupt()`` becomes the
 A2A ``input-required`` state and the next message on the task resumes the graph. Outbound,
 LangGraph agents use ``a2agw.adapters.langchain.as_langchain_tools`` (re-exported here).
 
@@ -19,6 +22,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
+from a2agw.adapters._contexts import context_key
 from a2agw.adapters._stream import content_text, stream_events
 from a2agw.adapters.langchain import as_langchain_tools
 from a2agw.core.events import AgentEvent, Done, Failed, NeedInput, Usage
@@ -58,7 +62,7 @@ def _last_ai_text(update: Any, output_key: str) -> str | None:
 class GraphAdapter:
     """Wraps a compiled LangGraph graph (anything with ``astream``).
 
-    Runs with ``thread_id = ctx.context_id``. On a resumed turn (``ctx.resumed``) the graph is
+    Runs with ``thread_id = context_key(ctx)`` (caller and context; see the module docstring). On a resumed turn (``ctx.resumed``) the graph is
     continued with ``Command(resume=ctx.text)``, otherwise it gets ``input_mapper(ctx)``
     (default ``{"messages": [("user", ctx.text)]}``).
 
@@ -139,7 +143,7 @@ class GraphAdapter:
 
         async def source() -> AsyncIterator[Any]:
             nonlocal tokens_in, tokens_out, saw_usage, streamed, final_text, interrupted
-            config = {"configurable": {"thread_id": ctx.context_id}}
+            config = {"configurable": {"thread_id": context_key(ctx)}}
             payload: Any = self.input_mapper(ctx)
             if ctx.resumed and await self._has_pending_interrupt(config):
                 payload = Command(resume=ctx.text)

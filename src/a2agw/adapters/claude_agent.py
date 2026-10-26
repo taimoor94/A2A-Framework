@@ -5,9 +5,10 @@ Importing this module requires ``claude-agent-sdk`` (the ``a2a-gateway[claude]``
 nothing in the core imports it. A real run starts the ``claude`` CLI the SDK bundles, which
 needs ``ANTHROPIC_API_KEY`` (or another Claude Code login).
 
-Session continuity: each A2A context maps to the SDK session its last turn ran in, and the
-next turn on that context resumes it (``options.resume``). The map is in memory, bounded to
-the ``MAX_SESSIONS`` most recently used contexts, unless a ``session_store`` mapping is given.
+Session continuity: each (caller, A2A context) pair maps to the SDK session its last turn ran
+in, and the caller's next turn on that context resumes it (``options.resume``); another caller
+sending the same ``contextId`` starts its own session. The map is in memory, bounded to the
+``MAX_SESSIONS`` most recently used pairs, unless a ``session_store`` mapping is given.
 Durable resumption (``durable_sessions=True``) needs both halves to survive a restart: a
 persistent ``session_store`` for the map, and the CLI's transcripts (its local
 ``~/.claude/projects`` directory, or the SDK's own ``ClaudeAgentOptions.session_store``).
@@ -46,7 +47,7 @@ try:
 except ImportError as e:  # pragma: no cover - exercised by a test that hides the package
     raise ImportError(CLAUDE_EXTRA_HINT) from e
 
-from a2agw.adapters._contexts import ContextRegistry
+from a2agw.adapters._contexts import ContextRegistry, context_key
 from a2agw.adapters._stream import stream_events
 from a2agw.consult.client import PartnerClient
 from a2agw.consult.tools import PartnerTool, invoke, strip_extensions, with_untrusted_note
@@ -57,7 +58,7 @@ from a2agw.security.principal import Principal
 __all__ = ["ClaudeAgentAdapter", "as_claude_tools"]
 
 DEFAULT_MAX_SESSIONS = 10_000
-MAX_SESSIONS = DEFAULT_MAX_SESSIONS  # contexts tracked per adapter (least recently used idle go)
+MAX_SESSIONS = DEFAULT_MAX_SESSIONS  # (caller, context) keys per adapter (LRU idle ones go)
 AGENT_ERROR = "agent error"  # the failure an error result maps to (details are logged)
 
 # Options that choose the session a run continues. The adapter picks it per A2A context
@@ -82,16 +83,21 @@ class _Context:
 class ClaudeAgentAdapter:
     """Runs each turn as ``query(prompt=ctx.text, options=...)`` of the Claude Agent SDK.
 
+    Sessions belong to the caller and the A2A context together, under the key
+    ``"<principal id or anonymous>\\x1f<context id>"`` (``_contexts.context_key``).
     ``options`` (default ``ClaudeAgentOptions()``) is copied for every turn with ``resume``
-    set to the context's SDK session (None on its first turn) and
+    set to the key's SDK session (None on its first turn) and
     ``include_partial_messages=True``; the caller's object is never changed. Options that
     choose the session themselves (``continue_conversation``, ``session_id``,
-    ``fork_session``, ``resume``, ``resume_session_at``) are refused with ``ValueError``: they
-    would carry one conversation across contexts. Turns on the same context are serialised. ``query`` defaults to ``claude_agent_sdk.query``.
+    ``fork_session``, ``resume``, ``resume_session_at``) are refused with ``ValueError``, at
+    construction and again on every turn: they would carry one conversation across contexts.
+    Turns on the same key are serialised. ``query`` defaults to ``claude_agent_sdk.query``.
 
-    ``session_store`` holds the ``context_id -> session_id`` map instead of the in-memory LRU
-    (``MAX_SESSIONS`` contexts); pass a persistent mapping with ``durable_sessions=True`` (it
-    is required then) so conversations resume across restarts.
+    ``session_store`` holds the ``key -> session_id`` map instead of the in-memory LRU (the
+    ``MAX_SESSIONS`` most recently used keys; ``MAX_SESSIONS`` is read when the adapter is
+    constructed); pass a persistent mapping with ``durable_sessions=True`` (it is required
+    then) so conversations resume across restarts. Stores written before keys included the
+    caller (bare context ids) are not resumed.
 
     Text streams as the artifact "output": partial-message deltas when the CLI sends them,
     else one chunk per text block. Each tool use is reported as ``Status("calling <tool>")``.
@@ -113,40 +119,35 @@ class ClaudeAgentAdapter:
         if durable_sessions and session_store is None:
             raise ValueError(
                 "durable_sessions=True needs a persistent session_store mapping "
-                "(context id -> Claude session id)"
+                "(caller and context key -> Claude session id)"
             )
         self.options = options if options is not None else ClaudeAgentOptions()
-        for name in _SESSION_OPTIONS:
-            if getattr(self.options, name, None):
-                raise ValueError(
-                    f"ClaudeAgentOptions.{name} is not supported: the adapter resumes one "
-                    "Claude session per A2A context itself"
-                )
+        _check_options(self.options)
         self.query = query if query is not None else claude_agent_sdk.query
         self.durable_sessions = durable_sessions
         self.session_store = session_store
-        # The ``MAX_SESSIONS`` most recently used contexts: a context with a turn in flight
-        # is never dropped; an idle one goes with its session id.
+        # The ``MAX_SESSIONS`` most recently used (caller, context) keys: a key with a turn in
+        # flight is never dropped; an idle one goes with its session id.
         self._contexts: ContextRegistry[str, _Context] = ContextRegistry(
-            lambda _cid: _Context(), max_size=MAX_SESSIONS
+            lambda _key: _Context(), max_size=MAX_SESSIONS
         )
 
-    def _session(self, context_id: str, entry: _Context) -> str | None:
+    def _session(self, key: str, entry: _Context) -> str | None:
         if self.session_store is not None:
-            return self.session_store.get(context_id)
+            return self.session_store.get(key)
         return entry.session_id
 
-    def _remember(self, context_id: str, entry: _Context, session_id: str) -> None:
+    def _remember(self, key: str, entry: _Context, session_id: str) -> None:
         if self.session_store is not None:
-            if self.session_store.get(context_id) != session_id:
-                self.session_store[context_id] = session_id
+            if self.session_store.get(key) != session_id:
+                self.session_store[key] = session_id
         else:
             entry.session_id = session_id
 
     async def run(self, ctx: InboundContext) -> AsyncIterator[AgentEvent]:
         # Turns on one context run one at a time: each resumes the session the last one used.
         async with (
-            self._contexts.turn(ctx.context_id) as entry,
+            self._contexts.turn(context_key(ctx)) as entry,
             aclosing(self._turn(ctx, entry)) as turn,
         ):
             # ``aclosing``: closing this stream runs ``_turn``'s cleanup now, not at GC.
@@ -154,9 +155,12 @@ class ClaudeAgentAdapter:
                 yield ev
 
     async def _turn(self, ctx: InboundContext, entry: _Context) -> AsyncIterator[AgentEvent]:
+        # Checked again here: ``self.options`` may have been changed since construction.
+        _check_options(self.options)
+        key = context_key(ctx)
         options = dataclasses.replace(
             self.options,
-            resume=self._session(ctx.context_id, entry),
+            resume=self._session(key, entry),
             include_partial_messages=True,
         )
         final: ResultMessage | None = None
@@ -168,7 +172,7 @@ class ClaudeAgentAdapter:
             async for msg in messages:
                 session_id = _session_id(msg)
                 if session_id:
-                    self._remember(ctx.context_id, entry, session_id)
+                    self._remember(key, entry, session_id)
                 if getattr(msg, "parent_tool_use_id", None):
                     continue  # a subagent's messages are not this agent's answer
                 if isinstance(msg, StreamEvent):
@@ -208,6 +212,15 @@ class ClaudeAgentAdapter:
             yield Failed(AGENT_ERROR)
             return
         yield Done() if streamed else Done(text=final.result)
+
+
+def _check_options(options: ClaudeAgentOptions) -> None:
+    for name in _SESSION_OPTIONS:
+        if getattr(options, name, None):
+            raise ValueError(
+                f"ClaudeAgentOptions.{name} is not supported: the adapter resumes one Claude "
+                "session per caller and A2A context itself"
+            )
 
 
 def _log(ctx: InboundContext) -> logging.Logger:
@@ -258,7 +271,8 @@ def as_claude_tools(
     """Project partner tools as an in-process SDK MCP server (``create_sdk_mcp_server``).
 
     Put it in ``ClaudeAgentOptions.mcp_servers`` under ``server_name``; Claude Code names the
-    tools ``mcp__<server_name>__<tool>`` (allow them with ``allowed_tools=["mcp__<server_name>"]``).
+    tools ``mcp__<server_name>__<tool>`` (allow them with
+    ``allowed_tools=["mcp__<server_name>"]``).
     Each tool returns the JSON envelope as text. The schema is a copy of the tool's without
     the gateway-only ``x-`` limits; the SDK validates arguments against it before the handler
     runs, and ``invoke`` enforces the full schema. Inside an inbound run the inbound task and

@@ -15,6 +15,7 @@ from langchain_core.runnables import Runnable
 from langchain_core.runnables.utils import AddableDict
 from langchain_core.tools import StructuredTool
 
+from a2agw.adapters._contexts import context_key
 from a2agw.adapters._stream import content_text, stream_events
 from a2agw.consult.client import PartnerClient
 from a2agw.consult.tools import UNTRUSTED_NOTE, PartnerTool, invoke
@@ -32,6 +33,10 @@ class RunnableAdapter:
     dicts are merged and published as a data artifact named "result". Token usage found on
     message chunks is summed (chunk usage is a per-chunk delta, the ``AIMessageChunk``
     convention) and reported as one ``Usage`` event at the end.
+
+    The run config's ``thread_id`` (what a runnable with memory keys it on) is
+    ``"<principal id or anonymous>\\x1f<context id>"`` (``_contexts.context_key``), so
+    another caller sending the same ``contextId`` gets its own thread.
     """
 
     def __init__(
@@ -49,7 +54,7 @@ class RunnableAdapter:
         async def texts() -> AsyncIterator[str]:
             nonlocal tokens_in, tokens_out, saw_usage, final
             payload: Any = {self.input_key: ctx.text} if self.input_key else ctx.text
-            config = {"configurable": {"thread_id": ctx.context_id}}
+            config = {"configurable": {"thread_id": context_key(ctx)}}
             async for chunk in self.runnable.astream(payload, config=config):  # type: ignore[arg-type]
                 if isinstance(chunk, dict):
                     # Merge partial dicts the way Runnable.ainvoke does.

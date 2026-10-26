@@ -16,6 +16,7 @@ from adapters.contract import (
     FakePartnerClient,
     assert_cancellable,
     assert_failure_maps,
+    assert_isolated_callers,
     assert_multi_turn,
     assert_projection,
     assert_text_stream,
@@ -209,8 +210,8 @@ async def test_custom_session_factory_keyed_by_context():
 
     adapter = OpenAIAgentsAdapter(make_agent(FakeModel()), session_factory=factory)
     await drive(adapter, "first", context_id="ctx-a")
-    assert list(made) == ["ctx-a"]
-    items = await made["ctx-a"].get_items()
+    assert list(made) == ["anonymous\x1fctx-a"]  # the factory gets the caller+context key
+    items = await made["anonymous\x1fctx-a"].get_items()
     assert _user_texts(items) == ["first"]
     for s in made.values():
         s.close()
@@ -239,7 +240,7 @@ async def test_memory_session_keeps_last_items_from_a_user_message():
 async def test_default_session_bounded_over_many_turns(monkeypatch):
     adapter = OpenAIAgentsAdapter(make_agent(FakeModel()))
     await drive(adapter, "first", context_id="c-long")
-    adapter._contexts["c-long"].session.max_items = 6  # 2 items per turn: 3 turns kept
+    adapter._contexts["anonymous\x1fc-long"].session.max_items = 6  # 2 items per turn: 3 turns kept
     for n in range(5):
         await drive(adapter, f"turn{n}", context_id="c-long")
     evs = await drive(adapter, "last", context_id="c-long")
@@ -274,7 +275,7 @@ async def test_idle_contexts_evicted_with_their_lock(monkeypatch):
     for cid in ("c-1", "c-2", "c-3"):
         await drive(adapter, "x", context_id=cid)
     # The in-flight context is kept; the oldest idle ones went, lock and session together.
-    assert list(adapter._contexts) == ["c-busy", "c-3"]
+    assert list(adapter._contexts) == ["anonymous\x1fc-busy", "anonymous\x1fc-3"]
     release.set()
     await busy
     evs = await drive(adapter, "again", context_id="c-1")
@@ -487,3 +488,9 @@ async def test_example_runs():
     from examples.adapters import openai_agents_example
 
     assert await openai_agents_example.main() == "echo: hello from A2A"
+
+
+async def test_isolated_callers():
+    # Another caller sending the same contextId does not continue this one's conversation.
+    adapter = OpenAIAgentsAdapter(make_agent(FakeModel()))
+    await assert_isolated_callers(adapter, "apples", "pears", "apples")

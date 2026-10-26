@@ -17,6 +17,7 @@ from adapters.contract import (
     FakePartnerClient,
     assert_cancellable,
     assert_failure_maps,
+    assert_isolated_callers,
     assert_multi_turn,
     assert_projection,
     assert_text_stream,
@@ -79,7 +80,7 @@ async def test_input_key_and_thread_id_config():
         return inp["q"].upper()
 
     evs = await collect(RunnableAdapter(RunnableLambda(fn), input_key="q"), "abc")
-    assert seen == {"inp": {"q": "abc"}, "thread": "ctx-1"}
+    assert seen == {"inp": {"q": "abc"}, "thread": "anonymous\x1fctx-1"}
     assert text_of(evs[0]) == "ABC"
 
 
@@ -264,3 +265,17 @@ async def test_contract_kit():
     client = FakePartnerClient()
     tools = as_langchain_tools(client.tools(), client)
     await assert_projection(tools, lambda t, args: t.ainvoke(args), client=client)
+
+
+async def test_isolated_callers():
+    # The thread_id a runnable keys its memory on is per caller, not the bare contextId.
+    seen: dict[str, list[str]] = {}
+
+    async def remembering(text, config):
+        history = seen.setdefault(config["configurable"]["thread_id"], [])
+        history.append(text)
+        yield "heard: "
+        yield ", ".join(history)
+
+    adapter = RunnableAdapter(RunnableLambda(remembering))
+    await assert_isolated_callers(adapter, "apples", "pears", "apples")

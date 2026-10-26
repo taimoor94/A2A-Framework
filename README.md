@@ -27,8 +27,10 @@ uv add "a2a-gateway[langchain]"    # adds the LangChain adapter and tools
 uv add "a2a-gateway[langgraph]"    # adds the LangGraph adapter (includes LangChain)
 uv add "a2a-gateway[openai]"       # adds the OpenAI Agents SDK adapter
 uv add "a2a-gateway[claude]"       # adds the Claude Agent SDK adapter
-uv add "a2a-gateway[adk]"          # adds the Google ADK adapter
+uv add "a2a-gateway[adk]"          # adds the Google ADK adapter (not part of [all])
 ```
+
+`[all]` installs every extra except `adk`. google-adk caps `opentelemetry-api`/`opentelemetry-sdk` at 1.44 and `websockets` below 16, so installing it can downgrade those packages; add `[adk]` explicitly when you want the ADK adapter.
 
 `pip install a2a-gateway` works the same way.
 
@@ -123,7 +125,7 @@ Events: `Status`, `ArtifactChunk`, `NeedInput`, `NeedAuth`, `Usage`, `Done`, `Fa
 
 ### A LangGraph agent
 
-`GraphAdapter` runs the graph with `thread_id = contextId`. A LangGraph `interrupt()` ends the turn as `input-required`; the next message on the same task resumes the graph. Use a checkpointer (a persistent one makes `input-required` tasks survive restarts).
+`GraphAdapter` runs the graph with a `thread_id` made of the caller and the `contextId` (`"<principal id or anonymous>\x1f<contextId>"`), so another caller sending the same `contextId` gets its own thread. Checkpoints saved under a bare `contextId` (before this keying) are not resumed after upgrading. `RunnableAdapter` passes the same `thread_id` in the run config. A LangGraph `interrupt()` ends the turn as `input-required`; the next message on the same task resumes the graph. Use a checkpointer (a persistent one makes `input-required` tasks survive restarts).
 
 ```python
 from langgraph.checkpoint.memory import InMemorySaver
@@ -158,7 +160,7 @@ host.add(deployer)
 
 ### An OpenAI Agents SDK agent
 
-`OpenAIAgentsAdapter` runs an `agents.Agent` with `Runner.run_streamed`. Each A2A `contextId` gets its own SDK session, so follow-up messages continue the conversation. The default is an in-memory session per context; pass `session_factory=lambda cid: SQLiteSession(cid, "sessions.db")` and `durable_sessions=True` to keep conversations across restarts. Model text streams as the `output` artifact, each tool call shows as a `calling <tool>` status, and token usage is reported. Cancelling the A2A task cancels the run.
+`OpenAIAgentsAdapter` runs an `agents.Agent` with `Runner.run_streamed`. Each caller and A2A `contextId` pair gets its own SDK session, so follow-up messages continue the conversation and another caller sending the same `contextId` does not. The default is an in-memory session per pair. `session_factory` receives the pair as one key string, `"<principal id or anonymous>\x1f<contextId>"`; pass `session_factory=lambda key: SQLiteSession(key, "sessions.db")` and `durable_sessions=True` to keep conversations across restarts. Model text streams as the `output` artifact, each tool call shows as a `calling <tool>` status, and token usage is reported. Cancelling the A2A task cancels the run.
 
 ```python
 from agents import Agent, RunConfig
@@ -180,7 +182,7 @@ The SDK exports traces to OpenAI when `OPENAI_API_KEY` is set. Pass `run_config=
 
 ### A Claude Agent SDK agent
 
-`ClaudeAgentAdapter` runs each turn with `claude_agent_sdk.query`, which starts the `claude` CLI bundled with the SDK. A real run needs `ANTHROPIC_API_KEY` (or another Claude Code login). Each A2A `contextId` resumes the Claude session its last turn used (`options.resume`), so follow-up messages continue the conversation. Options that pick the session themselves (`continue_conversation`, `session_id`, `fork_session`, `resume`, `resume_session_at`) are refused, because they would carry one conversation across contexts. That map lives in memory and holds the 10,000 most recently used contexts. To keep it across restarts, pass a persistent `session_store` mapping (context id to session id) with `durable_sessions=True`; without a `session_store`, `durable_sessions=True` is refused. The CLI's transcripts must survive too: they live in `~/.claude/projects`, or in the SDK's own `ClaudeAgentOptions.session_store`. Text streams as the `output` artifact, each tool use shows as a `calling <tool>` status, and tokens and cost are reported. An error result fails the task with `agent error`. Cancelling the A2A task stops the CLI.
+`ClaudeAgentAdapter` runs each turn with `claude_agent_sdk.query`, which starts the `claude` CLI bundled with the SDK. A real run needs `ANTHROPIC_API_KEY` (or another Claude Code login). Each caller and A2A `contextId` pair resumes the Claude session its last turn used (`options.resume`), so follow-up messages continue the conversation and another caller sending the same `contextId` starts its own session. Options that pick the session themselves (`continue_conversation`, `session_id`, `fork_session`, `resume`, `resume_session_at`) are refused, because they would carry one conversation across contexts. That map lives in memory and holds the 10,000 most recently used pairs. To keep it across restarts, pass a persistent `session_store` mapping, keyed by `"<principal id or anonymous>\x1f<contextId>"`, to the session id (entries keyed by a bare context id, from before this keying, are not resumed), with `durable_sessions=True`; without a `session_store`, `durable_sessions=True` is refused. The CLI's transcripts must survive too: they live in `~/.claude/projects`, or in the SDK's own `ClaudeAgentOptions.session_store`. Text streams as the `output` artifact, each tool use shows as a `calling <tool>` status, and tokens and cost are reported. An error result fails the task with `agent error`. Cancelling the A2A task stops the CLI.
 
 ```python
 from claude_agent_sdk import ClaudeAgentOptions

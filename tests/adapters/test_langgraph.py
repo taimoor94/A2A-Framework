@@ -15,6 +15,7 @@ from a2a.types import Message, Part, Role, SendMessageRequest, TaskState
 from adapters.contract import (
     assert_cancellable,
     assert_failure_maps,
+    assert_isolated_callers,
     assert_multi_turn,
     assert_text_stream,
     drive,
@@ -231,7 +232,7 @@ async def test_custom_input_mapper_and_thread_id():
     g.add_edge("n", END)
     adapter = GraphAdapter(g.compile(), input_mapper=lambda c: {"q": c.text.upper()})
     evs = await collect(adapter, ctx("abc", context_id="ctx-9"))
-    assert seen == {"thread": "ctx-9", "q": "ABC"}
+    assert seen == {"thread": "anonymous\x1fctx-9", "q": "ABC"}
     assert evs == [Done()]  # no AI message under "messages"
 
 
@@ -447,3 +448,18 @@ async def test_contract_kit():
     await assert_multi_turn(adapter, "apples", "pears", "apples")
     await assert_failure_maps(one_node(boom), match="boom")
     await assert_cancellable(one_node(block), started=started, stopped=stopped)
+
+
+async def test_isolated_callers():
+    # The checkpointer thread is per caller: another principal sending the same contextId
+    # starts its own thread.
+    def remembering(state: State):
+        heard = ", ".join(m.content for m in state["messages"] if m.type == "human")
+        return {"messages": [AIMessage(content=f"heard: {heard}")]}
+
+    g = StateGraph(State)
+    g.add_node("n", remembering)
+    g.add_edge(START, "n")
+    g.add_edge("n", END)
+    adapter = GraphAdapter(g.compile(checkpointer=InMemorySaver()))
+    await assert_isolated_callers(adapter, "apples", "pears", "apples")

@@ -1,6 +1,10 @@
 """Per-context state shared by the framework adapters: one entry per A2A context (or any
 hashable key), turns on one key serialised, at most ``max_size`` entries kept.
 
+Adapters that keep conversation memory key it by caller *and* context (``context_key``):
+nothing on the inbound path ties a ``contextId`` to the caller that started it, so keyed on
+the ``contextId`` alone, another caller sending it would continue that conversation.
+
 Each entry has a lock and an in-flight count. A turn counts itself in before it waits for the
 lock and out when it ends (however it ends), and only entries with no turn in flight are ever
 evicted. Counting before the wait matters: a released lock looks free while the next waiter
@@ -15,9 +19,31 @@ from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Hashable, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Generic, TypeVar
+from typing import TYPE_CHECKING, Generic, TypeVar
 
-__all__ = ["ContextRegistry"]
+if TYPE_CHECKING:
+    from a2agw.core.spi import InboundContext
+
+__all__ = ["ANONYMOUS", "KEY_SEP", "ContextRegistry", "context_key", "owner_id"]
+
+ANONYMOUS = "anonymous"  # the owner of a turn without a principal
+KEY_SEP = "\x1f"  # between the owner and the context id in ``context_key``
+
+
+def owner_id(ctx: InboundContext) -> str:
+    """The caller a turn's memory belongs to: the principal id, or ``"anonymous"``."""
+    return ctx.principal.id if ctx.principal is not None else ANONYMOUS
+
+
+def context_key(ctx: InboundContext) -> str:
+    """The memory key of a turn: ``"<owner>\\x1f<context id>"``.
+
+    In the owner, ``\\`` is written ``\\\\`` and the separator ``\\x1f`` (as four characters),
+    so the first separator always ends the owner and two different (owner, context) pairs
+    never share a key."""
+    owner = owner_id(ctx).replace("\\", "\\\\").replace(KEY_SEP, "\\x1f")
+    return f"{owner}{KEY_SEP}{ctx.context_id}"
+
 
 K = TypeVar("K", bound=Hashable)
 V = TypeVar("V")

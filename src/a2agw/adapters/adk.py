@@ -36,7 +36,7 @@ try:
 except ImportError as e:  # pragma: no cover - exercised by a test that hides the package
     raise ImportError(ADK_EXTRA_HINT) from e
 
-from a2agw.adapters._contexts import ContextRegistry
+from a2agw.adapters._contexts import ContextRegistry, owner_id
 from a2agw.adapters._stream import stream_events
 from a2agw.consult.client import PartnerClient
 from a2agw.consult.tools import PartnerTool, invoke, strip_extensions, with_untrusted_note
@@ -48,7 +48,6 @@ __all__ = ["AdkAdapter", "as_adk_tools"]
 
 MAX_SESSIONS = 1024  # (caller, context) pairs tracked per adapter (least recently used idle go)
 AGENT_ERROR = "agent error"  # the failure an error response maps to (details are logged)
-ANONYMOUS = "anonymous"  # the ADK user id of a turn without a principal
 
 
 class AdkAdapter:
@@ -58,7 +57,9 @@ class AdkAdapter:
     the A2A context, created on first use; so a follow-up message on the same context
     continues the conversation, and two callers never share one. Turns on the same context
     (and caller) are serialised. The default ``InMemorySessionService`` keeps the
-    ``MAX_SESSIONS`` most recently used sessions; a given ``session_service`` is never pruned.
+    ``MAX_SESSIONS`` most recently used sessions (read when the adapter is constructed); an
+    evicted user's last session goes with their user-scoped state. A given
+    ``session_service`` is never pruned.
     Pass a persistent one (e.g. ``DatabaseSessionService``) with ``durable_sessions=True`` (it
     is required then) to keep conversations across restarts.
 
@@ -104,20 +105,22 @@ class AdkAdapter:
         )
 
     def _evicted(self, key: tuple[str, str], _value: None) -> None:
-        if not self._owns_sessions:
+        service = self.session_service
+        if not self._owns_sessions or not isinstance(service, InMemorySessionService):
             return
         # Synchronous on purpose: nothing may run between the drop and the clean-up (an
         # awaited ``delete_session`` could remove a session a new turn already uses).
         user_id, session_id = key
-        assert isinstance(self.session_service, InMemorySessionService)
-        users = self.session_service.sessions.get(self.app_name, {})
-        sessions = users.get(user_id, {})
-        sessions.pop(session_id, None)
-        if not sessions:
-            users.pop(user_id, None)
+        users = service.sessions.get(self.app_name, {})
+        users.get(user_id, {}).pop(session_id, None)
+        if any(user == user_id for user, _ in self._contexts):
+            return  # the user still has a tracked session (maybe one being created)
+        # Their last one: drop the user with their user-scoped (``user:``) state.
+        users.pop(user_id, None)
+        service.user_state.get(self.app_name, {}).pop(user_id, None)
 
     async def run(self, ctx: InboundContext) -> AsyncIterator[AgentEvent]:
-        user_id = ctx.principal.id if ctx.principal is not None else ANONYMOUS
+        user_id = owner_id(ctx)
         # Turns on one session run one at a time: each sees the events the last one saved.
         async with (
             self._contexts.turn((user_id, ctx.context_id)),

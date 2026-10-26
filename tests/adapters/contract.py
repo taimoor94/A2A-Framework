@@ -30,9 +30,11 @@ __all__ = [
     "FakePartnerClient",
     "assert_cancellable",
     "assert_failure_maps",
+    "assert_isolated_callers",
     "assert_multi_turn",
     "assert_projection",
     "assert_text_stream",
+    "caller",
     "drive",
     "make_ctx",
     "output_text",
@@ -42,16 +44,35 @@ __all__ = [
 # -- inbound ------------------------------------------------------------------------------
 
 
-def make_ctx(text: str, *, context_id: str = "c1", task_id: str = "t1") -> InboundContext:
+def make_ctx(
+    text: str,
+    *,
+    context_id: str = "c1",
+    task_id: str = "t1",
+    principal: Principal | None = None,
+) -> InboundContext:
     m = Message(message_id=f"m-{task_id}", role=Role.ROLE_USER, parts=[Part(text=text)])
-    return InboundContext.from_message("contract", m, task_id=task_id, context_id=context_id)
+    return InboundContext.from_message(
+        "contract", m, task_id=task_id, context_id=context_id, principal=principal
+    )
+
+
+def caller(principal_id: str) -> Principal:
+    """An API-key principal with this id."""
+    return Principal(id=principal_id, kind="api_key", scopes=frozenset())
 
 
 async def drive(
-    adapter: InboundAdapter, text: str, *, context_id: str = "c1", task_id: str = "t1"
+    adapter: InboundAdapter,
+    text: str,
+    *,
+    context_id: str = "c1",
+    task_id: str = "t1",
+    principal: Principal | None = None,
 ) -> list[AgentEvent]:
     """Run one turn and collect every event the adapter yields."""
-    return [ev async for ev in adapter.run(make_ctx(text, context_id=context_id, task_id=task_id))]
+    ctx = make_ctx(text, context_id=context_id, task_id=task_id, principal=principal)
+    return [ev async for ev in adapter.run(ctx)]
 
 
 def _chunk_text(c: ArtifactChunk) -> str:
@@ -102,6 +123,24 @@ async def assert_multi_turn(
     assert expect_memory in output_text(two), output_text(two)
     other = await drive(adapter, second, context_id="c-mt-other", task_id="t-mt-3")
     assert expect_memory not in output_text(other), "memory leaked across contexts"
+
+
+async def assert_isolated_callers(
+    adapter: InboundAdapter, first: str, second: str, expect_memory: str
+) -> None:
+    """Memory belongs to the caller as well as the context: another principal sending the
+    same ``contextId`` must not see it (nothing ties a ``contextId`` to the caller that
+    started it), nor an anonymous turn. The owner's own follow-up does see it."""
+    alice, bob = caller("key:alice"), caller("key:bob")
+    one = await drive(adapter, first, context_id="c-iso", task_id="t-iso-1", principal=alice)
+    assert not any(isinstance(e, Failed) for e in one), one
+    other = await drive(adapter, second, context_id="c-iso", task_id="t-iso-2", principal=bob)
+    assert not any(isinstance(e, Failed) for e in other), other
+    assert expect_memory not in output_text(other), "memory leaked across callers"
+    anon = await drive(adapter, second, context_id="c-iso", task_id="t-iso-3")
+    assert expect_memory not in output_text(anon), "memory leaked to an anonymous caller"
+    own = await drive(adapter, second, context_id="c-iso", task_id="t-iso-4", principal=alice)
+    assert expect_memory in output_text(own), output_text(own)
 
 
 async def assert_failure_maps(adapter_raising: InboundAdapter, *, match: str | None = None) -> None:

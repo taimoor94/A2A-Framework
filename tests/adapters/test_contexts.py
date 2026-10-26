@@ -167,3 +167,23 @@ async def test_error_in_a_turn_releases_it():
 def test_max_size_must_be_positive():
     with pytest.raises(ValueError, match="max_size"):
         ContextRegistry(State, max_size=0)
+
+
+def test_context_key_is_per_caller_and_injective():
+    from adapters.contract import make_ctx
+
+    from a2agw.adapters._contexts import context_key, owner_id
+    from a2agw.security.principal import Principal
+
+    def key(owner: str | None, cid: str) -> str:
+        ctx = make_ctx("x", context_id=cid)
+        ctx.principal = None if owner is None else Principal(owner, "api_key", frozenset())
+        return context_key(ctx)
+
+    anon = make_ctx("x", context_id="c")
+    assert owner_id(anon) == "anonymous" and key(None, "c") == "anonymous\x1fc"
+    assert key("key:alice", "c") == "key:alice\x1fc"
+    assert key("key:alice", "c") != key("key:bob", "c")
+    # A separator inside the owner cannot make two pairs collide.
+    assert key("a\x1fb", "c") != key("a", "b\x1fc")
+    assert key("a\\x1fb", "c") != key("a\x1fb", "c")
