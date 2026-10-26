@@ -5,6 +5,7 @@ The core never imports langchain or langgraph; the adapters live in
 """
 
 from a2agw.adapters.callable import agent
+from a2agw.adapters.stdio import StdioAdapter
 from a2agw.adapters.webhook import WebhookAdapter
 from a2agw.consult.client import PartnerClient
 from a2agw.consult.registry import PartnerRegistry
@@ -44,6 +45,7 @@ __all__ = [
     "Reply",
     "SkillSpec",
     "Status",
+    "StdioAdapter",
     "ToolResult",
     "Usage",
     "WebhookAdapter",

@@ -62,3 +62,16 @@ class InboundAdapter(Protocol):
     durable_sessions: bool
 
     def run(self, ctx: InboundContext) -> AsyncIterator[AgentEvent]: ...
+
+
+@runtime_checkable
+class LifecycleAdapter(Protocol):
+    """An adapter that owns resources of its own (e.g. a supervised agent process).
+
+    Duck-typed and additive: ``AgentHost`` calls ``start()`` at startup, once the stores are
+    ready, and ``stop()`` at shutdown, before the database engine is disposed, for every
+    adapter that has both methods. ``stop()`` must be safe to call when ``start()`` was not."""
+
+    async def start(self) -> None: ...
+
+    async def stop(self) -> None: ...

@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import time
+import types
 from collections.abc import Awaitable, Callable
 
 import httpcore
@@ -387,12 +388,40 @@ async def test_undecodable_body_fails_protocol_error(caplog):
     assert any(r.name == LOGGER and "DecodingError" in r.getMessage() for r in caplog.records)
 
 
-async def test_other_request_errors_are_connection_lost():
+async def test_other_request_errors_use_connection_state():
+    # A RequestError that is not a TransportError: before the response, the agent was
+    # never reached; after it, the connection was lost.
     def broken(_req: httpx.Request) -> httpx.Response:
-        raise httpx.TooManyRedirects("loop")  # a RequestError that is not a TransportError
+        raise httpx.TooManyRedirects("loop")
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(broken)) as hc:
-        assert await collect(WebhookAdapter(URL, http=hc)) == [Failed("agent connection lost")]
+        assert await collect(WebhookAdapter(URL, http=hc)) == [Failed("agent unreachable")]
+
+    class Breaks(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'{"type":"status","text":"s"}\n'
+            raise httpx.RequestError("gone")
+
+    def midway(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": NDJSON}, stream=Breaks())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(midway)) as hc:
+        events = await collect(WebhookAdapter(URL, http=hc))
+    assert events == [Status("s"), Failed("agent connection lost")]
+
+
+async def test_deadline_sent_is_captured_at_turn_start(agent, monkeypatch):
+    from a2agw.adapters import _sidecar
+
+    clock = [1000.0]
+    monkeypatch.setattr(_sidecar, "time", types.SimpleNamespace(time=lambda: clock[0]))
+
+    async def slow_grant(_c: InboundContext) -> None:
+        clock[0] += 50.0  # the grant takes a while; the turn's deadline does not move
+
+    agent.ndjson({"type": "done"})
+    await collect(adapter(agent, consult=slow_grant, timeout_s=300.0))
+    assert json.loads(agent.requests[0][1])["deadline"] == 1300.0
 
 
 async def test_consult_setup_failure_and_timeout(agent, caplog):

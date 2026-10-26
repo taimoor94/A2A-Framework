@@ -2,7 +2,9 @@
 
 a2agw can serve an agent written in any language (spec section 7.7). The gateway speaks A2A to
 callers on the agent's behalf and hands each turn to the agent through a small local
-contract, the invoke protocol `a2agw.invoke/1`. This page is that contract.
+contract, the invoke protocol `a2agw.invoke/1`. This page is that contract. The agent is reached
+over HTTP (the webhook transport) or runs as a process the gateway supervises (the stdio
+transport); both carry the same invoke body and events.
 
 ## Webhook transport
 
@@ -115,7 +117,7 @@ WARNING on the logger `a2agw.agent.<agent id>`.
 | Situation | Task fails with |
 |---|---|
 | Non-2xx status | `agent returned HTTP <code>` |
-| Cannot connect, or the address is refused by the tier | `agent unreachable` |
+| Cannot connect, the address is refused by the tier, or the request fails before a response | `agent unreachable` |
 | Connection breaks mid-response | `agent connection lost` |
 | Invalid JSON, invalid event, wrong content type, an undecodable body, a limit exceeded | `agent protocol error` |
 | The gateway could not prepare the consult grant | `agent consult setup failed` |
@@ -153,3 +155,111 @@ if body.protocol != "a2agw.invoke/1":      reject 400
 
 Parse the body only after the check, and compare in constant time. Keep the endpoint on a
 loopback or private address; the signature proves the request came from your gateway.
+
+## Stdio transport
+
+The agent is a long-lived local process that the gateway starts and supervises. It reads
+JSON lines on stdin and writes JSON lines on stdout. Configure it in `a2agw.yaml`:
+
+```yaml
+agents:
+  - id: coder
+    name: Coder
+    description: Writes and reviews code
+    skills:
+      - {id: code, name: Code, description: Writes code, tags: [dev]}
+    durable_sessions: false
+    stdio:
+      command: [node, agent.js]   # argv, at least one item; no shell
+      cwd: agents/coder           # optional; relative to the config file's directory
+      env_from:                   # optional: variable for the process -> gateway env var
+        OPENAI_API_KEY: CODER_OPENAI_KEY
+      max_concurrency: 16         # optional: turns in flight at once
+      timeout_s: 300              # optional: end-to-end deadline per turn
+```
+
+An entry has exactly one transport (`webhook` or `stdio`). Environment values are never
+written inline: `env:` is rejected, use `env_from`. A variable named in `env_from` that is not
+set in the gateway's environment is a configuration error naming it. In Python, the same agent
+is `AgentSpec(..., adapter=StdioAdapter(["node", "agent.js"], cwd=..., env={...}))`; the
+host starts the process at startup and stops it at shutdown.
+
+The process does not inherit the gateway's environment. It gets only `PATH`, `HOME`, `LANG`,
+`TZ` and `PYTHONPATH` (those that are set), plus the `env_from` variables.
+
+### Framing
+
+One JSON object per line, UTF-8, each ending with `\n`. Every turn is a run with its own id
+(32 hex characters); runs are multiplexed over the one process, so several can be in flight
+at once and their events may interleave.
+
+The gateway writes to stdin:
+
+| Line | Meaning |
+|---|---|
+| `{"op":"invoke","id":"<run id>","request":{...}}` | Start a run. `request` is the invoke body, exactly as the webhook's request body |
+| `{"op":"cancel","id":"<run id>"}` | Stop the run: the task was cancelled, timed out, or the run broke the protocol |
+| `{"op":"shutdown"}` | Exit cleanly; stdin is closed right after |
+
+The agent writes to stdout, for each event of a run:
+
+```json
+{"id": "<run id>", "event": {"type": "text", "text": "fn main() {"}}
+```
+
+`event` is one of the webhook's events (same types, fields and rules). A run ends at its
+first `need_input`, `need_auth`, `done`, `failed` or `reply`; the gateway ignores anything
+after it for that run. Unlike a webhook response, there is no "end of stream": always end a
+run with a terminal event, or it fails when its deadline passes.
+
+Stdout carries the protocol only: write logs to stderr. The gateway forwards stderr to the
+logger `a2agw.agent.<agent id>` at INFO, one record per line, capped at 4 KiB a line.
+
+A minimal agent in Python:
+
+```python
+import json, sys
+
+for raw in sys.stdin:
+    op = json.loads(raw)
+    if op["op"] == "shutdown":
+        break
+    if op["op"] == "invoke":
+        out = {"id": op["id"], "event": {"type": "done", "text": "echo: " + op["request"]["text"]}}
+        sys.stdout.write(json.dumps(out) + "\n")
+        sys.stdout.flush()
+```
+
+### Supervision
+
+- The process starts with the host (or on the first turn). The gateway never uses a shell.
+- When it exits, every run in flight fails with `agent process exited`, and the gateway starts
+  it again after a back-off of 1, 2, 4 ... up to 30 seconds. The back-off starts again at 1
+  second once a process has stayed up for 60 seconds.
+- A turn that arrives while the process is down waits for it, up to the turn's deadline, then
+  fails with `agent unavailable`.
+- At shutdown the gateway sends `shutdown` and closes stdin, waits 5 seconds, sends SIGTERM,
+  waits 2 more seconds, then kills the process.
+
+### Failures
+
+As for the webhook transport, the A2A caller sees a fixed reason and the gateway logs the
+detail (an error class or a protocol rule, never a value) at WARNING on
+`a2agw.agent.<agent id>`.
+
+| Situation | Task fails with |
+|---|---|
+| The process exited (or was stopped) during the run | `agent process exited` |
+| No running process within the deadline (it cannot start, or is backing off) | `agent unavailable` |
+| An invalid event, a line without exactly `id` and `event`, a limit exceeded | `agent protocol error` |
+| The gateway could not prepare the consult grant | `agent consult setup failed` |
+| `timeout_s` passed (including a wait for a free slot under `max_concurrency`) | `agent timed out` |
+
+A line that breaks the protocol fails only the run it names, and that run is sent `cancel`. A
+line that names no run (invalid JSON, no `id`, longer than 1 MiB) is logged and ignored: the
+run it was meant for then ends at its deadline. Lines for a run that has ended are ignored.
+
+### Limits
+
+The webhook limits apply to each run: 1 MiB a line (`MAX_LINE_BYTES`), 16 MiB of lines in
+all (`MAX_RESPONSE_BYTES`) and 10,000 events (`MAX_EVENTS`).

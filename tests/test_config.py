@@ -348,3 +348,81 @@ def test_webhook_inline_secret_rejected(tmp_path):
         load_config(p, env={})
     msg = str(ei.value)
     assert "agents.0.webhook.secret" in msg and "secret_env" in msg and "hunter2" not in msg
+
+
+STDIO = """\
+base_url: http://gw
+db_url: sqlite+aiosqlite:///{db}
+agents:
+  - id: coder
+    name: Coder
+    description: Writes code
+    skills:
+      - {{id: code, name: Code, description: Writes code}}
+    durable_sessions: true
+    stdio:
+      command: [python3, -u, agent.py, --port, "0"]
+      cwd: agents/coder
+      env_from: {{API_KEY: CODER_API_KEY, TOKEN: CODER_TOKEN}}
+      max_concurrency: 4
+      timeout_s: 60
+"""
+
+
+def test_external_stdio_agent_builds_spec(tmp_path, monkeypatch):
+    from a2agw.adapters.stdio import StdioAdapter
+
+    p = write(tmp_path, STDIO.format(db=tmp_path / "g.db"))
+    cfg = load_config(p, env={})  # an env_from name like TOKEN is not an inline secret
+    monkeypatch.setenv("CODER_API_KEY", "key-value")
+    monkeypatch.delenv("CODER_TOKEN", raising=False)
+    with pytest.raises(ConfigError) as ei:
+        build_host(cfg, config_dir=tmp_path)
+    assert "agents.0.stdio.env_from.TOKEN" in str(ei.value) and "CODER_TOKEN" in str(ei.value)
+    assert "key-value" not in str(ei.value)
+
+    monkeypatch.setenv("CODER_TOKEN", "tok-value")
+    host = build_host(cfg, config_dir=tmp_path)
+    a = host.specs["coder"].adapter
+    assert isinstance(a, StdioAdapter) and a.durable_sessions is True
+    assert a.command == ["python3", "-u", "agent.py", "--port", "0"]
+    assert a.cwd == (tmp_path / "agents" / "coder").resolve()  # relative to the config dir
+    assert a.env == {"API_KEY": "key-value", "TOKEN": "tok-value"}
+    assert (a.max_concurrency, a.timeout_s, a.agent_id) == (4, 60.0, "coder")
+    assert "key-value" not in repr(a) and "tok-value" not in repr(a)
+
+    # Defaults; an absolute cwd is kept as is.
+    minimal = GatewayConfig.model_validate(
+        _ext(stdio={"command": ["agent"], "cwd": str(tmp_path)}, id="min")
+    )
+    a = build_host(minimal, config_dir=tmp_path / "elsewhere").specs["min"].adapter
+    assert (a.env, a.max_concurrency, a.timeout_s, a.cwd) == ({}, 16, 300.0, tmp_path.resolve())
+    nocwd = GatewayConfig.model_validate(_ext(stdio={"command": ["agent"]}))
+    assert build_host(nocwd, config_dir=tmp_path).specs["ext"].adapter.cwd is None
+
+
+def test_stdio_config_validation(tmp_path):
+    for bad in (
+        _ext(stdio={"command": []}),
+        _ext(stdio={"command": [""]}),
+        _ext(stdio={"command": "agent"}),
+        _ext(stdio={"command": ["a"], "max_concurrency": 0}),
+        _ext(stdio={"command": ["a"], "timeout_s": 0}),
+        _ext(stdio={"command": ["a"], "env_from": {"BAD=NAME": "X"}}),
+        _ext(stdio={"command": ["a"], "env_from": {"OK": "not a var"}}),
+        _ext(stdio={"command": ["a"]}, webhook={"url": "http://x/"}),  # two transports
+    ):
+        with pytest.raises(ValueError):
+            GatewayConfig.model_validate(bad)
+    with pytest.raises(ValueError, match="webhook or stdio"):
+        GatewayConfig.model_validate(_ext())
+    # Inline environment values are not allowed: only env_from names an env var.
+    p = write(
+        tmp_path,
+        "base_url: http://gw\nagents:\n  - id: ext\n    name: E\n    description: d\n"
+        "    skills: [{id: s, name: S, description: d}]\n"
+        "    stdio: {command: [a], env: {API_KEY: hunter2-inline}}\n",
+    )
+    with pytest.raises(ConfigError) as ei:
+        load_config(p, env={})
+    assert "agents.0.stdio.env" in str(ei.value) and "hunter2" not in str(ei.value)

@@ -25,17 +25,24 @@ Security and failure handling:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, aclosing
-from typing import Any, TypeVar
+from typing import Any
 
 import httpx
 
-from a2agw.adapters._stream import stream_events
+from a2agw.adapters._sidecar import (
+    ConsultFn,
+    TurnDeadline,
+    TurnFailure,
+    check_line,
+    consult_grant,
+    loads,
+    run_turn,
+)
 from a2agw.consult.guarded_net import fixed_tier, guarded_async_client, is_unsafe_address
 from a2agw.consult.netguard import Tier, check_url_syntax, require_https
 from a2agw.core.events import AgentEvent, Done, Failed
@@ -46,7 +53,6 @@ from a2agw.gateway.protocol import (
     MAX_RESPONSE_BYTES,
     PROTOCOL,
     TERMINAL,
-    ConsultGrant,
     ProtocolError,
     build_invoke,
     parse_event,
@@ -58,8 +64,6 @@ __all__ = ["WebhookAdapter"]
 NDJSON = "application/x-ndjson"
 JSON = "application/json"
 
-T = TypeVar("T")
-ConsultFn = Callable[[InboundContext], Awaitable[ConsultGrant | None]]
 _Within = Callable[[Awaitable[Any]], Awaitable[Any]]
 
 
@@ -95,16 +99,9 @@ class WebhookAdapter:
 
     async def run(self, ctx: InboundContext) -> AsyncIterator[AgentEvent]:
         log = logging.getLogger(f"a2agw.agent.{ctx.agent_id}")
-        async with (
-            aclosing(self._turn(ctx, log)) as items,
-            aclosing(stream_events(items)) as events,
-        ):
-            terminal = False
+        async with aclosing(run_turn(self._turn(ctx, log))) as events:
             async for ev in events:
-                terminal = isinstance(ev, TERMINAL)
                 yield ev
-        if not terminal:  # a clean end of stream without a terminal event
-            yield Done()
 
     def _headers(self, body: bytes) -> dict[str, str]:
         ts = str(int(time.time()))
@@ -123,28 +120,17 @@ class WebhookAdapter:
         self, ctx: InboundContext, log: logging.Logger
     ) -> AsyncIterator[AgentEvent | str]:
         """Wire events (a ``str`` is a text delta), then possibly one ``Failed``."""
-        deadline = asyncio.get_running_loop().time() + self.timeout_s
-
-        async def within(aw: Awaitable[T]) -> T:
-            async with asyncio.timeout_at(deadline):
-                return await aw
-
+        # Both clocks are read once, now: the deadline sent is the one enforced.
+        deadline = TurnDeadline(self.timeout_s)
+        within = deadline.within
+        try:
+            grant = await consult_grant(self.consult, ctx, deadline, log)
+        except TurnFailure as e:
+            yield Failed(e.reason)
+            return
         connected = False
         failure: str | None = None
-        grant: ConsultGrant | None = None
-        if self.consult is not None:
-            try:
-                grant = await within(self.consult(ctx))
-            except TimeoutError:
-                log.warning("agent timed out after %ss (consult setup)", self.timeout_s)
-                failure = "agent timed out"
-            except Exception as e:  # noqa: BLE001 - any failure of the grant callable
-                log.warning("agent consult setup failed: %s", type(e).__name__)
-                failure = "agent consult setup failed"
-            if failure is not None:
-                yield Failed(failure)
-                return
-        invoke = build_invoke(ctx, consult=grant, deadline=time.time() + self.timeout_s)
+        invoke = build_invoke(ctx, consult=grant, deadline=deadline.wall)
         body = json.dumps(invoke, separators=(",", ":")).encode()
         try:
             async with AsyncExitStack() as stack:
@@ -176,17 +162,10 @@ class WebhookAdapter:
         except httpx.DecodingError as e:  # e.g. a Content-Encoding the body does not match
             log.warning("agent protocol error: %s", type(e).__name__)
             failure = "agent protocol error"
-        except httpx.TransportError as e:
+        except httpx.RequestError as e:  # TransportError, or any other request failure
             reason = "unsafe address" if is_unsafe_address(e) else type(e).__name__
-            if connected:
-                log.warning("agent connection lost: %s", reason)
-                failure = "agent connection lost"
-            else:
-                log.warning("agent unreachable: %s", reason)
-                failure = "agent unreachable"
-        except httpx.RequestError as e:  # any other request failure
-            log.warning("agent connection lost: %s", type(e).__name__)
-            failure = "agent connection lost"
+            failure = "agent connection lost" if connected else "agent unreachable"
+            log.warning("%s: %s", failure, reason)
         if failure is not None:
             yield Failed(failure)
 
@@ -207,7 +186,7 @@ class WebhookAdapter:
 
         async with aclosing(_chunks(response, within)) as chunks:
             if ctype == JSON:
-                data = _loads(b"".join([c async for c in chunks]))
+                data = loads(b"".join([c async for c in chunks]))
                 if not isinstance(data, dict) or len(data) != 1:
                     raise ProtocolError("JSON response needs exactly one of text or events")
                 if "text" in data:
@@ -229,25 +208,11 @@ class WebhookAdapter:
                     line = bytes(buf[:i])
                     del buf[: i + 1]
                     if line.strip():
-                        yield event(_loads(_line(line)))
+                        yield event(loads(check_line(line)))
                 if len(buf) > MAX_LINE_BYTES:
                     raise ProtocolError("line longer than MAX_LINE_BYTES")
             if buf.strip():  # a last line without its newline
-                yield event(_loads(_line(bytes(buf))))
-
-
-def _line(line: bytes) -> bytes:
-    line = line.removesuffix(b"\r")
-    if len(line) > MAX_LINE_BYTES:
-        raise ProtocolError("line longer than MAX_LINE_BYTES")
-    return line
-
-
-def _loads(data: bytes) -> Any:
-    try:
-        return json.loads(data)
-    except (ValueError, RecursionError):  # incl. UnicodeDecodeError
-        raise ProtocolError("invalid JSON") from None
+                yield event(loads(check_line(bytes(buf))))
 
 
 async def _chunks(response: httpx.Response, within: _Within) -> AsyncIterator[bytes]:

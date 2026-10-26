@@ -68,6 +68,7 @@ from a2agw.consult.registry import CardFetchError, PartnerRecord, PartnerRegistr
 from a2agw.consult.tls import TlsClientConfig
 from a2agw.consult.tools import PartnerTool, partner_tools
 from a2agw.context.signing import CallContextSigner, CallContextVerifier
+from a2agw.core.spi import LifecycleAdapter
 from a2agw.ops.admin import ADMIN_PREFIX, HEALTH_PATH, admin_routes
 from a2agw.ops.audit import AuditEvent, AuditLog, registry_audit_event
 from a2agw.ops.bus import EventBus
@@ -1001,6 +1002,8 @@ class AgentHost:
         self.maintenance_interval_s = maintenance_interval_s
         self.ledger: MessageLedger | None = None  # created at startup
         self._maintenance: asyncio.Task[None] | None = None
+        # Adapters with a lifecycle (``LifecycleAdapter``) started at startup, in order.
+        self._started_adapters: list[tuple[str, LifecycleAdapter]] = []
         # Signed call contexts between gateways (a2agw.context.signing): the signer signs the
         # call context of every outbound consult; the verifier lets agents trust a signed one.
         # With both set, the host trusts its own key: a token it signed and a partner forwarded
@@ -1093,6 +1096,7 @@ class AgentHost:
         try:
             await self._startup()
         except BaseException:
+            await self._stop_adapters()
             if self.audit is not None:
                 # Registry changes submitted during startup are written before the engine
                 # goes (and never left running against a disposed engine).
@@ -1251,6 +1255,12 @@ class AgentHost:
                 )
             )
         routes.append(Mount("/agents", app=_agent_not_found))
+        # Adapters that own resources (e.g. a supervised agent process) start once the stores
+        # are ready, before the first request can reach them.
+        for agent_id, spec in self.specs.items():
+            if isinstance(spec.adapter, LifecycleAdapter):
+                self._started_adapters.append((agent_id, spec.adapter))
+                await spec.adapter.start()
         if len(self.cards) == 1:
             routes += create_agent_card_routes(
                 next(iter(self.cards.values())), cache_control=self.card_cache_control
@@ -1475,9 +1485,9 @@ class AgentHost:
         return self.push_senders[agent_id].counters()
 
     async def shutdown(self) -> None:
-        # Order matters: end event streams, stop the executors, flush pending push
-        # deliveries (bounded), let the partner client drain its cancellation cleanups (they
-        # need the engine), then dispose the engine.
+        # Order matters: end event streams, stop the executors and the adapters with a
+        # lifecycle, flush pending push deliveries (bounded), let the partner client drain its
+        # cancellation cleanups (they need the engine), then dispose the engine.
         self.bus.close_all()
         if self._maintenance is not None:
             self._maintenance.cancel()
@@ -1485,6 +1495,7 @@ class AgentHost:
             self._maintenance = None
         for handler in self.handlers.values():
             await handler.aclose()
+        await self._stop_adapters()
         if self.push_senders:
             await asyncio.gather(*(s.aclose(DRAIN_TIMEOUT_S) for s in self.push_senders.values()))
         if self.push_http is not None:
@@ -1498,6 +1509,16 @@ class AgentHost:
         if self.engine is not None:
             await self.engine.dispose()
             self.engine = None
+
+    async def _stop_adapters(self) -> None:
+        """Stop the adapters started at startup, last first. One that fails to stop is
+        logged (its error class) and the others are still stopped."""
+        started, self._started_adapters = self._started_adapters, []
+        for agent_id, adapter in reversed(started):
+            try:
+                await adapter.stop()
+            except Exception as e:  # noqa: BLE001 - keep stopping the others
+                logger.error("agent %s: adapter stop failed: %s", agent_id, type(e).__name__)
 
     async def _delegate(self, scope: Scope, receive: Receive, send: Send) -> None:
         if self._inner is None:

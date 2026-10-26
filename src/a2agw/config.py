@@ -41,6 +41,7 @@ from pydantic import (
     model_validator,
 )
 
+from a2agw.adapters.stdio import StdioAdapter
 from a2agw.adapters.webhook import WebhookAdapter
 from a2agw.consult.credentials import ChainCredentials, CredentialProvider, EnvCredentials
 from a2agw.consult.netguard import Tier, UnsafeURL, check_url_syntax, require_https
@@ -107,6 +108,9 @@ _SECRET_KEYS = frozenset(
 _NAME_MAPS = frozenset(
     {"oauth", "credentials", "tls", "trust.card_keys", "trust.context_issuers", "auth.api_keys"}
 )
+# The same, for paths with a list index: a stdio agent's env_from keys are variable names.
+_NAME_MAP_PATHS = re.compile(r"^agents\.\d+\.stdio\.env_from$")
+_ENV_NAME = r"^[A-Za-z_][A-Za-z0-9_]*$"
 # userinfo password in a URL: scheme://user:PASSWORD@host
 _URL_PASSWORD = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://[^/@:]*:([^/@]*)@")
 _WHOLE_VAR = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?::-[^}]*)?\}")
@@ -167,6 +171,25 @@ class WebhookConfig(BaseModel):
         return self
 
 
+class StdioConfig(BaseModel):
+    """An external agent run as a supervised local process speaking JSON lines
+    (``a2agw.adapters.stdio.StdioAdapter``).
+
+    ``cwd`` is relative to the config file's directory. The process gets only a few variables
+    of the gateway's environment, plus ``env_from``: each key is a variable set for the
+    process, its value the name of the gateway's environment variable to read it from. Inline
+    values are not allowed."""
+
+    model_config = _FORBID
+    command: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1)
+    cwd: str | None = None
+    env_from: dict[
+        Annotated[str, Field(pattern=_ENV_NAME)], Annotated[str, Field(pattern=_ENV_NAME)]
+    ] = Field(default_factory=dict)
+    max_concurrency: int = Field(default=16, ge=1)
+    timeout_s: float = Field(default=300.0, gt=0)
+
+
 class ExternalAgentConfig(BaseModel):
     """An agent in another process or language, served by the gateway (spec 7.7). It
     names exactly one transport (each transport is a field)."""
@@ -180,12 +203,13 @@ class ExternalAgentConfig(BaseModel):
     output_modes: list[str] | None = Field(default=None, min_length=1)
     durable_sessions: bool = False
     webhook: WebhookConfig | None = None
+    stdio: StdioConfig | None = None
 
     @model_validator(mode="after")
     def _one_transport(self) -> ExternalAgentConfig:
-        transports = [t for t in (self.webhook,) if t is not None]
+        transports = [t for t in (self.webhook, self.stdio) if t is not None]
         if len(transports) != 1:
-            raise ValueError("external agent needs exactly one transport: webhook")
+            raise ValueError("external agent needs exactly one transport: webhook or stdio")
         return self
 
 
@@ -414,7 +438,8 @@ def _reject_inline_secrets(node: Any, source: str, path: str = "") -> None:
         for k, v in node.items():
             key = str(k)
             where = f"{path}.{key}" if path else key
-            if path not in _NAME_MAPS and key.lower() in _SECRET_KEYS:
+            named = path in _NAME_MAPS or _NAME_MAP_PATHS.match(path)
+            if not named and key.lower() in _SECRET_KEYS:
                 raise ConfigError(
                     f"{source}: {where}: inline secrets are not allowed in config; name an "
                     f"environment variable with {key}_env (or put key material in a *_file)"
@@ -511,10 +536,7 @@ def _load_agent(ref: str, config_dir: Path) -> AgentSpec:
     return obj
 
 
-def _external_agent(entry: ExternalAgentConfig, where: str) -> AgentSpec:
-    """The ``AgentSpec`` for an external agent, with its transport's adapter."""
-    w = entry.webhook
-    assert w is not None  # ExternalAgentConfig._one_transport
+def _webhook_adapter(entry: ExternalAgentConfig, w: WebhookConfig, where: str) -> WebhookAdapter:
     secret = None
     if w.secret_env is not None:
         secret = os.environ.get(w.secret_env)
@@ -522,13 +544,45 @@ def _external_agent(entry: ExternalAgentConfig, where: str) -> AgentSpec:
             raise ConfigError(
                 f"{where}.webhook.secret_env: environment variable {w.secret_env} is not set"
             )
-    adapter = WebhookAdapter(
+    return WebhookAdapter(
         w.url,
         secret=secret,
         timeout_s=w.timeout_s,
         tier=w.tier,
         durable_sessions=entry.durable_sessions,
     )
+
+
+def _stdio_adapter(
+    entry: ExternalAgentConfig, s: StdioConfig, where: str, config_dir: Path
+) -> StdioAdapter:
+    env: dict[str, str] = {}
+    for name, var in s.env_from.items():
+        value = os.environ.get(var)
+        if value is None:
+            raise ConfigError(
+                f"{where}.stdio.env_from.{name}: environment variable {var} is not set"
+            )
+        env[name] = value
+    return StdioAdapter(
+        list(s.command),
+        cwd=(config_dir / s.cwd).resolve() if s.cwd is not None else None,
+        env=env,
+        max_concurrency=s.max_concurrency,
+        timeout_s=s.timeout_s,
+        durable_sessions=entry.durable_sessions,
+        agent_id=entry.id,
+    )
+
+
+def _external_agent(entry: ExternalAgentConfig, where: str, config_dir: Path) -> AgentSpec:
+    """The ``AgentSpec`` for an external agent, with its transport's adapter."""
+    adapter: WebhookAdapter | StdioAdapter
+    if entry.webhook is not None:
+        adapter = _webhook_adapter(entry, entry.webhook, where)
+    else:
+        assert entry.stdio is not None  # ExternalAgentConfig._one_transport
+        adapter = _stdio_adapter(entry, entry.stdio, where, config_dir)
     modes = {
         k: v
         for k, v in (("input_modes", entry.input_modes), ("output_modes", entry.output_modes))
@@ -787,7 +841,7 @@ def build_host(cfg: GatewayConfig, *, config_dir: Path | str = ".") -> AgentHost
         if isinstance(entry, AgentRef):
             host.add(_load_agent(entry.spec, config_dir))
         else:
-            host.add(_external_agent(entry, f"agents.{i}"))
+            host.add(_external_agent(entry, f"agents.{i}", config_dir))
     return host
 
 
