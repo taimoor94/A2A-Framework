@@ -1,4 +1,4 @@
-"""Who is calling the gateway's sidecar APIs (the outbound REST API, and the MCP server).
+"""Who is calling the gateway's sidecar APIs (the outbound REST API and the MCP server).
 
 A sidecar call acts as one agent id, established in one of two ways:
 
@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AGENT_HEADER",
+    "MCP_PREFIX",
     "SidecarAuthError",
     "SidecarIdentity",
     "audit_denied",
@@ -40,12 +41,14 @@ __all__ = [
 ]
 
 AGENT_HEADER = "x-a2agw-agent"
+MCP_PREFIX = "/a2agw/mcp"  # the MCP server's mount (``a2agw.gateway.mcp_server``)
 
 # Refusal reasons (audited; fixed text, never a value from the request).
 NOT_AUTHENTICATED = "not authenticated"
 MISSING_SCOPE = "missing a2agw:sidecar scope"
 NO_AGENT = "no agent id"
 AGENT_NOT_ALLOWED = "agent not allowed for principal"
+OTHER_AGENT = "consult token for another agent"  # MCP: the path names the agent
 
 
 @dataclass(frozen=True)

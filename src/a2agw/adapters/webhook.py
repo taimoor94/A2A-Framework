@@ -128,8 +128,11 @@ class WebhookAdapter:
         # Both clocks are read once, now: the deadline sent is the one enforced.
         deadline = TurnDeadline(self.timeout_s)
         within = deadline.within
+        # Read once: the grant is revoked by the callable that issued it, even if
+        # ``consult`` is replaced meanwhile (a host stopping or starting).
+        consult = self.consult
         try:
-            grant = await consult_grant(self.consult, ctx, deadline, log)
+            grant = await consult_grant(consult, ctx, deadline, log)
         except TurnFailure as e:
             yield Failed(e.reason)
             return
@@ -177,7 +180,7 @@ class WebhookAdapter:
             if failure is not None:
                 yield Failed(failure)
         finally:
-            release_grant(self.consult, grant, log)
+            release_grant(consult, grant, log)
 
     async def _events(
         self, response: httpx.Response, within: _Within

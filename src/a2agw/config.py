@@ -368,18 +368,29 @@ class LimitsConfig(BaseModel):
     max_open_sidecar_tasks_per_caller: int = Field(default=64, ge=1)
 
 
+class McpConfig(BaseModel):
+    """The outbound MCP server (``docs/sidecar.md``): the agent ids whose partner tools are
+    served over MCP. ``enabled`` mounts ``/a2agw/mcp/{agent_id}`` on ``a2agw serve``;
+    ``a2agw mcp --agent <id>`` (stdio) serves any listed id either way."""
+
+    model_config = _FORBID
+    enabled: bool = False
+    agents: list[Annotated[str, Field(pattern=AGENT_ID_PATTERN)]] = Field(default_factory=list)
+
+
 class SidecarConfig(BaseModel):
     """Sidecar agents (spec 7.7) calling the outbound REST API without a consult token.
 
     ``clients`` maps a principal id (``key:<id>`` for an API key, ``jwt:<sub>`` for a JWT
     subject) to the agent ids it may act as; the principal also needs the ``a2agw:sidecar``
     scope. An agent id here need not be served by this gateway: it is the identity the
-    partner calls are routed, checked and audited as."""
+    partner calls are routed, checked and audited as. ``mcp`` configures the MCP server."""
 
     model_config = _FORBID
     clients: dict[
         Annotated[str, Field(min_length=1)], list[Annotated[str, Field(pattern=AGENT_ID_PATTERN)]]
     ] = Field(default_factory=dict)
+    mcp: McpConfig = Field(default_factory=McpConfig)
 
 
 class ServerTlsConfig(BaseModel):
@@ -861,6 +872,8 @@ def build_host(cfg: GatewayConfig, *, config_dir: Path | str = ".") -> AgentHost
             push=push,
             audit=cfg.audit,
             sidecar_clients=cfg.sidecar.clients,
+            sidecar_agents=cfg.sidecar.mcp.agents,
+            mcp_agents=cfg.sidecar.mcp.agents if cfg.sidecar.mcp.enabled else None,
             max_open_sidecar_tasks_per_caller=cfg.limits.max_open_sidecar_tasks_per_caller,
         )
     except ValueError as e:  # e.g. a trusted context kid that clashes with the signing kid
@@ -960,6 +973,7 @@ __all__ = [
     "ConfigError",
     "ExternalAgentConfig",
     "GatewayConfig",
+    "McpConfig",
     "build_host",
     "card_verifier",
     "config_file",

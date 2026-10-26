@@ -16,7 +16,7 @@ import time
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterable, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 from a2a.compat.v0_3.jsonrpc_adapter import JSONRPC03Adapter
@@ -71,6 +71,8 @@ from a2agw.consult.tls import TlsClientConfig
 from a2agw.consult.tools import PartnerTool, partner_tools
 from a2agw.context.signing import CallContextSigner, CallContextVerifier
 from a2agw.core.spi import LifecycleAdapter
+from a2agw.gateway.auth import MCP_PREFIX
+from a2agw.gateway.calls import SidecarCalls
 from a2agw.gateway.rest import REST_PREFIX, rest_routes
 from a2agw.gateway.tokens import ConsultTokens, GrantIssuer
 from a2agw.ops.admin import ADMIN_PREFIX, HEALTH_PATH, admin_routes
@@ -123,6 +125,9 @@ from a2agw.serve.store import (
     recover_on_startup,
     task_store_for,
 )
+
+if TYPE_CHECKING:
+    from a2agw.gateway.mcp_server import McpHttpApp
 
 CARD_PATH = "/.well-known/agent-card.json"
 logger = logging.getLogger(__name__)
@@ -839,10 +844,10 @@ class _AnonymousMiddleware:
 
 
 def _is_sidecar(scope: Scope) -> bool:
-    """The outbound REST API: its routes accept a consult token instead of the gateway's
-    auth, so they decide who is calling (``a2agw.gateway.auth``)."""
+    """The outbound REST API and MCP server: they accept a consult token instead of the
+    gateway's auth, so they decide who is calling (``a2agw.gateway.auth``)."""
     path = get_route_path(scope)
-    return path == REST_PREFIX or path.startswith(REST_PREFIX + "/")
+    return any(path == p or path.startswith(p + "/") for p in (REST_PREFIX, MCP_PREFIX))
 
 
 def _is_public(scope: Scope) -> bool:
@@ -1003,6 +1008,7 @@ class AgentHost:
         sidecar_clients: Mapping[str, Iterable[str]] | None = None,
         sidecar_agents: Iterable[str] = (),
         max_open_sidecar_tasks_per_caller: int = DEFAULT_MAX_OPEN_SIDECAR_TASKS,
+        mcp_agents: Iterable[str] | None = None,
     ) -> None:
         self.base_url = base_url
         # Sidecar agents (spec 7.7) consult partners through the outbound REST API
@@ -1017,13 +1023,21 @@ class AgentHost:
         self.sidecar_clients: dict[str, frozenset[str]] = {
             principal: frozenset(agents) for principal, agents in (sidecar_clients or {}).items()
         }
-        self.sidecar_agents = frozenset(sidecar_agents)
+        # The outbound MCP server (``a2agw.gateway.mcp_server``, imported only when this is
+        # set): the agent ids whose partner tools are served at ``/a2agw/mcp/{agent_id}``.
+        # None: no MCP server. These ids are sidecar agents too.
+        self.mcp_agents = frozenset(mcp_agents) if mcp_agents is not None else None
+        self._mcp: McpHttpApp | None = None
+        self.sidecar_agents = frozenset(sidecar_agents) | (self.mcp_agents or frozenset())
         # A standalone sidecar principal's open partner tasks with no inbound task, per agent
         # id it acts as (over it a new consult is ``unavailable``, audited
         # ``limit.exceeded``); linked calls are bounded by ``max_consults_per_task``.
         if max_open_sidecar_tasks_per_caller < 1:
             raise ValueError("max_open_sidecar_tasks_per_caller must be at least 1")
         self.max_open_sidecar_tasks_per_caller = max_open_sidecar_tasks_per_caller
+        # The partner-tool call path of the REST API and the MCP server (one per host: the
+        # open-task cap counts the consults in flight through either).
+        self.sidecar_calls = SidecarCalls(self)
         # Adapters given this host's ``consult_issuer`` at startup (reset at shutdown).
         self._issued_adapters: list[WebhookAdapter | StdioAdapter] = []
         # Spec 7.2 / 11a.4 per-caller caps: agent turns running at once per principal
@@ -1137,6 +1151,8 @@ class AgentHost:
         try:
             await self._startup()
         except BaseException:
+            if self._mcp is not None:
+                await self._mcp.stop()
             await self._stop_adapters()
             if self.audit is not None:
                 # Registry changes submitted during startup are written before the engine
@@ -1318,6 +1334,8 @@ class AgentHost:
                 next(iter(self.cards.values())), cache_control=self.card_cache_control
             )
         self._inner = Starlette(routes=routes)
+        if self.mcp_agents is not None:
+            await self._mcp_app().start()
         self.last_recovery = await recover_on_startup(
             index,
             stores,
@@ -1532,7 +1550,7 @@ class AgentHost:
 
     def sidecar_agent_ids(self) -> set[str]:
         """This host's sidecar agents: the external (webhook, stdio) agents it serves, every
-        agent id in ``sidecar_clients``, and ``sidecar_agents``."""
+        agent id in ``sidecar_clients``, and ``sidecar_agents`` (``mcp_agents`` included)."""
         served = {
             i for i, s in self.specs.items() if isinstance(s.adapter, WebhookAdapter | StdioAdapter)
         }
@@ -1569,6 +1587,8 @@ class AgentHost:
             self._maintenance.cancel()
             await asyncio.gather(self._maintenance, return_exceptions=True)
             self._maintenance = None
+        if self._mcp is not None:
+            await self._mcp.stop()  # its sessions' calls in flight end here
         for handler in self.handlers.values():
             await handler.aclose()
         await self._stop_adapters()
@@ -1601,6 +1621,14 @@ class AgentHost:
             if isinstance(result, BaseException):
                 logger.error("agent %s: adapter stop failed: %s", agent_id, type(result).__name__)
 
+    def _mcp_app(self) -> McpHttpApp:
+        """The MCP server's ASGI app (imports ``mcp``: only when ``mcp_agents`` is set)."""
+        if self._mcp is None:
+            from a2agw.gateway.mcp_server import mcp_asgi_app
+
+            self._mcp = mcp_asgi_app(self)
+        return self._mcp
+
     async def _delegate(self, scope: Scope, receive: Receive, send: Send) -> None:
         if self._inner is None:
             await JSONResponse({"error": "not started"}, status_code=503)(scope, receive, send)
@@ -1626,6 +1654,7 @@ class AgentHost:
                 *self.extra_routes,
                 *(admin_routes(self) if self.admin else []),
                 *rest_routes(self),
+                *([Mount(MCP_PREFIX, app=self._mcp_app())] if self.mcp_agents is not None else []),
                 Mount("/", app=self._delegate),
             ],
             lifespan=lifespan,

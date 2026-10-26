@@ -623,3 +623,51 @@ async def test_revoked_mid_request_is_audited_with_the_binding(env, monkeypatch)
         "a",
         "consult token revoked",
     )
+
+
+# -- fix round 2 ---------------------------------------------------------------------------
+
+
+async def test_standalone_open_task_cap_is_hard_under_concurrency(env):
+    """Concurrent first consults cannot all pass the open-task check before any of them
+    records its partner task: exactly ``cap`` proceed."""
+    e = await standalone_env(env, Blocker(), max_open_sidecar_tasks_per_caller=2)
+    ask = {"message": "go", "wait_seconds": HANDLE_WAIT_S}
+    replies = await asyncio.gather(
+        *(e.hc.post(f"{V1}/partners/b/messages", json=ask, headers=as_svc(SVC)) for _ in range(6))
+    )
+    states = sorted(r.json()["state"] for r in replies)
+    assert states == ["unavailable"] * 4 + ["working"] * 2
+    assert {r.json().get("reason") for r in replies if r.json()["state"] == "unavailable"} == {
+        "too many open tasks"
+    }
+    assert await b_states(e) == [WORKING, WORKING]
+
+
+async def test_wait_bounds_handle_lookups(env, monkeypatch):
+    e = await env(spec("a", Fn(echo)), spec("b", Blocker()))
+    await e.register("b")
+    h = bearer(e.host.consult_tokens.issue("a", "T1", None, None))
+    r = await e.hc.post(
+        f"{V1}/partners/b/messages",
+        json={"message": "go", "wait_seconds": HANDLE_WAIT_S},
+        headers=h,
+    )
+    tid = r.json()["task_id"]
+    lookups = 0
+    get = e.host.handles.get
+
+    async def counting(pid, task_id):
+        nonlocal lookups
+        lookups += 1
+        return await get(pid, task_id)
+
+    monkeypatch.setattr(e.host.handles, "get", counting)
+    item = {"partner_id": "b", "task_id": tid}
+    r = await e.hc.post(f"{V1}/wait", json={"tasks": [item] * 1000, "seconds": 0}, headers=h)
+    assert r.json()["state"] == "rejected"
+    assert lookups <= 20
+    lookups = 0
+    r = await e.hc.post(f"{V1}/wait", json={"tasks": [item] * 20, "seconds": 0}, headers=h)
+    assert [x["state"] for x in r.json()["results"]] == ["working"]
+    assert lookups == 1  # the same handle is looked up once

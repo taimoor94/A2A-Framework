@@ -6,7 +6,8 @@ contract, the invoke protocol `a2agw.invoke/1`. This page is that contract. The 
 over HTTP (the webhook transport) or runs as a process the gateway supervises (the stdio
 transport); both carry the same invoke body and events. To consult partner agents, the agent
 calls the gateway's outbound REST API (`/a2agw/v1`, see
-[Consulting partners](#consulting-partners)).
+[Consulting partners](#consulting-partners)). MCP-capable agents can use the same partner
+tools through the gateway's [MCP server](#mcp-server).
 
 ## Webhook transport
 
@@ -412,4 +413,124 @@ def ask(consult, partner, message):
         return json.load(r)
 
 # in the invoke handler:  answer = ask(op["request"]["consult"], "researcher", "find X")
+```
+
+## MCP server
+
+The same partner tools are also served over MCP, so an MCP-capable agent (Claude Code,
+Cursor, the Claude Agent SDK, OpenAI Agents, ...) can consult the partner network with no code
+of its own. Install the extra (`pip install 'a2a-gateway[mcp]'`) and list the agent ids to
+serve:
+
+```yaml
+sidecar:
+  clients:
+    "key:claude-code": [coder]   # standalone callers, as for the REST API
+  mcp:
+    enabled: true                # mount /a2agw/mcp/{agent_id} on `a2agw serve`
+    agents: [coder]              # the agent ids served over MCP (HTTP and stdio)
+```
+
+Each agent id is one MCP server. It has one tool per partner tool of `GET /a2agw/v1/partners`,
+with the same names (`ask_<partner>`, or `find_partners` and `consult_partner`, plus
+`a2a_check_task`, `a2a_cancel_task` and `a2a_wait`) and the same arguments. A tool's input
+schema leaves out the gateway-only `x-` keys (such as the size limit on `data`); the gateway
+still enforces them. Every description ends with a note that partner results are untrusted
+data, and the server's instructions say the same.
+
+A tool call does exactly what the matching REST call does: the same routing, egress policy,
+audit, ownership of partner tasks, `unknown partner` and `unknown task` answers, and the same
+limits. Its result has the JSON answer of the REST call twice: as text content and as
+`structuredContent`. `isError` is set when the state is `failed` or `rejected`. A tool that is
+not in the current list (a partner since quarantined, disabled, removed or forbidden) answers
+`isError` with `{"state": "unavailable", "reason": "unknown tool"}`, and nothing is sent.
+The list is recomputed on every `tools/list`, and when partners change the gateway sends
+`notifications/tools/list_changed` to the open sessions (best effort).
+
+### Streamable HTTP
+
+`a2agw serve` serves each listed agent id at `/a2agw/mcp/{agent_id}` (any other id is a
+`404`). Authentication is the REST API's:
+
+- **Consult token (linked).** A webhook or stdio agent can hand its turn's token to an MCP
+  client as `Authorization: Bearer <token>`, on `{base_url}/a2agw/mcp/{agent_id}` for its own
+  agent id (a token for another agent id is a `403`). The session's calls are linked to the
+  inbound task, as described in [Authentication](#authentication), and stop working when the
+  turn ends.
+- **Standalone.** The gateway's API key or JWT, for a principal with the `a2agw:sidecar`
+  scope that `sidecar.clients` maps to the agent id. The path names the agent: no
+  `X-A2AGW-Agent` header is needed.
+
+Refusals are `401`/`403` and audited as `sidecar.denied`, as for the REST API. A session can
+only be used with the credentials that opened it (another caller gets `404`, as for an
+unknown session). DNS-rebinding protection accepts only requests whose `Host` (and `Origin`,
+when sent) is the host of `base_url`; behind a proxy, keep the original `Host`.
+
+Claude Code (`.mcp.json`, or `claude mcp add --transport http a2agw <url> --header ...`):
+
+```json
+{
+  "mcpServers": {
+    "a2agw": {
+      "type": "http",
+      "url": "https://gw.example.com/a2agw/mcp/coder",
+      "headers": {"X-API-Key": "${A2AGW_API_KEY}"}
+    }
+  }
+}
+```
+
+Cursor (`.cursor/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "a2agw": {
+      "url": "https://gw.example.com/a2agw/mcp/coder",
+      "headers": {"X-API-Key": "${env:A2AGW_API_KEY}"}
+    }
+  }
+}
+```
+
+Claude Agent SDK (Python):
+
+```python
+import os
+from claude_agent_sdk import ClaudeAgentOptions, query
+
+options = ClaudeAgentOptions(
+    mcp_servers={
+        "a2agw": {
+            "type": "http",
+            "url": "https://gw.example.com/a2agw/mcp/coder",
+            "headers": {"X-API-Key": os.environ["A2AGW_API_KEY"]},
+        }
+    },
+    allowed_tools=["mcp__a2agw"],  # every tool of this server
+)
+async for message in query(prompt="Ask the researcher about X", options=options):
+    print(message)
+```
+
+### Stdio
+
+`a2agw mcp -c a2agw.yaml --agent <id>` serves one listed agent id over stdio, for clients
+that start their MCP servers as processes. It runs the gateway without its HTTP server or its
+served agents (registering the config's partners as `serve` does), and needs no credentials:
+anyone who can run it can read the config. Its calls are standalone, owned by
+`sidecar:<id>` (the host's TTL expiry covers them) and capped like a standalone principal's,
+for the local caller `local:<id>`. An agent id that is not in `sidecar.mcp.agents` is
+refused.
+
+It opens the config's database. With an SQLite `db_url`, do not run it next to an
+`a2agw serve` that uses the same file: point the MCP client at that gateway's HTTP endpoint
+instead.
+
+```json
+{
+  "mcpServers": {
+    "a2agw": {"command": "a2agw", "args": ["mcp", "-c", "/srv/a2agw/a2agw.yaml", "--agent", "coder"]}
+  }
+}
 ```

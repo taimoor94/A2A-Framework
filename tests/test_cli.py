@@ -351,3 +351,19 @@ def test_partners_list_flags_v03_only_partners(pf):
     old = next(ln for ln in out.splitlines() if ln.startswith("old"))
     new = next(ln for ln in out.splitlines() if ln.startswith("new"))
     assert "a2a-0.3" in old and "a2a-0.3" not in new
+
+
+def test_mcp_command_refuses_unlisted_agent(tmp_path, monkeypatch):
+    from a2agw.gateway import mcp_server
+
+    started = []
+    monkeypatch.setattr(mcp_server, "run_stdio", lambda *a: started.append(a))
+    (tmp_path / "a2agw.yaml").write_text(
+        "base_url: http://x\n"
+        f"db_url: sqlite+aiosqlite:///{tmp_path / 'db.sqlite'}\n"
+        "sidecar: {mcp: {agents: [coder]}}\n"
+    )
+    r = run("mcp", "-c", str(tmp_path / "a2agw.yaml"), "--agent", "other")
+    assert r.exit_code == 1, r.output
+    assert "error: agent 'other' is not in sidecar.mcp.agents" in r.output
+    assert "Traceback" not in r.output and started == []

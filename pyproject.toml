@@ -26,7 +26,8 @@ dependencies = [
 langchain = ["langchain-core>=1.7"]
 langgraph = ["langgraph>=1.2", "langchain-core>=1.7"]
 postgres = ["asyncpg>=0.30"]
-all = ["langchain-core>=1.7", "langgraph>=1.2", "asyncpg>=0.30"]
+mcp = ["mcp>=2.3,<3"]
+all = ["langchain-core>=1.7", "langgraph>=1.2", "asyncpg>=0.30", "mcp>=2.3,<3"]
 
 [project.scripts]
 a2agw = "a2agw.cli:app"
@@ -40,6 +41,7 @@ dev = [
     "mypy",
     "langgraph-checkpoint-sqlite>=3.1.2",
     "asyncpg>=0.32.0",
+    "mcp>=2.3,<3",
 ]
 
 [tool.hatch.build.targets.wheel]

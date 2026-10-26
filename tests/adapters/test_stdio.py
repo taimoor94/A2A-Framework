@@ -358,6 +358,28 @@ async def test_grant_revoked_when_the_run_ends(make, tmp_path):
     assert revoked == issued and len(issued) == 2
 
 
+async def test_grant_revoked_by_the_issuer_that_issued_it(make, tmp_path):
+    """The consult callable is read once per turn (see the webhook test of the same name)."""
+    revoked: list[tuple[str, ConsultGrant]] = []
+
+    class Grants:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def __call__(self, c: InboundContext) -> ConsultGrant:
+            return ConsultGrant(url="http://gw/a2agw/v1", token=self.name, expires_at=1.0)
+
+        def revoke(self, grant: ConsultGrant) -> None:
+            revoked.append((self.name, grant))
+
+    a = make("serve", str(tmp_path / "ops.jsonl"), consult=Grants("first"))
+    events = a.run(ctx("block"))
+    assert await anext(events) == Status("working")
+    a.consult = Grants("second")
+    await events.aclose()
+    assert [(name, g.token) for name, g in revoked] == [("first", "first")]
+
+
 async def test_stdout_reader_failure_is_logged(make, monkeypatch, caplog):
     """N1: a reader that fails is an ERROR naming the exception class, not the "closed stdout
     but kept running" warning; the process is killed and its runs fail."""

@@ -474,6 +474,53 @@ def serve(
     )
 
 
+# -- mcp -------------------------------------------------------------------------------------
+@app.command()
+@guarded
+def mcp(
+    agent: Annotated[
+        str, typer.Option("--agent", help="Agent id to act as (listed in sidecar.mcp.agents).")
+    ],
+    config: ConfigOpt = Path("a2agw.yaml"),
+) -> None:
+    """Serve one agent id's partner tools as an MCP server over stdio (Claude Code, Cursor,
+    the Claude Agent SDK, ...).
+
+    Runs the gateway without its HTTP server or served agents. Calls are standalone (not
+    linked to an inbound task), owned by ``sidecar:<agent>``. Do not share an SQLite
+    ``db_url`` with a running ``a2agw serve``: point MCP clients at its HTTP endpoint
+    (``/a2agw/mcp/<agent>``) instead."""
+    cfg = load_config(config)
+    if agent not in cfg.sidecar.mcp.agents:
+        raise ConfigError(f"agent {agent!r} is not in sidecar.mcp.agents")
+    try:
+        from a2agw.gateway import mcp_server
+    except ImportError:
+        raise ConfigError(
+            "the MCP server needs the mcp extra: pip install 'a2a-gateway[mcp]'"
+        ) from None
+    config_dir = config.resolve().parent
+    # No served agents and no HTTP endpoint: this process only serves stdio.
+    sidecar = cfg.sidecar.model_copy(
+        update={"mcp": cfg.sidecar.mcp.model_copy(update={"enabled": False})}
+    )
+    gw = build_host(
+        cfg.model_copy(update={"agents": [], "server_tls": None, "sidecar": sidecar}),
+        config_dir=config_dir,
+    )
+    _db_run(cfg.db_url, _check_db(cfg.db_url))
+
+    async def serve_stdio() -> None:
+        await register_partners(gw, cfg, config_dir=config_dir)
+        await gw.startup()
+        try:
+            await mcp_server.run_stdio(gw, agent)
+        finally:
+            await gw.shutdown()
+
+    _db_run(cfg.db_url, serve_stdio())
+
+
 # -- partners --------------------------------------------------------------------------------
 def _registry(config: Path, partners_file: Path | None) -> PartnerRegistry:
     """The partner registry, with the config's card trust and mTLS settings (when the config

@@ -526,6 +526,22 @@ async def test_grant_revoked_when_the_run_ends(agent):
     assert consult.revoked == consult.issued and len(consult.issued) == 3
 
 
+async def test_grant_revoked_by_the_issuer_that_issued_it(agent):
+    """The consult callable is read once per turn: one replaced mid-turn (a host stopping or
+    another host starting) does not receive the grant it never issued."""
+    first, second = RevocableGrant(), RevocableGrant()
+    a = adapter(agent, consult=first)
+
+    async def swap(_req: Request) -> Response:
+        a.consult = second
+        return Response(json.dumps({"type": "done"}) + "\n", media_type=NDJSON)
+
+    agent.handler = swap
+    await collect(a)
+    assert first.revoked == first.issued and len(first.issued) == 1
+    assert second.issued == second.revoked == []
+
+
 def test_constructor_validates_url_and_options():
     assert WebhookAdapter(URL, durable_sessions=True).durable_sessions is True
     assert WebhookAdapter(URL).durable_sessions is False

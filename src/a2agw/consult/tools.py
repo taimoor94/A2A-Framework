@@ -536,7 +536,7 @@ async def invoke(
     try:
         a = _check_object(args, tool.parameters, "") if isinstance(args, dict) else _bad("args")
     except _Invalid as e:
-        return {"state": "rejected", "reason": f"invalid arguments: {str(e)[:64]}"}
+        return _rejected(e)
     try:
         if tool.kind in ("consult", "consult_any"):
             if tool.kind == "consult":
@@ -579,6 +579,22 @@ async def invoke(
         logger.exception("partner tool %s failed", tool.name)
         return {"state": "failed", "reason": "internal error"}
     return {"state": "failed", "reason": "internal error"}
+
+
+def rejection(tool: PartnerTool, args: Any) -> dict[str, Any] | None:
+    """The ``rejected`` answer ``invoke`` gives ``args`` for ``tool``, or None when they are
+    valid (checked against the full schema, ``x-`` limits included; nothing is sent)."""
+    try:
+        if not isinstance(args, dict):
+            _bad("args")
+        _check_object(args, tool.parameters, "")
+    except _Invalid as e:
+        return _rejected(e)
+    return None
+
+
+def _rejected(e: _Invalid) -> dict[str, Any]:
+    return {"state": "rejected", "reason": f"invalid arguments: {str(e)[:64]}"}
 
 
 def _bad(path: str) -> Any:

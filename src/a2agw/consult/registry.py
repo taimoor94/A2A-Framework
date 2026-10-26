@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import json
@@ -621,6 +622,11 @@ class PartnerRegistry:
         """Call ``fn(rec, event)`` on every change, after ``on_change`` (which stays the
         single user-settable callback); ``change_info`` is readable from inside it."""
         self._listeners.append(fn)
+
+    def remove_listener(self, fn: Callable[[PartnerRecord, str], None]) -> None:
+        """Stop calling ``fn`` (added with ``add_listener``); unknown ones are ignored."""
+        with contextlib.suppress(ValueError):
+            self._listeners.remove(fn)
 
     def _notify(self, rec: PartnerRecord, event: str, info: dict[str, Any] | None = None) -> None:
         callbacks = [cb for cb in (self.on_change, *self._listeners) if cb is not None]

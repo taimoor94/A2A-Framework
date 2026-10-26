@@ -527,8 +527,11 @@ class StdioAdapter:
     ) -> AsyncIterator[AgentEvent | str]:
         """Wire events (a ``str`` is a text delta), then possibly one ``Failed``."""
         deadline = TurnDeadline(self.timeout_s)
+        # Read once: the grant is revoked by the callable that issued it, even if
+        # ``consult`` is replaced meanwhile (a host stopping or starting).
+        consult = self.consult
         try:
-            grant = await consult_grant(self.consult, ctx, deadline, log)
+            grant = await consult_grant(consult, ctx, deadline, log)
         except TurnFailure as e:
             yield Failed(e.reason)
             return
@@ -572,7 +575,7 @@ class StdioAdapter:
                 if child is not None and not ended:  # ended on our side: the agent may still run it
                     self._send_nowait(child, {"op": "cancel", "id": rid})
         finally:
-            release_grant(self.consult, grant, log)
+            release_grant(consult, grant, log)
 
     async def _register(self, rid: str, deadline: TurnDeadline) -> tuple[_Child, _Run]:
         """Wait (within the deadline) for a running process and register the run with it."""
