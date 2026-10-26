@@ -2,9 +2,10 @@
 
 The LangGraph ``thread_id`` is the caller and the A2A ``contextId`` together
 (``"<principal id or anonymous>\\x1f<context id>"``, ``_contexts.context_key``): another caller
-sending the same ``contextId`` gets its own thread. Checkpoints saved before this change
-(``thread_id`` = bare ``contextId``) are not resumed. A LangGraph ``interrupt()`` becomes the
-A2A ``input-required`` state and the next message on the task resumes the graph. Outbound,
+sending the same ``contextId`` gets its own thread. A task paused at an interrupt before this
+change (``thread_id`` = bare ``contextId``) is still resumed from that thread (see
+``GraphAdapter``); other old checkpoints are not continued. A LangGraph ``interrupt()`` becomes
+the A2A ``input-required`` state and the next message on the task resumes the graph. Outbound,
 LangGraph agents use ``a2agw.adapters.langchain.as_langchain_tools`` (re-exported here).
 
 Importing this module requires ``langgraph``; nothing in the core imports it.
@@ -62,9 +63,13 @@ def _last_ai_text(update: Any, output_key: str) -> str | None:
 class GraphAdapter:
     """Wraps a compiled LangGraph graph (anything with ``astream``).
 
-    Runs with ``thread_id = context_key(ctx)`` (caller and context; see the module docstring). On a resumed turn (``ctx.resumed``) the graph is
-    continued with ``Command(resume=ctx.text)``, otherwise it gets ``input_mapper(ctx)``
-    (default ``{"messages": [("user", ctx.text)]}``).
+    Runs with ``thread_id = context_key(ctx)`` (caller and context; see the module
+    docstring). On a resumed turn (``ctx.resumed``) the graph is continued with
+    ``Command(resume=ctx.text)``, otherwise it gets ``input_mapper(ctx)`` (default
+    ``{"messages": [("user", ctx.text)]}``). A resumed turn with no interrupt pending on that
+    thread resumes the legacy thread (``thread_id`` = the bare ``contextId``, from before the
+    caller keying) if that one is paused at an interrupt. That is safe because inbound tasks
+    are owner-scoped: a resumed task belongs to the caller resuming it.
 
     Text of AI message chunks streams as the artifact "output" (``stream_nodes`` limits it to
     chunks from those graph nodes). If nothing was streamed, the text of the last AI message
@@ -145,8 +150,13 @@ class GraphAdapter:
             nonlocal tokens_in, tokens_out, saw_usage, streamed, final_text, interrupted
             config = {"configurable": {"thread_id": context_key(ctx)}}
             payload: Any = self.input_mapper(ctx)
-            if ctx.resumed and await self._has_pending_interrupt(config):
-                payload = Command(resume=ctx.text)
+            if ctx.resumed:
+                legacy = {"configurable": {"thread_id": ctx.context_id}}
+                if await self._has_pending_interrupt(config):
+                    payload = Command(resume=ctx.text)
+                elif await self._has_pending_interrupt(legacy):
+                    # Paused before threads were keyed by caller (owner-scoped task: ours).
+                    config, payload = legacy, Command(resume=ctx.text)
             # The (mode, data) unpack below assumes ``subgraphs=False`` (the default); a
             # subgraph interrupt still surfaces as an ``__interrupt__`` update of the parent.
             async for mode, data in self.graph.astream(

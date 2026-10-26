@@ -117,6 +117,27 @@ async def test_interrupt_without_checkpointer_fails_fast():
     assert "no checkpointer" in evs[0].error
 
 
+async def test_legacy_bare_context_checkpoint_is_resumed():
+    # A task paused before threads were keyed by caller and context: its checkpoint is under
+    # the bare contextId. Inbound tasks are owner-scoped, so the resumed task is this caller's.
+    saver = InMemorySaver()
+    graph = ask_graph(saver)
+    legacy = {"configurable": {"thread_id": "ctx-1"}}
+    await graph.ainvoke({"messages": [("user", "start")]}, config=legacy)
+    assert (await graph.aget_state(legacy)).interrupts  # paused under the old key
+    adapter = GraphAdapter(graph)
+    evs = await collect(adapter, ctx("postgres", resumed=True))
+    assert [text_of(e) for e in evs if isinstance(e, ArtifactChunk)] == ["using postgres"]
+    assert evs[-1] == Done()
+    assert not (await graph.aget_state(legacy)).interrupts  # resumed in place
+    # Only a resumed turn looks there: a new message starts on the caller's own thread.
+    legacy2 = {"configurable": {"thread_id": "ctx-2"}}
+    await graph.ainvoke({"messages": [("user", "start")]}, config=legacy2)
+    evs = await collect(adapter, ctx("fresh", context_id="ctx-2"))
+    assert evs == [NeedInput(question="which db?")]
+    assert (await graph.aget_state(legacy2)).interrupts
+
+
 async def test_resume_on_completed_thread_runs_as_fresh_input():
     adapter = GraphAdapter(echo_graph(InMemorySaver()))
     await collect(adapter, ctx("one"))

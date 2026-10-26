@@ -126,7 +126,7 @@ Events: `Status`, `ArtifactChunk`, `NeedInput`, `NeedAuth`, `Usage`, `Done`, `Fa
 
 ### A LangGraph agent
 
-`GraphAdapter` runs the graph with a `thread_id` made of the caller and the `contextId` (`"<principal id or anonymous>\x1f<contextId>"`), so another caller sending the same `contextId` gets its own thread. Checkpoints saved under a bare `contextId` (before this keying) are not resumed after upgrading. `RunnableAdapter` passes the same `thread_id` in the run config. A LangGraph `interrupt()` ends the turn as `input-required`; the next message on the same task resumes the graph. Use a checkpointer (a persistent one makes `input-required` tasks survive restarts).
+`GraphAdapter` runs the graph with a `thread_id` made of the caller and the `contextId` (`"<principal id or anonymous>\x1f<contextId>"`), so another caller sending the same `contextId` gets its own thread. An `input-required` task paused before this keying (its checkpoint is under the bare `contextId`) is still resumed from that thread after upgrading; inbound tasks are owner-scoped, so only its own caller can resume it. Other checkpoints under a bare `contextId` are not continued. `RunnableAdapter` passes the same `thread_id` in the run config. A LangGraph `interrupt()` ends the turn as `input-required`; the next message on the same task resumes the graph. Use a checkpointer (a persistent one makes `input-required` tasks survive restarts).
 
 ```python
 from langgraph.checkpoint.memory import InMemorySaver
