@@ -8,6 +8,7 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 
+import httpcore
 import httpx
 import pytest
 from a2a.types import Message, Part, Role
@@ -19,6 +20,7 @@ from streaming_asgi import StreamingASGITransport
 
 from a2agw.adapters import webhook as webhook_mod
 from a2agw.adapters.webhook import WebhookAdapter
+from a2agw.consult.guarded_net import GuardedBackend
 from a2agw.core.events import ArtifactChunk, Done, Failed, NeedInput, Status, Usage
 from a2agw.core.spi import InboundContext
 from a2agw.gateway.protocol import MAX_LINE_BYTES, PROTOCOL, sign
@@ -141,6 +143,7 @@ async def test_signature_headers_present_and_valid(agent):
     assert headers["x-a2agw-protocol"] == PROTOCOL
     assert headers["content-type"] == "application/json"
     assert headers["accept"] == "application/x-ndjson, application/json"
+    assert headers["accept-encoding"] == "identity"
     assert b"shh" not in body
 
     await collect(adapter(agent))  # no secret: no signature header
@@ -345,12 +348,72 @@ async def test_unreachable_agent():
     assert events == [Failed("agent unreachable")]
 
 
-async def test_metadata_ip_refused_on_internal_tier(caplog):
+async def test_metadata_ip_refused_on_internal_tier(caplog, monkeypatch):
+    vetted: list[str] = []
+    connects: list[str] = []
+    real_vetted = GuardedBackend._vetted
+
+    async def spy_vetted(self, host, timeout):
+        vetted.append(host)
+        return await real_vetted(self, host, timeout)
+
+    async def no_connect(self, host, *args, **kw):  # the socket layer must never be reached
+        connects.append(host)
+        raise AssertionError("connection attempted")
+
+    monkeypatch.setattr(GuardedBackend, "_vetted", spy_vetted)
+    monkeypatch.setattr(httpcore.AnyIOBackend, "connect_tcp", no_connect)
     a = WebhookAdapter("http://169.254.169.254/latest/meta-data")  # guarded client, tier internal
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         events = await collect(a)
     assert events == [Failed("agent unreachable")]
-    assert "169.254" not in caplog.text
+    assert vetted == ["169.254.169.254"]  # the guard ran ...
+    assert connects == []  # ... and refused before any connection
+    assert "unsafe address" in caplog.text and "169.254" not in caplog.text
+
+
+async def test_undecodable_body_fails_protocol_error(caplog):
+    def bad_gzip(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": NDJSON, "content-encoding": "gzip"},
+            content=b"not gzip at all",
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(bad_gzip)) as hc:
+        with caplog.at_level(logging.WARNING, logger=LOGGER):
+            events = await collect(WebhookAdapter(URL, http=hc))
+    assert events == [Failed("agent protocol error")]
+    assert any(r.name == LOGGER and "DecodingError" in r.getMessage() for r in caplog.records)
+
+
+async def test_other_request_errors_are_connection_lost():
+    def broken(_req: httpx.Request) -> httpx.Response:
+        raise httpx.TooManyRedirects("loop")  # a RequestError that is not a TransportError
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(broken)) as hc:
+        assert await collect(WebhookAdapter(URL, http=hc)) == [Failed("agent connection lost")]
+
+
+async def test_consult_setup_failure_and_timeout(agent, caplog):
+    agent.ndjson({"type": "done"})
+
+    async def boom(_c: InboundContext):
+        raise RuntimeError("SECRET-MARKER detail")
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        events = await collect(adapter(agent, consult=boom))
+    assert events == [Failed("agent consult setup failed")]
+    assert "RuntimeError" in caplog.text and "SECRET-MARKER" not in caplog.text
+    assert agent.requests == []  # nothing sent
+
+    async def hang(_c: InboundContext):
+        await asyncio.Event().wait()
+
+    start = time.monotonic()
+    events = await collect(adapter(agent, consult=hang, timeout_s=0.2))
+    assert events == [Failed("agent timed out")]
+    assert time.monotonic() - start < 2.0 and agent.requests == []
 
 
 async def test_end_without_terminal_is_done(agent):

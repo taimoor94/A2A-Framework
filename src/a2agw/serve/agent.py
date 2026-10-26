@@ -23,7 +23,9 @@ from a2agw.context.call_context import EXTENSION_URI
 from a2agw.core.spi import InboundAdapter
 from a2agw.security.auth import AgentAccess, AuthConfig
 
-_AGENT_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+# The rule for agent ids (``AgentSpec.id``, and external agents in the config).
+AGENT_ID_PATTERN = r"^[a-z0-9][a-z0-9-]{0,62}$"
+_AGENT_ID = re.compile(AGENT_ID_PATTERN)
 
 # Fields the A2A card marks REQUIRED: an empty value would make every built card invalid.
 _NonEmpty = Annotated[str, Field(min_length=1)]

@@ -52,7 +52,7 @@ from a2agw.security.auth import AuthConfig
 from a2agw.security.cardsign import CardSigner, CardVerifier, load_public_key
 from a2agw.security.classify import RegexPiiClassifier
 from a2agw.security.policy import PolicyEngine, PolicyError, load_policy
-from a2agw.serve.agent import _AGENT_ID, AgentSpec, SkillSpec
+from a2agw.serve.agent import AGENT_ID_PATTERN, AgentSpec, SkillSpec
 from a2agw.serve.host import AgentHost
 from a2agw.serve.push import PushSettings
 
@@ -172,7 +172,7 @@ class ExternalAgentConfig(BaseModel):
     names exactly one transport (each transport is a field)."""
 
     model_config = _FORBID
-    id: str = Field(pattern=_AGENT_ID.pattern)
+    id: str = Field(pattern=AGENT_ID_PATTERN)
     name: str = Field(min_length=1)
     description: str = Field(min_length=1)
     skills: list[SkillConfig] = Field(min_length=1)

@@ -45,6 +45,7 @@ Headers:
 |---|---|
 | `Content-Type` | `application/json` |
 | `Accept` | `application/x-ndjson, application/json` |
+| `Accept-Encoding` | `identity` (send the body uncompressed) |
 | `X-A2AGW-Protocol` | `a2agw.invoke/1` |
 | `X-A2AGW-Timestamp` | Unix time in seconds, when the request was signed |
 | `X-A2AGW-Signature` | `v1=<hex>`, only when a secret is configured |
@@ -116,7 +117,8 @@ WARNING on the logger `a2agw.agent.<agent id>`.
 | Non-2xx status | `agent returned HTTP <code>` |
 | Cannot connect, or the address is refused by the tier | `agent unreachable` |
 | Connection breaks mid-response | `agent connection lost` |
-| Invalid JSON, invalid event, wrong content type, a limit exceeded | `agent protocol error` |
+| Invalid JSON, invalid event, wrong content type, an undecodable body, a limit exceeded | `agent protocol error` |
+| The gateway could not prepare the consult grant | `agent consult setup failed` |
 | `timeout_s` passed (connect to last event) | `agent timed out` |
 
 ### Limits

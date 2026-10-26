@@ -9,7 +9,11 @@ Security and failure handling:
 
 - The request goes through a guarded client (``a2agw.consult.guarded_net``) vetted with the
   configured tier (default ``internal``: loopback and private addresses are allowed, metadata
-  addresses never are). A client injected with ``http=`` is used as given (the test seam).
+  addresses never are). A client injected with ``http=`` is used as given and bypasses the
+  guarded network entirely (no tier vetting): it is a test seam only, as for
+  ``PartnerRegistry``.
+- Responses are requested with ``Accept-Encoding: identity`` (no decompression
+  amplification); a body that cannot be decoded is a protocol error.
 - With a ``secret``, every request is signed (``X-A2AGW-Signature``, see ``protocol.sign``).
 - ``timeout_s`` is one end-to-end deadline for the whole turn, connect to last event.
 - Failures become a ``Failed`` event whose reason is fixed text (the A2A caller sees it);
@@ -107,6 +111,7 @@ class WebhookAdapter:
         headers = {
             "Content-Type": JSON,
             "Accept": f"{NDJSON}, {JSON}",
+            "Accept-Encoding": "identity",
             "X-A2AGW-Protocol": PROTOCOL,
             "X-A2AGW-Timestamp": ts,
         }
@@ -124,11 +129,23 @@ class WebhookAdapter:
             async with asyncio.timeout_at(deadline):
                 return await aw
 
-        grant = await self.consult(ctx) if self.consult is not None else None
-        invoke = build_invoke(ctx, consult=grant, deadline=time.time() + self.timeout_s)
-        body = json.dumps(invoke, separators=(",", ":")).encode()
         connected = False
         failure: str | None = None
+        grant: ConsultGrant | None = None
+        if self.consult is not None:
+            try:
+                grant = await within(self.consult(ctx))
+            except TimeoutError:
+                log.warning("agent timed out after %ss (consult setup)", self.timeout_s)
+                failure = "agent timed out"
+            except Exception as e:  # noqa: BLE001 - any failure of the grant callable
+                log.warning("agent consult setup failed: %s", type(e).__name__)
+                failure = "agent consult setup failed"
+            if failure is not None:
+                yield Failed(failure)
+                return
+        invoke = build_invoke(ctx, consult=grant, deadline=time.time() + self.timeout_s)
+        body = json.dumps(invoke, separators=(",", ":")).encode()
         try:
             async with AsyncExitStack() as stack:
                 client = self.http
@@ -156,6 +173,9 @@ class WebhookAdapter:
         except ProtocolError as e:
             log.warning("agent protocol error: %s", e)
             failure = "agent protocol error"
+        except httpx.DecodingError as e:  # e.g. a Content-Encoding the body does not match
+            log.warning("agent protocol error: %s", type(e).__name__)
+            failure = "agent protocol error"
         except httpx.TransportError as e:
             reason = "unsafe address" if is_unsafe_address(e) else type(e).__name__
             if connected:
@@ -164,6 +184,9 @@ class WebhookAdapter:
             else:
                 log.warning("agent unreachable: %s", reason)
                 failure = "agent unreachable"
+        except httpx.RequestError as e:  # any other request failure
+            log.warning("agent connection lost: %s", type(e).__name__)
+            failure = "agent connection lost"
         if failure is not None:
             yield Failed(failure)
 
