@@ -59,6 +59,8 @@ from starlette.routing import BaseRoute, Mount, get_route_path
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from a2agw._ddl import retry_ddl
+from a2agw.adapters.stdio import StdioAdapter
+from a2agw.adapters.webhook import WebhookAdapter
 from a2agw.consult.client import MAX_CONSULTS_PER_TASK, PartnerClient
 from a2agw.consult.credentials import CredentialProvider
 from a2agw.consult.guarded_net import is_guarded_client
@@ -69,6 +71,8 @@ from a2agw.consult.tls import TlsClientConfig
 from a2agw.consult.tools import PartnerTool, partner_tools
 from a2agw.context.signing import CallContextSigner, CallContextVerifier
 from a2agw.core.spi import LifecycleAdapter
+from a2agw.gateway.rest import REST_PREFIX, rest_routes
+from a2agw.gateway.tokens import ConsultTokens, GrantIssuer
 from a2agw.ops.admin import ADMIN_PREFIX, HEALTH_PATH, admin_routes
 from a2agw.ops.audit import AuditEvent, AuditLog, registry_audit_event
 from a2agw.ops.bus import EventBus
@@ -833,6 +837,13 @@ class _AnonymousMiddleware:
         await self.app(scope, receive, send)
 
 
+def _is_sidecar(scope: Scope) -> bool:
+    """The outbound REST API: its routes accept a consult token instead of the gateway's
+    auth, so they decide who is calling (``a2agw.gateway.auth``)."""
+    path = get_route_path(scope)
+    return path == REST_PREFIX or path.startswith(REST_PREFIX + "/")
+
+
 def _is_public(scope: Scope) -> bool:
     """Public paths (cards, health), matched on the route path so root_path cannot confuse it."""
     path = get_route_path(scope)
@@ -871,8 +882,13 @@ class _AuthMiddleware:
         try:
             result = await self.backend.authenticate(conn)
         except AuthenticationError as exc:
-            await on_auth_error(conn, exc)(scope, receive, send)  # type: ignore[arg-type,misc]
-            return
+            if _is_sidecar(scope):
+                # A consult token is no gateway credential: the sidecar routes check it, and
+                # refuse everything else with 401 themselves.
+                result = None
+            else:
+                await on_auth_error(conn, exc)(scope, receive, send)  # type: ignore[arg-type,misc]
+                return
         # The backend returns None only if no credential is accepted; treat that as anonymous.
         scope["auth"], scope["user"] = result or (AuthCredentials(), _anonymous_user())
         await self.app(scope, receive, send)
@@ -983,8 +999,23 @@ class AgentHost:
         tls: Mapping[str, TlsClientConfig] | None = None,
         max_concurrent_tasks_per_caller: int = DEFAULT_MAX_CONCURRENT_TASKS_PER_CALLER,
         max_consults_per_task: int = MAX_CONSULTS_PER_TASK,
+        sidecar_clients: Mapping[str, Iterable[str]] | None = None,
+        sidecar_agents: Iterable[str] = (),
     ) -> None:
         self.base_url = base_url
+        # Sidecar agents (spec 7.7) consult partners through the outbound REST API
+        # (``/a2agw/v1``): with a consult token issued for one turn of a webhook or stdio agent
+        # (``consult_tokens``; ``consult_issuer`` is the adapters' ``consult`` callable), or,
+        # standalone, as a principal with the ``a2agw:sidecar`` scope acting as one of the
+        # agent ids ``sidecar_clients`` maps it to ({principal id: agent ids}).
+        # ``sidecar_agents`` names further sidecar identities (MCP clients), whose unlinked
+        # partner tasks this host's TTL expiry also covers (``sidecar_agent_ids``).
+        self.consult_tokens = ConsultTokens(url=f"{base_url.rstrip('/')}{REST_PREFIX}")
+        self.consult_issuer = GrantIssuer(self.consult_tokens)
+        self.sidecar_clients: dict[str, frozenset[str]] = {
+            principal: frozenset(agents) for principal, agents in (sidecar_clients or {}).items()
+        }
+        self.sidecar_agents = frozenset(sidecar_agents)
         # Spec 7.2 / 11a.4 per-caller caps: agent turns running at once per principal
         # (across all agents; over it a send is InvalidRequestError, audited
         # ``limit.exceeded``) and new partner tasks per inbound task (over it a consult is
@@ -1133,7 +1164,7 @@ class AgentHost:
         self._warn_unknown_routing_partners()
         handles = self.handles = OutboundHandleStore(engine)
         await handles.initialize()
-        client = self.client = PartnerClient(
+        self.client = PartnerClient(
             self.partners,
             credentials=self.credentials,
             handles=handles,
@@ -1168,8 +1199,9 @@ class AgentHost:
                 audit=audit,
                 context_verifier=self.context_verifier,
             )
-            # Cancelling an inbound task cancels the partner tasks it started.
-            executor.on_cancel = client.cancel_for_inbound
+            # Cancelling an inbound task cancels the partner tasks it started (and ends the
+            # consult tokens of its runs, with their REST calls in flight).
+            executor.on_cancel = self._end_inbound
             card = build_card(spec, self.base_url, security=self.auth, push=push is not None)
             if self.card_signer is not None:
                 card = self.card_signer.sign(card)
@@ -1255,6 +1287,11 @@ class AgentHost:
                 )
             )
         routes.append(Mount("/agents", app=_agent_not_found))
+        # External agents consult partners with a grant the host issues for each turn.
+        for spec in self.specs.values():
+            adapter = spec.adapter
+            if isinstance(adapter, WebhookAdapter | StdioAdapter) and adapter.consult is None:
+                adapter.consult = self.consult_issuer
         # Adapters that own resources (e.g. a supervised agent process) start once the stores
         # are ready, before the first request can reach them.
         for agent_id, spec in self.specs.items():
@@ -1290,8 +1327,10 @@ class AgentHost:
         audited as ``outbound.expire``) and purge inbound message ids past retention.
 
         Scoped to this gateway: only handles of partners in this host's registry whose
-        inbound task belongs to one of this host's agents, so several gateways can share one
-        database (handles with no inbound task are not expired by any host)."""
+        inbound task belongs to one of this host's agents, or that have no inbound task and
+        are owned by one of its sidecar agents (``sidecar_owner``), so several gateways can
+        share one database (other handles with no inbound task are not expired by any
+        host)."""
         if self.handles is None or self.ledger is None:
             raise RuntimeError("host not started")
         report = await expire_outbound(
@@ -1303,6 +1342,7 @@ class AgentHost:
             cancel_timeout_s=self.default_deadline_s,
             partner_ids={r.id for r in self.partners.all()},
             agent_ids=set(self.specs),
+            owners={self.sidecar_owner(a) for a in self.sidecar_agent_ids()},
         )
         await self.ledger.purge(now)
         await self.refresh_due_partners(now=now)
@@ -1469,6 +1509,27 @@ class AgentHost:
         self._warn_unknown_routing_partners()
         return {**changes, "open_handles": open_handles}
 
+    @staticmethod
+    def sidecar_owner(agent_id: str) -> str:
+        """The handle owner of a partner task a sidecar agent started outside any inbound
+        task (a standalone REST or MCP call)."""
+        return f"sidecar:{agent_id}"
+
+    def sidecar_agent_ids(self) -> set[str]:
+        """This host's sidecar agents: the external (webhook, stdio) agents it serves, every
+        agent id in ``sidecar_clients``, and ``sidecar_agents``."""
+        served = {
+            i for i, s in self.specs.items() if isinstance(s.adapter, WebhookAdapter | StdioAdapter)
+        }
+        return served.union(*self.sidecar_clients.values(), self.sidecar_agents)
+
+    async def _end_inbound(self, task_id: str) -> int:
+        """An inbound task was cancelled or ended: its consult tokens stop working (their
+        REST calls in flight are cancelled) and its open partner tasks are cancelled."""
+        self.consult_tokens.revoke_task(task_id)
+        assert self.client is not None
+        return await self.client.cancel_for_inbound(task_id)
+
     def partner_tools(self, agent_id: str, **kwargs: Any) -> list[PartnerTool]:
         """``partner_tools`` for one of this host's agents, filtered by the host's policy."""
         return partner_tools(self.partners, policy=self.policy, agent_id=agent_id, **kwargs)
@@ -1544,6 +1605,7 @@ class AgentHost:
             routes=[
                 *self.extra_routes,
                 *(admin_routes(self) if self.admin else []),
+                *rest_routes(self),
                 Mount("/", app=self._delegate),
             ],
             lifespan=lifespan,

@@ -44,6 +44,9 @@ if TYPE_CHECKING:
 ADMIN_PREFIX = "/a2agw/admin"
 HEALTH_PATH = f"{ADMIN_PREFIX}/healthz"
 ADMIN_SCOPE = "a2agw:admin"
+# Lets a principal use the outbound REST API (``a2agw.gateway.rest``) without a consult
+# token, as one of the agent ids ``sidecar.clients`` maps it to.
+SIDECAR_SCOPE = "a2agw:sidecar"
 # Required on every admin POST (CSRF): ``X-A2AGW-Admin: 1``.
 ADMIN_HEADER = "X-A2AGW-Admin"
 AUDIT_MAX_LIMIT = 500

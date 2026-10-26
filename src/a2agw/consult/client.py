@@ -132,6 +132,8 @@ _STRICTNESS: dict[Tier, int] = {"internal": 0, "partner": 1, "public": 2}
 
 # The inbound caller whose credentials apply to the current outbound call.
 _caller: ContextVar[Principal | None] = ContextVar("a2agw_outbound_caller", default=None)
+# The owner recorded on the handles of the current consult (``consult(owner=...)``).
+_owner: ContextVar[str | None] = ContextVar("a2agw_outbound_owner", default=None)
 # Per call: the Authorization value the credential interceptor last sent, so a 401 only
 # invalidates that token (never a newer one fetched meanwhile by another call). In memory,
 # for the duration of one call only.
@@ -214,6 +216,11 @@ ErrorKind = Literal["connect", "unsafe", "server", "transport", "protocol", "oth
 def _caller_id() -> str | None:
     caller = _caller.get()
     return caller.id if caller is not None else None
+
+
+def _handle_ids() -> dict[str, str | None]:
+    """The caller and owner a handle recorded now is stamped with."""
+    return {"caller_id": _caller_id(), "owner": _owner.get()}
 
 
 def _http_root(exc: BaseException) -> httpx.HTTPError | None:
@@ -662,7 +669,7 @@ class PartnerClient:
                 inbound_task_id,
                 origin,
                 state,
-                caller_id=_caller_id(),
+                **_handle_ids(),
             )
         except Exception:
             logger.exception("could not record outbound handle for partner %s", partner_id)
@@ -717,9 +724,12 @@ class PartnerClient:
         inbound_task_id: str | None = None,
         caller: Principal | None = None,
         classification: Classification | str | None = None,
+        owner: str | None = None,
     ) -> ToolResult:
         """Consult a partner. ``inbound_task_id`` and ``caller`` default to the inbound task
-        and principal the executor is currently running an adapter for.
+        and principal the executor is currently running an adapter for. ``owner`` is recorded
+        on the partner task's handle (a sidecar call with no inbound task names its agent
+        there, so the TTL expiry of that agent's host covers it).
 
         With a policy, the egress check runs first, for the agent whose adapter is running
         (else this client's ``agent_id``), with ``classification`` as the caller's label. A
@@ -731,6 +741,7 @@ class PartnerClient:
         principal = caller if caller is not None else current_principal.get()
         agent_id = current_agent.get() or self.agent_id
         token = _caller.set(principal)
+        owner_token = _owner.set(owner)
         decision: Decision | None = None
         try:
             with get_tracer().start_as_current_span(
@@ -811,6 +822,7 @@ class PartnerClient:
                     span.set_attribute("a2a.task_id", result.task_id)
                 span.set_attribute("a2agw.result_state", result.state)
         finally:
+            _owner.reset(owner_token)
             _caller.reset(token)
         self._publish(result, started)
         if self.audit is not None:
@@ -1223,7 +1235,7 @@ class PartnerClient:
                             inbound_task_id,
                             origin,
                             state,
-                            caller_id=_caller_id(),
+                            **_handle_ids(),
                         )
         except TimeoutError:
             logger.warning("cleanup of cancelled call to partner %s timed out", partner_id)

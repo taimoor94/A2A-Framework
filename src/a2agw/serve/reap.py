@@ -183,13 +183,16 @@ async def expire_outbound(
     agent_ids: Collection[str] | None = None,
     concurrency: int | None = None,
     pass_deadline_s: float | None = None,
+    owners: Collection[str] = (),
 ) -> ExpireReport:
     """Spec 8.2: end every non-terminal outbound handle older than ``ttl_s``.
 
     Scope: with ``partner_ids`` / ``agent_ids`` (``AgentHost.maintain`` passes its registry's
     partners and its own agents) only handles of known partners whose inbound task belongs
     to one of those agents are touched, so gateways sharing a database never cancel each
-    other's partner tasks (and never with a partner record they do not have).
+    other's partner tasks (and never with a partner record they do not have). A handle with
+    no inbound task is touched only when its ``owner`` is one of ``owners`` (the host's
+    sidecar agents, ``sidecar:<agent id>``).
 
     Each handle is first claimed with a compare-and-set (``OutboundHandleStore.claim_end``):
     it becomes ``TASK_STATE_CANCELED`` with ``end_reason`` "ttl expired", and only the gateway
@@ -216,6 +219,7 @@ async def expire_outbound(
         agent_ids=agent_ids,
         retry_reason=CANCEL_FAILED_REASON,
         max_attempts=CANCEL_MAX_ATTEMPTS,
+        owners=owners,
     )
     gate = asyncio.Semaphore(concurrency or CANCEL_CONCURRENCY)
 

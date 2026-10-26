@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from a2a.types import Part
@@ -65,7 +65,7 @@ class ConsultGrant:
     gateway's consult URL, a bearer token scoped to the turn, and its expiry (epoch seconds)."""
 
     url: str
-    token: str
+    token: str = field(repr=False)  # a secret: never in a repr (or a log line built from one)
     expires_at: float
 
 

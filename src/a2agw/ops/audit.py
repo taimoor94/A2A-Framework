@@ -79,6 +79,7 @@ Action = Literal[
     "task.reap",
     "outbound.expire",
     "limit.exceeded",
+    "sidecar.denied",
 ]
 ACTIONS: frozenset[str] = frozenset(get_args(Action))
 DETAIL_KEYS = frozenset(

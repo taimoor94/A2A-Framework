@@ -106,7 +106,15 @@ _SECRET_KEYS = frozenset(
 )
 # Mappings whose keys are names chosen by the operator (a ref named "token" is fine).
 _NAME_MAPS = frozenset(
-    {"oauth", "credentials", "tls", "trust.card_keys", "trust.context_issuers", "auth.api_keys"}
+    {
+        "oauth",
+        "credentials",
+        "tls",
+        "trust.card_keys",
+        "trust.context_issuers",
+        "auth.api_keys",
+        "sidecar.clients",  # principal ids
+    }
 )
 # The same, for paths with a list index: a stdio agent's env_from keys are variable names.
 _NAME_MAP_PATHS = re.compile(r"^agents\.\d+\.stdio\.env_from$")
@@ -357,6 +365,20 @@ class LimitsConfig(BaseModel):
     max_consults_per_task: int = Field(default=16, ge=1)
 
 
+class SidecarConfig(BaseModel):
+    """Sidecar agents (spec 7.7) calling the outbound REST API without a consult token.
+
+    ``clients`` maps a principal id (``key:<id>`` for an API key, ``jwt:<sub>`` for a JWT
+    subject) to the agent ids it may act as; the principal also needs the ``a2agw:sidecar``
+    scope. An agent id here need not be served by this gateway: it is the identity the
+    partner calls are routed, checked and audited as."""
+
+    model_config = _FORBID
+    clients: dict[
+        Annotated[str, Field(min_length=1)], list[Annotated[str, Field(pattern=AGENT_ID_PATTERN)]]
+    ] = Field(default_factory=dict)
+
+
 class ServerTlsConfig(BaseModel):
     """HTTPS for ``a2agw serve`` (the ``--ssl-*`` flags override it)."""
 
@@ -398,6 +420,7 @@ class GatewayConfig(BaseModel):
     push: PushConfig | None = None
     audit: bool = True
     server_tls: ServerTlsConfig | None = None
+    sidecar: SidecarConfig = Field(default_factory=SidecarConfig)
 
     @model_validator(mode="after")
     def _refs_exist(self) -> GatewayConfig:
@@ -834,6 +857,7 @@ def build_host(cfg: GatewayConfig, *, config_dir: Path | str = ".") -> AgentHost
             policy=policy,
             push=push,
             audit=cfg.audit,
+            sidecar_clients=cfg.sidecar.clients,
         )
     except ValueError as e:  # e.g. a trusted context kid that clashes with the signing kid
         raise ConfigError(str(e)) from None

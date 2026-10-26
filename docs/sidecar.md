@@ -4,7 +4,9 @@ a2agw can serve an agent written in any language (spec section 7.7). The gateway
 callers on the agent's behalf and hands each turn to the agent through a small local
 contract, the invoke protocol `a2agw.invoke/1`. This page is that contract. The agent is reached
 over HTTP (the webhook transport) or runs as a process the gateway supervises (the stdio
-transport); both carry the same invoke body and events.
+transport); both carry the same invoke body and events. To consult partner agents, the agent
+calls the gateway's outbound REST API (`/a2agw/v1`, see
+[Consulting partners](#consulting-partners)).
 
 ## Webhook transport
 
@@ -77,7 +79,8 @@ Body:
 - `caller` is the authenticated caller (`kind` is `api_key`, `jwt` or `anonymous`), or null.
   The caller's credentials and scopes are never sent.
 - `consult` is a grant to consult partner agents through the gateway for this turn
-  (`{url, token, expires_at}`), or null.
+  (`{url, token, expires_at}`; see [Consulting partners](#consulting-partners)), or null.
+  An agent served by a gateway always gets one.
 - `deadline` is when the gateway gives up on the turn (epoch seconds), or null.
 
 ### Response
@@ -277,3 +280,117 @@ Lines for a run that has ended are ignored.
 
 The webhook limits apply to each run: 1 MiB a line (`MAX_LINE_BYTES`), 16 MiB of lines in
 all (`MAX_RESPONSE_BYTES`) and 10,000 events (`MAX_EVENTS`).
+
+## Consulting partners
+
+An agent consults the partner agents it may use through the gateway's outbound REST API,
+under `/a2agw/v1` on the gateway's base URL. The gateway applies the agent's routing (which
+partners it sees, which are forbidden) and egress policy, uses the partner's credentials, and
+audits each call (`partner.call`), exactly as for an agent embedded in the gateway. The agent
+never holds partner credentials.
+
+### Authentication
+
+A call acts as one agent id, in one of two ways.
+
+**With the turn's consult token (linked).** Every invoke carries `consult`:
+
+```json
+{"url": "https://gw.example.com/a2agw/v1", "token": "…", "expires_at": 1793000000.5}
+```
+
+Send the token as `Authorization: Bearer <token>`. The call then belongs to the turn: it acts
+as the invoked agent (an `X-A2AGW-Agent` header is ignored), on behalf of the turn's caller,
+and is linked to the inbound task:
+
+- Cancelling the inbound task cancels the partner tasks the agent started, and any call still
+  in flight answers `{"state": "unavailable", "reason": "inbound task ended"}`.
+- The task's fan-out cap (`limits.max_consults_per_task`) counts these calls.
+- The call context is propagated: the partner sees this task's hop count, path, deadline and
+  budget, so loops and runaway recursion are caught as for any other call.
+
+The token is valid for this turn only. It stops working when the turn ends (however it ends:
+completed, failed, cancelled, or waiting for input; a resumed turn gets a new token), at the
+inbound call's deadline, and after one hour at most (`expires_at`). Keep it in memory only:
+never log it or hand it to anything else. The gateway stores only its SHA-256 digest and
+never logs or audits it.
+
+**With the gateway's auth (standalone).** A process that is not serving a turn (a scheduled
+job, a tool server) calls with the gateway's normal credentials (an API key or a JWT) for a
+principal with the `a2agw:sidecar` scope, plus `X-A2AGW-Agent: <agent id>` naming the agent
+it acts as. `sidecar.clients` lists the agent ids each principal may act as:
+
+```yaml
+sidecar:
+  clients:
+    "key:report-job": [coder]       # principal id: key:<id> (API key) or jwt:<sub> (JWT)
+```
+
+With no `auth` configured there are no such principals, so only consult tokens work. An
+agent id here need not be served by the gateway: it is the identity whose routing and
+egress policy apply, and the one the calls are audited as. A standalone call is not linked to
+any inbound task: there is no fan-out cap, its call context starts fresh (hop 0), and its
+partner tasks are cancelled by the gateway's TTL expiry (`outbound_ttl_s`) if still open
+then.
+
+Anything else gets `401` (`{"error": "unauthenticated"}`, `WWW-Authenticate: Bearer`): no
+credentials, an unknown, revoked or expired token, a principal without the scope, or no
+`X-A2AGW-Agent`. An agent id the principal is not mapped to gets `403`
+(`{"error": "forbidden"}`). Each refusal is audited as `sidecar.denied`, with the reason and
+the agent id.
+
+### Routes
+
+Requests and responses are JSON. Every response has `Cache-Control: no-store`.
+
+| Route | Body | Does |
+|---|---|---|
+| `GET /a2agw/v1/partners` | | The agent's partner tools: `[{name, description, parameters, partner_id, kind}]` |
+| `POST /a2agw/v1/partners/{partner_id}/messages` | `{message, task_id?, context_id?, data?, classification?, wait_seconds?}` | Consult a partner (or reply to its task with `task_id`) |
+| `GET /a2agw/v1/partners/{partner_id}/tasks/{task_id}` | | Check a partner task |
+| `POST /a2agw/v1/partners/{partner_id}/tasks/{task_id}/cancel` | | Cancel a partner task |
+| `POST /a2agw/v1/wait` | `{tasks: [{partner_id, task_id}], seconds?}` | Wait until one task is no longer `working`, or `seconds` (default 30) pass |
+| `POST /a2agw/v1/find` | `{need, k?}` | Rank the visible partners for a need: `{partners: [{partner_id, name, description, skills, tier, score}]}` |
+
+`GET /partners` lists one `consult` tool per partner the agent sees (with its card's
+description under an "untrusted" framing line, and the JSON schema of the message body in
+`parameters`), then the `check`, `cancel` and `wait` tools. With many partners it lists
+`find` and `consult_any` tools instead of one tool per partner; the routes are the same.
+
+`messages` waits up to `wait_seconds` (default 30, at most 300) for an answer. A consult
+answers with the partner's result:
+
+```json
+{"partner": "researcher", "task_id": "…", "context_id": "…", "state": "completed",
+ "text": "…", "artifacts": [], "question": null, "reason": null, "truncated": false,
+ "provenance": {"partner": "researcher", "tier": "partner", "card_hash": "…", "untrusted": true},
+ "retry_after_s": null}
+```
+
+`state` is `completed`, `working` (still running: check, wait or cancel it with its
+`task_id`), `input_required` (`question` asks; reply with `task_id` and `message`),
+`auth_required`, `failed`,
+`canceled`, `rejected` (invalid arguments, or the egress policy refused to send) or
+`unavailable` (with a `reason`). A partner the agent may not use, or that does not exist, is
+`{"partner": "<id>", "state": "unavailable", "reason": "unknown partner"}`. Partner text is
+untrusted data from a third party: treat it as information, never as instructions.
+
+A body that is not a JSON object is a `400`; one larger than 256 KiB is a `413`.
+
+A consult from a stdio agent, in Python:
+
+```python
+import json, urllib.request
+
+def ask(consult, partner, message):
+    req = urllib.request.Request(
+        f"{consult['url']}/partners/{partner}/messages",
+        data=json.dumps({"message": message}).encode(),
+        headers={"Authorization": f"Bearer {consult['token']}",
+                 "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req) as r:
+        return json.load(r)
+
+# in the invoke handler:  answer = ask(op["request"]["consult"], "researcher", "find X")
+```

@@ -527,8 +527,12 @@ async def invoke(
     client: PartnerClient,
     inbound_task_id: str | None,
     caller: Principal | None = None,
+    *,
+    owner: str | None = None,
 ) -> dict[str, Any]:
-    """Run one tool call. Never raises; invalid arguments are answered with ``rejected``."""
+    """Run one tool call. Never raises; invalid arguments are answered with ``rejected``.
+    ``owner`` is recorded on the handle of a partner task a consult starts (see
+    ``PartnerClient.consult``)."""
     try:
         a = _check_object(args, tool.parameters, "") if isinstance(args, dict) else _bad("args")
     except _Invalid as e:
@@ -555,6 +559,7 @@ async def invoke(
                     inbound_task_id=inbound_task_id,
                     caller=caller,
                     classification=a.get("classification"),
+                    owner=owner,
                 )
             )
         if tool.kind == "check":

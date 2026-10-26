@@ -498,7 +498,7 @@ The core never imports a framework; adapters live in `a2agw.adapters.<name>` beh
 - `limit.exceeded` audit rows of authenticated callers are written one per refusal (only anonymous ones are coalesced).
 - Cancel-only calls (cascade, TTL, recovery) to a partner that has since been quarantined are refused like any other call, so its open partner tasks keep running until the partner ends them.
 - Reaping an agent creates its (empty) `push_configs_<agent>` table when push is configured and the table does not exist yet.
-- TTL expiry only covers partner tasks started for an inbound task of one of the host's agents; a partner task started by code outside any inbound task (a direct `host.client.consult(...)`) is not expired by any host.
+- TTL expiry only covers partner tasks started for an inbound task of one of the host's agents, or by one of its sidecar agents outside any inbound task (a standalone call to the outbound REST API, see [docs/sidecar.md](docs/sidecar.md)); a partner task started by other code outside any inbound task (a direct `host.client.consult(...)`) is not expired by any host.
 
 ## Roadmap
 

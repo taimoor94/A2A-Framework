@@ -14,6 +14,7 @@ import time
 import pytest
 from sqlalchemy import text
 
+from a2agw.adapters.webhook import WebhookAdapter
 from a2agw.consult.handles import OutboundHandleStore
 from a2agw.ops.audit import AuditLog
 from a2agw.serve import reap as reap_mod
@@ -99,6 +100,59 @@ async def test_gateways_sharing_a_database_only_expire_their_own_handles(db_url)
             await b.shutdown()
     finally:
         await a.shutdown()
+
+
+async def test_unlinked_sidecar_handles_expire_for_owner_only(db_url):
+    """Handles with no inbound task are expired only when their ``owner`` is one of this
+    host's sidecar agents: a served external agent, a ``sidecar.clients`` agent id or another
+    known sidecar identity (``sidecar_agents``)."""
+    host = AgentHost(
+        "http://localhost",
+        db_url=db_url,
+        sidecar_clients={"key:svc": ["side"]},
+        sidecar_agents=["mcpbot"],
+    )
+    host.add(spec("alpha"))
+    hook = WebhookAdapter("http://127.0.0.1:9/a2agw/invoke")
+    host.add(
+        AgentSpec(
+            id="hook",
+            name="h",
+            description="d",
+            skills=[SkillSpec(id="s", name="s", description="d")],
+            adapter=hook,
+        )
+    )
+    await host.partners.add_from_card("pa", CARD, "public")
+    await host.startup()
+    calls: list[str] = []
+
+    async def cancel(handle):
+        calls.append(handle["task_id"])
+
+    host._cancel_outbound = cancel  # type: ignore[method-assign]
+    try:
+        assert host.sidecar_owner("side") == "sidecar:side"
+        h = host.handles
+        await h.record("u-side", "pa", "c", None, "o", W, owner="sidecar:side")
+        await h.record("u-hook", "pa", "c", None, "o", W, owner="sidecar:hook")
+        await h.record("u-mcp", "pa", "c", None, "o", W, owner="sidecar:mcpbot")
+        await h.record("u-other", "pa", "c", None, "o", W, owner="sidecar:other")
+        await h.record("u-alpha", "pa", "c", None, "o", W, owner="sidecar:alpha")  # embedded
+        await h.record("u-none", "pa", "c", None, "o", W)
+        await h.record("u-zz", "zz", "c", None, "o", W, owner="sidecar:side")  # unknown partner
+        report = await host.maintain(now=FAR)
+        assert sorted(calls) == ["u-hook", "u-mcp", "u-side"]
+        assert report.expired == 3
+        for tid in ("u-other", "u-alpha", "u-none"):
+            assert (await h.get("pa", tid))["state"] == W, tid
+        assert (await h.get("zz", "u-zz"))["state"] == W
+        # A known owner never widens to handles that do have an inbound task.
+        await h.record("l-side", "pa", "c", "in-elsewhere", "o", W, owner="sidecar:side")
+        await host.maintain(now=FAR)
+        assert (await h.get("pa", "l-side"))["state"] == W
+    finally:
+        await host.shutdown()
 
 
 @pytest.fixture
@@ -230,6 +284,7 @@ async def test_older_databases_gain_the_attempts_column(db_url, phase):
         stores = [OutboundHandleStore(eng) for _ in range(3)]
         await asyncio.gather(*(s.initialize() for s in stores))
         assert (await stores[0].get("p", "old"))["cancel_attempts"] == 0
+        assert (await stores[0].get("p", "old"))["owner"] is None
 
         async def down(h):
             raise RuntimeError("partner down")

@@ -11,7 +11,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import aclosing
-from typing import Any, TypeVar
+from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from a2agw.adapters._stream import stream_events
 from a2agw.core.events import AgentEvent, Done
@@ -30,6 +30,16 @@ EXITED = "agent process exited"
 UNAVAILABLE = "agent unavailable"
 
 ConsultFn = Callable[[InboundContext], Awaitable[ConsultGrant | None]]
+
+
+@runtime_checkable
+class RevocableConsult(Protocol):
+    """A ``ConsultFn`` whose grants end with their turn (the host's ``GrantIssuer``): the
+    adapter calls ``revoke`` when the turn ends, however it ends."""
+
+    async def __call__(self, ctx: InboundContext) -> ConsultGrant | None: ...
+
+    def revoke(self, grant: ConsultGrant) -> None: ...
 
 
 class TurnFailure(Exception):
@@ -71,6 +81,19 @@ async def consult_grant(
     except Exception as e:  # noqa: BLE001 - any failure of the grant callable
         log.warning("%s: %s", CONSULT_FAILED, type(e).__name__)
         raise TurnFailure(CONSULT_FAILED) from None
+
+
+def release_grant(
+    consult: ConsultFn | None, grant: ConsultGrant | None, log: logging.Logger
+) -> None:
+    """End the turn's grant, when there is one and ``consult`` can revoke it. Never raises
+    (it runs while the turn closes); a failure is logged by its class."""
+    if grant is None or not isinstance(consult, RevocableConsult):
+        return
+    try:
+        consult.revoke(grant)
+    except Exception as e:  # noqa: BLE001 - closing the turn must not fail
+        log.error("consult grant revoke failed: %s", type(e).__name__)
 
 
 def check_line(line: bytes) -> bytes:

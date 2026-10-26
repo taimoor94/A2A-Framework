@@ -428,3 +428,34 @@ def test_stdio_config_validation(tmp_path):
     with pytest.raises(ConfigError) as ei:
         load_config(p, env={})
     assert "agents.0.stdio.env" in str(ei.value) and "hunter2" not in str(ei.value)
+
+
+def test_sidecar_clients_config(tmp_path):
+    cfg = GatewayConfig.model_validate({"base_url": "http://gw"})
+    assert cfg.sidecar.clients == {}
+    p = write(
+        tmp_path,
+        f"""\
+        base_url: http://gw
+        db_url: sqlite+aiosqlite:///{tmp_path / "g.db"}
+        sidecar:
+          clients:
+            "key:token": [coder, tool-bot]
+            "jwt:ci": [coder]
+        """,
+    )
+    cfg = load_config(p, env={})
+    host = build_host(cfg, config_dir=tmp_path)
+    assert host.sidecar_clients == {
+        "key:token": frozenset({"coder", "tool-bot"}),
+        "jwt:ci": frozenset({"coder"}),
+    }
+    assert host.sidecar_agent_ids() == {"coder", "tool-bot"}
+    for bad in (
+        {"clients": {"key:a": ["Bad Id"]}},
+        {"clients": {"": ["coder"]}},
+        {"clients": {"key:a": "coder"}},
+        {"unknown": {}},
+    ):
+        with pytest.raises(ValueError):
+            GatewayConfig.model_validate({"base_url": "http://gw", "sidecar": bad})

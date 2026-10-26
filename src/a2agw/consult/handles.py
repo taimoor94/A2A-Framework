@@ -51,12 +51,17 @@ _outbound = Table(
     Column("end_reason", String, nullable=True),
     # TTL expiry: partner cancels attempted so far (a failed one is retried, up to a cap).
     Column("cancel_attempts", Integer, nullable=False, server_default="0"),
+    # Who started a partner task that has no inbound task: ``sidecar:<agent id>`` for a
+    # standalone sidecar call (``AgentHost.sidecar_owner``), so that host's TTL expiry
+    # covers it. None for calls linked to an inbound task.
+    Column("owner", String, nullable=True),
 )
 # Columns added after Phase 1, with their DDL type (ALTER TABLE ... ADD COLUMN).
 _ADDED_COLUMNS = {
     "caller_id": "VARCHAR",
     "end_reason": "VARCHAR",
     "cancel_attempts": "INTEGER NOT NULL DEFAULT 0",
+    "owner": "VARCHAR",
 }
 OUTBOUND_TABLE = _outbound  # read by the inbound side's re-entry check (serve.store)
 
@@ -110,9 +115,10 @@ class OutboundHandleStore:
         state: str,
         *,
         caller_id: str | None = None,
+        owner: str | None = None,
     ) -> None:
-        """Insert a handle, or update its state. Known links (inbound task, origin, caller)
-        are kept."""
+        """Insert a handle, or update its state. Known links (inbound task, origin, caller,
+        owner) are kept."""
         insert = (
             sqlite_dialect.insert if self._engine.dialect.name == "sqlite" else postgresql.insert
         )
@@ -125,6 +131,7 @@ class OutboundHandleStore:
             state=state,
             created_at=time.time(),
             caller_id=caller_id,
+            owner=owner,
         )
         ex, t = stmt.excluded, _outbound.c
         stmt = stmt.on_conflict_do_update(
@@ -136,6 +143,7 @@ class OutboundHandleStore:
                 "inbound_task_id": func.coalesce(t.inbound_task_id, ex.inbound_task_id),
                 "origin": func.coalesce(t.origin, ex.origin),
                 "caller_id": func.coalesce(t.caller_id, ex.caller_id),
+                "owner": func.coalesce(t.owner, ex.owner),
             },
         )
         async with self._engine.begin() as conn:
@@ -204,13 +212,15 @@ class OutboundHandleStore:
         agent_ids: Collection[str] | None = None,
         retry_reason: str | None = None,
         max_attempts: int | None = None,
+        owners: Collection[str] = (),
     ) -> list[dict[str, Any]]:
         """Non-terminal handles created before ``cutoff`` (epoch seconds), oldest first.
 
         Scoping, for gateways sharing one database: ``partner_ids`` keeps only handles of
         those partners; ``agent_ids`` keeps only handles whose inbound task is indexed
-        (``a2agw_task_index``) under one of those agents (handles with no inbound task are
-        then excluded). With ``retry_reason`` and ``max_attempts``, handles that a2agw ended
+        (``a2agw_task_index``) under one of those agents, plus handles with no inbound task
+        whose ``owner`` is one of ``owners`` (other handles with no inbound task are then
+        excluded). With ``retry_reason`` and ``max_attempts``, handles that a2agw ended
         with that ``end_reason`` and fewer than ``max_attempts`` cancel attempts are
         selected too (whatever their age: they already passed the TTL)."""
         from a2agw.consult.results import TERMINAL_NAMES
@@ -226,8 +236,12 @@ class OutboundHandleStore:
         stmt = select(o)
         if agent_ids is not None:
             t = INDEX_TABLE
-            stmt = stmt.join(t, t.c.task_id == o.c.inbound_task_id)
-            conds.append(t.c.agent_id.in_(sorted(agent_ids)))
+            stmt = stmt.select_from(o.outerjoin(t, t.c.task_id == o.c.inbound_task_id))
+            mine = t.c.agent_id.in_(sorted(agent_ids))
+            if owners:
+                unlinked = and_(o.c.inbound_task_id.is_(None), o.c.owner.in_(sorted(owners)))
+                mine = or_(mine, unlinked)
+            conds.append(mine)
         stmt = stmt.where(*conds).order_by(o.c.created_at).limit(limit)
         async with self._engine.connect() as conn:
             return [dict(r._mapping) for r in (await conn.execute(stmt)).all()]

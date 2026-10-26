@@ -337,6 +337,44 @@ async def test_consult_setup_failure(make, tmp_path, caplog):
     assert ops(rec) == []
 
 
+async def test_grant_revoked_when_the_run_ends(make, tmp_path):
+    issued: list[ConsultGrant] = []
+    revoked: list[ConsultGrant] = []
+
+    class Grants:
+        async def __call__(self, c: InboundContext) -> ConsultGrant:
+            issued.append(ConsultGrant(url="http://gw/a2agw/v1", token="t", expires_at=1.0))
+            return issued[-1]
+
+        def revoke(self, grant: ConsultGrant) -> None:
+            revoked.append(grant)
+
+    a = make("serve", str(tmp_path / "ops.jsonl"), consult=Grants())
+    assert await collect(a) == echo("hello")
+    assert revoked == issued and len(issued) == 1
+    events = a.run(ctx("block"))
+    assert await anext(events) == Status("working")
+    await events.aclose()
+    assert revoked == issued and len(issued) == 2
+
+
+async def test_stdout_reader_failure_is_logged(make, monkeypatch, caplog):
+    """N1: a reader that fails is an ERROR naming the exception class, not the "closed stdout
+    but kept running" warning; the process is killed and its runs fail."""
+    monkeypatch.setattr(stdio_mod, "SHUTDOWN_GRACE_S", 0.05)
+
+    def broken(self, line, log):
+        raise RuntimeError("SECRET-MARKER")
+
+    monkeypatch.setattr(StdioAdapter, "_route", broken)
+    a = make("serve")
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        assert await asyncio.wait_for(collect(a), 10.0) == [Failed("agent process exited")]
+    errors = [r for r in caplog.records if r.name == LOGGER and r.levelno == logging.ERROR]
+    assert [r.getMessage() for r in errors] == ["agent stdout reader failed: RuntimeError"]
+    assert "closed stdout" not in caplog.text and "SECRET-MARKER" not in caplog.text
+
+
 def test_constructor_validates():
     a = StdioAdapter(["agent", "--flag"], durable_sessions=True)
     assert a.durable_sessions is True and a.command == ["agent", "--flag"]

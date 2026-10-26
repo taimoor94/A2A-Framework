@@ -489,6 +489,43 @@ async def test_consult_grant_is_sent(agent):
     assert sent["consult"] == {"url": "http://gw/consult", "token": "g-tok", "expires_at": 42.0}
 
 
+class RevocableGrant:
+    """A consult callable with ``revoke``, as the host gives its external adapters."""
+
+    def __init__(self) -> None:
+        self.issued: list = []
+        self.revoked: list = []
+
+    async def __call__(self, c: InboundContext):
+        from a2agw.gateway.protocol import ConsultGrant
+
+        grant = ConsultGrant(
+            url="http://gw/a2agw/v1", token=f"tok-{len(self.issued)}", expires_at=1.0
+        )
+        self.issued.append(grant)
+        return grant
+
+    def revoke(self, grant) -> None:
+        self.revoked.append(grant)
+
+
+async def test_grant_revoked_when_the_run_ends(agent):
+    consult = RevocableGrant()
+    agent.ndjson({"type": "done"})
+    a = adapter(agent, consult=consult)
+    await collect(a)
+    assert consult.revoked == consult.issued and len(consult.issued) == 1
+    # Also when the agent fails the turn, and when the run is closed mid-stream.
+    agent.ndjson({"type": "status", "text": "x"}, {"type": "need_input", "question": "?"})
+    await collect(a)
+    assert consult.revoked == consult.issued and len(consult.issued) == 2
+    agent.ndjson({"type": "status", "text": "x"}, {"type": "status", "text": "y"})
+    events = a.run(ctx())
+    assert await anext(events) == Status("x")
+    await events.aclose()
+    assert consult.revoked == consult.issued and len(consult.issued) == 3
+
+
 def test_constructor_validates_url_and_options():
     assert WebhookAdapter(URL, durable_sessions=True).durable_sessions is True
     assert WebhookAdapter(URL).durable_sessions is False

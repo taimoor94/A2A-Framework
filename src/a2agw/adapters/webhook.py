@@ -46,6 +46,7 @@ from a2agw.adapters._sidecar import (
     consult_grant,
     loads,
     partial_line_too_long,
+    release_grant,
     run_turn,
 )
 from a2agw.consult.guarded_net import fixed_tier, guarded_async_client, is_unsafe_address
@@ -132,46 +133,51 @@ class WebhookAdapter:
         except TurnFailure as e:
             yield Failed(e.reason)
             return
-        connected = False
-        failure: str | None = None
-        invoke = build_invoke(ctx, consult=grant, deadline=deadline.wall)
-        body = json.dumps(invoke, separators=(",", ":")).encode()
         try:
-            async with AsyncExitStack() as stack:
-                client = self.http
-                if client is None:
-                    client = await stack.enter_async_context(
-                        guarded_async_client(
-                            fixed_tier(self.tier), timeout=httpx.Timeout(self.timeout_s)
+            connected = False
+            failure: str | None = None
+            invoke = build_invoke(ctx, consult=grant, deadline=deadline.wall)
+            body = json.dumps(invoke, separators=(",", ":")).encode()
+            try:
+                async with AsyncExitStack() as stack:
+                    client = self.http
+                    if client is None:
+                        client = await stack.enter_async_context(
+                            guarded_async_client(
+                                fixed_tier(self.tier), timeout=httpx.Timeout(self.timeout_s)
+                            )
                         )
+                    request = client.stream(
+                        "POST", self.url, content=body, headers=self._headers(body)
                     )
-                request = client.stream("POST", self.url, content=body, headers=self._headers(body))
-                response = await within(stack.enter_async_context(request))
-                connected = True
-                if not 200 <= response.status_code < 300:
-                    log.warning("agent returned HTTP %d", response.status_code)
-                    failure = f"agent returned HTTP {response.status_code}"
-                else:
-                    async with aclosing(self._events(response, within)) as events:
-                        async for item in events:
-                            yield item
-                            if isinstance(item, TERMINAL):
-                                return
-        except (TimeoutError, httpx.TimeoutException):
-            log.warning("%s after %ss", TIMED_OUT, self.timeout_s)
-            failure = TIMED_OUT
-        except ProtocolError as e:
-            log.warning("%s: %s", PROTOCOL_ERROR, e)
-            failure = PROTOCOL_ERROR
-        except httpx.DecodingError as e:  # e.g. a Content-Encoding the body does not match
-            log.warning("%s: %s", PROTOCOL_ERROR, type(e).__name__)
-            failure = PROTOCOL_ERROR
-        except httpx.RequestError as e:  # TransportError, or any other request failure
-            reason = "unsafe address" if is_unsafe_address(e) else type(e).__name__
-            failure = CONNECTION_LOST if connected else UNREACHABLE
-            log.warning("%s: %s", failure, reason)
-        if failure is not None:
-            yield Failed(failure)
+                    response = await within(stack.enter_async_context(request))
+                    connected = True
+                    if not 200 <= response.status_code < 300:
+                        log.warning("agent returned HTTP %d", response.status_code)
+                        failure = f"agent returned HTTP {response.status_code}"
+                    else:
+                        async with aclosing(self._events(response, within)) as events:
+                            async for item in events:
+                                yield item
+                                if isinstance(item, TERMINAL):
+                                    return
+            except (TimeoutError, httpx.TimeoutException):
+                log.warning("%s after %ss", TIMED_OUT, self.timeout_s)
+                failure = TIMED_OUT
+            except ProtocolError as e:
+                log.warning("%s: %s", PROTOCOL_ERROR, e)
+                failure = PROTOCOL_ERROR
+            except httpx.DecodingError as e:  # e.g. a Content-Encoding the body does not match
+                log.warning("%s: %s", PROTOCOL_ERROR, type(e).__name__)
+                failure = PROTOCOL_ERROR
+            except httpx.RequestError as e:  # TransportError, or any other request failure
+                reason = "unsafe address" if is_unsafe_address(e) else type(e).__name__
+                failure = CONNECTION_LOST if connected else UNREACHABLE
+                log.warning("%s: %s", failure, reason)
+            if failure is not None:
+                yield Failed(failure)
+        finally:
+            release_grant(self.consult, grant, log)
 
     async def _events(
         self, response: httpx.Response, within: _Within

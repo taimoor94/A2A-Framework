@@ -64,6 +64,7 @@ from a2agw.adapters._sidecar import (
     consult_grant,
     loads,
     partial_line_too_long,
+    release_grant,
     run_turn,
 )
 from a2agw.core.events import AgentEvent, Failed
@@ -127,7 +128,10 @@ class _Child:
 
 class _Protocol(asyncio.subprocess.SubprocessStreamProtocol):
     """The standard stream protocol, plus an event set at process exit. (On 3.12,
-    ``Process.wait()`` resolves only once every pipe is closed as well.)"""
+    ``Process.wait()`` resolves only once every pipe is closed as well.)
+
+    Not public API: ``SubprocessStreamProtocol`` and its constructor are identical on Python
+    3.11-3.14; the stdio tests pin them (see ``_spawn``)."""
 
     def __init__(self, exited: asyncio.Event, loop: asyncio.AbstractEventLoop) -> None:
         super().__init__(limit=_READ_SIZE, loop=loop)
@@ -324,6 +328,9 @@ class StdioAdapter:
             env=self._child_env(),
             start_new_session=True,  # its own process group: signalled, and killed, as one
         )
+        # ``asyncio.subprocess.Process`` and ``SubprocessStreamProtocol`` (``_Protocol``) are
+        # constructed directly, which is not public API: their constructors are identical on
+        # Python 3.11-3.14, and the stdio tests pin that behaviour.
         child = _Child(asyncio.subprocess.Process(transport, protocol, loop), transport, exited)
         self._child = child
         self._up.set()
@@ -341,8 +348,13 @@ class StdioAdapter:
         exit_wait = asyncio.create_task(child.exited.wait())
         try:
             await asyncio.wait({out, exit_wait}, return_when=asyncio.FIRST_COMPLETED)
+            failed = out.done() and not out.cancelled() and out.exception() is not None
+            if failed:
+                # The reader broke (a bug, not the agent): nothing more can be routed, so the
+                # process is killed below and its runs fail.
+                log.error("agent stdout reader failed: %s", type(out.exception()).__name__)
             # stdout closed, yet the process runs on: give it a moment, then kill it.
-            if not child.exited.is_set() and not await _within(
+            elif not child.exited.is_set() and not await _within(
                 child.exited.wait(), SHUTDOWN_GRACE_S
             ):
                 log.warning("agent process closed stdout but kept running; killing it")
@@ -520,44 +532,47 @@ class StdioAdapter:
         except TurnFailure as e:
             yield Failed(e.reason)
             return
-        invoke = build_invoke(ctx, consult=grant, deadline=deadline.wall)
         try:
-            await deadline.within(self._sem.acquire())
-        except TimeoutError:
-            log.warning("%s after %ss (waiting for a free slot)", TIMED_OUT, self.timeout_s)
-            yield Failed(TIMED_OUT)
-            return
-        rid = uuid4().hex
-        child: _Child | None = None
-        ended = False  # by the agent (a terminal event) or by the process exiting
-        try:
+            invoke = build_invoke(ctx, consult=grant, deadline=deadline.wall)
             try:
-                child, run = await self._register(rid, deadline)
-            except TurnFailure as e:
-                yield Failed(e.reason)
-                return
-            try:
-                await deadline.within(
-                    self._write(child, {"op": "invoke", "id": rid, "request": invoke})
-                )
-                while True:
-                    item = await deadline.within(run.queue.get())
-                    if isinstance(item, _End):
-                        ended = not item.cancel
-                        yield Failed(item.reason)
-                        return
-                    ended = isinstance(item, TERMINAL)
-                    yield item
-                    if ended:
-                        return
+                await deadline.within(self._sem.acquire())
             except TimeoutError:
-                log.warning("%s after %ss", TIMED_OUT, self.timeout_s)
+                log.warning("%s after %ss (waiting for a free slot)", TIMED_OUT, self.timeout_s)
                 yield Failed(TIMED_OUT)
+                return
+            rid = uuid4().hex
+            child: _Child | None = None
+            ended = False  # by the agent (a terminal event) or by the process exiting
+            try:
+                try:
+                    child, run = await self._register(rid, deadline)
+                except TurnFailure as e:
+                    yield Failed(e.reason)
+                    return
+                try:
+                    await deadline.within(
+                        self._write(child, {"op": "invoke", "id": rid, "request": invoke})
+                    )
+                    while True:
+                        item = await deadline.within(run.queue.get())
+                        if isinstance(item, _End):
+                            ended = not item.cancel
+                            yield Failed(item.reason)
+                            return
+                        ended = isinstance(item, TERMINAL)
+                        yield item
+                        if ended:
+                            return
+                except TimeoutError:
+                    log.warning("%s after %ss", TIMED_OUT, self.timeout_s)
+                    yield Failed(TIMED_OUT)
+            finally:
+                self._sem.release()
+                self._runs.pop(rid, None)
+                if child is not None and not ended:  # ended on our side: the agent may still run it
+                    self._send_nowait(child, {"op": "cancel", "id": rid})
         finally:
-            self._sem.release()
-            self._runs.pop(rid, None)
-            if child is not None and not ended:  # ended on our side: the agent may still run it
-                self._send_nowait(child, {"op": "cancel", "id": rid})
+            release_grant(self.consult, grant, log)
 
     async def _register(self, rid: str, deadline: TurnDeadline) -> tuple[_Child, _Run]:
         """Wait (within the deadline) for a running process and register the run with it."""
