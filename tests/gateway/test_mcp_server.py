@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import subprocess
 import sys
 from contextlib import asynccontextmanager
@@ -23,6 +24,8 @@ from streaming_asgi import streaming_transport
 from a2agw.consult.credentials import StaticCredentials
 from a2agw.consult.tools import UNTRUSTED_NOTE
 from a2agw.core.events import Done
+from a2agw.gateway.auth import MCP_EXTRA_HINT
+from a2agw.gateway.mcp_server import _describe, _strip_x
 from a2agw.security.auth import ApiKeyEntry, AuthConfig, hash_api_key
 from a2agw.security.policy import Policy, PolicyEngine
 
@@ -42,6 +45,20 @@ INIT = {
     },
 }
 ACCEPT = {"Accept": "application/json, text/event-stream"}
+
+
+@pytest.fixture(autouse=True)
+def no_errors_logged(caplog):
+    """MCP traffic, including clients closing their sessions, logs no error or traceback."""
+    caplog.set_level(logging.WARNING)
+    yield
+    bad = [
+        r
+        for when in ("setup", "call")
+        for r in caplog.get_records(when)
+        if r.levelno >= logging.ERROR or r.exc_info
+    ]
+    assert bad == [], [r.getMessage() for r in bad]
 
 
 def bearer(grant) -> dict[str, str]:
@@ -143,7 +160,37 @@ async def test_untrusted_note_in_descriptions(env):
     async with session(e, "a", h) as s:
         tools = (await s.list_tools()).tools
     for t in tools:
-        assert t.description.endswith("\n\n" + UNTRUSTED_NOTE), t.name
+        assert t.description.endswith(UNTRUSTED_NOTE), t.name
+        assert t.description.count(UNTRUSTED_NOTE) == 1, t.name
+
+
+def test_untrusted_note_appended_when_missing():
+    assert _describe("Ask b.") == "Ask b.\n\n" + UNTRUSTED_NOTE
+    assert _describe("Ask b. " + UNTRUSTED_NOTE) == "Ask b. " + UNTRUSTED_NOTE
+
+
+def test_strip_x_strips_keywords_only():
+    schema = {
+        "type": "object",
+        "x-top": 1,
+        "properties": {
+            "x-trace": {"type": "string", "x-max-len": 5},  # a property named x-...
+            "data": {"type": "object", "x-max-json-bytes": 10, "default": {"x-keep": 1}},
+            "list": {"type": "array", "items": {"type": "string", "x-limit": 1}},
+            "choice": {"anyOf": [{"type": "string", "x-a": 1}], "enum": [{"x-v": 1}]},
+        },
+        "required": ["x-trace"],
+    }
+    assert _strip_x(schema) == {
+        "type": "object",
+        "properties": {
+            "x-trace": {"type": "string"},
+            "data": {"type": "object", "default": {"x-keep": 1}},
+            "list": {"type": "array", "items": {"type": "string"}},
+            "choice": {"anyOf": [{"type": "string"}], "enum": [{"x-v": 1}]},
+        },
+        "required": ["x-trace"],
+    }
 
 
 def quarantine(host, pid: str) -> None:
@@ -271,7 +318,7 @@ async def standalone(env, b_adapter, **kw):
         spec("a", Fn(echo)),
         spec("b", b_adapter),
         auth=auth_config(),
-        sidecar_clients={"key:svc": ["a"], "key:svc2": ["a"], "key:plain": ["a"]},
+        sidecar_clients={"key:svc": ["a"], "key:svc2": ["a", "b"], "key:plain": ["a"]},
         credentials=StaticCredentials({"gw": {"X-API-Key": PEER}}),
         mcp_agents=["a", "x"],
         **kw,
@@ -331,13 +378,102 @@ async def test_standalone_calls_owned_and_capped(env):
     )
 
 
-async def test_unknown_agent_404(env):
-    e, h = await linked(env, spec("b", Fn(echo)))
-    for agent in ("zzz", "b"):  # b is served, but not over MCP
-        r = await e.hc.post(f"{MCP}/{agent}", json=INIT, headers={**ACCEPT, **h})
-        assert r.status_code == 404, agent
-    r = await e.hc.post(f"{MCP}/a/extra", json=INIT, headers={**ACCEPT, **h})
+async def test_unknown_agent_404_only_after_auth(env):
+    """Callers are authenticated first, so the answers do not reveal which agent ids are
+    served: only a caller mapped to an agent id learns it is not served over MCP."""
+    e = await standalone(env, Fn(echo))
+    token_a = bearer(e.host.consult_tokens.issue("a", "T1", None, None))
+
+    async def status(agent: str, headers: dict[str, str]) -> int:
+        r = await e.hc.post(f"{MCP}/{agent}", json=INIT, headers={**ACCEPT, **headers})
+        return r.status_code
+
+    for agent in ("zzz", "b", "a/extra", "a"):
+        assert await status(agent, {}) == 401, agent
+        assert await status(agent, {"X-API-Key": "wrong"}) == 401, agent
+    for agent in ("zzz", "b", "a/extra"):
+        assert await status(agent, {"X-API-Key": SVC}) == 403, agent  # not mapped
+        assert await status(agent, token_a) == 403, agent  # the token is for a
+    assert await status("b", {"X-API-Key": SVC2}) == 404  # mapped, not served over MCP
+    assert await status("a", {"X-API-Key": SVC2}) == 200
+
+
+async def test_revoked_token_ends_its_sessions(env):
+    """A consult-token session does not outlive its turn: revoking the token (the inbound
+    task ended) ends the session, and its open notification stream completes."""
+    e, h = await linked(env)
+    r = await e.hc.post(f"{MCP}/a", json=INIT, headers={**ACCEPT, **h})
+    sid = r.headers["mcp-session-id"]
+    session_headers = {**h, "Mcp-Session-Id": sid, "MCP-Protocol-Version": "2025-11-25"}
+    note = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+    await e.hc.post(f"{MCP}/a", json=note, headers={**ACCEPT, **session_headers})
+    opened = asyncio.Event()
+
+    async def standalone_stream() -> int:
+        headers = {**session_headers, "Accept": "text/event-stream"}
+        async with e.hc.stream("GET", f"{MCP}/a", headers=headers) as resp:
+            opened.set()
+            async for _ in resp.aiter_bytes():
+                pass
+            return resp.status_code
+
+    stream = asyncio.create_task(standalone_stream())
+    await asyncio.wait_for(opened.wait(), 5)
+    e.host.consult_tokens.revoke_task("T1")
+    assert await asyncio.wait_for(stream, 5) == 200  # ended, completely
+    assert e.host._mcp._sessions == {}
+    # A new token for the same agent cannot use the ended session.
+    other = bearer(e.host.consult_tokens.issue("a", "T1", None, None))
+    listing = {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+    r = await e.hc.post(f"{MCP}/a", json=listing, headers={**ACCEPT, **session_headers, **other})
     assert r.status_code == 404
+
+
+async def test_mcp_prefix_uses_gateway_auth_when_mcp_is_off(env):
+    e = await env(spec("a", Fn(echo)), auth=auth_config())
+    r = await e.hc.post(f"{MCP}/a", json=INIT, headers={**ACCEPT, "X-API-Key": "wrong"})
+    assert r.status_code == 401
+    assert r.headers.get("cache-control") != "no-store"  # the gateway's refusal, not MCP's
+    r = await e.hc.post(f"{MCP}/a", json=INIT, headers={**ACCEPT, "X-API-Key": SVC})
+    assert r.status_code == 404  # nothing is served there
+
+
+def test_missing_extra_is_named(tmp_path):
+    """Without the mcp extra, enabling MCP fails with a hint naming it, not a raw
+    ModuleNotFoundError: in build_host (config), AgentHost.app() and the module import."""
+    cfg = tmp_path / "a2agw.yaml"
+    cfg.write_text(
+        "base_url: http://127.0.0.1:8000\n"
+        f"db_url: sqlite+aiosqlite:///{tmp_path / 'db.sqlite'}\n"
+        "sidecar: {mcp: {enabled: true, agents: [a]}}\n"
+    )
+    code = (
+        "import sys\n"
+        "sys.modules['mcp'] = None\n"
+        "sys.modules['mcp_types'] = None\n"
+        "from a2agw.config import ConfigError, build_host, load_config\n"
+        "from a2agw.serve.host import AgentHost\n"
+        "try:\n"
+        f"    build_host(load_config({str(cfg)!r}))\n"
+        "except ConfigError as e:\n"
+        "    print('config:', e)\n"
+        "try:\n"
+        "    AgentHost('http://t', mcp_agents=['a']).app()\n"
+        "except ImportError as e:\n"
+        "    print('host:', type(e).__name__, e)\n"
+        "try:\n"
+        "    import a2agw.gateway.mcp_server\n"
+        "except ImportError as e:\n"
+        "    print('import:', type(e).__name__, e)\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=60, check=True
+    )
+    assert out.stdout.splitlines() == [
+        f"config: sidecar.mcp.enabled: {MCP_EXTRA_HINT}",
+        f"host: ImportError {MCP_EXTRA_HINT}",
+        f"import: ImportError {MCP_EXTRA_HINT}",
+    ]
 
 
 async def test_rebinding_protection_allows_only_the_base_url_host(env):
@@ -360,9 +496,9 @@ def test_core_does_not_import_mcp(tmp_path, enabled):
         f"host = build_host(load_config({str(cfg)!r}))\n"
         "host.app()\n"
         "assert sorted(host.sidecar_agent_ids()) == ['a'], host.sidecar_agent_ids()\n"
-        "print('mcp' in sys.modules)\n"
+        "print('mcp' in sys.modules, 'mcp_types' in sys.modules)\n"
     )
     out = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=60, check=True
     )
-    assert out.stdout.strip() == str(enabled)
+    assert out.stdout.split() == [str(enabled), str(enabled)]

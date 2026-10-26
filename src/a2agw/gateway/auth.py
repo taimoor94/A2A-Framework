@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AGENT_HEADER",
+    "MCP_EXTRA_HINT",
     "MCP_PREFIX",
     "SidecarAuthError",
     "SidecarIdentity",
@@ -42,6 +43,7 @@ __all__ = [
 
 AGENT_HEADER = "x-a2agw-agent"
 MCP_PREFIX = "/a2agw/mcp"  # the MCP server's mount (``a2agw.gateway.mcp_server``)
+MCP_EXTRA_HINT = "the MCP server needs the mcp extra: pip install 'a2a-gateway[mcp]'"
 
 # Refusal reasons (audited; fixed text, never a value from the request).
 NOT_AUTHENTICATED = "not authenticated"

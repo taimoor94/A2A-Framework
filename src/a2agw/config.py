@@ -21,6 +21,7 @@ Rules for every section (``extra="forbid"`` at every level):
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import inspect
 import logging
 import os
@@ -49,6 +50,7 @@ from a2agw.consult.oauth import OAuthClientCredentials, OAuthTokenExchange
 from a2agw.consult.registry import CardFetchError, PartnerRegistry
 from a2agw.consult.tls import TlsClientConfig
 from a2agw.context.signing import CallContextSigner, CallContextVerifier
+from a2agw.gateway.auth import MCP_EXTRA_HINT
 from a2agw.security.auth import AuthConfig
 from a2agw.security.cardsign import CardSigner, CardVerifier, load_public_key
 from a2agw.security.classify import RegexPiiClassifier
@@ -827,6 +829,14 @@ def server_run_kwargs(cfg: GatewayConfig, *, config_dir: Path | str = ".") -> di
     }
 
 
+def _mcp_installed() -> bool:
+    """Whether the ``mcp`` extra is importable (without importing it)."""
+    try:
+        return all(importlib.util.find_spec(m) is not None for m in ("mcp", "mcp_types"))
+    except (ImportError, ValueError):  # e.g. a module entry that is None
+        return False
+
+
 def build_host(cfg: GatewayConfig, *, config_dir: Path | str = ".") -> AgentHost:
     """An ``AgentHost`` for the config, agents added (partners are registered separately,
     by ``register_partners``).
@@ -835,6 +845,8 @@ def build_host(cfg: GatewayConfig, *, config_dir: Path | str = ".") -> AgentHost
     serve`` applies it; with ``build_host``, run the host with
     ``host.run(**server_run_kwargs(cfg, config_dir=...))`` (a WARNING says so)."""
     config_dir = Path(config_dir).resolve()
+    if cfg.sidecar.mcp.enabled and not _mcp_installed():
+        raise ConfigError(f"sidecar.mcp.enabled: {MCP_EXTRA_HINT}")
     if cfg.server_tls is not None:
         logger.warning(
             "server_tls is applied when the server starts: pass "

@@ -87,7 +87,7 @@ def streaming_transport(httpx: ModuleType) -> type:
                     started.set_result(message)
                 elif message["type"] == "http.response.body":
                     if disconnected.is_set():
-                        raise OSError("client disconnected")
+                        return  # the client is gone: dropped, as uvicorn does
                     queue.put_nowait(message.get("body", b""))
                     if not message.get("more_body", False):
                         queue.put_nowait(None)

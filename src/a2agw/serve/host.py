@@ -71,7 +71,7 @@ from a2agw.consult.tls import TlsClientConfig
 from a2agw.consult.tools import PartnerTool, partner_tools
 from a2agw.context.signing import CallContextSigner, CallContextVerifier
 from a2agw.core.spi import LifecycleAdapter
-from a2agw.gateway.auth import MCP_PREFIX
+from a2agw.gateway.auth import MCP_EXTRA_HINT, MCP_PREFIX
 from a2agw.gateway.calls import SidecarCalls
 from a2agw.gateway.rest import REST_PREFIX, rest_routes
 from a2agw.gateway.tokens import ConsultTokens, GrantIssuer
@@ -843,11 +843,13 @@ class _AnonymousMiddleware:
         await self.app(scope, receive, send)
 
 
-def _is_sidecar(scope: Scope) -> bool:
-    """The outbound REST API and MCP server: they accept a consult token instead of the
-    gateway's auth, so they decide who is calling (``a2agw.gateway.auth``)."""
+def _is_sidecar(scope: Scope, *, mcp: bool) -> bool:
+    """The outbound REST API, and the MCP server when it is served (``mcp``): they accept a
+    consult token instead of the gateway's auth, so they decide who is calling
+    (``a2agw.gateway.auth``)."""
     path = get_route_path(scope)
-    return any(path == p or path.startswith(p + "/") for p in (REST_PREFIX, MCP_PREFIX))
+    prefixes = (REST_PREFIX, MCP_PREFIX) if mcp else (REST_PREFIX,)
+    return any(path == p or path.startswith(p + "/") for p in prefixes)
 
 
 def _is_public(scope: Scope) -> bool:
@@ -871,9 +873,10 @@ def _is_public(scope: Scope) -> bool:
 class _AuthMiddleware:
     """Authenticates every non-public request and stores the principal in the scope."""
 
-    def __init__(self, app: ASGIApp, config: AuthConfig) -> None:
+    def __init__(self, app: ASGIApp, config: AuthConfig, *, mcp: bool = False) -> None:
         self.app = app
         self.backend = GatewayAuthBackend(config)
+        self.mcp = mcp
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] not in ("http", "websocket"):
@@ -888,7 +891,7 @@ class _AuthMiddleware:
         try:
             result = await self.backend.authenticate(conn)
         except AuthenticationError as exc:
-            if _is_sidecar(scope):
+            if _is_sidecar(scope, mcp=self.mcp):
                 # A consult token is no gateway credential: the sidecar routes check it, and
                 # refuse everything else with 401 themselves.
                 result = None
@@ -1028,6 +1031,7 @@ class AgentHost:
         # None: no MCP server. These ids are sidecar agents too.
         self.mcp_agents = frozenset(mcp_agents) if mcp_agents is not None else None
         self._mcp: McpHttpApp | None = None
+        self._exit_tasks: set[asyncio.Task[None]] = set()
         self.sidecar_agents = frozenset(sidecar_agents) | (self.mcp_agents or frozenset())
         # A standalone sidecar principal's open partner tasks with no inbound task, per agent
         # id it acts as (over it a new consult is ``unavailable``, audited
@@ -1624,10 +1628,27 @@ class AgentHost:
     def _mcp_app(self) -> McpHttpApp:
         """The MCP server's ASGI app (imports ``mcp``: only when ``mcp_agents`` is set)."""
         if self._mcp is None:
-            from a2agw.gateway.mcp_server import mcp_asgi_app
-
+            try:
+                from a2agw.gateway.mcp_server import mcp_asgi_app
+            except ImportError as e:
+                raise ImportError(MCP_EXTRA_HINT) from e
             self._mcp = mcp_asgi_app(self)
         return self._mcp
+
+    async def end_streams(self) -> None:
+        """End the open endless responses: event streams and MCP sessions (refused from
+        then on). The server waits for open responses before the host shuts down, so the
+        exit signals do this at once; call it before stopping an embedded server some
+        other way (e.g. uvicorn's ``should_exit``)."""
+        self.bus.close_all()
+        if self._mcp is not None:
+            await self._mcp.close_sessions()
+
+    def _exiting(self) -> None:
+        """Exit-signal callback (on the event loop): ``end_streams``."""
+        task = asyncio.get_running_loop().create_task(self.end_streams(), name="a2agw:exit")
+        self._exit_tasks.add(task)
+        task.add_done_callback(self._exit_tasks.discard)
 
     async def _delegate(self, scope: Scope, receive: Receive, send: Send) -> None:
         if self._inner is None:
@@ -1644,7 +1665,7 @@ class AgentHost:
         async def lifespan(_: Starlette) -> AsyncIterator[None]:
             await self.startup()
             try:
-                with _on_exit_signal(self.bus.close_all):
+                with _on_exit_signal(self._exiting):
                     yield
             finally:
                 await self.shutdown()
@@ -1661,7 +1682,7 @@ class AgentHost:
         )
         # add_middleware prepends, so the last one added is outermost.
         if self.auth is not None:
-            app.add_middleware(_AuthMiddleware, config=self.auth)
+            app.add_middleware(_AuthMiddleware, config=self.auth, mcp=self.mcp_agents is not None)
         else:
             app.add_middleware(_AnonymousMiddleware)
         app.add_middleware(_BodyLimitMiddleware, max_bytes=self.max_body_bytes)

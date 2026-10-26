@@ -34,6 +34,7 @@ from a2agw.config import (
 from a2agw.consult.guarded_net import fixed_tier, guarded_async_client
 from a2agw.consult.netguard import UnsafeURL, check_url
 from a2agw.consult.registry import MAX_CARD_BYTES, CardFetchError, PartnerRegistry
+from a2agw.gateway.auth import MCP_EXTRA_HINT
 from a2agw.ops.audit import ACTIONS, AuditLog, parse_since, registry_audit_event
 from a2agw.serve.host import GRACEFUL_TIMEOUT_S
 
@@ -496,9 +497,7 @@ def mcp(
     try:
         from a2agw.gateway import mcp_server
     except ImportError:
-        raise ConfigError(
-            "the MCP server needs the mcp extra: pip install 'a2a-gateway[mcp]'"
-        ) from None
+        raise ConfigError(MCP_EXTRA_HINT) from None
     config_dir = config.resolve().parent
     # No served agents and no HTTP endpoint: this process only serves stdio.
     sidecar = cfg.sidecar.model_copy(

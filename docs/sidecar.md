@@ -449,14 +449,16 @@ The list is recomputed on every `tools/list`, and when partners change the gatew
 
 ### Streamable HTTP
 
-`a2agw serve` serves each listed agent id at `/a2agw/mcp/{agent_id}` (any other id is a
-`404`). Authentication is the REST API's:
+`a2agw serve` serves each listed agent id at `/a2agw/mcp/{agent_id}`. Authentication is the
+REST API's, and comes first: a caller that is not authenticated, or not allowed to act as the
+agent id in the path, gets `401` or `403` whatever the id, and only an allowed caller learns
+that an id is not served over MCP (`404`).
 
 - **Consult token (linked).** A webhook or stdio agent can hand its turn's token to an MCP
   client as `Authorization: Bearer <token>`, on `{base_url}/a2agw/mcp/{agent_id}` for its own
   agent id (a token for another agent id is a `403`). The session's calls are linked to the
-  inbound task, as described in [Authentication](#authentication), and stop working when the
-  turn ends.
+  inbound task, as described in [Authentication](#authentication), and the session itself
+  ends when the token stops working (the turn ended).
 - **Standalone.** The gateway's API key or JWT, for a principal with the `a2agw:sidecar`
   scope that `sidecar.clients` maps to the agent id. The path names the agent: no
   `X-A2AGW-Agent` header is needed.
@@ -465,6 +467,13 @@ Refusals are `401`/`403` and audited as `sidecar.denied`, as for the REST API. A
 only be used with the credentials that opened it (another caller gets `404`, as for an
 unknown session). DNS-rebinding protection accepts only requests whose `Host` (and `Origin`,
 when sent) is the host of `base_url`; behind a proxy, keep the original `Host`.
+
+On an exit signal (SIGTERM, SIGINT) the gateway ends the open sessions at once, so the server
+does not wait for their notification streams. An application that embeds the host and stops
+uvicorn some other way (`server.should_exit = True`) should `await host.end_streams()` first.
+
+Enabling MCP without the extra fails at startup with a message naming it
+(`pip install 'a2a-gateway[mcp]'`).
 
 Claude Code (`.mcp.json`, or `claude mcp add --transport http a2agw <url> --header ...`):
 

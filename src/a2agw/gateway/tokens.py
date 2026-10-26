@@ -14,10 +14,12 @@ never logged, audited or echoed. It stops resolving at the earliest of the end o
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
+import logging
 import secrets
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -32,6 +34,7 @@ if TYPE_CHECKING:
 __all__ = ["Binding", "ConsultTokens", "GrantIssuer", "token_digest"]
 
 DEFAULT_TTL_S = 3600.0
+logger = logging.getLogger(__name__)
 
 
 def token_digest(token: str) -> str:
@@ -65,6 +68,7 @@ class ConsultTokens:
         self._live: dict[str, Binding] = {}  # digest -> binding
         self._by_task: dict[str, set[str]] = {}  # inbound task id -> digests
         self._inflight: dict[str, set[asyncio.Task[object]]] = {}  # digest -> calls
+        self._on_revoke: list[Callable[[str], None]] = []  # called with the grant id
 
     def __repr__(self) -> str:  # counts only
         return f"ConsultTokens(live={len(self._live)}, ttl_s={self.ttl_s})"
@@ -125,6 +129,15 @@ class ConsultTokens:
             None,
         )
 
+    def add_revoke_listener(self, fn: Callable[[str], None]) -> None:
+        """Call ``fn(grant_id)`` whenever a live token stops resolving (revoked, its task
+        ended, or expired). ``fn`` must not block; an error in it is logged (class only)."""
+        self._on_revoke.append(fn)
+
+    def remove_revoke_listener(self, fn: Callable[[str], None]) -> None:
+        with contextlib.suppress(ValueError):
+            self._on_revoke.remove(fn)
+
     @contextmanager
     def track(self, binding: Binding, task: asyncio.Task[object]) -> Iterator[bool]:
         """Register ``task`` as a call made under ``binding`` for the duration of the block:
@@ -153,6 +166,12 @@ class ConsultTokens:
                     del self._by_task[binding.inbound_task_id]
         for task in self._inflight.pop(digest, ()):
             task.cancel()
+        if binding is not None:
+            for fn in list(self._on_revoke):
+                try:
+                    fn(digest[:12])
+                except Exception as e:  # noqa: BLE001 - a listener never breaks revocation
+                    logger.error("consult token revoke listener failed: %s", type(e).__name__)
 
     def _sweep(self, now: float) -> None:
         """Forget expired tokens (their runs normally revoke them first)."""
