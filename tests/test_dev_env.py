@@ -23,6 +23,7 @@ DEV_FRAMEWORKS = [
     "mcp",
     "claude_agent_sdk",
     "google.adk",
+    "ag2",
 ]
 
 

@@ -5,7 +5,7 @@ A framework-agnostic gateway for the [A2A (Agent2Agent) protocol](https://a2a-pr
 ## Features
 
 - One `AgentHost` serves many agents at `/agents/<id>/`, over JSON-RPC and HTTP+JSON, with streaming, cancel, and multi-turn (`input-required`).
-- Adapters: plain callables (sync, async, generators), LangChain runnables, and LangGraph graphs (`interrupt()` becomes `input-required`).
+- Adapters: plain callables (sync, async, generators), LangChain runnables, LangGraph graphs (`interrupt()` becomes `input-required`), and agents from the OpenAI Agents SDK, the Claude Agent SDK, Google ADK and AG2.
 - Partner registry with card fetch, pinning, change quarantine, and approval.
 - Partner tools with task handles (`ask_<id>`, `a2a_check_task`, `a2a_cancel_task`, `a2a_wait`), and a discovery mode (`find_partners`, `consult_partner`) above 12 partners.
 - Resilience on outbound calls: deadline, jittered retries, circuit breaker, per-partner bulkhead.
@@ -28,6 +28,7 @@ uv add "a2a-gateway[langgraph]"    # adds the LangGraph adapter (includes LangCh
 uv add "a2a-gateway[openai]"       # adds the OpenAI Agents SDK adapter
 uv add "a2a-gateway[claude]"       # adds the Claude Agent SDK adapter
 uv add "a2a-gateway[adk]"          # adds the Google ADK adapter (not part of [all])
+uv add "a2a-gateway[ag2]"          # adds the AG2 (1.x) adapter
 ```
 
 `[all]` installs every extra except `adk`. google-adk caps `opentelemetry-api`/`opentelemetry-sdk` at 1.44 and `websockets` below 16, so installing it can downgrade those packages; add `[adk]` explicitly when you want the ADK adapter.
@@ -223,6 +224,29 @@ assistant = AgentSpec(
 ```
 
 `as_adk_tools(tools, host.client)` projects partners as `FunctionTool`s that declare the partner tool's JSON schema (`parameters_json_schema`) and return the JSON envelope. Set them once the host has started, for example `agent.tools = as_adk_tools(host.partner_tools("assistant"), host.client)`. [examples/adapters/adk_example.py](examples/adapters/adk_example.py) runs offline with a scripted model.
+
+### An AG2 agent
+
+`AG2Adapter` runs an AG2 1.x agent (`ag2.Agent`, import name `ag2`) with `agent.run(text, stream=...)`. AG2 Classic (`import autogen`, `ConversableAgent`) is not supported; serve such an agent through the callable adapter. A real model needs its provider config and key, for example `OpenAIConfig(model=..., streaming=True)` with `OPENAI_API_KEY`. An AG2 conversation is a `Stream`, and there is one per caller and A2A `contextId`, so follow-up messages continue the conversation and another caller sending the same `contextId` starts its own. By default each is a `MemoryStream`: the 10,000 most recently used are kept, and each keeps its last `history_limit` messages (default 50; a turn is never split, so a tool call keeps its result). To keep conversations across restarts, pass `stream_factory(key)` returning a stream on persistent storage, with `durable_sessions=True`; without a `stream_factory`, `durable_sessions=True` is refused. Streams from a factory are never trimmed. Streamed text chunks become the `output` artifact; a model that does not stream answers with the reply text when the turn ends. Each tool call shows as a `calling <tool>` status, and tokens are reported. Errors fail the task. Cancelling the A2A task cancels the run, and a tool call it cut short is answered in the history so the conversation stays usable. AG2 traces only through its opt-in `TelemetryMiddleware`.
+
+```python
+from ag2 import Agent
+from ag2.config import OpenAIConfig
+
+from a2agw import AgentSpec, SkillSpec
+from a2agw.adapters.ag2 import AG2Adapter
+
+agent = Agent("assistant", "Answer helpfully.", config=OpenAIConfig(model="gpt-5-mini", streaming=True))
+assistant = AgentSpec(
+    id="assistant",
+    name="Assistant",
+    description="An AG2 agent.",
+    skills=[SkillSpec(id="chat", name="Chat", description="Answers questions")],
+    adapter=AG2Adapter(agent),
+)
+```
+
+`as_ag2_tools(tools, host.client)` projects partners as AG2 `FunctionTool`s that advertise the partner tool's JSON schema (given to `ag2.tools.tool(..., schema=)`, not inferred from a Python signature) and return the JSON envelope. Add them once the host has started, for example `for t in as_ag2_tools(host.partner_tools("assistant"), host.client): agent.add_tool(t)`. [examples/adapters/ag2_example.py](examples/adapters/ag2_example.py) runs offline with a scripted model.
 
 ### An agent that consults partners
 
