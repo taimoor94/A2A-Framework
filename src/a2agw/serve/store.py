@@ -536,11 +536,34 @@ class MessageLedger:
             row = (await conn.execute(select(_ledger_table).where(key.where()))).first()
         return dict(row._mapping) if row is not None else None
 
-    async def release(self, key: MessageKey, *, only_unfilled: bool = True) -> None:
-        """Forget ``key`` (a send that created no task, or answered with a bare Message)."""
+    async def supersede(
+        self, key: MessageKey, task_id: str, fingerprint: str, now: float | None = None
+    ) -> bool:
+        """Compare-and-set takeover of a key whose task has ended (or vanished): only if the
+        row still points at ``task_id`` with ``fingerprint``. Of several concurrent re-sends
+        exactly one wins (True) and runs; the others re-read and find the winner's send."""
+        stmt = (
+            update(_ledger_table)
+            .where(
+                key.where(),
+                _ledger_table.c.task_id == task_id,
+                _ledger_table.c.fingerprint == fingerprint,
+            )
+            .values(task_id=None, created_at=time.time() if now is None else now)
+        )
+        async with self._engine.begin() as conn:
+            return (await conn.execute(stmt)).rowcount == 1
+
+    async def release(
+        self, key: MessageKey, *, only_unfilled: bool = True, fingerprint: str | None = None
+    ) -> None:
+        """Forget ``key`` (a send that created no task, or answered with a bare Message);
+        with ``fingerprint``, only while the row is still that request's."""
         cond = key.where()
         if only_unfilled:
             cond = and_(cond, _ledger_table.c.task_id.is_(None))
+        if fingerprint is not None:
+            cond = and_(cond, _ledger_table.c.fingerprint == fingerprint)
         async with self._engine.begin() as conn:
             await conn.execute(delete(_ledger_table).where(cond))
 

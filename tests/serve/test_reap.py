@@ -117,3 +117,20 @@ async def test_ttl_is_measured_from_creation(env):
     later = time.time() + 61
     assert (await expire_outbound(handles, cancel, None, ttl_s=60, now=later)).expired == 1
     assert calls == ["t1"]
+
+
+async def test_partner_updates_never_reopen_an_ended_handle(env):
+    eng, handles, audit = env
+    await _seed(eng, handles)
+
+    async def cancel(h):
+        pass
+
+    await expire_outbound(handles, cancel, audit, ttl_s=86400)
+    # A late partner report (check, wait, a fresh consult response) does not overwrite it.
+    await handles.update_state("p", "old", COMPLETED)
+    await handles.record("old", "p", "c1", "in-1", "o", W)
+    old = await handles.get("p", "old")
+    assert (old["state"], old["end_reason"]) == (CANCELED, TTL_REASON)
+    await handles.update_state("p", "young", COMPLETED)  # handles not ended still update
+    assert (await handles.get("p", "young"))["state"] == COMPLETED

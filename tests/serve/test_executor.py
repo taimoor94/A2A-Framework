@@ -6,6 +6,7 @@ import asyncio
 import logging
 import uuid
 
+import pytest
 from a2a.server.agent_execution import RequestContext
 from a2a.server.context import ServerCallContext
 from a2a.server.routes import DefaultServerCallContextBuilder
@@ -845,12 +846,15 @@ async def test_completion_cancels_outstanding_partner_tasks_once(make_server):
         assert hooked == [task.id]
 
 
-async def test_interrupted_run_does_not_cascade(make_server):
+@pytest.mark.parametrize("auth", [False, True])
+async def test_interrupted_run_does_not_cascade(make_server, auth):
+    from a2agw.core.events import NeedAuth
+
     class Asker:
         durable_sessions = False
 
         async def run(self, ctx):
-            yield NeedInput("q")
+            yield NeedAuth(scheme="oauth2") if auth else NeedInput("q")
 
     h = await make_server(Asker())
     hooked: list[str] = []
@@ -860,6 +864,8 @@ async def test_interrupted_run_does_not_cascade(make_server):
 
     h.executor.on_cancel = on_cancel
     _, task = await send(h.client(streaming=False), user_msg("x"))
-    assert task.status.state == TaskState.TASK_STATE_INPUT_REQUIRED
+    assert task.status.state == (
+        TaskState.TASK_STATE_AUTH_REQUIRED if auth else TaskState.TASK_STATE_INPUT_REQUIRED
+    )
     await asyncio.sleep(0.05)
     assert hooked == []  # the task goes on: its partner work stays

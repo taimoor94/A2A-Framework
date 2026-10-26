@@ -15,6 +15,7 @@ from sqlalchemy import (
     MetaData,
     String,
     Table,
+    case,
     func,
     inspect,
     select,
@@ -116,7 +117,8 @@ class OutboundHandleStore:
         stmt = stmt.on_conflict_do_update(
             index_elements=["partner_id", "task_id"],
             set_={
-                "state": ex.state,
+                # A handle a2agw ended itself (end_reason set) keeps its state.
+                "state": case((t.end_reason.is_(None), ex.state), else_=t.state),
                 "context_id": func.coalesce(ex.context_id, t.context_id),
                 "inbound_task_id": func.coalesce(t.inbound_task_id, ex.inbound_task_id),
                 "origin": func.coalesce(t.origin, ex.origin),
@@ -127,9 +129,15 @@ class OutboundHandleStore:
             await conn.execute(stmt)
 
     async def update_state(self, partner_id: str, task_id: str, state: str) -> None:
+        """Record a state the partner reported. A handle a2agw itself ended (``end_reason``
+        set, e.g. TTL expiry) keeps its state."""
         stmt = (
             update(_outbound)
-            .where(_outbound.c.partner_id == partner_id, _outbound.c.task_id == task_id)
+            .where(
+                _outbound.c.partner_id == partner_id,
+                _outbound.c.task_id == task_id,
+                _outbound.c.end_reason.is_(None),
+            )
             .values(state=state)
         )
         async with self._engine.begin() as conn:

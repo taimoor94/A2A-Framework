@@ -729,7 +729,8 @@ def fixed_msg(mid: str, text: str = "hi") -> Message:
 
 async def test_resent_message_returns_the_open_task(env):
     """Spec 8.5: a re-send while the first task is open (here input-required) returns that
-    task and does not run the agent again; once the task has ended, the id is free."""
+    task and does not run the agent again; a different request under the id is a new
+    message; once the task has ended, an identical re-send starts a new task."""
     runs: list[str] = []
 
     class Asker:
@@ -758,8 +759,11 @@ async def test_resent_message_returns_the_open_task(env):
     answer.task_id, answer.context_id = first.task.id, first.task.context_id
     [done] = await send_one(client, answer)
     assert done.task.status.state == TaskState.TASK_STATE_COMPLETED
-    [fresh] = await send_one(client, fixed_msg("m-1", "changed text"))  # T2 still open
-    assert fresh.task.id == other.task.id and len(runs) == 3
+    [still] = await send_one(client, fixed_msg("m-1", "changed text"))  # T2 still open
+    assert still.task.id == other.task.id and len(runs) == 3
+    # T1 is completed: re-sending its first request unchanged now starts a new task.
+    [fresh] = await send_one(client, fixed_msg("m-1"))
+    assert fresh.task.id not in (first.task.id, other.task.id) and len(runs) == 4
 
 
 async def test_resent_stream_resubscribes_to_the_running_task(env):
@@ -872,8 +876,59 @@ async def test_direct_reply_message_is_not_remembered(env):
 # -- media types against input modes (spec 8.8) -------------------------------------------
 
 
+async def test_concurrent_resends_after_the_task_ended_run_once(env):
+    """N identical re-sends racing after the first task ended: exactly one takes the id
+    over and runs; every caller gets that one new task."""
+    agent = Counting()
+    e = await env(spec("alpha", agent))
+    [first] = await send_one(e.client("alpha"), fixed_msg("m-c"))
+    assert first.task.status.state == TaskState.TASK_STATE_COMPLETED
+    agent.gate = asyncio.Event()  # hold the new run so all re-sends overlap it
+    sends = [asyncio.create_task(send_one(e.client("alpha"), fixed_msg("m-c"))) for _ in range(8)]
+    await asyncio.sleep(0.3)
+    agent.gate.set()
+    results = await asyncio.wait_for(asyncio.gather(*sends), 15)
+    ids = {r[0].task.id for r in results}
+    assert len(ids) == 1 and first.task.id not in ids
+    assert agent.runs == 2
+    rows, _ = await e.host.index.list(agent_id="alpha")
+    assert len(rows) == 2
+
+
+@pytest.mark.parametrize("auth", [False, True])
+async def test_resent_stream_of_an_interrupted_task_returns_its_snapshot(env, auth):
+    from a2agw.core.events import NeedAuth
+
+    runs: list[int] = []
+
+    class Stops:
+        durable_sessions = False
+
+        async def run(self, ctx):
+            runs.append(1)
+            yield NeedAuth(scheme="oauth2") if auth else NeedInput("which one?")
+
+    e = await env(spec("alpha", Stops()))
+    stream = e.client("alpha", streaming=True)
+
+    async def collect():
+        req = SendMessageRequest(message=fixed_msg("s-i"))
+        return [ev async for ev in stream.send_message(req)]
+
+    first = await asyncio.wait_for(collect(), 10)
+    task_id = first[0].task.id
+    [again] = await asyncio.wait_for(collect(), 5)  # ends: no waiting for the next turn
+    expected = TaskState.TASK_STATE_AUTH_REQUIRED if auth else TaskState.TASK_STATE_INPUT_REQUIRED
+    assert again.task.id == task_id and again.task.status.state == expected
+    assert runs == [1]
+
+
 def test_media_type_matching():
     from a2agw.serve.host import media_type_accepted
+
+    for malformed in ("text", "text/", "/plain", "a/b/c", "   ", "text /plain", "*/*", "text/*"):
+        assert not media_type_accepted(malformed, ["text/*"]), malformed
+        assert not media_type_accepted(malformed, None), malformed
 
     assert media_type_accepted("image/png", ["image/*"])
     assert media_type_accepted("IMAGE/PNG; q=1", ["image/png"])
@@ -934,3 +989,31 @@ async def test_skill_input_modes_widen_what_is_accepted(env):
     )
     [ev] = await send_one(e.client("alpha"), msg_)
     assert ev.task.status.state == TaskState.TASK_STATE_COMPLETED
+
+
+async def test_v03_request_keeps_the_a2a_error_code(env):
+    """0.3 compat: an A2A error from the handler keeps its JSON-RPC code (the SDK would
+    turn it into -32603)."""
+    e = await env(spec("alpha"), max_parts=1)
+    hc = e.http(**{"A2A-Version": "0.3"})
+
+    async def error_of(parts):
+        body = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "message/send",
+            "params": {
+                "message": {
+                    "kind": "message",
+                    "messageId": uuid.uuid4().hex,
+                    "role": "user",
+                    "parts": parts,
+                }
+            },
+        }
+        return (await hc.post("/agents/alpha/", json=body)).json()["error"]
+
+    err = await error_of([{"kind": "file", "file": {"bytes": "aGk=", "mimeType": "image/png"}}])
+    assert err["code"] == -32005 and "image/png" in err["message"]
+    err = await error_of([{"kind": "text", "text": "a"}, {"kind": "text", "text": "b"}])
+    assert err["code"] == -32602 and err["message"] == "too many parts"

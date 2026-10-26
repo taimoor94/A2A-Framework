@@ -427,3 +427,19 @@ async def test_message_ledger_retention_and_purge(engine):
     assert await ledger.reserve(stale, now + RESERVATION_STALE_S + 1) is None
     assert await ledger.purge(now + 1000) == 2
     assert await ledger.get(key) is None
+
+
+async def test_message_ledger_supersede_is_won_once(engine):
+    import asyncio
+
+    from a2agw.serve.store import MessageKey, MessageLedger
+
+    ledger = MessageLedger(engine)
+    await ledger.initialize()
+    key = MessageKey("alpha", "", "anonymous", "m1")
+    assert await ledger.reserve(key, fingerprint="f") is None
+    await ledger.fill(key, "t1", fingerprint="f")
+    wins = await asyncio.gather(*(ledger.supersede(key, "t1", "f") for _ in range(5)))
+    assert sum(wins) == 1
+    assert (await ledger.get(key))["task_id"] is None  # held by the winner
+    assert not await ledger.supersede(key, "t1", "f")  # stale task id: no effect

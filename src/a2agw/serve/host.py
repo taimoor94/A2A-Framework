@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import signal
 import threading
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterator
@@ -16,7 +17,9 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from a2a.compat.v0_3.jsonrpc_adapter import JSONRPC03Adapter
 from a2a.server.context import ServerCallContext
+from a2a.server.jsonrpc_models import JSONRPCError
 from a2a.server.request_handlers import DefaultRequestHandler, RequestHandler
 from a2a.server.routes import (
     create_agent_card_routes,
@@ -34,6 +37,7 @@ from a2a.types import (
 )
 from a2a.types import Message as A2AMessage
 from a2a.utils.errors import (
+    JSON_RPC_ERROR_CODE_MAP,
     A2AError,
     ContentTypeNotSupportedError,
     InternalError,
@@ -282,12 +286,19 @@ def _bare(media_type: str) -> str:
     return media_type.split(";", 1)[0].strip().lower()
 
 
+_MEDIA_TYPE = re.compile(r"[^\s/;*]+/[^\s/;*]+")
+
+
 def media_type_accepted(media_type: str, modes: list[str] | None) -> bool:
     """True when ``media_type`` matches one of ``modes`` (``*/*`` and ``type/*`` wildcards;
-    parameters and case ignored). ``None`` accepts everything."""
+    parameters and case ignored). ``None`` accepts everything well formed. A malformed type
+    (not exactly ``type/subtype``, e.g. ``text`` or ``a/b/c``) is never accepted, so it
+    cannot slip through a ``type/*`` wildcard."""
+    mt = _bare(media_type)
+    if not _MEDIA_TYPE.fullmatch(mt):
+        return False
     if modes is None:
         return True
-    mt = _bare(media_type)
     major = mt.split("/", 1)[0]
     for mode in modes:
         m = _bare(mode)
@@ -314,6 +325,12 @@ _TERMINAL_TASK_STATES = {
     TaskState.TASK_STATE_FAILED,
     TaskState.TASK_STATE_CANCELED,
     TaskState.TASK_STATE_REJECTED,
+}
+
+
+_INTERRUPTED_TASK_STATES = {
+    TaskState.TASK_STATE_INPUT_REQUIRED,
+    TaskState.TASK_STATE_AUTH_REQUIRED,
 }
 
 
@@ -385,19 +402,33 @@ class LimitedRequestHandler(DefaultRequestHandler):
         tenant = params.tenant or str(getattr(context, "tenant", "") or "")
         return MessageKey(self._agent_id, tenant, _owner_of(context), mid)
 
-    async def _duplicate_of(self, key: MessageKey, params: SendMessageRequest) -> str | None:
-        """None when this send owns ``key``; else the task id of the first send. Only an
-        identical request (same fingerprint) is a duplicate."""
+    async def _resolve(
+        self, key: MessageKey, fingerprint: str, context: ServerCallContext
+    ) -> Task | None:
+        """None when this send now owns ``key`` and must run; else the task to answer with.
+
+        Only an identical request (same fingerprint) is a duplicate. A duplicate of an open
+        task gets that task. A duplicate of an ended (or vanished) task takes the key over
+        with a compare-and-set: one of several concurrent re-sends wins and runs, the rest
+        wait for the winner's task and get it, whatever its state by then."""
         assert self._ledger is not None
-        fingerprint = _fingerprint(params)
         loop = asyncio.get_running_loop()
         until = loop.time() + DUPLICATE_WAIT_S
+        saw_other = False  # another send held the key while we waited: share its task
         while True:
             row = await self._ledger.reserve(key, fingerprint=fingerprint)
             if row is None:
                 return None
-            if row["task_id"] is not None:
-                return str(row["task_id"])
+            task_id = row["task_id"]
+            if task_id is not None:
+                task = await self._existing(str(task_id), context, key)
+                if task is not None and (
+                    saw_other or task.status.state not in _TERMINAL_TASK_STATES
+                ):
+                    return task
+                if await self._ledger.supersede(key, str(task_id), row["fingerprint"]):
+                    return None
+            saw_other = True
             if loop.time() >= until:  # the first send is still setting up: refuse, not rerun
                 raise InvalidParamsError(message="duplicate message is still being processed")
             await asyncio.sleep(0.05)
@@ -433,24 +464,22 @@ class LimitedRequestHandler(DefaultRequestHandler):
         key = self._key(params, context)
         if key is None:
             return await super().on_message_send(params, context)
-        dup = await self._duplicate_of(key, params)
-        if dup is not None:
-            task = await self._existing(dup, context, key)
-            if task is not None and task.status.state not in _TERMINAL_TASK_STATES:
-                return task
-            # Gone, or finished: the message id is free for a new message.
-            await self._ledger.release(key, only_unfilled=False)  # type: ignore[union-attr]
-            return await self.on_message_send(params, context)
-        self._pending[id(params)] = (key, _fingerprint(params))
+        fingerprint = _fingerprint(params)
+        task = await self._resolve(key, fingerprint, context)
+        if task is not None:
+            return task
+        self._pending[id(params)] = (key, fingerprint)
         try:
             result = await super().on_message_send(params, context)
         except BaseException:
-            await self._ledger.release(key)  # type: ignore[union-attr]
+            await self._ledger.release(key, fingerprint=fingerprint)  # type: ignore[union-attr]
             raise
         finally:
             self._pending.pop(id(params), None)
         if not isinstance(result, Task):  # a bare Message: no task to return to a re-send
-            await self._ledger.release(key, only_unfilled=False)  # type: ignore[union-attr]
+            await self._ledger.release(  # type: ignore[union-attr]
+                key, only_unfilled=False, fingerprint=fingerprint
+            )
         return result
 
     async def on_message_send_stream(  # type: ignore[override]
@@ -462,33 +491,38 @@ class LimitedRequestHandler(DefaultRequestHandler):
             async for event in super().on_message_send_stream(params, context):
                 yield event
             return
-        while (dup := await self._duplicate_of(key, params)) is not None:
-            task = await self._existing(dup, context, key)
-            if task is not None and task.status.state not in _TERMINAL_TASK_STATES:
-                try:
-                    async for event in self.on_subscribe_to_task(
-                        SubscribeToTaskRequest(id=dup), context
-                    ):
-                        yield event
-                except UnsupportedOperationError:  # it ended meanwhile
-                    final = await self._existing(dup, context)
-                    if final is not None:
-                        yield final
+        fingerprint = _fingerprint(params)
+        task = await self._resolve(key, fingerprint, context)
+        if task is not None:
+            if task.status.state in _TERMINAL_TASK_STATES | _INTERRUPTED_TASK_STATES:
+                # Nothing more will happen until the caller acts: the snapshot is the answer
+                # (subscribing to an input-required task would wait for the next turn).
+                yield task
                 return
-            # Gone, or finished: the message id is free for a new message.
-            await self._ledger.release(key, only_unfilled=False)  # type: ignore[union-attr]
-        self._pending[id(params)] = (key, _fingerprint(params))
+            try:
+                async for event in self.on_subscribe_to_task(
+                    SubscribeToTaskRequest(id=task.id), context
+                ):
+                    yield event
+            except UnsupportedOperationError:  # it ended meanwhile
+                final = await self._existing(task.id, context)
+                if final is not None:
+                    yield final
+            return
+        self._pending[id(params)] = (key, fingerprint)
         task_seen = False
         try:
             async for event in super().on_message_send_stream(params, context):
                 if isinstance(event, A2AMessage) and not task_seen:
-                    await self._ledger.release(key, only_unfilled=False)  # type: ignore[union-attr]
+                    await self._ledger.release(  # type: ignore[union-attr]
+                        key, only_unfilled=False, fingerprint=fingerprint
+                    )
                 else:
                     task_seen = True
                 yield event
         except BaseException:
             if not task_seen:
-                await self._ledger.release(key)  # type: ignore[union-attr]
+                await self._ledger.release(key, fingerprint=fingerprint)  # type: ignore[union-attr]
             raise
         finally:
             self._pending.pop(id(params), None)
@@ -501,6 +535,43 @@ for _method in dir(RequestHandler):
             _method,
             _guard_handler_method(getattr(LimitedRequestHandler, _method)),
         )
+
+
+class _Compat03Adapter(JSONRPC03Adapter):
+    """The SDK's 0.3 JSON-RPC adapter, but an A2A error raised by the handler keeps its
+    JSON-RPC code (the SDK turns every one into -32603 internal error on 0.3 requests)."""
+
+    async def _process_non_streaming_request(  # type: ignore[override]
+        self, request_id: Any, request_obj: Any, context: ServerCallContext
+    ) -> Any:
+        try:
+            return await super()._process_non_streaming_request(request_id, request_obj, context)
+        except A2AError as exc:
+            code = JSON_RPC_ERROR_CODE_MAP.get(type(exc))
+            if code is None:
+                raise
+            message = getattr(exc, "message", None) or str(exc)
+            return self._generate_error_response(
+                request_id, JSONRPCError(code=code, message=message)
+            )
+
+
+def _with_v03_error_codes(routes: list[BaseRoute], handler: Any) -> list[BaseRoute]:
+    """Swap the dispatcher's 0.3 adapter for ``_Compat03Adapter``. Fails loudly if the SDK's
+    layout changes, rather than silently keeping the -32603 mapping."""
+    for route in routes:
+        dispatcher = getattr(getattr(route, "endpoint", None), "__self__", None)
+        old = getattr(dispatcher, "_v03_adapter", None)
+        if not isinstance(old, JSONRPC03Adapter):
+            raise RuntimeError(  # noqa: TRY004 - an SDK layout change, not a caller error
+                "unsupported a2a-sdk version: no v0.3 JSON-RPC adapter found"
+            )
+        dispatcher._v03_adapter = _Compat03Adapter(  # type: ignore[union-attr]
+            http_handler=handler,
+            context_builder=dispatcher._context_builder,  # type: ignore[union-attr]
+            shutdown_grace_period=dispatcher._shutdown_grace_period,  # type: ignore[union-attr]
+        )
+    return routes
 
 
 class _BodyLimitMiddleware:
@@ -1026,8 +1097,11 @@ class AgentHost:
             sub_routes: list[BaseRoute] = [
                 *create_agent_card_routes(card, cache_control=self.card_cache_control)
             ]
-            sub_routes += create_jsonrpc_routes(
-                handler, rpc_url="/", context_builder=builder, enable_v0_3_compat=True
+            sub_routes += _with_v03_error_codes(
+                create_jsonrpc_routes(
+                    handler, rpc_url="/", context_builder=builder, enable_v0_3_compat=True
+                ),
+                handler,
             )
             # REST under "/rest": the card's interface URL is ".../rest" with its ``tenant``
             # field, so SDK clients call ".../rest/{tenant}/...". The SDK's own "/{tenant}"
