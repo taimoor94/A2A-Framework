@@ -30,10 +30,17 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from a2agw.consult.credentials import ChainCredentials, CredentialProvider, EnvCredentials
-from a2agw.consult.netguard import Tier, UnsafeURL
+from a2agw.consult.netguard import Tier, UnsafeURL, require_https
 from a2agw.consult.oauth import OAuthClientCredentials, OAuthTokenExchange
 from a2agw.consult.registry import CardFetchError, PartnerRegistry
 from a2agw.consult.tls import TlsClientConfig
@@ -100,6 +107,17 @@ _NAME_MAPS = frozenset(
 # userinfo password in a URL: scheme://user:PASSWORD@host
 _URL_PASSWORD = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://[^/@:]*:([^/@]*)@")
 _WHOLE_VAR = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?::-[^}]*)?\}")
+# The default part of ${VAR:-default} (as ``interpolate`` reads it: up to the first "}").
+_VAR_DEFAULT = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*:-([^}]*)\}")
+
+
+def _https_only(url: str) -> str:
+    """Config-load check: an https URL (plain http only with ``A2AGW_DEV=1``)."""
+    try:
+        require_https(url)
+    except UnsafeURL as e:
+        raise ValueError(str(e)) from None
+    return url
 
 
 class AgentRef(BaseModel):
@@ -158,7 +176,8 @@ class TrustConfig(BaseModel):
 
     model_config = _FORBID
     card_keys: dict[str, str] = Field(default_factory=dict)  # kid -> PEM public key file
-    jwks_urls: list[str] = Field(default_factory=list)  # allowlisted jku URLs
+    jwks_urls: list[str] = Field(default_factory=list)  # allowlisted jku URLs (https)
+    jwks_tier: TierName = "public"  # netguard tier the JWKS hosts are vetted with
     require_signed: list[TierName] = Field(default_factory=list)
     context_issuers: dict[str, ContextIssuerConfig] = Field(default_factory=dict)
 
@@ -168,13 +187,21 @@ class TrustConfig(BaseModel):
             raise ValueError("require_signed needs card_keys or jwks_urls")
         return self
 
+    @field_validator("jwks_urls")
+    @classmethod
+    def _https_jwks(cls, v: list[str]) -> list[str]:
+        for url in v:
+            _https_only(url)
+        return v
+
 
 class OAuthConfig(BaseModel):
     """An OAuth2 credential for the partners whose ``credential_ref`` is this entry's key."""
 
     model_config = _FORBID
     type: Literal["client_credentials", "token_exchange"]
-    token_url: str
+    token_url: str  # https on every tier (plain http only with A2AGW_DEV=1)
+    token_tier: TierName = "public"  # netguard tier the token endpoint is vetted with
     client_id: str
     client_secret_env: str  # name of the env var holding the client secret
     scope: str | None = None
@@ -182,6 +209,11 @@ class OAuthConfig(BaseModel):
     # token_exchange only: a client_credentials entry used for maintenance calls (cascade
     # cancels, recovery) when there is no inbound caller token to exchange.
     fallback: str | None = None
+
+    @field_validator("token_url")
+    @classmethod
+    def _https_token_url(cls, v: str) -> str:
+        return _https_only(v)
 
     @model_validator(mode="after")
     def _shape(self) -> OAuthConfig:
@@ -314,13 +346,23 @@ def _reject_inline_secrets(node: Any, source: str, path: str = "") -> None:
     elif isinstance(node, list):
         for i, v in enumerate(node):
             _reject_inline_secrets(v, source, f"{path}.{i}")
-    if path == "db_url" and isinstance(node, str):
-        m = _URL_PASSWORD.match(node)
-        if m and m.group(1) and not _WHOLE_VAR.fullmatch(m.group(1)):
-            raise ConfigError(
-                f"{source}: db_url: inline database password; use ${{VAR}} for it "
-                "(or for the whole URL)"
-            )
+    if path == "db_url" and isinstance(node, str) and _inline_password(node):
+        raise ConfigError(
+            f"{source}: db_url: inline database password; use ${{VAR}} for it "
+            "(or for the whole URL)"
+        )
+
+
+def _inline_password(url: str) -> bool:
+    """A literal userinfo password in ``url``, or in the ``:-default`` part of any
+    ``${VAR:-default}`` in it (the default is used whenever the variable is unset)."""
+    m = _URL_PASSWORD.match(url)
+    if m and m.group(1) and not _WHOLE_VAR.fullmatch(m.group(1)):
+        return True
+    return any(
+        default is not None and _inline_password(default)
+        for default in (d.group(1) for d in _VAR_DEFAULT.finditer(url))
+    )
 
 
 def load_config(path: str | Path, env: dict[str, str] | None = None) -> GatewayConfig:
@@ -451,7 +493,7 @@ def card_verifier(cfg: GatewayConfig, config_dir: Path | str) -> CardVerifier | 
         kid: _public_key(config_dir, f, f"trust.card_keys.{kid}") for kid, f in t.card_keys.items()
     }
     try:
-        return CardVerifier(trusted=keys, jwks_urls=list(t.jwks_urls))
+        return CardVerifier(trusted=keys, jwks_urls=list(t.jwks_urls), jwks_tier=t.jwks_tier)
     except (ValueError, UnsafeURL) as e:
         raise ConfigError(f"trust: {e}") from None
 
@@ -498,6 +540,7 @@ def credentials_provider(cfg: GatewayConfig) -> CredentialProvider:
                         o.audience,
                         {ref},
                         fallback=fallback,
+                        tier=o.token_tier,
                     )
                 )
     except (ValueError, UnsafeURL) as e:
@@ -513,6 +556,7 @@ def _client_credentials(o: OAuthConfig, ref: str) -> OAuthClientCredentials:
         scope=o.scope,
         audience=o.audience,
         refs={ref},
+        tier=o.token_tier,
     )
 
 
@@ -561,8 +605,40 @@ def _policy(cfg: GatewayConfig, config_dir: Path) -> PolicyEngine | None:
     return PolicyEngine(policy, classifier=classifier)
 
 
-def build_host(cfg: GatewayConfig, *, config_dir: Path | str = ".") -> AgentHost:
+def server_run_kwargs(cfg: GatewayConfig, *, config_dir: Path | str = ".") -> dict[str, Any]:
+    """``AgentHost.run`` keyword arguments for the config's ``server_tls`` (HTTPS, and mTLS
+    with ``require_client_cert``); empty without it. ``a2agw serve`` uses this; code that
+    builds the host with ``build_host`` passes it on: ``host.run(**server_run_kwargs(cfg))``.
+    ConfigError (naming the file) for a missing certificate or key file."""
+    tls = cfg.server_tls
+    if tls is None:
+        return {}
     config_dir = Path(config_dir).resolve()
+    return {
+        "ssl_certfile": str(config_file(config_dir, tls.cert_file, "server_tls.cert_file")),
+        "ssl_keyfile": str(config_file(config_dir, tls.key_file, "server_tls.key_file")),
+        "ssl_ca_certs": (
+            str(config_file(config_dir, tls.ca_file, "server_tls.ca_file"))
+            if tls.ca_file is not None
+            else None
+        ),
+        "require_client_cert": tls.require_client_cert,
+    }
+
+
+def build_host(cfg: GatewayConfig, *, config_dir: Path | str = ".") -> AgentHost:
+    """An ``AgentHost`` for the config, agents added (partners are registered separately,
+    by ``register_partners``).
+
+    ``server_tls`` is not part of the host: it applies when the server starts. ``a2agw
+    serve`` applies it; with ``build_host``, run the host with
+    ``host.run(**server_run_kwargs(cfg, config_dir=...))`` (a WARNING says so)."""
+    config_dir = Path(config_dir).resolve()
+    if cfg.server_tls is not None:
+        logger.warning(
+            "server_tls is applied when the server starts: pass "
+            "server_run_kwargs(cfg) to host.run() (a2agw serve does this)"
+        )
     card_signer, context_signer = _signers(cfg, config_dir)
     reg = registry_options(cfg, config_dir)
     push = None
@@ -698,5 +774,6 @@ __all__ = [
     "partners_path",
     "register_partners",
     "registry_options",
+    "server_run_kwargs",
     "tls_configs",
 ]

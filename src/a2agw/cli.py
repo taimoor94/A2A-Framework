@@ -24,12 +24,12 @@ from a2agw.config import (
     ConfigError,
     GatewayConfig,
     build_host,
-    config_file,
     credentials_provider,
     load_config,
     partners_path,
     register_partners,
     registry_options,
+    server_run_kwargs,
 )
 from a2agw.consult.guarded_net import fixed_tier, guarded_async_client
 from a2agw.consult.netguard import UnsafeURL, check_url
@@ -419,15 +419,15 @@ def serve(
             raise ConfigError(f"{flag}: file {f} not found")
     cfg = load_config(config)
     config_dir = config.resolve().parent
-    tls = cfg.server_tls
-    if tls is not None and ssl_certfile is None:
-        ssl_certfile = str(config_file(config_dir, tls.cert_file, "server_tls.cert_file"))
+    tls = server_run_kwargs(cfg, config_dir=config_dir)
+    if tls and ssl_certfile is None:
+        ssl_certfile = tls["ssl_certfile"]
         if ssl_keyfile is None:
-            ssl_keyfile = str(config_file(config_dir, tls.key_file, "server_tls.key_file"))
-    if tls is not None and ssl_ca_certs is None and tls.ca_file is not None:
-        ssl_ca_certs = str(config_file(config_dir, tls.ca_file, "server_tls.ca_file"))
-    require_client_cert = require_client_cert or (tls is not None and tls.require_client_cert)
-    gw = build_host(cfg, config_dir=config_dir)
+            ssl_keyfile = tls["ssl_keyfile"]
+    if tls and ssl_ca_certs is None:
+        ssl_ca_certs = tls["ssl_ca_certs"]
+    require_client_cert = require_client_cert or bool(tls.get("require_client_cert"))
+    gw = build_host(cfg.model_copy(update={"server_tls": None}), config_dir=config_dir)
     _db_run(cfg.db_url, _check_db(cfg.db_url))
     asyncio.run(register_partners(gw, cfg, config_dir=config_dir))
     gw.run(

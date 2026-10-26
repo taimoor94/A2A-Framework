@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
 from jwt.utils import base64url_decode, base64url_encode
 
 from a2agw.consult import netguard
+from a2agw.consult.netguard import UnsafeURL
 from a2agw.core.events import Done
 from a2agw.security.cardsign import (
     CardSignatureError,
@@ -219,9 +220,9 @@ async def test_jwks_fetch_ssrf_guarded(keys):
     with pytest.raises(CardSignatureError):
         await CardVerifier(jwks_urls=[meta]).verify(signed)
     plain = "http://169.254.169.254/"
-    signed = signer(keys, "ec", kid="k7", jku=plain).sign(card())
-    with pytest.raises(CardSignatureError):
-        await CardVerifier(jwks_urls=[plain]).verify(signed)
+    # A plain-http JWKS URL is refused outright, on every tier (I5).
+    with pytest.raises(UnsafeURL, match="https"):
+        CardVerifier(jwks_urls=[plain])
     assert not route.called
 
 

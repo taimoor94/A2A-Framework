@@ -31,7 +31,14 @@ from jwt.algorithms import ECAlgorithm, OKPAlgorithm, RSAAlgorithm
 from jwt.exceptions import PyJWKError
 from jwt.utils import base64url_decode, base64url_encode
 
-from a2agw.consult.netguard import FetchError, UnsafeURL, check_url_syntax, safe_get
+from a2agw.consult.netguard import (
+    FetchError,
+    Tier,
+    UnsafeURL,
+    check_url_syntax,
+    require_https,
+    safe_get,
+)
 
 Alg = Literal["ES256", "RS256", "EdDSA"]
 ALGORITHMS: tuple[str, ...] = get_args(Alg)
@@ -221,7 +228,13 @@ class CardVerifier:
         trusted: dict[str, PyJWK] | None = None,
         jwks_urls: list[str] | tuple[str, ...] = (),
         http: httpx.AsyncClient | None = None,
+        *,
+        jwks_tier: Tier = "public",
     ) -> None:
+        if jwks_tier not in ("internal", "partner", "public"):
+            raise ValueError(f"invalid jwks tier: {jwks_tier!r}")
+        # The netguard tier JWKS hosts are vetted with; https is required on every tier.
+        self.jwks_tier: Tier = jwks_tier
         self.trusted = dict(trusted or {})
         for kid, key in self.trusted.items():
             try:
@@ -229,7 +242,7 @@ class CardVerifier:
             except ValueError:
                 raise ValueError(f"trusted key {kid!r} is not an allowed key/algorithm") from None
         for url in jwks_urls:
-            check_url_syntax(url)
+            require_https(url)
         self.jwks_urls = frozenset(jwks_urls)
         self._http = http
         self._jwks: dict[str, tuple[float, dict[str, PyJWK]]] = {}
@@ -237,9 +250,10 @@ class CardVerifier:
 
     async def _fetch_jwks(self, url: str) -> dict[str, PyJWK]:
         try:
+            require_https(url)
             body = await safe_get(
                 url,
-                "public",
+                self.jwks_tier,
                 max_bytes=JWKS_MAX_BYTES,
                 deadline_s=JWKS_DEADLINE_S,
                 http=self._http,

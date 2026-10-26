@@ -268,3 +268,13 @@ async def _capped(
     except httpx.HTTPError as e:
         raise FetchError(f"request failed: {type(e).__name__}") from None
     return bytes(buf)
+
+
+def require_https(url: str) -> None:
+    """UnsafeURL unless ``url`` is https, whatever its tier (plain http only with
+    ``A2AGW_DEV=1``). For endpoints that hand out keys or tokens: the OAuth token endpoint
+    and card JWKS URLs, which may be vetted with the ``internal`` tier (that tier alone
+    allows http)."""
+    scheme, _ = check_url_syntax(url)
+    if scheme != "https" and os.environ.get("A2AGW_DEV") != "1":
+        raise UnsafeURL("https is required")

@@ -1,7 +1,8 @@
 """OAuth2 outbound credentials: client credentials (RFC 6749 4.4) and token exchange (RFC 8693).
 
-Both providers fetch tokens from a ``token_url`` that must pass ``check_url(..., "public")``,
-with no redirects, a 64 KiB response cap and a 10 s deadline. They authenticate as the client
+Both providers fetch tokens from a ``token_url`` that must be https (plain http only with
+``A2AGW_DEV=1``) and pass ``check_url(..., tier)`` (``tier`` defaults to ``public``; use
+``internal`` for an identity provider on a private network), with no redirects, a 64 KiB response cap and a 10 s deadline. They authenticate as the client
 with HTTP Basic (the secret is read from an environment variable at fetch time, never kept),
 cache tokens until 30 s before they expire, fetch at most once at a time per cache key
 (a failed fetch is remembered for 5 s, so callers queued behind it fail fast during an
@@ -35,7 +36,7 @@ import httpx
 import jwt
 
 from a2agw.consult.credentials import CredentialError, CredentialProvider, MissingCredential
-from a2agw.consult.netguard import FetchError, UnsafeURL, check_url_syntax, safe_post
+from a2agw.consult.netguard import FetchError, Tier, UnsafeURL, require_https, safe_post
 from a2agw.consult.registry import PartnerRecord
 from a2agw.context.call_context import current_inbound_token, maintenance_call
 from a2agw.security.principal import Principal
@@ -84,8 +85,13 @@ class _OAuthProvider:
         refs: set[str] | None,
         http: httpx.AsyncClient | None,
         cache_size: int,
+        tier: Tier = "public",
     ) -> None:
-        check_url_syntax(token_url)  # fail early; the full public-tier check runs per fetch
+        if tier not in ("internal", "partner", "public"):
+            raise ValueError(f"invalid token endpoint tier: {tier!r}")
+        # Fail early (https on every tier); the full tier check runs per fetch.
+        require_https(token_url)
+        self.tier: Tier = tier
         self.token_url = token_url
         self.client_id = client_id
         self.client_secret_env = client_secret_env
@@ -180,9 +186,10 @@ class _OAuthProvider:
             "Accept": "application/json",
         }
         try:
+            require_https(self.token_url)
             body = await safe_post(
                 self.token_url,
-                "public",
+                self.tier,
                 data=form,
                 headers=headers,
                 max_bytes=TOKEN_MAX_BYTES,
@@ -247,8 +254,12 @@ class OAuthClientCredentials(_OAuthProvider):
         audience: str | None = None,
         refs: set[str] | None = None,
         http: httpx.AsyncClient | None = None,
+        *,
+        tier: Tier = "public",
     ) -> None:
-        super().__init__(token_url, client_id, client_secret_env, refs, http, cache_size=1)
+        super().__init__(
+            token_url, client_id, client_secret_env, refs, http, cache_size=1, tier=tier
+        )
         self.scope = scope
         self.audience = audience
 
@@ -300,12 +311,19 @@ class OAuthTokenExchange(_OAuthProvider):
         *,
         http: httpx.AsyncClient | None = None,
         fallback: CredentialProvider | None = None,
+        tier: Tier = "public",
     ) -> None:
         if not refs:
             raise ValueError("OAuthTokenExchange requires a non-empty refs set")
         self.fallback = fallback
         super().__init__(
-            token_url, client_id, client_secret_env, refs, http, cache_size=EXCHANGE_CACHE_SIZE
+            token_url,
+            client_id,
+            client_secret_env,
+            refs,
+            http,
+            cache_size=EXCHANGE_CACHE_SIZE,
+            tier=tier,
         )
         self.audience = audience
 

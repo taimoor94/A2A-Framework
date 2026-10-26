@@ -254,12 +254,15 @@ signing:                         # our key: signs our cards, push JWTs and call 
 trust:                           # partner cards and partner call contexts
   card_keys:                     # pinned partner keys: kid -> PEM public key file
     acme-1: keys/acme.pub.pem
-  jwks_urls:                     # allowlisted jku URLs (fetched SSRF-guarded, public tier)
+  jwks_urls:                     # allowlisted jku URLs (https; fetched SSRF-guarded)
     - https://agents.acme.example/.well-known/jwks.json
+  jwks_tier: public              # netguard tier for the JWKS hosts (internal: private network)
   require_signed: [partner, public]   # tiers whose cards must carry a valid signature
 ```
 
 Every card the host serves (per agent and the root card) is signed with JWS over the RFC 8785 canonical card. A partner card is verified on registration and on every refresh against the pinned keys or an allowlisted `jku`; only ES256, RS256 and EdDSA are accepted (`alg: none` and HS256 are refused). On a `require_signed` tier an unsigned, tampered or untrusted card is refused. A refreshed card signed by a different key, or with a signature that no longer verifies, is quarantined like any other significant change until you `a2agw partners approve` its hash. The `partners` commands use the same `trust` and `tls` settings as `serve`.
+
+The `require_signed` rule holds for every stored record, however it got there: a record of a required tier without a verified key (registered before `require_signed` was turned on, written into `partners.yaml` by hand) or whose key is no longer trusted (removed from `card_keys`, its key material replaced, its `jku` no longer allowlisted, or a stored card that no longer verifies against its pinned key) is quarantined on load, reload and startup, with the reason `unsigned card` or `signing key no longer trusted` in its `partner.quarantine` audit row, and consulting it returns `unavailable` with that reason. Approving it is refused; `a2agw partners verify` fetches the card again and, if it is now signed by a trusted key, stages it for approval. A running host also refreshes partner cards when their `ttl_s` (default 1 h) has passed, in its maintenance pass (at most 20 per pass): a changed card, a changed signing key or a failed signature quarantines the partner; an unreachable card URL leaves it as it is and logs a warning. `jwks_urls` must be https (plain http only with `A2AGW_DEV=1`), whatever `jwks_tier` says.
 
 ### Signed call contexts
 
@@ -284,6 +287,7 @@ oauth:                           # each key is a credential_ref
     client_secret_env: ACME_CLIENT_SECRET   # the env var holding the secret
     scope: a2a                   # optional
     audience: https://agents.acme.example   # optional
+    token_tier: public           # optional: netguard tier for token_url (internal: private IdP)
   acme-obo:                      # RFC 8693: exchange the inbound caller's JWT per call
     type: token_exchange
     token_url: https://login.acme.example/oauth/token
@@ -296,7 +300,7 @@ partners:
   - {id: acme, url: "https://agents.acme.example/agents/support/", tier: partner, credential_ref: acme-obo}
 ```
 
-A credential ref is either a static `credentials` entry or an `oauth` entry, never both. Token requests go through the SSRF-guarded client (public tier, https). Tokens are cached until shortly before expiry; a partner's 401 before it accepts a send drops the token and resends once with a fresh one. A token exchange needs an inbound JWT: when the caller authenticated with an API key (or there is no inbound call), the consult fails with "credential error" and nothing is sent.
+A credential ref is either a static `credentials` entry or an `oauth` entry, never both. Token requests go through the SSRF-guarded client for `token_tier` (default `public`; `internal` for an identity provider on a private network), and `token_url` must be https on every tier (plain http only with `A2AGW_DEV=1`; checked when the config is loaded). Tokens are cached until shortly before expiry; a partner's 401 before it accepts a send drops the token and resends once with a fresh one. A token exchange needs an inbound JWT: when the caller authenticated with an API key (or there is no inbound call), the consult fails with "credential error" and nothing is sent.
 
 ### mTLS
 
@@ -315,7 +319,7 @@ server_tls:                      # inbound HTTPS for `a2agw serve`
 
 One mapping built from `tls:` is shared by the registry (card fetches) and the partner client (calls); a partner with `tls_ref` then uses a dedicated TLS 1.2+ client that presents that certificate and trusts `ca_file`. An unknown `tls_ref` is a config error (and, for records added otherwise, fails closed at call time: `unavailable`, "tls config missing"). `a2agw partners add ... --tls-ref acme` registers a partner over mTLS. In code: `AgentHost(tls={"acme": TlsClientConfig(cert_file, key_file, ca_file)})`.
 
-Inbound: `server_tls`, or the flags `a2agw serve --ssl-certfile F --ssl-keyfile F [--ssl-ca-certs F --require-client-cert]` (the flags win), or `AgentHost.run(ssl_*=...)`. The client certificate is verified at the TLS layer only; ASGI servers do not expose it, so identity still comes from the API key or JWT. Certificates are loaded at startup; rotating them requires a restart. Passphrase-protected keys are refused, and a group- or world-readable key file logs a warning.
+Inbound: `server_tls`, or the flags `a2agw serve --ssl-certfile F --ssl-keyfile F [--ssl-ca-certs F --require-client-cert]` (the flags win), or `AgentHost.run(ssl_*=...)`. `server_tls` applies when the server starts, so code that builds the host with `build_host(cfg)` must pass it on: `host.run(**server_run_kwargs(cfg, config_dir=...))` (`build_host` logs a warning when `server_tls` is set). The client certificate is verified at the TLS layer only; ASGI servers do not expose it, so identity still comes from the API key or JWT. Certificates are loaded at startup; rotating them requires a restart. Passphrase-protected keys are refused, and a group- or world-readable key file logs a warning.
 
 Troubleshooting: when a partner rejects our client certificate under TLS 1.3, the result can show "delivery unknown" instead of "partner unreachable", because the platform reports a plain connection reset. The gateway deliberately never resends in that case.
 
@@ -438,10 +442,10 @@ telemetry:
 
 # Phase 2 sections, each optional (worked examples under Security hardening):
 # signing: {key_file, kid, alg, jku?, issuer?}
-# trust: {card_keys: {kid: pem_file}, jwks_urls: [...], require_signed: [tiers],
+# trust: {card_keys: {kid: pem_file}, jwks_urls: [...], jwks_tier?, require_signed: [tiers],
 #         context_issuers: {kid: {issuer, key_file}}}
 # oauth: {<credential_ref>: {type: client_credentials | token_exchange, token_url, client_id,
-#         client_secret_env, scope?, audience?, fallback?}}
+#         client_secret_env, scope?, audience?, fallback?, token_tier?}}
 # tls: {<tls_ref>: {cert_file, key_file, ca_file?}}
 # server_tls: {cert_file, key_file, ca_file?, require_client_cert?}
 # policy_file: policy.yaml
