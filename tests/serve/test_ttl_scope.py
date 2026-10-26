@@ -198,9 +198,10 @@ async def test_pass_deadline_leaves_unstarted_handles_for_the_next_pass(store):
     await _old(eng, handles, *ids)
 
     async def slow(h):
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(5)  # outlasts the pass deadline
 
-    report = await expire_outbound(handles, slow, None, ttl_s=86400, pass_deadline_s=0.1)
+    # The deadline leaves the first wave ample time to claim, even on a loaded machine.
+    report = await expire_outbound(handles, slow, None, ttl_s=86400, pass_deadline_s=1.0)
     assert report.expired == 8  # the first wave was claimed; the rest was not started
     left = [tid for tid in ids if (await handles.get("p", tid))["state"] == W]
     assert len(left) == 4

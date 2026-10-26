@@ -265,7 +265,7 @@ async def test_maintenance_refresh_is_bounded(tmp_path, monkeypatch):
         nonlocal running, peak
         running += 1
         peak = max(peak, running)
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0.05)
         running -= 1
         import httpx
 

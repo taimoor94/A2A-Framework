@@ -206,7 +206,10 @@ async def test_concurrent_tasks_per_caller_are_capped_isolated_and_released(env)
     try:
         await send(alice)
         await send(alice)
-        await asyncio.sleep(0.05)  # both runs have started
+        for _ in range(500):  # both runs have started (and hold their slots)
+            if e.host.caller_limiter.count("key:alice") == 2:
+                break
+            await asyncio.sleep(0.01)
         with pytest.raises(InvalidRequestError, match="too many concurrent tasks"):
             await send(alice)
         await send(bob)  # another principal is not affected
