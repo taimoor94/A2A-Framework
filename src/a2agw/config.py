@@ -602,45 +602,72 @@ async def register_partners(
 ) -> None:
     """Register config-listed partners that are not yet in the registry.
 
-    Existing URL partners are refreshed (a changed card is quarantined, never overwritten).
-    Existing card_file partners are left alone.
-    An unreachable or unsafe URL partner logs a warning and startup continues; its state is unchanged.
+    Existing partners: the config entry is authoritative for ``tier``, ``credential_ref``,
+    ``tls_ref`` and ``tags``. A difference is applied to the record, logged as a WARNING
+    naming the fields (never their values) and audited as ``partner.update`` (actor
+    "config"). Existing URL partners are then refreshed (a changed card is quarantined, never
+    overwritten); existing card_file partners keep their stored card.
+    An unreachable or unsafe URL partner logs a warning and startup continues; its state is
+    unchanged. Every record is finally checked against ``require_signed`` (quarantined if it
+    breaks it). Changes made here are audited with actor "config".
     """
     config_dir = Path(config_dir).resolve()
     reg = host.partners
-    reg.load()
-    known = {r.id for r in reg.all()}
-    for p in cfg.partners:
-        if p.id in known:
+    with reg.acting_as("config"):
+        reg.load()
+        known = {r.id for r in reg.all()}
+        for p in cfg.partners:
+            if p.id in known:
+                _apply_drift(reg, p)
+                if p.url is not None:
+                    try:
+                        await reg.refresh(p.id)
+                    except (CardFetchError, UnsafeURL) as e:
+                        logger.warning("partner %s: refresh failed (%s); state unchanged", p.id, e)
+                continue
             if p.url is not None:
                 try:
-                    await reg.refresh(p.id)
+                    await reg.add_from_url(
+                        p.id,
+                        p.url,
+                        p.tier,
+                        credential_ref=p.credential_ref,
+                        tags=p.tags,
+                        tls_ref=p.tls_ref,
+                    )
                 except (CardFetchError, UnsafeURL) as e:
-                    logger.warning("partner %s: refresh failed (%s); state unchanged", p.id, e)
-            continue
-        if p.url is not None:
-            try:
-                await reg.add_from_url(
+                    logger.warning("partner %s: not registered (%s); continuing", p.id, e)
+            else:
+                assert p.card_file is not None
+                card = _read_card(config_dir / p.card_file)
+                await reg.add_from_card(
                     p.id,
-                    p.url,
+                    card,
                     p.tier,
                     credential_ref=p.credential_ref,
                     tags=p.tags,
                     tls_ref=p.tls_ref,
                 )
-            except (CardFetchError, UnsafeURL) as e:
-                logger.warning("partner %s: not registered (%s); continuing", p.id, e)
-        else:
-            assert p.card_file is not None
-            card = _read_card(config_dir / p.card_file)
-            await reg.add_from_card(
-                p.id,
-                card,
-                p.tier,
-                credential_ref=p.credential_ref,
-                tags=p.tags,
-                tls_ref=p.tls_ref,
-            )
+        reg.enforce_signed()
+
+
+def _apply_drift(reg: PartnerRegistry, p: PartnerConfig) -> None:
+    """Make an existing record match its config entry (I9); WARNING with field names only."""
+    clear = [f for f in ("credential_ref", "tls_ref") if getattr(p, f) is None]
+    fields = reg.update_settings(
+        p.id,
+        tier=p.tier,
+        credential_ref=p.credential_ref,
+        tls_ref=p.tls_ref,
+        tags=p.tags,
+        clear=clear,
+    )
+    if fields:
+        logger.warning(
+            "partner %s: config differs from the registry in %s; the config entry is applied",
+            p.id,
+            ", ".join(fields),
+        )
 
 
 __all__ = [

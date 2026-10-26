@@ -126,6 +126,33 @@ def registry_audit_action(
     return REGISTRY_ACTIONS.get(event)
 
 
+def registry_audit_event(
+    rec: Any, event: str, info: dict[str, Any] | None = None
+) -> AuditEvent | None:
+    """The audit row for a ``PartnerRegistry`` change (None for events not audited).
+    ``info`` is the registry's ``change_info``: actor, reason, changed field names."""
+    info = info or {}
+    action = registry_audit_action(rec, event, info)
+    if action is None:
+        return None
+    detail: dict[str, Any] = {
+        "tier": rec.tier,
+        "state": rec.status,
+        "key_id": rec.signed_key_id,
+    }
+    if info.get("reason"):
+        detail["reason"] = info["reason"]
+    if info.get("fields"):
+        detail["fields"] = ",".join(info["fields"])
+    return AuditEvent(
+        actor=str(info.get("actor") or "system"),
+        action=action,
+        partner_id=rec.id,
+        outcome=rec.status,
+        detail=detail,
+    )
+
+
 DETAIL_MAX_CHARS = 256
 FIELD_MAX_CHARS = 256
 GENESIS_HASH = "0" * 64

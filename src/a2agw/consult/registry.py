@@ -8,7 +8,8 @@ import json
 import os
 import re
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -44,6 +45,8 @@ COSMETIC_FIELDS = frozenset({"version", "documentationUrl", "iconUrl", "provider
 _NOT_COMPARED = COSMETIC_FIELDS | {"signatures"}
 
 Status = Literal["active", "quarantined", "disabled"]
+# Record fields owned by the operator (the config file is authoritative for them).
+_SETTINGS = ("tier", "credential_ref", "tls_ref", "tags")
 # Quarantine reasons of the require_signed invariant (see ``PartnerRegistry.signed_violation``).
 UNSIGNED = "unsigned card"
 KEY_UNTRUSTED = "signing key no longer trusted"
@@ -192,6 +195,7 @@ class PartnerRegistry:
         # (e.g. {"reason": ..., "actor": ..., "fields": ...}); None outside of it.
         self.change_info: dict[str, Any] | None = None
         self._listeners: list[Callable[[PartnerRecord, str], None]] = []
+        self._actor: str | None = None  # see ``acting_as``
 
     # -- fetching -------------------------------------------------------
     async def _fetch(self, card_url: str, tier: Tier, tls_ref: str | None = None) -> dict[str, Any]:
@@ -468,6 +472,53 @@ class PartnerRegistry:
         return list(self._records.values())
 
     # -- persistence ----------------------------------------------------
+    @contextmanager
+    def acting_as(self, actor: str) -> Iterator[None]:
+        """Changes made inside report ``change_info["actor"] = actor`` (e.g. "config" while
+        ``register_partners`` applies the config file, ``cli:<user>`` for the CLI)."""
+        previous, self._actor = self._actor, actor
+        try:
+            yield
+        finally:
+            self._actor = previous
+
+    def update_settings(
+        self,
+        id: str,
+        *,
+        tier: Tier | None = None,
+        credential_ref: str | None = None,
+        tls_ref: str | None = None,
+        tags: Iterable[str] | None = None,
+        clear: Iterable[str] = (),
+    ) -> list[str]:
+        """Set operator-owned fields of a record (``tier``, ``credential_ref``, ``tls_ref``,
+        ``tags``); ``clear`` names ref fields to set to None. Returns the names of the fields
+        that changed (reported as one "updated" event with ``change_info["fields"]``). A new
+        tier is then checked against require_signed (quarantined if it now breaks it)."""
+        rec = self.get(id)
+        wanted: dict[str, Any] = {}
+        if tier is not None:
+            wanted["tier"] = tier
+        if credential_ref is not None:
+            wanted["credential_ref"] = credential_ref
+        if tls_ref is not None:
+            wanted["tls_ref"] = tls_ref
+        if tags is not None:
+            wanted["tags"] = list(tags)
+        for name in clear:
+            if name not in ("credential_ref", "tls_ref"):
+                raise ValueError(f"cannot clear {name}")
+            wanted[name] = None
+        fields = [f for f in _SETTINGS if f in wanted and getattr(rec, f) != wanted[f]]
+        if not fields:
+            return []
+        for f in fields:
+            setattr(rec, f, wanted[f])
+        self._changed(rec, "updated", fields=fields)
+        self.enforce_signed([id])
+        return fields
+
     def _changed(self, rec: PartnerRecord, event: str, **info: Any) -> None:
         self._version += 1
         if self.path is not None:
@@ -483,7 +534,10 @@ class PartnerRegistry:
         callbacks = [cb for cb in (self.on_change, *self._listeners) if cb is not None]
         if not callbacks:
             return
-        self.change_info = dict(info) if info else None
+        info = dict(info or {})
+        if self._actor is not None:
+            info.setdefault("actor", self._actor)
+        self.change_info = info or None
         try:
             for cb in callbacks:
                 cb(rec, event)

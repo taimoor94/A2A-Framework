@@ -11,6 +11,7 @@ import os
 import re
 import signal
 import threading
+import time
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterable, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
@@ -59,13 +60,13 @@ from a2agw._ddl import retry_ddl
 from a2agw.consult.client import PartnerClient
 from a2agw.consult.credentials import CredentialProvider
 from a2agw.consult.handles import OutboundHandleStore
-from a2agw.consult.netguard import Tier
-from a2agw.consult.registry import PartnerRecord, PartnerRegistry
+from a2agw.consult.netguard import Tier, UnsafeURL
+from a2agw.consult.registry import CardFetchError, PartnerRecord, PartnerRegistry
 from a2agw.consult.tls import TlsClientConfig
 from a2agw.consult.tools import PartnerTool, partner_tools
 from a2agw.context.signing import CallContextSigner, CallContextVerifier
 from a2agw.ops.admin import ADMIN_PREFIX, HEALTH_PATH, admin_routes
-from a2agw.ops.audit import AuditEvent, AuditLog, registry_audit_action
+from a2agw.ops.audit import AuditEvent, AuditLog, registry_audit_event
 from a2agw.ops.bus import EventBus
 from a2agw.security.auth import (
     AuthConfig,
@@ -112,6 +113,8 @@ from a2agw.serve.store import (
 CARD_PATH = "/.well-known/agent-card.json"
 logger = logging.getLogger(__name__)
 _AGENT_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+REFRESH_MAX_PER_PASS = 20  # partner cards refreshed per maintenance pass
+REFRESH_CONCURRENCY = 4
 _EARLY_AUDIT_MAX = 1000  # registry changes kept for the audit log until startup
 _EXIT_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 # Default bound on uvicorn's wait for open requests at shutdown.
@@ -1194,7 +1197,44 @@ class AgentHost:
             agent_ids=set(self.specs),
         )
         await self.ledger.purge(now)
+        await self.refresh_due_partners(now=now)
         return report
+
+    async def refresh_due_partners(self, *, now: float | None = None) -> dict[str, str]:
+        """Spec 7.3 / 8.7: refresh the cards of URL partners whose ``fetched_at + ttl_s`` has
+        passed (active or quarantined; oldest first), at most ``REFRESH_MAX_PER_PASS`` per
+        call, ``REFRESH_CONCURRENCY`` at a time. A changed card, a signature that no longer
+        verifies or a changed signing key quarantines the partner (audited like every
+        registry change). A fetch failure leaves the partner as it was and logs a WARNING.
+        Returns {partner id: "unchanged" | "quarantined" | "error"}."""
+        t = time.time() if now is None else now
+        due = sorted(
+            (
+                r
+                for r in self.partners.all()
+                if r.card_url and r.status != "disabled" and r.fetched_at + r.ttl_s <= t
+            ),
+            key=lambda r: r.fetched_at,
+        )[:REFRESH_MAX_PER_PASS]
+        gate = asyncio.Semaphore(REFRESH_CONCURRENCY)
+        out: dict[str, str] = {}
+
+        async def one(pid: str) -> None:
+            async with gate:
+                try:
+                    out[pid] = await self.partners.refresh(pid)
+                except KeyError:
+                    return  # removed meanwhile (a reload)
+                except Exception as exc:  # noqa: BLE001 - one partner never stops the pass
+                    out[pid] = "error"
+                    logger.warning(
+                        "partner %s: card refresh failed (%s); state unchanged",
+                        pid,
+                        exc if isinstance(exc, (CardFetchError, UnsafeURL)) else type(exc).__name__,
+                    )
+
+        await asyncio.gather(*(one(r.id) for r in due))
+        return out
 
     async def _maintenance_loop(self) -> None:
         while True:
@@ -1274,26 +1314,9 @@ class AgentHost:
 
     def _audit_registry_change(self, rec: PartnerRecord, event: str) -> None:
         """Registry listener: one audit row per partner lifecycle change."""
-        info = self.partners.change_info or {}
-        action = registry_audit_action(rec, event, info)
-        if action is None:
+        ev = registry_audit_event(rec, event, self.partners.change_info)
+        if ev is None:
             return
-        detail: dict[str, Any] = {
-            "tier": rec.tier,
-            "state": rec.status,
-            "key_id": rec.signed_key_id,
-        }
-        if info.get("reason"):
-            detail["reason"] = info["reason"]
-        if info.get("fields"):
-            detail["fields"] = ",".join(info["fields"])
-        ev = AuditEvent(
-            actor=str(info.get("actor") or "system"),
-            action=action,
-            partner_id=rec.id,
-            outcome=rec.status,
-            detail=detail,
-        )
         if self.audit is not None:
             self.audit.submit(ev)
         elif len(self._early_audit) < _EARLY_AUDIT_MAX:

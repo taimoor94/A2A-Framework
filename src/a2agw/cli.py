@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import json
 import os
 import unicodedata
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Iterator
 from pathlib import Path
 from typing import Annotated, Any, Literal, TypeVar, cast
 
@@ -33,7 +34,7 @@ from a2agw.config import (
 from a2agw.consult.guarded_net import fixed_tier, guarded_async_client
 from a2agw.consult.netguard import UnsafeURL, check_url
 from a2agw.consult.registry import MAX_CARD_BYTES, CardFetchError, PartnerRegistry
-from a2agw.ops.audit import ACTIONS, AuditLog, parse_since
+from a2agw.ops.audit import ACTIONS, AuditLog, parse_since, registry_audit_event
 from a2agw.serve.host import GRACEFUL_TIMEOUT_S
 
 app = typer.Typer(help="A2A gateway: serve agents and manage partner agents.", no_args_is_help=True)
@@ -444,6 +445,27 @@ def serve(
 def _registry(config: Path, partners_file: Path | None) -> PartnerRegistry:
     """The partner registry, with the config's card trust and mTLS settings (when the config
     file exists; ``--partners-file`` alone works without one)."""
+    with _partners(config, partners_file) as reg:
+        return reg
+
+
+def _cli_actor() -> str:
+    """``cli:<os user>``: the actor of audit rows written by CLI commands."""
+    import getpass
+
+    try:
+        user = getpass.getuser()
+    except Exception:  # noqa: BLE001 - no user name available
+        user = "unknown"
+    return f"cli:{user}"
+
+
+@contextlib.contextmanager
+def _partners(config: Path, partners_file: Path | None) -> Iterator[PartnerRegistry]:
+    """The loaded registry (see ``_registry``). Every change made through it (loading
+    included: it may quarantine records breaking ``require_signed``) is appended to the
+    configured database's audit log afterwards, as actor ``cli:<os user>``, when that
+    database and its audit table already exist (nothing is created)."""
     cfg = load_config(config) if config.exists() else None
     config_dir = config.resolve().parent
     if partners_file is None:
@@ -452,8 +474,53 @@ def _registry(config: Path, partners_file: Path | None) -> PartnerRegistry:
         partners_file = partners_path(cfg, config_dir)
     options = registry_options(cfg, config_dir) if cfg is not None else {}
     reg = PartnerRegistry(partners_file, **options)
-    reg.load()
-    return reg
+    events: list[Any] = []
+
+    def collect(rec: Any, event: str) -> None:
+        ev = registry_audit_event(rec, event, reg.change_info)
+        if ev is not None:
+            events.append(ev)
+
+    reg.add_listener(collect)
+    try:
+        with reg.acting_as(_cli_actor()):
+            reg.load()
+            yield reg
+    finally:
+        if events and cfg is not None:
+            _write_cli_audit(cfg, events)
+
+
+def _write_cli_audit(cfg: GatewayConfig, events: list[Any]) -> None:
+    """Append ``events`` to the configured audit log if it exists. A database that cannot
+    be used is a warning (the registry change itself is already saved), never an error."""
+    try:
+        _db_run(cfg.db_url, _append_existing(cfg, events))
+    except (DatabaseError, ConfigError) as e:
+        typer.echo(f"warning: audit log not written: {e}", err=True)
+
+
+async def _append_existing(cfg: GatewayConfig, events: list[Any]) -> None:
+    from sqlalchemy import inspect as sa_inspect
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    url = make_url(cfg.db_url)
+    if url.get_backend_name() == "sqlite":
+        db = url.database or ""
+        if db in ("", ":memory:") or not Path(db).is_file():
+            return  # no gateway database here: nothing to append to
+    engine = create_async_engine(cfg.db_url)
+    try:
+        async with engine.connect() as conn:
+            exists = await conn.run_sync(lambda sync: sa_inspect(sync).has_table("a2agw_audit"))
+        if not exists:
+            return
+        log = AuditLog(engine)
+        for ev in events:
+            await log.append(ev)
+    finally:
+        await engine.dispose()
 
 
 @partners_app.command("add")
@@ -472,12 +539,14 @@ def partners_add(
 ) -> None:
     """Fetch a partner's Agent Card and register it."""
     t = _tier(tier)
-    reg = _registry(config, partners_file)
-    if tls_ref is not None and tls_ref not in reg.tls:
-        raise ConfigError(f"unknown tls_ref {tls_ref!r} (not in the config's tls section)")
-    rec = asyncio.run(
-        reg.add_from_url(id, url, t, credential_ref=credential_ref, tags=tag or (), tls_ref=tls_ref)
-    )
+    with _partners(config, partners_file) as reg:
+        if tls_ref is not None and tls_ref not in reg.tls:
+            raise ConfigError(f"unknown tls_ref {tls_ref!r} (not in the config's tls section)")
+        rec = asyncio.run(
+            reg.add_from_url(
+                id, url, t, credential_ref=credential_ref, tags=tag or (), tls_ref=tls_ref
+            )
+        )
     typer.echo(f"added {rec.id} ({rec.tier}) hash {rec.card_hash[:12]}")
 
 
@@ -487,7 +556,8 @@ def partners_list(
     config: ConfigOpt = Path("a2agw.yaml"), partners_file: PartnersFileOpt = None
 ) -> None:
     """List partners."""
-    reg = _registry(config, partners_file)
+    with _partners(config, partners_file) as reg:
+        pass
     rows = [("ID", "TIER", "STATUS", "HASH", "PENDING", "PROTOCOL")]
     for r in reg.all():
         rows.append(
@@ -513,19 +583,19 @@ def partners_verify(
     partners_file: PartnersFileOpt = None,
 ) -> None:
     """Refresh one partner (or all) and report unchanged or quarantined."""
-    reg = _registry(config, partners_file)
-    ids = [id] if id else [r.id for r in reg.all()]
-    if id:
-        reg.get(id)
     failed = False
-    for pid in ids:
-        try:
-            typer.echo(f"{pid}: {asyncio.run(reg.refresh(pid))}")
-        except (CardFetchError, UnsafeURL) as e:
-            if id:
-                raise
-            failed = True
-            typer.echo(f"{pid}: error: {e}", err=True)
+    with _partners(config, partners_file) as reg:
+        ids = [id] if id else [r.id for r in reg.all()]
+        if id:
+            reg.get(id)
+        for pid in ids:
+            try:
+                typer.echo(f"{pid}: {asyncio.run(reg.refresh(pid))}")
+            except (CardFetchError, UnsafeURL) as e:
+                if id:
+                    raise
+                failed = True
+                typer.echo(f"{pid}: error: {e}", err=True)
     if failed:
         raise typer.Exit(1)
 
@@ -539,8 +609,8 @@ def partners_approve(
     partners_file: PartnersFileOpt = None,
 ) -> None:
     """Approve a quarantined card change."""
-    reg = _registry(config, partners_file)
-    rec = reg.approve(id, expected_hash=hash)
+    with _partners(config, partners_file) as reg:
+        rec = reg.approve(id, expected_hash=hash)
     typer.echo(f"approved {rec.id} hash {rec.card_hash[:12]}")
 
 
@@ -550,7 +620,8 @@ def partners_disable(
     id: str, config: ConfigOpt = Path("a2agw.yaml"), partners_file: PartnersFileOpt = None
 ) -> None:
     """Disable a partner."""
-    _registry(config, partners_file).disable(id)
+    with _partners(config, partners_file) as reg:
+        reg.disable(id)
     typer.echo(f"disabled {id}")
 
 
@@ -560,8 +631,9 @@ def partners_enable(
     id: str, config: ConfigOpt = Path("a2agw.yaml"), partners_file: PartnersFileOpt = None
 ) -> None:
     """Re-enable a disabled partner."""
-    _registry(config, partners_file).enable(id)
-    typer.echo(f"enabled {id}")
+    with _partners(config, partners_file) as reg:
+        status = reg.enable(id).status
+    typer.echo(f"enabled {id}" if status == "active" else f"enabled {id} ({status})")
 
 
 # -- card validate / call ---------------------------------------------------------------------
