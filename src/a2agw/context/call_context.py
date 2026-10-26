@@ -281,6 +281,21 @@ def use_maintenance() -> Iterator[None]:
 current_agent: ContextVar[str | None] = ContextVar("a2agw_current_agent", default=None)
 
 
+# The consult grant a sidecar's linked REST call was made with, as its id (the first 12 hex
+# characters of the token's SHA-256, never the token): audited with the partner calls it
+# makes, so they can be traced to the grant (``a2agw.gateway.rest``).
+current_grant: ContextVar[str | None] = ContextVar("a2agw_current_grant", default=None)
+
+
+@contextmanager
+def use_grant(grant_id: str | None) -> Iterator[None]:
+    reset = current_grant.set(grant_id)
+    try:
+        yield
+    finally:
+        current_grant.reset(reset)
+
+
 @contextmanager
 def use_agent(agent_id: str | None) -> Iterator[None]:
     reset = current_agent.set(agent_id)

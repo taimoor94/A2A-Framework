@@ -363,6 +363,9 @@ class LimitsConfig(BaseModel):
     model_config = _FORBID
     max_concurrent_tasks_per_caller: int = Field(default=32, ge=1)
     max_consults_per_task: int = Field(default=16, ge=1)
+    # Open partner tasks a standalone sidecar principal may have with no inbound task, per
+    # agent id it acts as (``sidecar.clients``).
+    max_open_sidecar_tasks_per_caller: int = Field(default=64, ge=1)
 
 
 class SidecarConfig(BaseModel):
@@ -858,6 +861,7 @@ def build_host(cfg: GatewayConfig, *, config_dir: Path | str = ".") -> AgentHost
             push=push,
             audit=cfg.audit,
             sidecar_clients=cfg.sidecar.clients,
+            max_open_sidecar_tasks_per_caller=cfg.limits.max_open_sidecar_tasks_per_caller,
         )
     except ValueError as e:  # e.g. a trusted context kid that clashes with the signing kid
         raise ConfigError(str(e)) from None

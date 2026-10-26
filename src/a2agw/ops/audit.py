@@ -97,6 +97,7 @@ DETAIL_KEYS = frozenset(
         "fields",  # partner.update from config: the names of the changed fields
         "attempt",  # outbound.expire: which cancel attempt this row reports
         "limit",  # limit.exceeded: which limit
+        "grant",  # sidecar consult grant id: 12 hex chars of the token hash, never the token
     }
 )
 # PartnerRegistry change events -> audit actions (``registry_audit_action``).

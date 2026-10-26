@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+from contextlib import contextmanager
 from typing import Any
 
 from a2a.types import CancelTaskRequest, TaskState
@@ -18,6 +20,7 @@ from a2agw.context.call_context import EXTENSION_URI
 from a2agw.core.events import Done
 from a2agw.security.auth import ApiKeyEntry, AuthConfig, hash_api_key
 from a2agw.security.policy import Policy, PolicyEngine
+from a2agw.security.principal import Principal
 
 V1 = "http://t/a2agw/v1"
 CANCELED = TaskState.Name(TaskState.TASK_STATE_CANCELED)
@@ -455,3 +458,168 @@ async def test_standalone_call_context_is_a_fresh_root(env):
         headers={"X-API-Key": SVC, "X-A2AGW-Agent": "a"},
     )
     assert (seen["b"]["hop"], seen["b"]["path"], seen["b"]["root_agent"]) == (0, ["a"], "a")
+
+
+# -- task ownership (fix round 1) ---------------------------------------------------------
+
+UNKNOWN_TASK = {"partner": "b", "state": "unavailable", "reason": "unknown task"}
+WORKING = TaskState.Name(TaskState.TASK_STATE_WORKING)
+
+
+async def task_ops(e, headers: dict[str, str], tid: str) -> list[Any]:
+    """check, cancel, wait and a reply on partner b's task ``tid``: the JSON answers."""
+    out = []
+    for method, path, body in (
+        ("GET", f"/partners/b/tasks/{tid}", None),
+        ("POST", f"/partners/b/tasks/{tid}/cancel", None),
+        ("POST", "/wait", {"tasks": [{"partner_id": "b", "task_id": tid}], "seconds": 0}),
+        ("POST", "/partners/b/messages", {"message": "more", "task_id": tid}),
+    ):
+        r = await e.hc.request(method, f"{V1}{path}", json=body, headers=headers)
+        out.append(r.json())
+    return out
+
+
+async def b_states(e) -> list[str]:
+    rows, _ = await e.host.index.list(agent_id="b")
+    return [r["state"] for r in rows]
+
+
+async def test_task_ops_need_the_linked_inbound_task(env):
+    e = await env(spec("a", Fn(echo)), spec("b", Blocker()))
+    await e.register("b")
+    tokens = e.host.consult_tokens
+    owner = bearer(tokens.issue("a", "T1", None, None))
+    r = await e.hc.post(
+        f"{V1}/partners/b/messages",
+        json={"message": "go", "wait_seconds": HANDLE_WAIT_S},
+        headers=owner,
+    )
+    tid = r.json()["task_id"]
+    for other in (tokens.issue("a", "T2", None, None), tokens.issue("b", "T3", None, None)):
+        assert await task_ops(e, bearer(other), tid) == [UNKNOWN_TASK] * 4
+    # Not reaching the partner at all: its task still runs, and an unknown id looks the same.
+    assert await b_states(e) == [WORKING]
+    check = await e.hc.get(f"{V1}/partners/b/tasks/nope", headers=owner)
+    assert check.json() == UNKNOWN_TASK
+    # The owner's own calls work.
+    check = await e.hc.get(f"{V1}/partners/b/tasks/{tid}", headers=owner)
+    assert check.json()["state"] == "working"
+    cancel = await e.hc.post(f"{V1}/partners/b/tasks/{tid}/cancel", headers=owner)
+    assert cancel.json()["state"] == "canceled"
+
+
+SVC2 = "svc2-key"
+
+
+def auth_config2() -> AuthConfig:
+    cfg = auth_config()
+    cfg.api_keys[hash_api_key(SVC2)] = ApiKeyEntry(principal_id="svc2", scopes=["a2agw:sidecar"])
+    return cfg
+
+
+async def standalone_env(env, b_adapter, **kw):
+    e = await env(
+        spec("a", Fn(echo)),
+        spec("b", b_adapter),
+        auth=auth_config2(),
+        sidecar_clients={"key:svc": ["a"], "key:svc2": ["a"]},
+        credentials=StaticCredentials({"gw": {"X-API-Key": PEER}}),
+        **kw,
+    )
+    card = MessageToDict(e.host.cards["b"])
+    await e.host.partners.add_from_card("b", card, "internal", credential_ref="gw")
+    return e
+
+
+def as_svc(key: str) -> dict[str, str]:
+    return {"X-API-Key": key, "X-A2AGW-Agent": "a"}
+
+
+async def test_standalone_task_ops_need_owner_and_caller(env):
+    e = await standalone_env(env, Blocker())
+    ask = {"message": "go", "wait_seconds": HANDLE_WAIT_S}
+    r = await e.hc.post(f"{V1}/partners/b/messages", json=ask, headers=as_svc(SVC))
+    mine = r.json()["task_id"]
+    linked = bearer(e.host.consult_tokens.issue("a", "T1", None, None))
+    r = await e.hc.post(f"{V1}/partners/b/messages", json=ask, headers=linked)
+    theirs = r.json()["task_id"]
+    assert await task_ops(e, as_svc(SVC), theirs) == [UNKNOWN_TASK] * 4  # a linked handle
+    assert await task_ops(e, as_svc(SVC2), mine) == [UNKNOWN_TASK] * 4  # another caller's
+    assert await task_ops(e, linked, mine) == [UNKNOWN_TASK] * 4  # a standalone handle
+    assert await b_states(e) == [WORKING, WORKING]
+    check = await e.hc.get(f"{V1}/partners/b/tasks/{mine}", headers=as_svc(SVC))
+    assert check.json()["state"] == "working"
+
+
+async def test_standalone_open_task_cap(env):
+    e = await standalone_env(env, Blocker(), max_open_sidecar_tasks_per_caller=1)
+    ask = {"message": "go", "wait_seconds": HANDLE_WAIT_S}
+    first = await e.hc.post(f"{V1}/partners/b/messages", json=ask, headers=as_svc(SVC))
+    assert first.json()["state"] == "working"
+    second = await e.hc.post(f"{V1}/partners/b/messages", json=ask, headers=as_svc(SVC))
+    assert second.json() == {
+        "partner": "b",
+        "state": "unavailable",
+        "reason": "too many open tasks",
+    }
+    assert await b_states(e) == [WORKING]  # nothing sent
+    other = await e.hc.post(f"{V1}/partners/b/messages", json=ask, headers=as_svc(SVC2))
+    assert other.json()["state"] == "working"  # counted per caller
+    [row] = await audit_rows(e.host, "limit.exceeded")
+    assert (row["actor"], row["agent_id"], row["partner_id"]) == ("key:svc", "a", "b")
+    assert row["detail"]["limit"] == "max_open_sidecar_tasks_per_caller"
+    assert row["detail"]["count"] == 1
+    # Once the task ends, the slot is free again.
+    tid = first.json()["task_id"]
+    await e.hc.post(f"{V1}/partners/b/tasks/{tid}/cancel", headers=as_svc(SVC))
+    again = await e.hc.post(f"{V1}/partners/b/messages", json=ask, headers=as_svc(SVC))
+    assert again.json()["state"] == "working"
+
+
+async def test_unknown_paths_under_the_prefix_stay_in_the_api(env):
+    e = await env(spec("a", Fn(echo)), auth=auth_config())
+    cases = (
+        ("POST", "/a2agw/v1/partners", 405),
+        ("DELETE", "/a2agw/v1/partners/b/tasks/x", 405),
+        ("GET", "/a2agw/v1/nope", 404),
+        ("GET", "/a2agw/v1/agents/a/.well-known/agent-card.json", 404),
+        ("GET", "/a2agw/v1", 404),
+    )
+    for method, path, status in cases:
+        r = await e.hc.request(method, f"http://t{path}", headers={"X-API-Key": "wrong"})
+        assert r.status_code == status, path
+        assert r.headers["cache-control"] == "no-store", path  # answered by the API itself
+    assert (await e.hc.post(f"{V1}/partners")).headers["allow"] == "GET, HEAD"
+
+
+async def test_linked_partner_call_rows_carry_the_grant_id(env):
+    e = await standalone_env(env, Fn(echo))
+    grant = e.host.consult_tokens.issue("a", "T1", None, None)
+    await e.hc.post(f"{V1}/partners/b/messages", json={"message": "x"}, headers=bearer(grant))
+    await e.hc.post(f"{V1}/partners/b/messages", json={"message": "x"}, headers=as_svc(SVC))
+    rows = await audit_rows(e.host, "partner.call")
+    linked, standalone = rows
+    assert linked["detail"]["grant"] == hashlib.sha256(grant.token.encode()).hexdigest()[:12]
+    assert "grant" not in standalone["detail"]
+    assert grant.token not in json.dumps(rows)
+
+
+async def test_revoked_mid_request_is_audited_with_the_binding(env, monkeypatch):
+    e = await env(spec("a", Fn(echo)))
+    alice = Principal("key:alice", "api_key", frozenset())
+    grant = e.host.consult_tokens.issue("a", "T1", None, alice)
+
+    @contextmanager
+    def gone(binding, task):
+        yield False  # revoked between authentication and the call
+
+    monkeypatch.setattr(e.host.consult_tokens, "track", gone)
+    r = await e.hc.get(f"{V1}/partners", headers=bearer(grant))
+    assert r.status_code == 401
+    [row] = await audit_rows(e.host, "sidecar.denied")
+    assert (row["actor"], row["agent_id"], row["detail"]["reason"]) == (
+        "key:alice",
+        "a",
+        "consult token revoked",
+    )

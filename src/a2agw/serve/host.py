@@ -134,6 +134,7 @@ _EARLY_AUDIT_MAX = 1000  # registry changes kept for the audit log until startup
 _EXIT_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 # Default bound on uvicorn's wait for open requests at shutdown.
 GRACEFUL_TIMEOUT_S = 10.0
+DEFAULT_MAX_OPEN_SIDECAR_TASKS = 64
 
 
 @contextmanager
@@ -1001,6 +1002,7 @@ class AgentHost:
         max_consults_per_task: int = MAX_CONSULTS_PER_TASK,
         sidecar_clients: Mapping[str, Iterable[str]] | None = None,
         sidecar_agents: Iterable[str] = (),
+        max_open_sidecar_tasks_per_caller: int = DEFAULT_MAX_OPEN_SIDECAR_TASKS,
     ) -> None:
         self.base_url = base_url
         # Sidecar agents (spec 7.7) consult partners through the outbound REST API
@@ -1016,6 +1018,14 @@ class AgentHost:
             principal: frozenset(agents) for principal, agents in (sidecar_clients or {}).items()
         }
         self.sidecar_agents = frozenset(sidecar_agents)
+        # A standalone sidecar principal's open partner tasks with no inbound task, per agent
+        # id it acts as (over it a new consult is ``unavailable``, audited
+        # ``limit.exceeded``); linked calls are bounded by ``max_consults_per_task``.
+        if max_open_sidecar_tasks_per_caller < 1:
+            raise ValueError("max_open_sidecar_tasks_per_caller must be at least 1")
+        self.max_open_sidecar_tasks_per_caller = max_open_sidecar_tasks_per_caller
+        # Adapters given this host's ``consult_issuer`` at startup (reset at shutdown).
+        self._issued_adapters: list[WebhookAdapter | StdioAdapter] = []
         # Spec 7.2 / 11a.4 per-caller caps: agent turns running at once per principal
         # (across all agents; over it a send is InvalidRequestError, audited
         # ``limit.exceeded``) and new partner tasks per inbound task (over it a consult is
@@ -1287,11 +1297,16 @@ class AgentHost:
                 )
             )
         routes.append(Mount("/agents", app=_agent_not_found))
-        # External agents consult partners with a grant the host issues for each turn.
+        # External agents consult partners with a grant this host issues for each turn. An
+        # issuer another host installed (the adapter is shared) is replaced; a consult
+        # callable of the user's own is kept.
         for spec in self.specs.values():
             adapter = spec.adapter
-            if isinstance(adapter, WebhookAdapter | StdioAdapter) and adapter.consult is None:
+            if isinstance(adapter, WebhookAdapter | StdioAdapter) and (
+                adapter.consult is None or isinstance(adapter.consult, GrantIssuer)
+            ):
                 adapter.consult = self.consult_issuer
+                self._issued_adapters.append(adapter)
         # Adapters that own resources (e.g. a supervised agent process) start once the stores
         # are ready, before the first request can reach them.
         for agent_id, spec in self.specs.items():
@@ -1573,7 +1588,12 @@ class AgentHost:
 
     async def _stop_adapters(self) -> None:
         """Stop the adapters started at startup, concurrently (one slow shutdown does not
-        hold up the others). One that fails to stop is logged (its error class only)."""
+        hold up the others). One that fails to stop is logged (its error class only). The
+        grant issuer this host gave its adapters is taken back (unless replaced since)."""
+        issued, self._issued_adapters = self._issued_adapters, []
+        for adapter in issued:
+            if adapter.consult is self.consult_issuer:
+                adapter.consult = None
         started, self._started_adapters = self._started_adapters, []
         started.reverse()
         results = await asyncio.gather(*(a.stop() for _, a in started), return_exceptions=True)

@@ -334,3 +334,35 @@ async def test_webhook_agent_consults_partner_with_token(tmp_path):
         await host.shutdown()
         await agent_http.aclose()
         await partner_http.aclose()
+
+
+async def test_each_host_installs_and_removes_its_own_grant_issuer(tmp_path):
+    adapter = WebhookAdapter("http://coder/a2agw/invoke")
+
+    def host(n: int) -> AgentHost:
+        h = AgentHost("http://gw", db_url=f"sqlite+aiosqlite:///{tmp_path / f'gw{n}.db'}")
+        h.add(_spec("coder", adapter))
+        return h
+
+    one, two, three = host(1), host(2), host(3)
+    await one.startup()
+    assert adapter.consult is one.consult_issuer
+    await one.shutdown()
+    assert adapter.consult is None  # removed with its host
+    await two.startup()
+    assert adapter.consult is two.consult_issuer  # never the stale one
+    await three.startup()
+    assert adapter.consult is three.consult_issuer  # replaced while two still runs
+    await two.shutdown()
+    assert adapter.consult is three.consult_issuer  # not two's to remove
+    await three.shutdown()
+    assert adapter.consult is None
+
+    async def mine(ctx):  # a consult callable of the user's own is kept
+        return None
+
+    adapter.consult = mine
+    four = host(4)
+    await four.startup()
+    await four.shutdown()
+    assert adapter.consult is mine

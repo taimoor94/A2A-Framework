@@ -109,12 +109,14 @@ class ConsultTokens:
         for digest in list(self._by_task.get(inbound_task_id, ())):
             self._drop(digest)
 
-    @contextmanager
-    def track(self, binding: Binding, task: asyncio.Task[object]) -> Iterator[bool]:
-        """Register ``task`` as a call made under ``binding`` for the duration of the block:
-        revoking the binding's token cancels it. Yields False (and registers nothing) when
-        the binding's token is no longer live."""
-        digest = next(
+    def grant_id(self, binding: Binding) -> str | None:
+        """The id a live binding's grant is audited as: the first 12 hex characters of its
+        token's digest (None once revoked)."""
+        digest = self._digest_of(binding)
+        return None if digest is None else digest[:12]
+
+    def _digest_of(self, binding: Binding) -> str | None:
+        return next(
             (
                 d
                 for d in self._by_task.get(binding.inbound_task_id, ())
@@ -122,6 +124,13 @@ class ConsultTokens:
             ),
             None,
         )
+
+    @contextmanager
+    def track(self, binding: Binding, task: asyncio.Task[object]) -> Iterator[bool]:
+        """Register ``task`` as a call made under ``binding`` for the duration of the block:
+        revoking the binding's token cancels it. Yields False (and registers nothing) when
+        the binding's token is no longer live."""
+        digest = self._digest_of(binding)
         if digest is None:
             yield False
             return

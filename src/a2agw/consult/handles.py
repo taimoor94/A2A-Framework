@@ -198,6 +198,21 @@ class OutboundHandleStore:
         async with self._engine.connect() as conn:
             return {str(pid): int(n) for pid, n in (await conn.execute(stmt)).all()}
 
+    async def count_open_unlinked(self, owner: str, caller_id: str | None) -> int:
+        """Non-terminal handles with no inbound task, of this owner and caller."""
+        from a2agw.consult.results import TERMINAL_NAMES
+
+        o = _outbound
+        caller = o.c.caller_id.is_(None) if caller_id is None else o.c.caller_id == caller_id
+        stmt = select(func.count()).where(
+            o.c.inbound_task_id.is_(None),
+            o.c.owner == owner,
+            caller,
+            o.c.state.notin_(sorted(TERMINAL_NAMES)),
+        )
+        async with self._engine.connect() as conn:
+            return int((await conn.execute(stmt)).scalar_one())
+
     async def seen_origin(self, origin: str) -> bool:
         stmt = select(_outbound.c.task_id).where(_outbound.c.origin == origin).limit(1)
         async with self._engine.connect() as conn:

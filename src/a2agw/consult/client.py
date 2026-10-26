@@ -87,6 +87,7 @@ from a2agw.context.call_context import (
     CallContext,
     current_agent,
     current_call,
+    current_grant,
     current_inbound_task,
     current_principal,
     maintenance_call,
@@ -216,6 +217,12 @@ ErrorKind = Literal["connect", "unsafe", "server", "transport", "protocol", "oth
 def _caller_id() -> str | None:
     caller = _caller.get()
     return caller.id if caller is not None else None
+
+
+def _grant_detail() -> dict[str, str]:
+    """Audit detail of a sidecar's linked call: the id of its consult grant."""
+    grant = current_grant.get()
+    return {} if grant is None else {"grant": grant}
 
 
 def _handle_ids() -> dict[str, str | None]:
@@ -860,7 +867,7 @@ class PartnerClient:
             task_id=inbound_task_id,
             classification=label if isinstance(label, Classification) else None,
             outcome=outcome,
-            detail={"state": outcome, "tier": tier},
+            detail={"state": outcome, "tier": tier, **_grant_detail()},
         )
 
     def _forbidden(self, partner_id: str, agent_id: str) -> bool:
@@ -909,7 +916,11 @@ class PartnerClient:
                 partner_id=partner_id,
                 task_id=inbound_task_id,
                 outcome="unavailable",
-                detail={"limit": "max_consults_per_task", "count": self.max_consults_per_task},
+                detail={
+                    "limit": "max_consults_per_task",
+                    "count": self.max_consults_per_task,
+                    **_grant_detail(),
+                },
             )
         )
 
@@ -982,6 +993,7 @@ class PartnerClient:
                     "reason": decision.reason if decision is not None else result.reason,
                     "rule": decision.rule if decision is not None else None,
                     "tier": (result.provenance or {}).get("tier"),
+                    **_grant_detail(),
                 },
             )
         )

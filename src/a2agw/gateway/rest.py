@@ -24,17 +24,20 @@ from typing import TYPE_CHECKING, Any
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
-from starlette.routing import Route
+from starlette.routing import Match, Route
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from a2agw.consult.tools import PartnerTool, invoke
 from a2agw.context.call_context import (
     CallContext,
     use_agent,
     use_call,
+    use_grant,
     use_inbound,
     use_inbound_token,
 )
 from a2agw.gateway.auth import SidecarAuthError, SidecarIdentity, audit_denied, resolve_sidecar
+from a2agw.ops.audit import AuditEvent
 
 if TYPE_CHECKING:
     from a2agw.serve.host import AgentHost
@@ -44,6 +47,8 @@ __all__ = ["MAX_BODY_BYTES", "REST_PREFIX", "rest_routes"]
 REST_PREFIX = "/a2agw/v1"
 MAX_BODY_BYTES = 256 * 1024
 UNKNOWN_PARTNER = "unknown partner"
+UNKNOWN_TASK = "unknown task"  # also a task the caller does not own: existence is not revealed
+TOO_MANY_OPEN = "too many open tasks"
 INBOUND_ENDED = "inbound task ended"  # the consult token was revoked while the call ran
 TOKEN_REVOKED = "consult token revoked"
 
@@ -62,6 +67,17 @@ Args = dict[str, Any]
 Work = Callable[[], Awaitable[Any]]
 
 
+class _AsgiApp:
+    """Wraps an ASGI callable so Starlette mounts it as an app (every method) rather than as
+    a request/response endpoint (GET only)."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        await self.app(scope, receive, send)
+
+
 class _BodyError(Exception):
     def __init__(self, status: int, error: str) -> None:
         self.status = status
@@ -72,8 +88,8 @@ def _json(content: Any, status: int = 200, headers: dict[str, str] | None = None
     return JSONResponse(content, status_code=status, headers={**_NO_STORE, **(headers or {})})
 
 
-def _unknown(partner_id: str) -> dict[str, Any]:
-    return {"partner": partner_id, "state": "unavailable", "reason": UNKNOWN_PARTNER}
+def _unknown(partner_id: str, reason: str = UNKNOWN_PARTNER) -> dict[str, Any]:
+    return {"partner": partner_id, "state": "unavailable", "reason": reason}
 
 
 async def _read_object(request: Request) -> Args:
@@ -105,9 +121,10 @@ def _visible(host: AgentHost, tools: list[PartnerTool]) -> set[str]:
 
 
 @contextmanager
-def _acting_as(ident: SidecarIdentity) -> Iterator[None]:
+def _acting_as(ident: SidecarIdentity, grant_id: str | None) -> Iterator[None]:
     """The context an embedded agent's tool call would run in: its call context, inbound
-    task, caller and agent id. A standalone call is a fresh root with no inbound task."""
+    task, caller and agent id. A standalone call is a fresh root with no inbound task. A
+    linked call's partner calls are audited with ``grant_id``."""
     b = ident.binding
     if b is not None:
         call = b.call or CallContext.new(ident.agent_id)
@@ -119,6 +136,7 @@ def _acting_as(ident: SidecarIdentity) -> Iterator[None]:
         use_inbound(task_id, principal),
         use_inbound_token(None),
         use_agent(ident.agent_id),
+        use_grant(grant_id),
     ):
         yield
 
@@ -138,17 +156,61 @@ def rest_routes(host: AgentHost) -> list[Route]:
             owner=None if b is not None else host.sidecar_owner(ident.agent_id),
         )
 
+    async def owns(ident: SidecarIdentity, pid: str, tid: str) -> bool:
+        """Whether the caller may act on partner task ``tid``: tasks belong to whoever
+        started them. A linked call owns the partner tasks of its inbound task; a standalone
+        call owns the unlinked ones its agent id started for the same principal."""
+        if host.handles is None:
+            return False
+        h = await host.handles.get(pid, tid)
+        if h is None:
+            return False
+        b, p = ident.binding, ident.principal
+        if b is not None:
+            return h["inbound_task_id"] == b.inbound_task_id
+        return (
+            h["inbound_task_id"] is None
+            and h.get("owner") == host.sidecar_owner(ident.agent_id)
+            and p is not None
+            and h.get("caller_id") == p.id
+        )
+
+    async def over_cap(ident: SidecarIdentity, pid: str) -> bool:
+        """A standalone principal may have at most ``max_open_sidecar_tasks_per_caller``
+        open unlinked partner tasks per agent id (audited ``limit.exceeded`` beyond)."""
+        p, cap = ident.principal, host.max_open_sidecar_tasks_per_caller
+        if ident.binding is not None or host.handles is None or p is None:
+            return False
+        owner = host.sidecar_owner(ident.agent_id)
+        if await host.handles.count_open_unlinked(owner, p.id) < cap:
+            return False
+        if host.audit is not None:
+            await host.audit.emit(
+                AuditEvent(
+                    actor=p.id,
+                    action="limit.exceeded",
+                    agent_id=ident.agent_id,
+                    partner_id=pid,
+                    outcome="unavailable",
+                    detail={"limit": "max_open_sidecar_tasks_per_caller", "count": cap},
+                )
+            )
+        return True
+
     async def call(ident: SidecarIdentity, partner: str | None, work: Work) -> Any:
         """Run ``work`` as the agent. A linked call is tracked: revoking its token (the run
         ended) cancels it, and it then answers ``unavailable``."""
-        with _acting_as(ident):
-            if ident.binding is None:
+        b = ident.binding
+        with _acting_as(ident, None if b is None else host.consult_tokens.grant_id(b)):
+            if b is None:
                 return await work()
             task = asyncio.ensure_future(work())
-        with host.consult_tokens.track(ident.binding, task) as live:
+        with host.consult_tokens.track(b, task) as live:
             if not live:
                 task.cancel()  # never started
-                raise SidecarAuthError(401, TOKEN_REVOKED, agent_id=ident.agent_id)
+                raise SidecarAuthError(
+                    401, TOKEN_REVOKED, agent_id=ident.agent_id, principal=ident.principal
+                )
             try:
                 return await task
             except asyncio.CancelledError:
@@ -208,12 +270,19 @@ def rest_routes(host: AgentHost) -> list[Route]:
         async def work() -> dict[str, Any]:
             if "partner_id" in args:  # the path names the partner
                 return {"state": "rejected", "reason": "invalid arguments: partner_id"}
-            if tool is not None:
-                return await run(ident, tool, args)
-            anyone = next((t for t in tools if t.kind == "consult_any"), None)
-            if anyone is None or pid not in _visible(host, tools):
-                return _unknown(pid)
-            return await run(ident, anyone, {**args, "partner_id": pid})
+            chosen, call_args = tool, args
+            if chosen is None:
+                anyone = next((t for t in tools if t.kind == "consult_any"), None)
+                if anyone is None or pid not in _visible(host, tools):
+                    return _unknown(pid)
+                chosen, call_args = anyone, {**args, "partner_id": pid}
+            tid = args.get("task_id")
+            if isinstance(tid, str):  # a reply: only into a task the caller owns
+                if not await owns(ident, pid, tid):
+                    return _unknown(pid, UNKNOWN_TASK)
+            elif await over_cap(ident, pid):
+                return _unknown(pid, TOO_MANY_OPEN)
+            return await run(ident, chosen, call_args)
 
         return pid, work
 
@@ -225,6 +294,8 @@ def rest_routes(host: AgentHost) -> list[Route]:
             async def work() -> dict[str, Any]:
                 if pid not in _visible(host, tools):
                     return _unknown(pid)
+                if not await owns(ident, pid, tid):
+                    return _unknown(pid, UNKNOWN_TASK)
                 tool = next(t for t in tools if t.kind == kind)
                 return await run(ident, tool, {"partner_id": pid, "task_id": tid})
 
@@ -240,8 +311,15 @@ def rest_routes(host: AgentHost) -> list[Route]:
             items = args.get("tasks")
             for item in items if isinstance(items, list) else ():
                 pid = item.get("partner_id") if isinstance(item, dict) else None
+                tid = item.get("task_id") if isinstance(item, dict) else None
                 if isinstance(pid, str) and pid not in visible:
                     return _unknown(pid)
+                if (
+                    isinstance(pid, str)
+                    and isinstance(tid, str)
+                    and not await owns(ident, pid, tid)
+                ):
+                    return _unknown(pid, UNKNOWN_TASK)
             return await run(ident, next(t for t in tools if t.kind == "wait"), args)
 
         return None, work
@@ -258,8 +336,24 @@ def rest_routes(host: AgentHost) -> list[Route]:
 
         return None, work
 
+    async def fallback(scope: Scope, receive: Receive, send: Send) -> None:
+        """Anything else under the prefix, whatever the method: 405 for a known path, else
+        404. Never handed on to the rest of the gateway (the auth middleware lets these
+        paths through). An ASGI app, not a function, so its routes take every method."""
+        methods = {
+            m for r in routes if r.matches(scope)[0] == Match.PARTIAL for m in (r.methods or ())
+        }
+        if methods:
+            allow = {"Allow": ", ".join(sorted(methods))}
+            response = _json({"error": "method not allowed"}, 405, allow)
+        else:
+            response = _json({"error": "not found"}, 404)
+        await response(scope, receive, send)
+
+    catch_all = _AsgiApp(fallback)
+
     p = REST_PREFIX
-    return [
+    routes = [
         Route(f"{p}/partners", endpoint(partners, body=False), methods=["GET"]),
         Route(
             f"{p}/partners/{{partner_id}}/messages", endpoint(messages, body=True), methods=["POST"]
@@ -277,3 +371,4 @@ def rest_routes(host: AgentHost) -> list[Route]:
         Route(f"{p}/wait", endpoint(wait, body=True), methods=["POST"]),
         Route(f"{p}/find", endpoint(find, body=True), methods=["POST"]),
     ]
+    return [*routes, Route(p, catch_all), Route(f"{p}/{{rest:path}}", catch_all)]

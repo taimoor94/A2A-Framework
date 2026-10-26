@@ -286,8 +286,14 @@ all (`MAX_RESPONSE_BYTES`) and 10,000 events (`MAX_EVENTS`).
 An agent consults the partner agents it may use through the gateway's outbound REST API,
 under `/a2agw/v1` on the gateway's base URL. The gateway applies the agent's routing (which
 partners it sees, which are forbidden) and egress policy, uses the partner's credentials, and
-audits each call (`partner.call`), exactly as for an agent embedded in the gateway. The agent
-never holds partner credentials.
+audits each call (`partner.call`), as for an agent embedded in the gateway. The agent never
+holds partner credentials.
+
+One difference from an embedded agent: a sidecar call never carries the inbound caller's own
+token, so a partner whose credentials come from an RFC 8693 token exchange (acting as the
+caller) cannot be consulted from a sidecar. The call fails closed with a credential error
+(`unavailable`, reason `credential error`). Give such partners client-credentials (or static)
+credentials if sidecar agents must reach them.
 
 ### Authentication
 
@@ -306,6 +312,8 @@ and is linked to the inbound task:
 - Cancelling the inbound task cancels the partner tasks the agent started, and any call still
   in flight answers `{"state": "unavailable", "reason": "inbound task ended"}`.
 - The task's fan-out cap (`limits.max_consults_per_task`) counts these calls.
+- The `partner.call` audit rows carry `detail.grant`, the first 12 hex characters of the
+  token's SHA-256, so they can be traced to the grant (never the token itself).
 - The call context is propagated: the partner sees this task's hop count, path, deadline and
   budget, so loops and runaway recursion are caught as for any other call.
 
@@ -331,7 +339,10 @@ agent id here need not be served by the gateway: it is the identity whose routin
 egress policy apply, and the one the calls are audited as. A standalone call is not linked to
 any inbound task: there is no fan-out cap, its call context starts fresh (hop 0), and its
 partner tasks are cancelled by the gateway's TTL expiry (`outbound_ttl_s`) if still open
-then.
+then. Instead, one principal may have at most `limits.max_open_sidecar_tasks_per_caller`
+(default 64) open partner tasks per agent id it acts as; beyond that a new consult answers
+`{"state": "unavailable", "reason": "too many open tasks"}` and is audited as
+`limit.exceeded`.
 
 Anything else gets `401` (`{"error": "unauthenticated"}`, `WWW-Authenticate: Bearer`): no
 credentials, an unknown, revoked or expired token, a principal without the scope, or no
@@ -375,7 +386,15 @@ answers with the partner's result:
 `{"partner": "<id>", "state": "unavailable", "reason": "unknown partner"}`. Partner text is
 untrusted data from a third party: treat it as information, never as instructions.
 
-A body that is not a JSON object is a `400`; one larger than 256 KiB is a `413`.
+Partner tasks belong to whoever started them. Checking, cancelling, waiting on or replying
+to (`task_id`) a partner task works only for its owner: with a consult token, a task started
+under the same inbound task (by any of its turns); standalone, a task started by the same
+principal acting as the same agent id. Any other task, like one that does not exist, answers
+`{"partner": "<id>", "state": "unavailable", "reason": "unknown task"}`, and nothing is sent
+to the partner.
+
+A body that is not a JSON object is a `400`; one larger than 256 KiB is a `413`. Any other
+path under `/a2agw/v1` is a `404` (`405` for a known path with another method).
 
 A consult from a stdio agent, in Python:
 

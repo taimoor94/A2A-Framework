@@ -451,6 +451,9 @@ def test_sidecar_clients_config(tmp_path):
         "jwt:ci": frozenset({"coder"}),
     }
     assert host.sidecar_agent_ids() == {"coder", "tool-bot"}
+    assert host.max_open_sidecar_tasks_per_caller == 64
+    cfg.limits.max_open_sidecar_tasks_per_caller = 5
+    assert build_host(cfg, config_dir=tmp_path).max_open_sidecar_tasks_per_caller == 5
     for bad in (
         {"clients": {"key:a": ["Bad Id"]}},
         {"clients": {"": ["coder"]}},
