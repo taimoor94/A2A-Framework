@@ -46,6 +46,7 @@ __all__ = [
     "UnsafeAddress",
     "fixed_tier",
     "guarded_async_client",
+    "is_guarded_client",
     "is_unsafe_address",
 ]
 
@@ -317,3 +318,8 @@ def guarded_async_client(
     )
     _swap_pool(transport, pool)
     return _GuardedClient(transport=transport, timeout=timeout, follow_redirects=False, **kw)
+
+
+def is_guarded_client(client: httpx.AsyncClient) -> bool:
+    """Whether ``client`` was built by ``guarded_async_client``."""
+    return isinstance(client, _GuardedClient)

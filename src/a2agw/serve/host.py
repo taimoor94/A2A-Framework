@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import ipaddress
 import json
 import logging
 import os
@@ -60,6 +61,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from a2agw._ddl import retry_ddl
 from a2agw.consult.client import MAX_CONSULTS_PER_TASK, PartnerClient
 from a2agw.consult.credentials import CredentialProvider
+from a2agw.consult.guarded_net import is_guarded_client
 from a2agw.consult.handles import OutboundHandleStore
 from a2agw.consult.netguard import Tier, UnsafeURL
 from a2agw.consult.registry import CardFetchError, PartnerRecord, PartnerRegistry
@@ -198,6 +200,16 @@ def _warn_env_proxies() -> None:
             "environment proxies and connect directly",
             "/".join(names),
         )
+
+
+def _loopback(bind: str) -> bool:
+    """Whether a bind address only accepts connections from this machine."""
+    if bind == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(bind.strip("[]")).is_loopback
+    except ValueError:
+        return False
 
 
 __all__ = [
@@ -1043,6 +1055,11 @@ class AgentHost:
         self.credentials = credentials
         # Injected for tests: used as given, bypassing the guarded outbound clients.
         self.partner_http = partner_http
+        if partner_http is not None and not is_guarded_client(partner_http):
+            logger.warning(
+                "AgentHost(partner_http=...) is not a guarded client: partner calls and card "
+                "fetches bypass the connect-time address checks (use guarded_async_client)"
+            )
         self.default_deadline_s = default_deadline_s
         self.handles: OutboundHandleStore | None = None
         self.client: PartnerClient | None = None
@@ -1071,6 +1088,10 @@ class AgentHost:
         try:
             await self._startup()
         except BaseException:
+            if self.audit is not None:
+                # Registry changes submitted during startup are written before the engine
+                # goes (and never left running against a disposed engine).
+                await self.audit.drain()
             if self.push_http is not None:
                 await self.push_http.aclose()
                 self.push_http = None
@@ -1540,6 +1561,12 @@ class AgentHost:
 
         import uvicorn
 
+        if self.admin and self.auth is None and self.admin_without_auth and not _loopback(host):
+            logger.warning(
+                "admin_without_auth with a non-loopback bind (%s): the admin API is open to "
+                "anyone who can reach this port; configure auth",
+                host,
+            )
         kwargs: dict[str, Any] = {}
         if require_client_cert and not ssl_ca_certs:
             raise ValueError("require_client_cert needs ssl_ca_certs")

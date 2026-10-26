@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import httpx
@@ -26,17 +25,20 @@ KID = "software-team-1"
 def generate_signing_key(directory: Path) -> tuple[Path, Path]:
     """A fresh Ed25519 key pair in ``directory`` (private key mode 0600): (private, public)."""
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    from a2agw import cli
+
     key = ed25519.Ed25519PrivateKey.generate()
     private, public = directory / "signing.pem", directory / "signing.pub.pem"
-    fd = os.open(private, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb") as f:
-        f.write(
-            key.private_bytes(
-                serialization.Encoding.PEM,
-                serialization.PrivateFormat.PKCS8,
-                serialization.NoEncryption(),
-            )
-        )
+    private.unlink(missing_ok=True)
+    # The CLI's writer: created 0600 from the start, never through a symlink.
+    cli._write_private(
+        private,
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ),
+    )
     public.write_bytes(
         key.public_key().public_bytes(
             serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo

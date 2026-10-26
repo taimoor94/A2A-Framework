@@ -1,7 +1,9 @@
 """Management API (read only, except POST /tasks/reap and POST /partners/reload), mounted by
 AgentHost under /a2agw/admin.
 
-Every route except /healthz needs a principal with the ``a2agw:admin`` scope.
+Every route except /healthz needs a principal with the ``a2agw:admin`` scope. Every POST
+also needs the header ``X-A2AGW-Admin: 1`` (403 without it, in every auth mode, including
+``admin_without_auth``): a cross-site form or a simple request cannot set it.
 Authentication happens in the host middleware; here we only read ``scope["user"]``.
 With no auth configured there are no principals, so admin fails closed unless the
 host was created with ``admin_without_auth=True`` (development only).
@@ -42,6 +44,8 @@ if TYPE_CHECKING:
 ADMIN_PREFIX = "/a2agw/admin"
 HEALTH_PATH = f"{ADMIN_PREFIX}/healthz"
 ADMIN_SCOPE = "a2agw:admin"
+# Required on every admin POST (CSRF): ``X-A2AGW-Admin: 1``.
+ADMIN_HEADER = "X-A2AGW-Admin"
 AUDIT_MAX_LIMIT = 500
 AUDIT_DEFAULT_LIMIT = 100
 MAX_FILTER_CHARS = 256
@@ -113,6 +117,12 @@ def admin_routes(host: AgentHost) -> list[Route]:
             if not _allowed(host, request):
                 await audit(request, "authz.deny", "forbidden", f"admin {category}")
                 return JSONResponse({"error": "forbidden"}, status_code=403)
+            if not read and request.headers.get(ADMIN_HEADER) != "1":
+                # CSRF: a browser cannot add this header to a cross-site form POST.
+                await audit(request, "authz.deny", "forbidden", f"admin {category}: no header")
+                return JSONResponse(
+                    {"error": f"forbidden: send the {ADMIN_HEADER}: 1 header"}, status_code=403
+                )
             if read:
                 await audit(request, "admin.read", "ok", category)
             try:

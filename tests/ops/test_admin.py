@@ -53,6 +53,7 @@ def auth() -> AuthConfig:
 
 
 ADMIN = {"X-API-Key": "admin-secret"}
+ADMIN_POST = {**ADMIN, "X-A2AGW-Admin": "1"}  # admin POSTs need the CSRF header
 USER = {"X-API-Key": "user-secret"}
 
 
@@ -405,8 +406,8 @@ async def test_partners_reload_makes_cli_added_partner_usable(make, tmp_path):
         await cli.add_from_card("echo", MessageToDict(partner.cards["echo"]), "internal")
 
         url = "/a2agw/admin/partners/reload"
-        assert (await hc.post(url, headers=USER)).status_code == 403
-        r = await hc.post(url, headers=ADMIN)
+        assert (await hc.post(url, headers={**USER, "X-A2AGW-Admin": "1"})).status_code == 403
+        r = await hc.post(url, headers=ADMIN_POST)
         assert r.status_code == 200
         assert r.json() == {"added": ["echo"], "updated": [], "removed": [], "open_handles": 0}
         assert host.client is client  # same running client
@@ -421,14 +422,14 @@ async def test_partners_reload_makes_cli_added_partner_usable(make, tmp_path):
         # An invalid file is refused and changes nothing.
         pf_before = pf.read_text()
         pf.write_text("partners: {}\n")
-        r = await hc.post(url, headers=ADMIN)
+        r = await hc.post(url, headers=ADMIN_POST)
         assert r.status_code == 400 and r.json() == {"error": "partners file not reloaded"}
         assert [p.id for p in host.partners.all()] == ["echo"]
 
         # Removing it from the file removes it from the running host.
         assert "echo" in pf_before
         pf.write_text("partners: []\n")
-        r = await hc.post(url, headers=ADMIN)
+        r = await hc.post(url, headers=ADMIN_POST)
         assert r.json() == {"added": [], "updated": [], "removed": ["echo"], "open_handles": 0}
         assert (await client.consult("echo", "hi", wait_seconds=5)).reason == "unknown partner"
     finally:
@@ -442,7 +443,7 @@ async def test_partners_reload_broken_yaml_is_400_audited_without_content(make, 
     host, hc = await make(spec(), auth=auth(), partners_path=pf)
     for broken in (b"partners: [\n  - id: s3cret-line\n  bad: : :\n", b"\xff\xfe s3cret-line"):
         pf.write_bytes(broken)
-        r = await hc.post("/a2agw/admin/partners/reload", headers=ADMIN)
+        r = await hc.post("/a2agw/admin/partners/reload", headers=ADMIN_POST)
         assert r.status_code == 400 and "s3cret" not in r.text
     rows = (await hc.get("/a2agw/admin/audit?action=partner.reload", headers=ADMIN)).json()
     assert [(e["outcome"], e["detail"]["reason"]) for e in rows["events"]] == [
@@ -463,16 +464,16 @@ async def test_partners_reload_refuses_removing_partner_with_open_handles(make, 
     cli.load()
     await cli.add_from_card("ghost", to_dict(host.cards["alpha"]), "internal")
     url = "/a2agw/admin/partners/reload"
-    assert (await hc.post(url, headers=ADMIN)).json()["added"] == ["ghost"]
+    assert (await hc.post(url, headers=ADMIN_POST)).json()["added"] == ["ghost"]
     await host.handles.record("t1", "ghost", "c1", None, None, "TASK_STATE_WORKING")
     await host.handles.record("t2", "ghost", "c1", None, None, "TASK_STATE_COMPLETED")
     pf.write_text("partners: []\n")
 
-    r = await hc.post(url, headers=ADMIN)
+    r = await hc.post(url, headers=ADMIN_POST)
     assert r.status_code == 409 and r.json()["open_handles"] == 1
     assert [p.id for p in host.partners.all()] == ["ghost"]  # unchanged
-    assert (await hc.post(url + "?force=maybe", headers=ADMIN)).status_code == 400
-    r = await hc.post(url + "?force=true", headers=ADMIN)
+    assert (await hc.post(url + "?force=maybe", headers=ADMIN_POST)).status_code == 400
+    r = await hc.post(url + "?force=true", headers=ADMIN_POST)
     assert r.status_code == 200
     assert r.json() == {"added": [], "updated": [], "removed": ["ghost"], "open_handles": 1}
     assert host.partners.all() == []
@@ -492,18 +493,19 @@ async def test_partners_reload_conflict_is_409_other_runtime_error_is_500(make, 
     )
     url = "/a2agw/admin/partners/reload"
     try:
+
         def conflict(plan):
             raise ReloadConflict("partner registry changed during reload")
 
         host.partners.apply_reload = conflict  # type: ignore[method-assign]
-        r = await hc.post(url, headers=ADMIN)
+        r = await hc.post(url, headers=ADMIN_POST)
         assert r.status_code == 409 and "retry" in r.json()["error"]
 
         def bug(plan):
             raise RuntimeError("unexpected")
 
         host.partners.apply_reload = bug  # type: ignore[method-assign]
-        r = await hc.post(url, headers=ADMIN)
+        r = await hc.post(url, headers=ADMIN_POST)
         assert r.status_code == 500
         rows = (await hc.get("/a2agw/admin/audit?action=partner.reload", headers=ADMIN)).json()
         assert [(e["outcome"], e["detail"]["reason"]) for e in rows["events"]] == [

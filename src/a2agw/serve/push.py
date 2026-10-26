@@ -31,7 +31,9 @@ Receivers. Each request carries:
 - ``X-A2AGW-Delivery-Id``: one id per update per webhook, the same on every retry attempt.
   Receivers should de-duplicate on it: a retry after a lost 2xx delivers the update twice.
 - with ``jwt_signer``: a JWT signed with the gateway key, in ``Authorization: Bearer`` or, when
-  the config's ``authentication`` uses that header, in ``X-A2AGW-Push-JWT``. Claims: ``iss``
+  the config's ``authentication`` uses that header, in ``X-A2AGW-Push-JWT``. Its JOSE header
+  has ``typ: a2agw-push+jwt`` (receivers should require it, so no other token signed with the
+  gateway key passes as a push JWT). Claims: ``iss``
   (the host's base URL), ``aud`` (the exact webhook URL, query string included), ``iat``,
   ``exp`` (``iat`` + 300 s), ``task_id``, ``delivery_id``, ``body_sha256`` (hex SHA-256 of the
   exact request body) and ``jti`` (unique per attempt). A receiver should verify the signature
@@ -102,6 +104,7 @@ BACKOFF_CAP_S = 4.0
 MAX_BACKLOG = 100  # queued updates per task; on overflow the oldest is dropped
 DRAIN_TIMEOUT_S = 5.0  # host shutdown waits this long for pending deliveries
 JWT_TTL_S = 300
+PUSH_JWT_TYP = "a2agw-push+jwt"  # JOSE header ``typ`` of push JWTs
 # Carries the gateway JWT when the config's own `authentication` already uses Authorization.
 JWT_HEADER = "X-A2AGW-Push-JWT"
 DELIVERY_ID_HEADER = "X-A2AGW-Delivery-Id"
@@ -525,7 +528,8 @@ class GuardedPushSender(PushNotificationSender):
                     "delivery_id": delivery_id,
                     "body_sha256": digest,
                     "jti": uuid.uuid4().hex,
-                }
+                },
+                typ=PUSH_JWT_TYP,
             )
             if "Authorization" in headers:
                 headers[JWT_HEADER] = token

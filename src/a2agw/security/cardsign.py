@@ -131,11 +131,15 @@ class CardSigner:
         out.CopyFrom(card)
         return self._sign(out)
 
-    def sign_jwt(self, claims: dict[str, Any]) -> str:
-        """A compact JWT over `claims`, signed with this signer's key (header `kid`, `alg`).
+    def sign_jwt(self, claims: dict[str, Any], *, typ: str | None = None) -> str:
+        """A compact JWT over `claims`, signed with this signer's key (header `kid`, `alg`,
+        and `typ` when given, e.g. "a2agw-push+jwt" so a receiver can tell token kinds apart).
 
         The claims are signed as given; the caller sets `iss`, `aud`, `exp` and the rest."""
-        return jwt.encode(claims, self._key.key, algorithm=self.alg, headers={"kid": self.kid})
+        headers: dict[str, Any] = {"kid": self.kid}
+        if typ is not None:
+            headers["typ"] = typ
+        return jwt.encode(claims, self._key.key, algorithm=self.alg, headers=headers)
 
 
 def _protected_header(sig: AgentCardSignature) -> dict[str, Any] | None:

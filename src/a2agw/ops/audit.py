@@ -18,9 +18,13 @@ classification name and a small ``detail`` dict restricted to ``DETAIL_KEYS`` wi
 values cut to ``DETAIL_MAX_CHARS``. Never message text, artifact contents or secrets.
 
 Concurrency: appends are serialized by an ``asyncio.Lock`` per ``AuditLog`` (read the last
-hash, insert, in one transaction). Phase 2 assumes a single writer process per database;
-two processes appending to the same table could fork the chain. Each event is its own
-committed transaction (one fsync per event on sqlite WAL). Waiting for the lock is bounded
+hash, insert, in one transaction). On PostgreSQL a transaction-scoped advisory lock also
+serializes writers across processes, so several gateways (and the CLI) can append to one
+chain safely. On SQLite each append starts with a no-op write, which takes the database's
+write lock before the last hash is read, so writer processes on one file (a gateway and the
+``a2agw partners`` commands) are serialized too; the wait is bounded by the connection's
+busy timeout. Each event is its own committed transaction (one fsync per event on sqlite
+WAL). Waiting for the lock is bounded
 by ``LOCK_TIMEOUT_S``: a stalled database turns into counted audit errors, not into stuck
 requests.
 
@@ -329,6 +333,11 @@ class AuditLog:
             async with self._engine.begin() as conn:
                 if conn.dialect.name == "postgresql":
                     await self._advisory_lock(conn)
+                elif conn.dialect.name == "sqlite":
+                    # A no-op write first: it opens the transaction and takes SQLite's write
+                    # lock, so another process cannot read the same last hash meanwhile
+                    # (it waits on busy_timeout instead).
+                    await conn.execute(text("UPDATE a2agw_audit SET seq = seq WHERE 0"))
                 last = (
                     await conn.execute(select(t.c.hash).order_by(t.c.seq.desc()).limit(1))
                 ).scalar_one_or_none()

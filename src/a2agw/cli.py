@@ -115,7 +115,14 @@ def redact_db_url(url: str) -> str:
 
 _DB_DRIVERS = frozenset({"asyncpg", "aiosqlite", "psycopg", "psycopg2", "aiomysql", "asyncmy"})
 # File-system errors are not database errors (a partners file, a key file, ...).
-_FS_ERRORS = (FileNotFoundError, PermissionError, IsADirectoryError, NotADirectoryError)
+# A broken pipe is our own stdout going away (e.g. `| head`), not the database.
+_FS_ERRORS = (
+    FileNotFoundError,
+    PermissionError,
+    IsADirectoryError,
+    NotADirectoryError,
+    BrokenPipeError,
+)
 
 
 def _is_db_error(e: BaseException) -> bool:
@@ -184,7 +191,7 @@ def _tier(value: str) -> Tier:
 CONFIG_TEMPLATE = """\
 base_url: ${A2AGW_BASE_URL:-http://localhost:8000}
 db_url: sqlite+aiosqlite:///a2agw.db
-admin_without_auth: true   # development only: remove and configure `auth` for real use
+admin_without_auth: true   # development only (loopback bind): configure `auth` for real use
 
 agents:
   - spec: agent:echo
@@ -278,6 +285,21 @@ SIGNING_KEY = "keys/signing.pem"
 SIGNING_PUB = "keys/signing.pub.pem"
 
 
+# init --secure: config files that name keys and auth hashes are created mode 0600.
+_PRIVATE_FILES = frozenset({"a2agw.yaml", "policy.yaml"})
+
+
+def _append_lines(path: Path, content: str) -> None:
+    """Append the lines of ``content`` that ``path`` does not have yet."""
+    existing = path.read_text()
+    have = set(existing.splitlines())
+    missing = [line for line in content.splitlines() if line and line not in have]
+    if missing:
+        sep = "" if not existing or existing.endswith("\n") else "\n"
+        with path.open("a") as f:
+            f.write(sep + "\n".join(missing) + "\n")
+
+
 def _write_private(path: Path, data: bytes) -> None:
     """Create ``path`` with mode 0600 from the start (never world-readable, not even briefly)."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
@@ -369,8 +391,18 @@ def init(
             _write_private(directory / name, data)
             typer.echo(f"wrote {directory / name} (mode 0600)")
     for name, content in files.items():
-        (directory / name).write_text(content)
-        typer.echo(f"wrote {directory / name}")
+        path = directory / name
+        if secure and name == ".gitignore" and path.exists():
+            _append_lines(path, content)  # keep the project's own entries
+            typer.echo(f"updated {path}")
+            continue
+        if secure and name in _PRIVATE_FILES:
+            path.unlink(missing_ok=True)  # --force: replaced, never written through
+            _write_private(path, content.encode())
+            typer.echo(f"wrote {path} (mode 0600)")
+            continue
+        path.write_text(content)
+        typer.echo(f"wrote {path}")
     if api_key is not None:
         typer.echo(f"\nAPI key: {api_key}")
         typer.echo(
@@ -548,6 +580,10 @@ def partners_add(
             )
         )
     typer.echo(f"added {rec.id} ({rec.tier}) hash {rec.card_hash[:12]}")
+    typer.echo(
+        "a running gateway picks it up after POST /a2agw/admin/partners/reload "
+        "(admin scope, header X-A2AGW-Admin: 1) or on its next start"
+    )
 
 
 @partners_app.command("list")

@@ -525,7 +525,11 @@ async def test_admin_reap_is_dry_run_idle_guarded_confirmed_and_audited(tmp_path
     e.host.add(spec("alpha"))
     await e.start()
     try:
-        hc = httpx.AsyncClient(transport=httpx.ASGITransport(app=e.host.app()), base_url="http://t")
+        hc = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=e.host.app()),
+            base_url="http://t",
+            headers={"X-A2AGW-Admin": "1"},  # admin POSTs need the CSRF header
+        )
         url = "/a2agw/admin/tasks/reap"
         async with hc:
             assert (await hc.post(url)).status_code == 400  # agent is required
@@ -556,7 +560,9 @@ async def test_admin_reap_is_dry_run_idle_guarded_confirmed_and_audited(tmp_path
         await TaskIndex(eng).upsert("gone-3", "gone", "key:a", "c", W, None)
         await _age(eng)
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=e.host.app()), base_url="http://t"
+            transport=httpx.ASGITransport(app=e.host.app()),
+            base_url="http://t",
+            headers={"X-A2AGW-Admin": "1"},
         ) as hc:
             r = await hc.post(url, params={"agent": "gone", "confirm": "true"})
             assert r.status_code == 200 and r.json()["reaped"] == 1
