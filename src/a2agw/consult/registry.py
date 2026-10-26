@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import stat
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
@@ -54,10 +55,18 @@ UNSIGNED = "unsigned card"
 KEY_UNTRUSTED = "signing key no longer trusted"
 
 
+LOCK_RETRY_S = 0.02
+
+
+class PartnersFileBusy(TimeoutError):
+    """Another process held the partners file lock for longer than the registry waits."""
+
+
 @contextmanager
-def _file_lock(path: Path) -> Iterator[None]:
+def _file_lock(path: Path, timeout_s: float = 10.0) -> Iterator[None]:
     """Exclusive lock on ``<path>.lock`` (POSIX ``fcntl.flock``; elsewhere no lock), held
-    while a registry re-reads and rewrites the partners file."""
+    while a registry re-reads and rewrites the partners file. Never waits longer than
+    ``timeout_s`` (non-blocking attempts, retried): ``PartnersFileBusy`` after that."""
     lock_path = path.with_name(path.name + ".lock")
     try:
         import fcntl
@@ -65,11 +74,60 @@ def _file_lock(path: Path) -> Iterator[None]:
         yield
         return
     with open(lock_path, "a") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise PartnersFileBusy(f"{path.name} is locked by another process") from None
+                time.sleep(LOCK_RETRY_S)
         try:
             yield
         finally:
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+def _write_durably(path: Path, text: str) -> None:
+    """Replace ``path`` with ``text`` atomically and durably: a temporary file (never
+    following a symlink, with the current file's mode, or 0644 under the umask for a new
+    file) is fsynced before ``os.replace``, then the directory is fsynced, so a crash
+    leaves either the old file or the new one, never an empty or truncated one."""
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        mode = None
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.unlink()  # a leftover temporary file, or a planted symlink: never written through
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    try:
+        if mode is not None:
+            os.fchmod(fd, mode)
+        with os.fdopen(fd, "w") as f:
+            fd = -1
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        if fd != -1:
+            os.close(fd)
+        tmp.unlink(missing_ok=True)
+        raise
+    try:
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+    except OSError:  # pragma: no cover - platform without directory fds
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:  # pragma: no cover - some filesystems refuse a directory fsync
+        pass
+    finally:
+        os.close(dir_fd)
 
 
 class CardFetchError(Exception):
@@ -199,6 +257,8 @@ class PartnerRegistry:
         verifier: CardVerifier | None = None,
         require_signed: frozenset[Tier] = frozenset(),
         tls: Mapping[str, TlsClientConfig] | None = None,
+        lock_timeout_s: float = 10.0,
+        defer_busy_saves: bool = False,
     ):
         if require_signed and verifier is None:
             raise ValueError("require_signed needs a verifier")
@@ -215,6 +275,12 @@ class PartnerRegistry:
         self._disk: dict[str, Any] = {}
         self._dirty: set[str] = set()
         self._version = 0  # bumped by every change (reload plans are checked against it)
+        # How long a save waits for the partners file lock, and what a save does when it
+        # cannot get it: raise ``PartnersFileBusy`` (the CLI: the operator must know), or
+        # keep the changes unsaved with a WARNING until ``flush`` (the host: never stall
+        # the event loop behind another process).
+        self.lock_timeout_s = lock_timeout_s
+        self.defer_busy_saves = defer_busy_saves
         self.on_change: Callable[[PartnerRecord, str], None] | None = None
         # Extra detail of the change being reported, readable from inside ``on_change``
         # (e.g. {"reason": ..., "actor": ..., "fields": ...}); None outside of it.
@@ -578,7 +644,29 @@ class PartnerRegistry:
         self._dirty.update(set(self._disk) - set(self._records))  # removed here: removed there
         self._save_dirty()
 
+    @property
+    def unsaved(self) -> bool:
+        """Whether changes are waiting to be written to the partners file."""
+        return self.path is not None and bool(self._dirty)
+
+    def flush(self) -> None:
+        """Write the changes a busy lock kept unsaved (see ``defer_busy_saves``)."""
+        self._save_dirty()
+
     def _save_dirty(self) -> None:
+        try:
+            self._save_dirty_locked()
+        except PartnersFileBusy:
+            if not self.defer_busy_saves:
+                raise
+            logger.warning(
+                "partners file %s busy (locked by another process); %d change(s) kept "
+                "unsaved, retried on the next save or maintenance pass",
+                self.path.name if self.path else "",
+                len(self._dirty),
+            )
+
+    def _save_dirty_locked(self) -> None:
         """Write the records changed since the last save, and nothing else.
 
         Under an exclusive lock on the sidecar ``<file>.lock`` (taken by every registry
@@ -593,7 +681,7 @@ class PartnerRegistry:
             return
         path = self.path
         path.parent.mkdir(parents=True, exist_ok=True)
-        with _file_lock(path):
+        with _file_lock(path, self.lock_timeout_s):
             try:
                 entries = self._read_raw(path) if path.exists() else []
             except ValueError as e:
@@ -634,9 +722,7 @@ class PartnerRegistry:
                 return
             entries = [e for e in entries if not (isinstance(e, dict) and e.get("id") in removed)]
             text = yaml.safe_dump({"partners": entries}, sort_keys=False)
-            tmp = path.with_name(path.name + ".tmp")
-            tmp.write_text(text)
-            os.replace(tmp, path)
+            _write_durably(path, text)
             reread = {e["id"]: e for e in yaml.safe_load(text)["partners"]}
             for pid in written:
                 if pid in reread:

@@ -174,9 +174,9 @@ def test_saves_take_the_sidecar_lock(tmp_path, monkeypatch):
     taken: list[str] = []
     real = registry_mod._file_lock
 
-    def spy(path):
+    def spy(path, *args):
         taken.append(path.name)
-        return real(path)
+        return real(path, *args)
 
     monkeypatch.setattr(registry_mod, "_file_lock", spy)
     reg = PartnerRegistry(tmp_path / "partners.yaml")

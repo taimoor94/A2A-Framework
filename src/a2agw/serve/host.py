@@ -124,6 +124,7 @@ logger = logging.getLogger(__name__)
 _AGENT_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 REFRESH_MAX_PER_PASS = 20  # partner cards refreshed per maintenance pass
 REFRESH_CONCURRENCY = 4
+PARTNERS_LOCK_TIMEOUT_S = 0.25  # longest a save on the event loop waits for the file lock
 _EARLY_AUDIT_MAX = 1000  # registry changes kept for the audit log until startup
 _EXIT_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 # Default bound on uvicorn's wait for open requests at shutdown.
@@ -1051,6 +1052,10 @@ class AgentHost:
             verifier=card_verifier,
             require_signed=frozenset(require_signed),
             tls=self.tls,
+            # Saves run on the event loop: never wait long for another process's lock on
+            # the partners file; keep the change unsaved instead (``maintain`` retries it).
+            lock_timeout_s=PARTNERS_LOCK_TIMEOUT_S,
+            defer_busy_saves=True,
         )
         self.credentials = credentials
         # Injected for tests: used as given, bypassing the guarded outbound clients.
@@ -1291,6 +1296,7 @@ class AgentHost:
         )
         await self.ledger.purge(now)
         await self.refresh_due_partners(now=now)
+        self.partners.flush()  # changes a busy partners file lock kept unsaved
         return report
 
     async def refresh_due_partners(self, *, now: float | None = None) -> dict[str, str]:
