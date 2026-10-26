@@ -96,6 +96,8 @@ class GatewayConfig(BaseModel):
     partners: list[PartnerConfig] = Field(default_factory=list)
     credentials: dict[str, CredentialConfig] = Field(default_factory=dict)
     telemetry: TelemetryConfig | None = None
+    # Spec 8.2: outbound partner tasks still open after this many seconds are cancelled.
+    outbound_ttl_s: float = Field(default=86400.0, gt=0)
 
     @model_validator(mode="after")
     def _credential_refs_exist(self) -> GatewayConfig:
@@ -205,6 +207,7 @@ def build_host(cfg: GatewayConfig, *, config_dir: Path | str = ".") -> AgentHost
         partners_path=partners_path(cfg, config_dir),
         credentials=EnvCredentials({k: (v.header, v.env) for k, v in cfg.credentials.items()}),
         admin_without_auth=cfg.admin_without_auth,
+        outbound_ttl_s=cfg.outbound_ttl_s,
     )
     for ref in cfg.agents:
         host.add(_load_agent(ref.spec, config_dir))

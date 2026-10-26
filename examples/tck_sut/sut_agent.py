@@ -126,6 +126,10 @@ def sut_spec() -> AgentSpec:
                 tags=["tck"],
             )
         ],
+        # The reference SUT accepts any media type: the pinned TCK's CORE-SEND-003 sends
+        # application/x-unsupported-tck-type and expects success (it declares no expected
+        # error), so this agent takes every media type.
+        input_modes=["*/*"],
         adapter=CallableAdapter(tck_behaviour),
         direct_replies=True,  # "tck-message-response" answers with a bare Message
     )

@@ -18,9 +18,13 @@ from a2a.types import (
     SendMessageRequest,
     TaskState,
 )
-from a2a.utils.errors import InvalidParamsError, TaskNotFoundError
+from a2a.utils.errors import (
+    ContentTypeNotSupportedError,
+    InvalidParamsError,
+    TaskNotFoundError,
+)
 
-from a2agw.core.events import Done
+from a2agw.core.events import Done, NeedInput
 from a2agw.security.auth import AgentAccess, ApiKeyEntry, AuthConfig
 from a2agw.serve.agent import AgentSpec, SkillSpec
 from a2agw.serve.host import AgentHost
@@ -520,9 +524,7 @@ async def test_exit_signal_over_sig_ign_does_nothing_more(sig_name):
     termination)."""
     import signal
 
-    ran, raised = await _exit_signal_with_previous(
-        getattr(signal, sig_name), signal.SIG_IGN
-    )
+    ran, raised = await _exit_signal_with_previous(getattr(signal, sig_name), signal.SIG_IGN)
     assert ran and raised is None
 
 
@@ -702,3 +704,233 @@ async def test_rest_tenant_path_from_the_card_is_served(env):
         "/agents/alpha/rest/message:send", json=body
     )
     assert plain.status_code == 200
+
+
+# -- inbound idempotency (spec 8.5) -------------------------------------------------------
+
+
+class Counting:
+    durable_sessions = False
+
+    def __init__(self) -> None:
+        self.runs = 0
+        self.gate: asyncio.Event | None = None
+
+    async def run(self, ctx):
+        self.runs += 1
+        if self.gate is not None:
+            await self.gate.wait()
+        yield Done(text=f"run {self.runs}")
+
+
+def fixed_msg(mid: str, text: str = "hi") -> Message:
+    return Message(message_id=mid, role=Role.ROLE_USER, parts=[Part(text=text)])
+
+
+async def test_resent_message_returns_the_open_task(env):
+    """Spec 8.5: a re-send while the first task is open (here input-required) returns that
+    task and does not run the agent again; once the task has ended, the id is free."""
+    runs: list[str] = []
+
+    class Asker:
+        durable_sessions = False
+
+        async def run(self, ctx):
+            runs.append(ctx.text)
+            if not ctx.resumed:
+                yield NeedInput("which one?")
+                return
+            yield Done(text="ok")
+
+    e = await env(spec("alpha", Asker()))
+    client = e.client("alpha")
+    [first] = await send_one(client, fixed_msg("m-1"))
+    assert first.task.status.state == TaskState.TASK_STATE_INPUT_REQUIRED
+    [again] = await send_one(client, fixed_msg("m-1"))
+    assert again.task.id == first.task.id and runs == ["hi"]
+    rows, _ = await e.host.index.list(agent_id="alpha")
+    assert len(rows) == 1
+    # The id re-used for a different request is a different message (the A2A TCK does this).
+    [other] = await send_one(client, fixed_msg("m-1", "changed text"))
+    assert other.task.id != first.task.id and runs == ["hi", "changed text"]
+    # Once the task has ended, the id is free: the identical request starts a new task.
+    answer = fixed_msg("m-2", "the second")
+    answer.task_id, answer.context_id = first.task.id, first.task.context_id
+    [done] = await send_one(client, answer)
+    assert done.task.status.state == TaskState.TASK_STATE_COMPLETED
+    [fresh] = await send_one(client, fixed_msg("m-1", "changed text"))  # T2 still open
+    assert fresh.task.id == other.task.id and len(runs) == 3
+
+
+async def test_resent_stream_resubscribes_to_the_running_task(env):
+    agent = Counting()
+    agent.gate = asyncio.Event()
+    e = await env(spec("alpha", agent))
+    stream = e.client("alpha", streaming=True)
+
+    async def collect():
+        return [
+            ev async for ev in stream.send_message(SendMessageRequest(message=fixed_msg("s-1")))
+        ]
+
+    first = asyncio.create_task(collect())
+    async with asyncio.timeout(5):
+        while agent.runs == 0:
+            await asyncio.sleep(0.01)
+    second = asyncio.create_task(collect())
+    await asyncio.sleep(0.2)
+    agent.gate.set()
+    a, b = await asyncio.wait_for(asyncio.gather(first, second), 10)
+
+    def ids(events):
+        return {
+            ev.task.id if ev.HasField("task") else ev.status_update.task_id
+            for ev in events
+            if ev.HasField("task") or ev.HasField("status_update")
+        }
+
+    assert ids(a) == ids(b) and len(ids(a)) == 1
+    last = b[-1]
+    state = last.task.status.state if last.HasField("task") else last.status_update.status.state
+    assert state == TaskState.TASK_STATE_COMPLETED
+    assert agent.runs == 1
+    # Once that task is terminal the id is free again: a new task (the A2A TCK relies on it).
+    again = [ev async for ev in stream.send_message(SendMessageRequest(message=fixed_msg("s-1")))]
+    assert ids(again).isdisjoint(ids(a)) and agent.runs == 2
+
+
+async def test_same_message_id_from_another_principal_or_tenant_is_new(env):
+    agent = Counting()
+    e = await env(spec("alpha", agent), auth=key_auth(a="secret-a", b="secret-b"))
+    [a] = await send_one(e.client("alpha", **{"X-API-Key": "secret-a"}), fixed_msg("m-1"))
+    [b] = await send_one(e.client("alpha", **{"X-API-Key": "secret-b"}), fixed_msg("m-1"))
+    assert a.task.id != b.task.id and agent.runs == 2
+    hc = e.http(**{"X-API-Key": "secret-a", "A2A-Version": "1.0"})
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "SendMessage",
+        "params": {
+            "tenant": "t2",
+            "message": {"messageId": "m-1", "role": "ROLE_USER", "parts": [{"text": "x"}]},
+        },
+    }
+    r = await hc.post("/agents/alpha/", json=body)
+    assert r.json()["result"]["task"]["id"] not in (a.task.id, b.task.id)
+    assert agent.runs == 3
+
+
+class DurableAsker:
+    durable_sessions = True  # an input-required task survives a restart
+
+    def __init__(self) -> None:
+        self.runs = 0
+
+    async def run(self, ctx):
+        self.runs += 1
+        yield NeedInput("which one?")
+
+
+async def test_message_ids_survive_a_restart(tmp_path, db_url):
+    e1 = Env(tmp_path, db_url=db_url)
+    e1.host.add(spec("alpha", DurableAsker()))
+    await e1.start()
+    [first] = await send_one(e1.client("alpha"), fixed_msg("m-r"))
+    assert first.task.status.state == TaskState.TASK_STATE_INPUT_REQUIRED
+    await e1.stop()
+    agent = DurableAsker()
+    e2 = Env(tmp_path, db_url=db_url)
+    e2.host.add(spec("alpha", agent))
+    await e2.start()
+    try:
+        assert e2.host.last_recovery.kept == [first.task.id]
+        [again] = await send_one(e2.client("alpha"), fixed_msg("m-r"))
+        assert again.task.id == first.task.id and agent.runs == 0
+    finally:
+        await e2.stop()
+
+
+async def test_direct_reply_message_is_not_remembered(env):
+    from a2agw.core.events import Reply
+
+    runs: list[int] = []
+
+    class Replier:
+        durable_sessions = False
+
+        async def run(self, ctx):
+            runs.append(1)
+            yield Reply("hello")
+
+    e = await env(spec("alpha", Replier(), direct_replies=True))
+    for _ in range(2):
+        [ev] = await send_one(e.client("alpha"), fixed_msg("m-d"))
+        assert ev.HasField("message")
+    assert len(runs) == 2  # no task to point a re-send at: it runs again
+
+
+# -- media types against input modes (spec 8.8) -------------------------------------------
+
+
+def test_media_type_matching():
+    from a2agw.serve.host import media_type_accepted
+
+    assert media_type_accepted("image/png", ["image/*"])
+    assert media_type_accepted("IMAGE/PNG; q=1", ["image/png"])
+    assert media_type_accepted("video/mp4", ["*/*"])
+    assert media_type_accepted("anything/x", None)
+    assert not media_type_accepted("image/png", ["text/plain", "application/json"])
+    assert not media_type_accepted("imagex/png", ["image/*"])
+
+
+def test_accepted_modes_union_of_skills_with_fallback():
+    from a2agw.serve.host import accepted_input_modes
+
+    s = spec("alpha", input_modes=["text/plain"])
+    s.skills.append(SkillSpec(id="img", name="Img", description="d", input_modes=["image/*"]))
+    assert accepted_input_modes(s) == ["text/plain", "image/*"]
+    s.skills.append(SkillSpec(id="any", name="Any", description="d", input_modes=[]))
+    assert accepted_input_modes(s) is None  # an empty list accepts all
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_part_media_type_checked_against_input_modes(env, streaming):
+    e = await env(spec("alpha"))  # default modes: text/plain, application/json
+    client = e.client("alpha", streaming=streaming)
+    ok = Message(
+        message_id=uuid.uuid4().hex,
+        role=Role.ROLE_USER,
+        parts=[Part(text="x")],
+    )
+    from google.protobuf.json_format import ParseDict
+
+    ok.parts.append(ParseDict({"data": {"k": 1}}, Part()))
+    assert await send_one(client, ok)
+    for part, shown in (
+        (Part(raw=b"\x89PNG", media_type="image/png", filename="a.png"), "image/png"),
+        (Part(raw=b"MZ", filename="a.exe"), "application/octet-stream"),
+        (Part(url="https://x.example/a.pdf", media_type="application/pdf"), "application/pdf"),
+        (Part(text="x", media_type="text/html"), "text/html"),
+    ):
+        bad = Message(
+            message_id=uuid.uuid4().hex, role=Role.ROLE_USER, parts=[Part(text="x"), part]
+        )
+        with pytest.raises(
+            ContentTypeNotSupportedError, match=f"media type {shown} is not accepted"
+        ):
+            await send_one(client, bad)
+    rows, _ = await e.host.index.list(agent_id="alpha")
+    assert len(rows) == 1
+
+
+async def test_skill_input_modes_widen_what_is_accepted(env):
+    s = spec("alpha")
+    s.skills.append(SkillSpec(id="img", name="Img", description="d", input_modes=["image/*"]))
+    e = await env(s)
+    msg_ = Message(
+        message_id=uuid.uuid4().hex,
+        role=Role.ROLE_USER,
+        parts=[Part(raw=b"\x89PNG", media_type="image/png", filename="a.png")],
+    )
+    [ev] = await send_one(e.client("alpha"), msg_)
+    assert ev.task.status.state == TaskState.TASK_STATE_COMPLETED

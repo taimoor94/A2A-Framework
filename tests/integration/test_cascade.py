@@ -577,3 +577,66 @@ async def test_direct_reply_drops_index_row_and_cancels_partner_work(env):
     assert rows == []
     [handle] = await host.handles.by_inbound(seen["a_task"])
     assert handle["state"] == CANCELED
+
+
+async def test_completion_cancels_outstanding_partner_and_leaves_finished_one(env):
+    """Spec 8.2: when the inbound task completes, the partner task it left working is
+    cancelled; a partner task that already finished is not touched."""
+    b = Blocker()
+    seen: dict[str, Any] = {}
+
+    async def a_run(ctx):
+        seen["a_task"] = ctx.task_id
+        seen["done"] = await host.client.consult("c", "go", wait_seconds=5)
+        seen["open"] = await host.client.consult("b", "go", wait_seconds=HANDLE_WAIT_S)
+        yield Done(text="finished without waiting for b")
+
+    e = await env(spec("a", Fn(a_run)), spec("b", b), spec("c", Fn(echo)))
+    host = e.host
+    await e.register("b", "c")
+    [ev] = await e.send("a", "start")
+    assert ev.task.status.state == TaskState.TASK_STATE_COMPLETED
+    assert seen["done"].state == "completed" and seen["open"].state == "working"
+
+    async def b_canceled() -> bool:
+        rows, _ = await host.index.list(agent_id="b")
+        return [r["state"] for r in rows] == [CANCELED]
+
+    await until(b_canceled)
+    handles = {h["partner_id"]: h["state"] for h in await host.handles.by_inbound(seen["a_task"])}
+    assert handles == {"b": CANCELED, "c": TaskState.Name(TaskState.TASK_STATE_COMPLETED)}
+    rows, _ = await host.index.list(agent_id="c")
+    assert [r["state"] for r in rows] == [TaskState.Name(TaskState.TASK_STATE_COMPLETED)]
+
+
+async def test_outbound_ttl_cancels_a_partner_task_left_open(env):
+    """Spec 8.2: a partner task still open after ``outbound_ttl_s`` is cancelled by the
+    host's maintenance pass, its handle ended with a reason, and the expiry audited."""
+    import time
+
+    from a2agw.core.events import NeedInput
+
+    b = Blocker()
+    seen: dict[str, Any] = {}
+
+    async def a_run(ctx):
+        seen["a_task"] = ctx.task_id
+        seen["open"] = await host.client.consult("b", "go", wait_seconds=HANDLE_WAIT_S)
+        yield NeedInput("waiting for the user")  # the inbound task stays open
+
+    e = await env(spec("a", Fn(a_run)), spec("b", b), outbound_ttl_s=3600)
+    host = e.host
+    await e.register("b")
+    [ev] = await e.send("a", "start")
+    assert ev.task.status.state == TaskState.TASK_STATE_INPUT_REQUIRED
+    assert seen["open"].state == "working"
+    assert (await host.maintain()).expired == 0  # not old enough yet
+    report = await host.maintain(now=time.time() + 3601)
+    assert (report.expired, report.cancel_failed) == (1, 0)
+    rows, _ = await host.index.list(agent_id="b")
+    assert [r["state"] for r in rows] == [CANCELED]
+    [handle] = await host.handles.by_inbound(seen["a_task"])
+    assert handle["state"] == CANCELED and handle["end_reason"] == "ttl expired"
+    await host.audit.drain()
+    audit, _ = await host.audit.query({"action": "outbound.expire"}, 10)
+    assert [(r["partner_id"], r["outcome"]) for r in audit] == [("b", "canceled")]

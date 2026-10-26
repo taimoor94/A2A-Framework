@@ -73,6 +73,7 @@ Action = Literal[
     "partner.reload",
     "admin.read",
     "task.reap",
+    "outbound.expire",
 ]
 ACTIONS: frozenset[str] = frozenset(get_args(Action))
 DETAIL_KEYS = frozenset(

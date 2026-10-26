@@ -376,3 +376,54 @@ async def test_in_memory_sqlite_engine_skips_pragmas():
             assert (await conn.execute(text("PRAGMA journal_mode"))).scalar() == "memory"
     finally:
         await eng.dispose()
+
+
+# -- inbound message ledger (spec 8.5) ----------------------------------------------------
+
+
+async def test_message_ledger_reserve_fill_and_duplicate(engine):
+    from a2agw.serve.store import MessageKey, MessageLedger
+
+    ledger = MessageLedger(engine)
+    await ledger.initialize()
+    key = MessageKey("alpha", "", "key:a", "m1")
+    assert await ledger.reserve(key) is None  # first send owns it
+    dup = await ledger.reserve(key)
+    assert dup is not None and dup["task_id"] is None  # still being set up
+    await ledger.fill(key, "t1")
+    assert (await ledger.reserve(key))["task_id"] == "t1"
+    # The same id for a different request takes the key over; the old send can no longer
+    # fill it.
+    assert await ledger.reserve(key, fingerprint="other") is None
+    await ledger.fill(key, "t-old", fingerprint="")
+    assert (await ledger.get(key))["task_id"] is None
+    await ledger.fill(key, "t2", fingerprint="other")
+    assert (await ledger.reserve(key, fingerprint="other"))["task_id"] == "t2"
+    # Another owner, tenant or agent is a different key.
+    for other in (
+        MessageKey("alpha", "", "key:b", "m1"),
+        MessageKey("alpha", "acme", "key:a", "m1"),
+        MessageKey("beta", "", "key:a", "m1"),
+    ):
+        assert await ledger.reserve(other) is None
+
+
+async def test_message_ledger_retention_and_purge(engine):
+    import time
+
+    from a2agw.serve.store import RESERVATION_STALE_S, MessageKey, MessageLedger
+
+    ledger = MessageLedger(engine, retention_s=100)
+    await ledger.initialize()
+    key = MessageKey("alpha", "", "anonymous", "m1")
+    now = time.time()
+    assert await ledger.reserve(key, now) is None
+    await ledger.fill(key, "t1")
+    assert (await ledger.reserve(key, now + 99))["task_id"] == "t1"
+    assert await ledger.reserve(key, now + 101) is None  # expired: a new message again
+    # A reservation that never got a task (crashed send) is taken over.
+    stale = MessageKey("alpha", "", "anonymous", "m2")
+    assert await ledger.reserve(stale, now) is None
+    assert await ledger.reserve(stale, now + RESERVATION_STALE_S + 1) is None
+    assert await ledger.purge(now + 1000) == 2
+    assert await ledger.get(key) is None

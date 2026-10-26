@@ -53,6 +53,22 @@ _index_table = Table(
     Column("origin", String, nullable=True),
 )
 
+# Inbound message ids already acted on (spec 8.5): a re-sent message is answered with the task
+# the first one created instead of running the agent again. One row per (agent, tenant,
+# owner, messageId); ``task_id`` is NULL while the first send is still setting up.
+_ledger_table = Table(
+    "a2agw_inbound_messages",
+    _metadata,
+    Column("agent_id", String, primary_key=True),
+    Column("tenant", String, primary_key=True),
+    Column("owner", String, primary_key=True),
+    Column("message_id", String, primary_key=True),
+    Column("task_id", String, nullable=True),
+    # SHA-256 of the whole request: only an identical re-send is a duplicate.
+    Column("fingerprint", String, nullable=False, default=""),
+    Column("created_at", Float, nullable=False, index=True),
+)
+
 _RESUMABLE_STATES = {
     TaskState.Name(TaskState.TASK_STATE_INPUT_REQUIRED),
     TaskState.Name(TaskState.TASK_STATE_AUTH_REQUIRED),
@@ -416,3 +432,121 @@ async def reap_tasks(
     if to_cancel and cancel_outbound is not None:
         await _cancel_all(to_cancel, cancel_outbound, cancel_timeout_s, report)
     return report
+
+
+MESSAGE_RETENTION_S = 24 * 3600.0  # a message id is a duplicate for this long
+RESERVATION_STALE_S = 60.0  # a reservation never given a task (crashed send) is taken over
+
+
+@dataclass(frozen=True)
+class MessageKey:
+    agent_id: str
+    tenant: str
+    owner: str
+    message_id: str
+
+    def where(self) -> Any:
+        t = _ledger_table.c
+        return and_(
+            t.agent_id == self.agent_id,
+            t.tenant == self.tenant,
+            t.owner == self.owner,
+            t.message_id == self.message_id,
+        )
+
+
+class MessageLedger:
+    """Inbound message ids (spec 8.5), persisted so duplicates are recognised across restarts
+    and across gateways sharing the database. Rows older than ``retention_s`` no longer count
+    and are deleted by ``purge`` (the host's maintenance loop)."""
+
+    def __init__(self, engine: AsyncEngine, *, retention_s: float = MESSAGE_RETENTION_S) -> None:
+        self._engine = engine
+        self.retention_s = retention_s
+
+    async def initialize(self) -> None:
+        async def create() -> None:
+            async with self._engine.begin() as conn:
+                await conn.run_sync(_ledger_table.create, checkfirst=True)
+
+        await retry_ddl(create)
+
+    async def reserve(
+        self, key: MessageKey, now: float | None = None, *, fingerprint: str = ""
+    ) -> dict[str, Any] | None:
+        """Claim ``key`` for a new send. Returns None when the caller now owns it, else the
+        existing row (a duplicate: its ``task_id`` may still be NULL while the first send is
+        setting up). A row with another ``fingerprint`` (the id re-used for a different
+        request), an expired row, or a reservation that never got a task within
+        ``RESERVATION_STALE_S`` is taken over with a compare-and-set."""
+        now = time.time() if now is None else now
+        insert = (
+            sqlite_dialect.insert if self._engine.dialect.name == "sqlite" else postgresql.insert
+        )
+        stmt = (
+            insert(_ledger_table)
+            .values(
+                agent_id=key.agent_id,
+                tenant=key.tenant,
+                owner=key.owner,
+                message_id=key.message_id,
+                task_id=None,
+                fingerprint=fingerprint,
+                created_at=now,
+            )
+            .on_conflict_do_nothing()
+        )
+        async with self._engine.begin() as conn:
+            if (await conn.execute(stmt)).rowcount == 1:
+                return None
+            row = (await conn.execute(select(_ledger_table).where(key.where()))).first()
+        if row is None:  # deleted in between: try once more
+            return await self.reserve(key, now, fingerprint=fingerprint)
+        existing = dict(row._mapping)
+        expired = now - existing["created_at"] >= self.retention_s
+        stale = existing["task_id"] is None and now - existing["created_at"] >= RESERVATION_STALE_S
+        other = existing["fingerprint"] != fingerprint
+        if expired or stale or other:
+            take = (
+                update(_ledger_table)
+                .where(
+                    key.where(),
+                    _ledger_table.c.created_at == existing["created_at"],
+                    _ledger_table.c.fingerprint == existing["fingerprint"],
+                )
+                .values(task_id=None, created_at=now, fingerprint=fingerprint)
+            )
+            async with self._engine.begin() as conn:
+                if (await conn.execute(take)).rowcount == 1:
+                    return None
+            return await self.get(key) or existing
+        return existing
+
+    async def fill(self, key: MessageKey, task_id: str, *, fingerprint: str | None = None) -> None:
+        """Record the task of the send holding ``key`` (only while it still holds it)."""
+        cond = and_(key.where(), _ledger_table.c.task_id.is_(None))
+        if fingerprint is not None:
+            cond = and_(cond, _ledger_table.c.fingerprint == fingerprint)
+        stmt = update(_ledger_table).where(cond).values(task_id=task_id)
+        async with self._engine.begin() as conn:
+            await conn.execute(stmt)
+
+    async def get(self, key: MessageKey) -> dict[str, Any] | None:
+        async with self._engine.connect() as conn:
+            row = (await conn.execute(select(_ledger_table).where(key.where()))).first()
+        return dict(row._mapping) if row is not None else None
+
+    async def release(self, key: MessageKey, *, only_unfilled: bool = True) -> None:
+        """Forget ``key`` (a send that created no task, or answered with a bare Message)."""
+        cond = key.where()
+        if only_unfilled:
+            cond = and_(cond, _ledger_table.c.task_id.is_(None))
+        async with self._engine.begin() as conn:
+            await conn.execute(delete(_ledger_table).where(cond))
+
+    async def purge(self, now: float | None = None) -> int:
+        """Delete rows past the retention window; returns how many."""
+        cutoff = (time.time() if now is None else now) - self.retention_s
+        stmt = delete(_ledger_table).where(_ledger_table.c.created_at < cutoff)
+        async with self._engine.begin() as conn:
+            return int((await conn.execute(stmt)).rowcount or 0)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -23,8 +24,23 @@ from a2a.server.routes import (
     create_rest_routes,
 )
 from a2a.server.tasks import TaskStore
-from a2a.types import AgentCard, SendMessageRequest
-from a2a.utils.errors import A2AError, InternalError, InvalidParamsError
+from a2a.types import (
+    AgentCard,
+    GetTaskRequest,
+    SendMessageRequest,
+    SubscribeToTaskRequest,
+    Task,
+    TaskState,
+)
+from a2a.types import Message as A2AMessage
+from a2a.utils.errors import (
+    A2AError,
+    ContentTypeNotSupportedError,
+    InternalError,
+    InvalidParamsError,
+    TaskNotFoundError,
+    UnsupportedOperationError,
+)
 from google.protobuf.json_format import MessageToDict
 from google.protobuf.message import Message as ProtoMessage
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -68,13 +84,18 @@ from a2agw.serve.push import (
     push_http_client,
 )
 from a2agw.serve.reap import (
+    OUTBOUND_TTL_S,
     AgentServedError,
+    ExpireReport,
     ReapResult,
     RecentActivityError,
+    expire_outbound,
     make_cancel_outbound,
     reap_agent,
 )
 from a2agw.serve.store import (
+    MessageKey,
+    MessageLedger,
     RecoveryReport,
     TaskIndex,
     create_engine,
@@ -244,30 +265,233 @@ def _guard_handler_method(fn: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
-class LimitedRequestHandler(DefaultRequestHandler):
-    """DefaultRequestHandler that rejects messages with too many parts, or with a part that
-    carries no content (empty, or only fields the parser does not know and dropped)."""
+def part_media_type(part: Any) -> str:
+    """The media type a part is checked as (spec 8.8): its declared ``media_type``, else
+    text/plain for text, application/json for data and application/octet-stream for a file."""
+    if part.media_type:
+        return str(part.media_type)
+    kind = part.WhichOneof("content")
+    if kind == "text":
+        return "text/plain"
+    if kind == "data":
+        return "application/json"
+    return "application/octet-stream"
 
-    def __init__(self, *args: Any, max_parts: int, **kwargs: Any) -> None:
+
+def _bare(media_type: str) -> str:
+    return media_type.split(";", 1)[0].strip().lower()
+
+
+def media_type_accepted(media_type: str, modes: list[str] | None) -> bool:
+    """True when ``media_type`` matches one of ``modes`` (``*/*`` and ``type/*`` wildcards;
+    parameters and case ignored). ``None`` accepts everything."""
+    if modes is None:
+        return True
+    mt = _bare(media_type)
+    major = mt.split("/", 1)[0]
+    for mode in modes:
+        m = _bare(mode)
+        if m in ("*/*", "*", mt) or (m.endswith("/*") and m[:-2] == major):
+            return True
+    return False
+
+
+def accepted_input_modes(spec: AgentSpec) -> list[str] | None:
+    """The media types the agent takes: every skill's ``input_modes`` (a skill without its
+    own falls back to the agent's ``input_modes``). A message names no skill, so this is the
+    union. An empty list anywhere means "accept all" (None)."""
+    out: list[str] = []
+    lists = [s.input_modes if s.input_modes is not None else spec.input_modes for s in spec.skills]
+    for modes in lists or [spec.input_modes]:
+        if not modes:
+            return None
+        out.extend(m for m in modes if m not in out)
+    return out
+
+
+_TERMINAL_TASK_STATES = {
+    TaskState.TASK_STATE_COMPLETED,
+    TaskState.TASK_STATE_FAILED,
+    TaskState.TASK_STATE_CANCELED,
+    TaskState.TASK_STATE_REJECTED,
+}
+
+
+def _owner_of(context: ServerCallContext) -> str:
+    user = context.user if context is not None else None
+    if isinstance(user, PrincipalUser):
+        return user.principal.id
+    return "anonymous"
+
+
+DUPLICATE_WAIT_S = 10.0  # how long a duplicate waits for the first send's task id
+
+
+def _fingerprint(params: SendMessageRequest) -> str:
+    return hashlib.sha256(params.SerializeToString(deterministic=True)).hexdigest()
+
+
+class LimitedRequestHandler(DefaultRequestHandler):
+    """DefaultRequestHandler with the gateway's input checks and inbound idempotency.
+
+    - Too many parts, a part with no content (empty, or only fields the parser does not know
+      and dropped), or a part whose media type the agent does not take
+      (``accepted_input_modes``) is ``InvalidParamsError`` before anything runs.
+    - Spec 8.5, with a ``ledger``: a request re-sent unchanged (same messageId, same
+      content and configuration) by the same owner in the same tenant (within the ledger's
+      retention) while the task it created is
+      still open (submitted, working, input- or auth-required) does not run the agent again:
+      ``SendMessage`` answers with that task and ``SendStreamingMessage`` resubscribes to it.
+      Once that task is terminal the id is free again: A2A makes send idempotency optional
+      ("MAY") and the A2A TCK re-uses message ids across tasks, expecting a new task each
+      time; for the same reason a *different* request under a known id is a new message.
+      A send answered with a bare Message (direct reply) is forgotten too.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        max_parts: int,
+        input_modes: list[str] | None = None,
+        ledger: MessageLedger | None = None,
+        agent_id: str = "",
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         self._max_parts = max_parts
+        self._input_modes = input_modes
+        self._ledger = ledger
+        self._agent_id = agent_id
+        # Each send being set up, by id() of its params: its ledger key and its request
+        # fingerprint, taken before the SDK fills in ids (read by ``_setup_active_task``).
+        self._pending: dict[int, tuple[MessageKey, str]] = {}
 
     def _check_parts(self, params: SendMessageRequest) -> None:
         if len(params.message.parts) > self._max_parts:
             raise InvalidParamsError(message="too many parts")
         if any(p.WhichOneof("content") is None for p in params.message.parts):
             raise InvalidParamsError(message="unsupported part")
+        for p in params.message.parts:
+            mt = part_media_type(p)
+            if not media_type_accepted(mt, self._input_modes):
+                shown = _bare(mt)[:100]
+                # A2A's error for this (TCK CORE-SEND-003): -32005, HTTP 415 on REST.
+                raise ContentTypeNotSupportedError(message=f"media type {shown} is not accepted")
+
+    def _key(self, params: SendMessageRequest, context: ServerCallContext) -> MessageKey | None:
+        mid = params.message.message_id
+        if self._ledger is None or not mid:
+            return None
+        tenant = params.tenant or str(getattr(context, "tenant", "") or "")
+        return MessageKey(self._agent_id, tenant, _owner_of(context), mid)
+
+    async def _duplicate_of(self, key: MessageKey, params: SendMessageRequest) -> str | None:
+        """None when this send owns ``key``; else the task id of the first send. Only an
+        identical request (same fingerprint) is a duplicate."""
+        assert self._ledger is not None
+        fingerprint = _fingerprint(params)
+        loop = asyncio.get_running_loop()
+        until = loop.time() + DUPLICATE_WAIT_S
+        while True:
+            row = await self._ledger.reserve(key, fingerprint=fingerprint)
+            if row is None:
+                return None
+            if row["task_id"] is not None:
+                return str(row["task_id"])
+            if loop.time() >= until:  # the first send is still setting up: refuse, not rerun
+                raise InvalidParamsError(message="duplicate message is still being processed")
+            await asyncio.sleep(0.05)
+
+    async def _setup_active_task(self, params: SendMessageRequest, call_context: Any) -> Any:
+        active, request_context = await super()._setup_active_task(params, call_context)
+        pending = self._pending.get(id(params))
+        if pending is not None and self._ledger is not None and request_context.task_id:
+            key, fingerprint = pending
+            await self._ledger.fill(key, request_context.task_id, fingerprint=fingerprint)
+        return active, request_context
+
+    async def _existing(
+        self, task_id: str, context: ServerCallContext, key: MessageKey | None = None
+    ) -> Task | None:
+        """The first send's task. With ``key``, wait (up to ``DUPLICATE_WAIT_S``) for a task
+        that is still being stored, unless the first send gave up its key (a direct reply)."""
+        loop = asyncio.get_running_loop()
+        until = loop.time() + DUPLICATE_WAIT_S
+        while True:
+            try:
+                return await self.on_get_task(GetTaskRequest(id=task_id), context)
+            except TaskNotFoundError:
+                if key is None or self._ledger is None or loop.time() >= until:
+                    return None
+                row = await self._ledger.get(key)
+                if row is None or row["task_id"] != task_id:
+                    return None
+            await asyncio.sleep(0.05)
 
     async def on_message_send(self, params: SendMessageRequest, context: ServerCallContext):  # type: ignore[override]
         self._check_parts(params)
-        return await super().on_message_send(params, context)
+        key = self._key(params, context)
+        if key is None:
+            return await super().on_message_send(params, context)
+        dup = await self._duplicate_of(key, params)
+        if dup is not None:
+            task = await self._existing(dup, context, key)
+            if task is not None and task.status.state not in _TERMINAL_TASK_STATES:
+                return task
+            # Gone, or finished: the message id is free for a new message.
+            await self._ledger.release(key, only_unfilled=False)  # type: ignore[union-attr]
+            return await self.on_message_send(params, context)
+        self._pending[id(params)] = (key, _fingerprint(params))
+        try:
+            result = await super().on_message_send(params, context)
+        except BaseException:
+            await self._ledger.release(key)  # type: ignore[union-attr]
+            raise
+        finally:
+            self._pending.pop(id(params), None)
+        if not isinstance(result, Task):  # a bare Message: no task to return to a re-send
+            await self._ledger.release(key, only_unfilled=False)  # type: ignore[union-attr]
+        return result
 
     async def on_message_send_stream(  # type: ignore[override]
         self, params: SendMessageRequest, context: ServerCallContext
     ) -> AsyncGenerator[Any, None]:
         self._check_parts(params)
-        async for event in super().on_message_send_stream(params, context):
-            yield event
+        key = self._key(params, context)
+        if key is None:
+            async for event in super().on_message_send_stream(params, context):
+                yield event
+            return
+        while (dup := await self._duplicate_of(key, params)) is not None:
+            task = await self._existing(dup, context, key)
+            if task is not None and task.status.state not in _TERMINAL_TASK_STATES:
+                try:
+                    async for event in self.on_subscribe_to_task(
+                        SubscribeToTaskRequest(id=dup), context
+                    ):
+                        yield event
+                except UnsupportedOperationError:  # it ended meanwhile
+                    final = await self._existing(dup, context)
+                    if final is not None:
+                        yield final
+                return
+            # Gone, or finished: the message id is free for a new message.
+            await self._ledger.release(key, only_unfilled=False)  # type: ignore[union-attr]
+        self._pending[id(params)] = (key, _fingerprint(params))
+        task_seen = False
+        try:
+            async for event in super().on_message_send_stream(params, context):
+                if isinstance(event, A2AMessage) and not task_seen:
+                    await self._ledger.release(key, only_unfilled=False)  # type: ignore[union-attr]
+                else:
+                    task_seen = True
+                yield event
+        except BaseException:
+            if not task_seen:
+                await self._ledger.release(key)  # type: ignore[union-attr]
+            raise
+        finally:
+            self._pending.pop(id(params), None)
 
 
 for _method in dir(RequestHandler):
@@ -605,8 +829,19 @@ class AgentHost:
         push: PushSettings | None = None,
         context_signer: CallContextSigner | None = None,
         context_verifier: CallContextVerifier | None = None,
+        outbound_ttl_s: float = OUTBOUND_TTL_S,
+        maintenance_interval_s: float = 300.0,
     ) -> None:
         self.base_url = base_url
+        # Spec 8.2: outbound partner tasks still open after this long are cancelled by the
+        # maintenance loop (every ``maintenance_interval_s``), which also forgets inbound
+        # message ids past their retention (spec 8.5). See ``maintain``.
+        if outbound_ttl_s <= 0 or maintenance_interval_s <= 0:
+            raise ValueError("outbound_ttl_s and maintenance_interval_s must be positive")
+        self.outbound_ttl_s = outbound_ttl_s
+        self.maintenance_interval_s = maintenance_interval_s
+        self.ledger: MessageLedger | None = None  # created at startup
+        self._maintenance: asyncio.Task[None] | None = None
         # Signed call contexts between gateways (a2agw.context.signing): the signer signs the
         # call context of every outbound consult; the verifier lets agents trust a signed one.
         # With both set, the host trusts its own key: a token it signed and a partner forwarded
@@ -696,6 +931,8 @@ class AgentHost:
         engine = self.engine = await create_engine(self.db_url)
         index = self.index = TaskIndex(engine)
         await index.initialize()
+        ledger = self.ledger = MessageLedger(engine)
+        await ledger.initialize()
         audit: AuditLog | None = None
         if self.audit_enabled:
             audit = self.audit = AuditLog(engine)
@@ -775,6 +1012,9 @@ class AgentHost:
                 task_store=store,
                 agent_card=card,
                 max_parts=self.max_parts,
+                input_modes=accepted_input_modes(spec),
+                ledger=ledger,
+                agent_id=agent_id,
                 **push_kwargs,
             )
             self.executors[agent_id] = executor
@@ -837,6 +1077,39 @@ class AgentHost:
                 "other gateway serves them, run `a2agw tasks reap --agent <id>`",
                 foreign,
             )
+        self._maintenance = asyncio.create_task(self._maintenance_loop(), name="a2agw:maint")
+
+    async def maintain(self, *, now: float | None = None) -> ExpireReport:
+        """One maintenance pass: end outbound handles older than ``outbound_ttl_s`` (their
+        partner tasks cancelled best-effort, each audited as ``outbound.expire``) and purge
+        inbound message ids past retention. Safe with several gateways on one database."""
+        if self.handles is None or self.ledger is None:
+            raise RuntimeError("host not started")
+        report = await expire_outbound(
+            self.handles,
+            self._cancel_outbound,
+            self.audit,
+            ttl_s=self.outbound_ttl_s,
+            now=now,
+            cancel_timeout_s=self.default_deadline_s,
+        )
+        await self.ledger.purge(now)
+        return report
+
+    async def _maintenance_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.maintenance_interval_s)
+            try:
+                report = await self.maintain()
+            except Exception as exc:  # noqa: BLE001 - keep the loop alive; retried next pass
+                logger.warning("maintenance pass failed: %s", type(exc).__name__)
+                continue
+            if report.expired:
+                logger.info(
+                    "expired %d outbound task(s) past the TTL (%d not confirmed canceled)",
+                    report.expired,
+                    report.cancel_failed,
+                )
 
     async def reap(
         self, agent_id: str, *, confirm: bool = False, force: bool = False, actor: str = "system"
@@ -941,6 +1214,10 @@ class AgentHost:
         # deliveries (bounded), let the partner client drain its cancellation cleanups (they
         # need the engine), then dispose the engine.
         self.bus.close_all()
+        if self._maintenance is not None:
+            self._maintenance.cancel()
+            await asyncio.gather(self._maintenance, return_exceptions=True)
+            self._maintenance = None
         for handler in self.handlers.values():
             await handler.aclose()
         if self.push_senders:

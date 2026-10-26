@@ -210,3 +210,13 @@ async def test_register_partners_unreachable_continues(tmp_path, caplog):
     with respx.mock, caplog.at_level("WARNING"):
         await register_partners(host, cfg, config_dir=tmp_path)
     assert host.partners.all() == [] and "dead" in caplog.text
+
+
+def test_outbound_ttl_config_reaches_the_host(tmp_path):
+    cfg = load_config(write(tmp_path, "base_url: http://x\noutbound_ttl_s: 600\n"), env={})
+    assert cfg.outbound_ttl_s == 600
+    assert build_host(cfg, config_dir=tmp_path).outbound_ttl_s == 600
+    default = load_config(write(tmp_path, "base_url: http://x\n", "d.yaml"), env={})
+    assert build_host(default, config_dir=tmp_path).outbound_ttl_s == 86400
+    with pytest.raises(ConfigError, match="outbound_ttl_s"):
+        load_config(write(tmp_path, "base_url: http://x\noutbound_ttl_s: 0\n", "z.yaml"), env={})

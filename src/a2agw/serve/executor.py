@@ -97,6 +97,7 @@ class _Run:
     # is owed once it is.
     pending: Message | None = None
     working_due: bool = False
+    cascaded: bool = False  # on_cancel already ran for this run (direct reply or end)
     # Serializes this run's index writes with cancel()'s, so an in-flight write never lands
     # after CANCELED.
     lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
@@ -415,6 +416,19 @@ class AdapterExecutor(AgentExecutor):
         finally:
             if self._running.get(updater.task_id) is work:
                 del self._running[updater.task_id]
+        await self._end_cascade(run, context)
+
+    async def _end_cascade(self, run: _Run, context: RequestContext) -> None:
+        """Spec 8.2: a run that ended its task (completed or failed) cancels the partner tasks
+        it left open, as a direct reply does. An interrupted task keeps its partner work."""
+        if not run.terminal or run.cancelled or run.cascaded or self.on_cancel is None:
+            return
+        run.cascaded = True
+        try:
+            with use_inbound_token(_inbound_token(context)):
+                await self.on_cancel(run.updater.task_id)
+        except Exception:
+            logger.exception("on_cancel hook failed after task %s ended", run.updater.task_id)
 
     async def _audit(
         self,
@@ -607,6 +621,7 @@ class AdapterExecutor(AgentExecutor):
         )
         self._publish(task_id, updater.context_id, DIRECT_REPLY)
         # The reply ends the turn: partner work it started would otherwise be orphaned.
+        run.cascaded = True
         if self.on_cancel is not None:
             try:
                 await self.on_cancel(task_id)

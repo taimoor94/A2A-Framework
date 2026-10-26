@@ -493,7 +493,8 @@ async def test_cancel_after_complete_is_noop(make_server):
     await h.executor.cancel(ctx, queue)
 
     assert queue.events == []
-    assert hooked == []
+    # Completion itself ran the hook once (spec 8.2); the late cancel adds nothing.
+    await _until(lambda: hooked == [task.id])
     assert await _index_state(h) == ST(TaskState.TASK_STATE_COMPLETED)
     assert _states(h)[-1] == ST(TaskState.TASK_STATE_COMPLETED)
 
@@ -806,3 +807,59 @@ async def test_direct_reply_runs_cascade_hook_and_marks_span(make_server, spans)
     [span] = [s for s in spans.get_finished_spans() if s.name == "a2agw.inbound"]
     assert span.attributes["a2agw.direct_reply"] is True
     assert span.attributes["a2a.task_id"] == cancelled[0]
+
+
+async def _until(pred, timeout: float = 5.0) -> None:
+    async with asyncio.timeout(timeout):
+        while not pred():
+            await asyncio.sleep(0.01)
+
+
+async def test_completion_cancels_outstanding_partner_tasks_once(make_server):
+    """Spec 8.2: a run that ends (completed or failed) cancels the partner tasks it left
+    open, like a direct reply does; the hook runs once per task."""
+
+    class Boom:
+        durable_sessions = False
+
+        async def run(self, ctx):
+            yield Status("working")
+            raise RuntimeError("bug")
+
+    for adapter, state in (
+        (EchoAdapter(), TaskState.TASK_STATE_COMPLETED),
+        (Boom(), TaskState.TASK_STATE_FAILED),
+    ):
+        h = await make_server(adapter, id=type(adapter).__name__.lower())
+        hooked: list[str] = []
+
+        async def on_cancel(task_id: str, hooked=hooked) -> None:
+            hooked.append(task_id)
+
+        h.executor.on_cancel = on_cancel
+        client = h.client(streaming=False)
+        _, task = await send(client, user_msg("x"))
+        assert task.status.state == state
+        await _until(lambda hooked=hooked, tid=task.id: hooked == [tid])
+        await asyncio.sleep(0.05)
+        assert hooked == [task.id]
+
+
+async def test_interrupted_run_does_not_cascade(make_server):
+    class Asker:
+        durable_sessions = False
+
+        async def run(self, ctx):
+            yield NeedInput("q")
+
+    h = await make_server(Asker())
+    hooked: list[str] = []
+
+    async def on_cancel(task_id: str) -> None:
+        hooked.append(task_id)
+
+    h.executor.on_cancel = on_cancel
+    _, task = await send(h.client(streaming=False), user_msg("x"))
+    assert task.status.state == TaskState.TASK_STATE_INPUT_REQUIRED
+    await asyncio.sleep(0.05)
+    assert hooked == []  # the task goes on: its partner work stays

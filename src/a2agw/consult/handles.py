@@ -42,6 +42,8 @@ _outbound = Table(
     # The prefixed id of the inbound caller the partner task was started for (``key:...``,
     # ``jwt:...``), so cascade and recovery cancels are made with that caller's credentials.
     Column("caller_id", String, nullable=True),
+    # Why a2agw itself ended the handle (e.g. "ttl expired"); None for partner-reported states.
+    Column("end_reason", String, nullable=True),
 )
 OUTBOUND_TABLE = _outbound  # read by the inbound side's re-entry check (serve.store)
 
@@ -58,27 +60,30 @@ class OutboundHandleStore:
                 columns = await conn.run_sync(
                     lambda sync: {c["name"] for c in inspect(sync).get_columns(_outbound.name)}
                 )
-                if "caller_id" not in columns:
-                    await self._add_caller_id(conn)
+                for name in ("caller_id", "end_reason"):  # added after Phase 1
+                    if name not in columns:
+                        await self._add_column(conn, name)
 
         await retry_ddl(migrate)
 
     @staticmethod
     async def _add_caller_id(conn: AsyncConnection) -> None:
+        await OutboundHandleStore._add_column(conn, "caller_id")
+
+    @staticmethod
+    async def _add_column(conn: AsyncConnection, name: str) -> None:
         # postgres: IF NOT EXISTS tolerates a concurrent startup doing the same. sqlite has
         # no such clause: a concurrent startup shows up as a "duplicate column" error.
         guard = "IF NOT EXISTS " if conn.dialect.name == "postgresql" else ""
         try:
-            await conn.execute(
-                text(f"ALTER TABLE a2agw_outbound ADD COLUMN {guard}caller_id VARCHAR")
-            )
+            await conn.execute(text(f"ALTER TABLE a2agw_outbound ADD COLUMN {guard}{name} VARCHAR"))
         except OperationalError as e:
             if "duplicate column" not in str(e).lower():
                 raise
             columns = await conn.run_sync(
                 lambda sync: {c["name"] for c in inspect(sync).get_columns(_outbound.name)}
             )
-            if "caller_id" not in columns:
+            if name not in columns:
                 raise
 
     async def record(
@@ -168,3 +173,37 @@ class OutboundHandleStore:
         stmt = select(_outbound.c.task_id).where(_outbound.c.origin == origin).limit(1)
         async with self._engine.connect() as conn:
             return (await conn.execute(stmt)).first() is not None
+
+    async def older_than(self, cutoff: float, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Non-terminal handles created before ``cutoff`` (epoch seconds), oldest first."""
+        from a2agw.consult.results import TERMINAL_NAMES
+
+        stmt = (
+            select(_outbound)
+            .where(
+                _outbound.c.created_at < cutoff,
+                _outbound.c.state.notin_(sorted(TERMINAL_NAMES)),
+            )
+            .order_by(_outbound.c.created_at)
+            .limit(limit)
+        )
+        async with self._engine.connect() as conn:
+            return [dict(r._mapping) for r in (await conn.execute(stmt)).all()]
+
+    async def claim_end(
+        self, partner_id: str, task_id: str, seen_state: str, state: str, reason: str
+    ) -> bool:
+        """Compare-and-set: end the handle (``state``, ``end_reason``) only if it is still in
+        ``seen_state``. Exactly one of several gateways sharing the database wins a claim, on
+        sqlite and on Postgres alike (one conditional UPDATE)."""
+        stmt = (
+            update(_outbound)
+            .where(
+                _outbound.c.partner_id == partner_id,
+                _outbound.c.task_id == task_id,
+                _outbound.c.state == seen_state,
+            )
+            .values(state=state, end_reason=reason)
+        )
+        async with self._engine.begin() as conn:
+            return (await conn.execute(stmt)).rowcount == 1
