@@ -9,7 +9,7 @@ import os
 import re
 import time
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -44,6 +44,9 @@ COSMETIC_FIELDS = frozenset({"version", "documentationUrl", "iconUrl", "provider
 _NOT_COMPARED = COSMETIC_FIELDS | {"signatures"}
 
 Status = Literal["active", "quarantined", "disabled"]
+# Quarantine reasons of the require_signed invariant (see ``PartnerRegistry.signed_violation``).
+UNSIGNED = "unsigned card"
+KEY_UNTRUSTED = "signing key no longer trusted"
 
 
 class CardFetchError(Exception):
@@ -151,6 +154,8 @@ class ReloadPlan:
     updated: list[str]
     removed: list[str]
     version: int
+    # Records of the file that break the require_signed invariant, quarantined in the plan.
+    quarantined: dict[str, str] = field(default_factory=dict)
 
     def changes(self) -> dict[str, list[str]]:
         return {"added": self.added, "updated": self.updated, "removed": self.removed}
@@ -183,6 +188,10 @@ class PartnerRegistry:
         self._records: dict[str, PartnerRecord] = {}
         self._version = 0  # bumped by every change (reload plans are checked against it)
         self.on_change: Callable[[PartnerRecord, str], None] | None = None
+        # Extra detail of the change being reported, readable from inside ``on_change``
+        # (e.g. {"reason": ..., "actor": ..., "fields": ...}); None outside of it.
+        self.change_info: dict[str, Any] | None = None
+        self._listeners: list[Callable[[PartnerRecord, str], None]] = []
 
     # -- fetching -------------------------------------------------------
     async def _fetch(self, card_url: str, tier: Tier, tls_ref: str | None = None) -> dict[str, Any]:
@@ -354,6 +363,17 @@ class PartnerRegistry:
         if rec.pending_card is not None:
             if expected_hash is not None and expected_hash != card_hash(rec.pending_card):
                 raise ValueError("pending card changed since it was reviewed")
+            staged = rec.model_copy(
+                update={"card": rec.pending_card, "signed_key_id": rec.pending_key_id}
+            )
+            violation = self.signed_violation(staged)
+        else:
+            violation = self.signed_violation(rec)
+        if violation is not None:
+            # Approval never activates a card the require_signed tiers would refuse: refresh
+            # the partner to fetch (and verify) a signed card first.
+            raise ValueError(f"cannot approve {id!r}: {violation}; refresh to verify a signed card")
+        if rec.pending_card is not None:
             rec.card = rec.pending_card
             rec.card_hash = card_hash(rec.card)
             rec.signed_key_id = rec.pending_key_id
@@ -374,9 +394,65 @@ class PartnerRegistry:
         rec = self.get(id)
         if rec.status != "disabled":
             raise ValueError(f"partner {id!r} is not disabled (status: {rec.status})")
+        violation = self.signed_violation(rec)
+        if violation is not None:  # re-enabled, but straight into quarantine
+            rec.status = "quarantined"
+            self._changed(rec, "quarantined", reason=violation)
+            return rec
         rec.status = "active"
         self._changed(rec, "enabled")
         return rec
+
+    # -- the require_signed invariant -------------------------------------------------
+    def signed_violation(self, rec: PartnerRecord) -> str | None:
+        """Why ``rec`` breaks the require_signed invariant, or None if it holds.
+
+        A record whose tier is in ``require_signed`` needs a ``signed_key_id`` (else
+        ``UNSIGNED``) that the current verifier still trusts (else ``KEY_UNTRUSTED``): a
+        pinned key must still be pinned with the same key material, and the stored card must
+        still verify against it locally; a JWKS key needs its URL still allowlisted. Fails
+        closed: any error is a violation."""
+        if rec.tier not in self.require_signed:
+            return None
+        if not rec.signed_key_id:
+            return UNSIGNED
+        if self.verifier is None:
+            return KEY_UNTRUSTED
+        try:
+            card = parse_agent_card(copy.deepcopy(rec.card))
+            ok = self.verifier.still_trusts(rec.signed_key_id, card)
+        except Exception:  # noqa: BLE001 - fail closed
+            ok = False
+        return None if ok else KEY_UNTRUSTED
+
+    def enforce_signed(self, ids: Iterable[str] | None = None) -> dict[str, str]:
+        """Quarantine every (or every listed) active record that breaks the require_signed
+        invariant; ``on_change`` reports each as "quarantined" with ``change_info["reason"]``.
+        Returns {id: reason}."""
+        out: dict[str, str] = {}
+        for pid in list(self._records) if ids is None else list(ids):
+            rec = self._records.get(pid)
+            if rec is None or rec.status != "active":
+                continue
+            reason = self.signed_violation(rec)
+            if reason is not None:
+                rec.status = "quarantined"
+                out[pid] = reason
+                self._changed(rec, "quarantined", reason=reason)
+        return out
+
+    def _quarantine_fresh(self, records: dict[str, PartnerRecord]) -> dict[str, str]:
+        """``enforce_signed`` on records read from the file but not yet installed: their
+        status is changed in place, nothing is reported. Returns {id: reason}."""
+        out: dict[str, str] = {}
+        for pid, rec in records.items():
+            if rec.status != "active":
+                continue
+            reason = self.signed_violation(rec)
+            if reason is not None:
+                rec.status = "quarantined"
+                out[pid] = reason
+        return out
 
     # -- queries --------------------------------------------------------
     def get(self, id: str) -> PartnerRecord:
@@ -392,12 +468,27 @@ class PartnerRegistry:
         return list(self._records.values())
 
     # -- persistence ----------------------------------------------------
-    def _changed(self, rec: PartnerRecord, event: str) -> None:
+    def _changed(self, rec: PartnerRecord, event: str, **info: Any) -> None:
         self._version += 1
         if self.path is not None:
             self.save()
-        if self.on_change is not None:
-            self.on_change(rec, event)
+        self._notify(rec, event, info)
+
+    def add_listener(self, fn: Callable[[PartnerRecord, str], None]) -> None:
+        """Call ``fn(rec, event)`` on every change, after ``on_change`` (which stays the
+        single user-settable callback); ``change_info`` is readable from inside it."""
+        self._listeners.append(fn)
+
+    def _notify(self, rec: PartnerRecord, event: str, info: dict[str, Any] | None = None) -> None:
+        callbacks = [cb for cb in (self.on_change, *self._listeners) if cb is not None]
+        if not callbacks:
+            return
+        self.change_info = dict(info) if info else None
+        try:
+            for cb in callbacks:
+                cb(rec, event)
+        finally:
+            self.change_info = None
 
     def save(self) -> None:
         if self.path is None:
@@ -413,6 +504,9 @@ class PartnerRegistry:
             return
         self._records = self._read_file(self.path)
         self._version += 1
+        # The invariant holds however a record got into the file (written before
+        # require_signed was turned on, a key since removed from the trust config, an edit).
+        self.enforce_signed()
 
     def prepare_reload(self) -> ReloadPlan:
         """Read and validate the partners file and diff it against the registry, without
@@ -421,6 +515,7 @@ class PartnerRegistry:
         if self.path is None:
             raise ValueError("registry has no partners file")
         fresh = self._read_file(self.path) if self.path.exists() else {}
+        quarantined = self._quarantine_fresh(fresh)
         old = self._records
         updated = [
             i
@@ -433,6 +528,7 @@ class PartnerRegistry:
             updated=updated,
             removed=[i for i in old if i not in fresh],
             version=self._version,
+            quarantined=quarantined,
         )
 
     def apply_reload(self, plan: ReloadPlan) -> dict[str, list[str]]:
@@ -446,15 +542,28 @@ class PartnerRegistry:
         keep = set(old) - set(plan.updated)
         self._records = {i: old[i] if i in keep else r for i, r in plan.fresh.items()}
         self._version += 1
-        if self.on_change is not None:
+        if self.on_change is not None or self._listeners:
             for event, ids, source in (
                 ("added", plan.added, self._records),
                 ("updated", plan.updated, self._records),
                 ("removed", plan.removed, old),
             ):
                 for i in ids:
-                    self.on_change(source[i], event)
+                    self._notify(source[i], event, self._event_info(old, source[i], event))
+            for i, reason in plan.quarantined.items():
+                if i in plan.added or i in plan.updated:
+                    self._notify(self._records[i], "quarantined", {"reason": reason})
         return plan.changes()
+
+    @staticmethod
+    def _event_info(
+        old: dict[str, PartnerRecord], rec: PartnerRecord, event: str
+    ) -> dict[str, Any] | None:
+        """Reload: an updated record whose status changed reports that transition."""
+        prev = old.get(rec.id)
+        if event != "updated" or prev is None or prev.status == rec.status:
+            return None
+        return {"from_status": prev.status}
 
     def reload(self) -> dict[str, list[str]]:
         """Re-read the partners file (e.g. after ``a2agw partners add`` on a running host):

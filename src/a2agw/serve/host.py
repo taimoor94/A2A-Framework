@@ -65,7 +65,7 @@ from a2agw.consult.tls import TlsClientConfig
 from a2agw.consult.tools import PartnerTool, partner_tools
 from a2agw.context.signing import CallContextSigner, CallContextVerifier
 from a2agw.ops.admin import ADMIN_PREFIX, HEALTH_PATH, admin_routes
-from a2agw.ops.audit import AuditEvent, AuditLog
+from a2agw.ops.audit import AuditEvent, AuditLog, registry_audit_action
 from a2agw.ops.bus import EventBus
 from a2agw.security.auth import (
     AuthConfig,
@@ -111,16 +111,7 @@ from a2agw.serve.store import (
 
 CARD_PATH = "/.well-known/agent-card.json"
 logger = logging.getLogger(__name__)
-# Registry on_change events -> audit actions.
-_REGISTRY_ACTIONS = {
-    "added": "partner.add",
-    "quarantined": "partner.quarantine",
-    "approved": "partner.approve",
-    "disabled": "partner.disable",
-    "enabled": "partner.enable",
-    "updated": "partner.update",
-    "removed": "partner.remove",
-}
+_EARLY_AUDIT_MAX = 1000  # registry changes kept for the audit log until startup
 _EXIT_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 # Default bound on uvicorn's wait for open requests at shutdown.
 GRACEFUL_TIMEOUT_S = 10.0
@@ -983,7 +974,12 @@ class AgentHost:
         self.handles: OutboundHandleStore | None = None
         self.client: PartnerClient | None = None
         self._inner: Starlette | None = None
-        self._audit_hooked = False
+        # Registry changes are audited from construction on: changes made before startup
+        # (``register_partners`` on the ``a2agw serve`` path) are kept here and written once
+        # the audit log exists.
+        self._early_audit: list[AuditEvent] = []
+        if audit:
+            self.partners.add_listener(self._audit_registry_change)
         self._app_built = False
         self._app: Starlette | None = None
 
@@ -1027,7 +1023,9 @@ class AgentHost:
         if self.audit_enabled:
             audit = self.audit = AuditLog(engine)
             await audit.initialize()
-            self._hook_registry_audit()
+            early, self._early_audit = self._early_audit, []
+            for ev in early:
+                await audit.emit(ev)
         self.partners.load()
         self._warn_unknown_routing_partners()
         handles = self.handles = OutboundHandleStore(engine)
@@ -1227,30 +1225,34 @@ class AgentHost:
             cancel_timeout_s=self.default_deadline_s,
         )
 
-    def _hook_registry_audit(self) -> None:
-        """Chain an audit callback onto the registry's ``on_change`` (once per host)."""
-        if self._audit_hooked:
+    def _audit_registry_change(self, rec: PartnerRecord, event: str) -> None:
+        """Registry listener: one audit row per partner lifecycle change."""
+        info = self.partners.change_info or {}
+        action = registry_audit_action(rec, event, info)
+        if action is None:
             return
-        self._audit_hooked = True
-        previous = self.partners.on_change
-
-        def on_change(rec: PartnerRecord, event: str) -> None:
-            if previous is not None:
-                previous(rec, event)
-            action = _REGISTRY_ACTIONS.get(event)
-            if self.audit is None or action is None:
-                return
-            self.audit.submit(
-                AuditEvent(
-                    actor="system",
-                    action=action,  # type: ignore[arg-type]
-                    partner_id=rec.id,
-                    outcome=rec.status,
-                    detail={"tier": rec.tier, "state": rec.status, "key_id": rec.signed_key_id},
-                )
-            )
-
-        self.partners.on_change = on_change
+        detail: dict[str, Any] = {
+            "tier": rec.tier,
+            "state": rec.status,
+            "key_id": rec.signed_key_id,
+        }
+        if info.get("reason"):
+            detail["reason"] = info["reason"]
+        if info.get("fields"):
+            detail["fields"] = ",".join(info["fields"])
+        ev = AuditEvent(
+            actor=str(info.get("actor") or "system"),
+            action=action,
+            partner_id=rec.id,
+            outcome=rec.status,
+            detail=detail,
+        )
+        if self.audit is not None:
+            self.audit.submit(ev)
+        elif len(self._early_audit) < _EARLY_AUDIT_MAX:
+            self._early_audit.append(ev)
+        else:
+            logger.warning("partner change before startup not audited (buffer full)")
 
     def _warn_unknown_routing_partners(self) -> None:
         if self.policy is None:

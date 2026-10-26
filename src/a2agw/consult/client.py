@@ -558,8 +558,16 @@ class PartnerClient:
             rec = self.registry.get(partner_id)
         except KeyError:
             return None, None, self._unavailable(partner_id, None, "unknown partner")
+        # Defence in depth for the require_signed invariant (the registry enforces it on
+        # load, reload and every mutation): never build a client for a record breaking it,
+        # and name that reason rather than the bare status.
+        violation = self.registry.signed_violation(rec)
         if rec.status != "active":
-            return rec, None, self._unavailable(partner_id, rec, f"partner {rec.status}")
+            reason = violation if rec.status == "quarantined" and violation else None
+            return rec, None, self._unavailable(partner_id, rec, reason or f"partner {rec.status}")
+        if violation is not None:
+            self.registry.enforce_signed([partner_id])
+            return rec, None, self._unavailable(partner_id, rec, violation)
         try:
             await self.registry.verify_endpoints(partner_id)
         except CardFetchError:

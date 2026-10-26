@@ -74,6 +74,7 @@ Action = Literal[
     "admin.read",
     "task.reap",
     "outbound.expire",
+    "limit.exceeded",
 ]
 ACTIONS: frozenset[str] = frozenset(get_args(Action))
 DETAIL_KEYS = frozenset(
@@ -88,8 +89,43 @@ DETAIL_KEYS = frozenset(
         "key_id",
         "count",
         "context",  # call-context signature: "signed" or "bad signature" (never the token)
+        "fields",  # partner.update from config: the names of the changed fields
+        "attempt",  # outbound.expire: which cancel attempt this row reports
+        "limit",  # limit.exceeded: which limit
     }
 )
+# PartnerRegistry change events -> audit actions (``registry_audit_action``).
+REGISTRY_ACTIONS: dict[str, Action] = {
+    "added": "partner.add",
+    "quarantined": "partner.quarantine",
+    "approved": "partner.approve",
+    "disabled": "partner.disable",
+    "enabled": "partner.enable",
+    "updated": "partner.update",
+    "removed": "partner.remove",
+}
+
+
+def registry_audit_action(
+    rec: Any, event: str, info: dict[str, Any] | None = None
+) -> Action | None:
+    """The audit action for a registry change. A reload that turns a quarantined record
+    active is an approval, and one that disables a record is a disable (the edit was made
+    to the file, but its effect is the same as ``approve`` / ``disable``)."""
+    info = info or {}
+    status = getattr(rec, "status", None)
+    if event == "updated" and info.get("from_status") is not None:
+        if info["from_status"] == "quarantined" and status == "active":
+            return "partner.approve"
+        if status == "disabled":
+            return "partner.disable"
+        if status == "quarantined":
+            return "partner.quarantine"
+        if info["from_status"] == "disabled" and status == "active":
+            return "partner.enable"
+    return REGISTRY_ACTIONS.get(event)
+
+
 DETAIL_MAX_CHARS = 256
 FIELD_MAX_CHARS = 256
 GENESIS_HASH = "0" * 64

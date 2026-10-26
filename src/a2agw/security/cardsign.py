@@ -292,6 +292,52 @@ class CardVerifier:
             raise
         return (key, jku) if key is not None else None
 
+    def still_trusts(self, key_id: str, card: AgentCard | None = None) -> bool:
+        """Whether a stored ``VerifiedKey.id`` is still trusted by this verifier, offline.
+
+        A pinned key ("trusted" source) must still be pinned under that kid with the same key
+        material (thumbprint), and, given ``card``, one of its signatures with that kid must
+        still verify against it locally. A JWKS key needs its URL still allowlisted (the key
+        itself is checked at the next refresh). Any parse or verification error is False."""
+        try:
+            source, kid, thumbprint = key_id.rsplit("#", 2)
+        except (AttributeError, ValueError):
+            return False
+        if source != "trusted":
+            return source in self.jwks_urls
+        key = self.trusted.get(kid)
+        try:
+            if key is None or jwk_thumbprint(key) != thumbprint:
+                return False
+        except Exception:  # noqa: BLE001 - an unusable key is not trusted
+            return False
+        if card is None:
+            return True
+        for sig in list(card.signatures)[:MAX_SIGNATURES]:
+            header = _protected_header(sig)
+            if (
+                header is None
+                or header.get("kid") != kid
+                or header.get("alg") != key.algorithm_name
+            ):
+                continue
+            if self._verifies(card, sig, key):
+                return True
+        return False
+
+    @staticmethod
+    def _verifies(card: AgentCard, sig: AgentCardSignature, key: PyJWK) -> bool:
+        single = AgentCard()
+        single.CopyFrom(card)
+        del single.signatures[:]
+        single.signatures.append(sig)
+        verifier = create_signature_verifier(_fixed_key(key), list(ALGORITHMS))
+        try:
+            verifier(single)
+        except Exception:  # noqa: BLE001 - any failure means this signature is bad
+            return False
+        return True
+
     async def verify(self, card: AgentCard) -> VerifiedKey:
         """Return the key of the first signature that verifies, else raise CardSignatureError."""
         if not card.signatures:
@@ -313,16 +359,7 @@ class CardVerifier:
             if found is None:
                 continue
             key, source = found
-            if key.algorithm_name != alg:
-                continue
-            single = AgentCard()
-            single.CopyFrom(card)
-            del single.signatures[:]
-            single.signatures.append(sig)
-            verifier = create_signature_verifier(_fixed_key(key), list(ALGORITHMS))
-            try:
-                verifier(single)
-            except Exception:  # noqa: BLE001, S112 - any failure means this signature is bad
+            if key.algorithm_name != alg or not self._verifies(card, sig, key):
                 continue
             return VerifiedKey(kid=kid, source=source, thumbprint=jwk_thumbprint(key))
         if fetch_error is not None:
