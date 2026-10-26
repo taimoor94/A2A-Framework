@@ -27,20 +27,23 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import yaml
 from pydantic import (
     BaseModel,
     ConfigDict,
+    Discriminator,
     Field,
+    Tag,
     ValidationError,
     field_validator,
     model_validator,
 )
 
+from a2agw.adapters.webhook import WebhookAdapter
 from a2agw.consult.credentials import ChainCredentials, CredentialProvider, EnvCredentials
-from a2agw.consult.netguard import Tier, UnsafeURL, require_https
+from a2agw.consult.netguard import Tier, UnsafeURL, check_url_syntax, require_https
 from a2agw.consult.oauth import OAuthClientCredentials, OAuthTokenExchange
 from a2agw.consult.registry import CardFetchError, PartnerRegistry
 from a2agw.consult.tls import TlsClientConfig
@@ -49,7 +52,7 @@ from a2agw.security.auth import AuthConfig
 from a2agw.security.cardsign import CardSigner, CardVerifier, load_public_key
 from a2agw.security.classify import RegexPiiClassifier
 from a2agw.security.policy import PolicyEngine, PolicyError, load_policy
-from a2agw.serve.agent import AgentSpec
+from a2agw.serve.agent import _AGENT_ID, AgentSpec, SkillSpec
 from a2agw.serve.host import AgentHost
 from a2agw.serve.push import PushSettings
 
@@ -123,6 +126,80 @@ def _https_only(url: str) -> str:
 class AgentRef(BaseModel):
     model_config = ConfigDict(extra="forbid")
     spec: str = Field(pattern=r"^[A-Za-z_][\w.]*:[A-Za-z_]\w*$")
+
+
+class SkillConfig(BaseModel):
+    """A skill of an external agent (the fields of ``a2agw.serve.agent.SkillSpec``)."""
+
+    model_config = _FORBID
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    tags: list[str] = Field(default_factory=list)
+    examples: list[str] = Field(default_factory=list)
+    input_modes: list[str] | None = None
+    output_modes: list[str] | None = None
+
+
+class WebhookConfig(BaseModel):
+    """An external agent served over HTTP (``a2agw.adapters.webhook.WebhookAdapter``).
+
+    The URL is vetted with ``tier`` at connect time; ``internal`` (the default) allows plain
+    http to loopback and private addresses, other tiers need https."""
+
+    model_config = _FORBID
+    url: str
+    secret_env: str | None = None  # env var holding the request-signing secret
+    timeout_s: float = Field(default=300.0, gt=0)
+    tier: TierName = "internal"
+
+    @model_validator(mode="after")
+    def _url(self) -> WebhookConfig:
+        try:
+            check_url_syntax(self.url)
+        except UnsafeURL as e:
+            raise ValueError(f"url: {e}") from None
+        if self.tier != "internal":
+            try:
+                require_https(self.url)
+            except UnsafeURL as e:
+                raise ValueError(f"url: {e} on the {self.tier} tier") from None
+        return self
+
+
+class ExternalAgentConfig(BaseModel):
+    """An agent in another process or language, served by the gateway (spec 7.7). It
+    names exactly one transport (each transport is a field)."""
+
+    model_config = _FORBID
+    id: str = Field(pattern=_AGENT_ID.pattern)
+    name: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    skills: list[SkillConfig] = Field(min_length=1)
+    input_modes: list[str] | None = Field(default=None, min_length=1)
+    output_modes: list[str] | None = Field(default=None, min_length=1)
+    durable_sessions: bool = False
+    webhook: WebhookConfig | None = None
+
+    @model_validator(mode="after")
+    def _one_transport(self) -> ExternalAgentConfig:
+        transports = [t for t in (self.webhook,) if t is not None]
+        if len(transports) != 1:
+            raise ValueError("external agent needs exactly one transport: webhook")
+        return self
+
+
+def _agent_kind(v: Any) -> str:
+    """``spec:`` entries are module agents; anything else is an external agent."""
+    if isinstance(v, dict):
+        return "module" if "spec" in v else "external"
+    return "module" if isinstance(v, AgentRef) else "external"
+
+
+AgentEntry = Annotated[
+    Annotated[AgentRef, Tag("module")] | Annotated[ExternalAgentConfig, Tag("external")],
+    Discriminator(_agent_kind),
+]
 
 
 class PartnerConfig(BaseModel):
@@ -279,7 +356,7 @@ class GatewayConfig(BaseModel):
     auth: AuthConfig | None = None
     admin_without_auth: bool = False
     partners_file: str = "partners.yaml"
-    agents: list[AgentRef] = Field(default_factory=list)
+    agents: list[AgentEntry] = Field(default_factory=list)
     partners: list[PartnerConfig] = Field(default_factory=list)
     credentials: dict[str, CredentialConfig] = Field(default_factory=dict)
     telemetry: TelemetryConfig | None = None
@@ -432,6 +509,39 @@ def _load_agent(ref: str, config_dir: Path) -> AgentSpec:
     if not isinstance(obj, AgentSpec):
         raise ConfigError(f"agent {ref!r} is not an AgentSpec or a factory returning one")
     return obj
+
+
+def _external_agent(entry: ExternalAgentConfig, where: str) -> AgentSpec:
+    """The ``AgentSpec`` for an external agent, with its transport's adapter."""
+    w = entry.webhook
+    assert w is not None  # ExternalAgentConfig._one_transport
+    secret = None
+    if w.secret_env is not None:
+        secret = os.environ.get(w.secret_env)
+        if not secret:
+            raise ConfigError(
+                f"{where}.webhook.secret_env: environment variable {w.secret_env} is not set"
+            )
+    adapter = WebhookAdapter(
+        w.url,
+        secret=secret,
+        timeout_s=w.timeout_s,
+        tier=w.tier,
+        durable_sessions=entry.durable_sessions,
+    )
+    modes = {
+        k: v
+        for k, v in (("input_modes", entry.input_modes), ("output_modes", entry.output_modes))
+        if v is not None
+    }
+    return AgentSpec(
+        id=entry.id,
+        name=entry.name,
+        description=entry.description,
+        skills=[SkillSpec(**s.model_dump()) for s in entry.skills],
+        adapter=adapter,
+        **modes,
+    )
 
 
 def _setup_telemetry(cfg: TelemetryConfig) -> None:
@@ -673,8 +783,11 @@ def build_host(cfg: GatewayConfig, *, config_dir: Path | str = ".") -> AgentHost
         )
     except ValueError as e:  # e.g. a trusted context kid that clashes with the signing kid
         raise ConfigError(str(e)) from None
-    for ref in cfg.agents:
-        host.add(_load_agent(ref.spec, config_dir))
+    for i, entry in enumerate(cfg.agents):
+        if isinstance(entry, AgentRef):
+            host.add(_load_agent(entry.spec, config_dir))
+        else:
+            host.add(_external_agent(entry, f"agents.{i}"))
     return host
 
 
@@ -763,6 +876,7 @@ def _apply_drift(reg: PartnerRegistry, p: PartnerConfig) -> None:
 
 __all__ = [
     "ConfigError",
+    "ExternalAgentConfig",
     "GatewayConfig",
     "build_host",
     "card_verifier",

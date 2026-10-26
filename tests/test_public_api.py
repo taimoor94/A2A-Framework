@@ -29,6 +29,7 @@ def test_public_api_exports():
         "AgentAccess",
         "setup_telemetry",
         "ToolResult",
+        "WebhookAdapter",
     ):
         assert name in a2agw.__all__, name
 

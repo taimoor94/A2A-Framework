@@ -220,3 +220,131 @@ def test_outbound_ttl_config_reaches_the_host(tmp_path):
     assert build_host(default, config_dir=tmp_path).outbound_ttl_s == 86400
     with pytest.raises(ConfigError, match="outbound_ttl_s"):
         load_config(write(tmp_path, "base_url: http://x\noutbound_ttl_s: 0\n", "z.yaml"), env={})
+
+
+# -- external (sidecar) agents ---------------------------------------------------------
+
+EXTERNAL = """\
+base_url: http://gw
+db_url: sqlite+aiosqlite:///{db}
+agents:
+  - id: coder
+    name: Coder
+    description: Writes code
+    skills:
+      - {{id: code, name: Code, description: Writes code, tags: [dev]}}
+    output_modes: [text/plain]
+    durable_sessions: true
+    webhook:
+      url: http://127.0.0.1:9000/a2agw/invoke
+      secret_env: CODER_SECRET
+      timeout_s: 30
+"""
+
+
+def test_external_webhook_agent_builds_spec(tmp_path, monkeypatch):
+    from a2agw.adapters.webhook import WebhookAdapter
+
+    p = write(tmp_path, EXTERNAL.format(db=tmp_path / "g.db"))
+    cfg = load_config(p, env={})
+    monkeypatch.delenv("CODER_SECRET", raising=False)
+    with pytest.raises(ConfigError, match="CODER_SECRET") as ei:
+        build_host(cfg, config_dir=tmp_path)
+    assert "agents.0.webhook.secret_env" in str(ei.value)
+
+    monkeypatch.setenv("CODER_SECRET", "s3cret-value")
+    host = build_host(cfg, config_dir=tmp_path)
+    assert host.specs["coder"].adapter.secret == "s3cret-value"
+    spec = host.specs["coder"]
+    assert (spec.name, spec.description) == ("Coder", "Writes code")
+    assert [s.id for s in spec.skills] == ["code"] and spec.skills[0].tags == ["dev"]
+    assert spec.output_modes == ["text/plain"]
+    assert spec.input_modes == ["text/plain", "application/json"]  # the default
+    a = spec.adapter
+    assert isinstance(a, WebhookAdapter) and a.durable_sessions is True
+    assert a.url == "http://127.0.0.1:9000/a2agw/invoke" and a.timeout_s == 30.0
+    assert a.tier == "internal"
+    assert "s3cret-value" not in repr(a)
+
+    # A module agent and an external agent side by side; no secret is fine.
+    (tmp_path / "t1_ext_mod.py").write_text(
+        "from a2agw.adapters.callable import agent\n"
+        "@agent(id='local', description='d')\n"
+        "async def local(ctx):\n    return ctx.text\n"
+    )
+    cfg2 = GatewayConfig.model_validate(
+        {
+            "base_url": "http://gw",
+            "db_url": f"sqlite+aiosqlite:///{tmp_path / 'g2.db'}",
+            "agents": [
+                {"spec": "t1_ext_mod:local"},
+                {
+                    "id": "ext",
+                    "name": "Ext",
+                    "description": "d",
+                    "skills": [{"id": "s", "name": "S", "description": "d"}],
+                    "webhook": {"url": "http://localhost:1/a2agw/invoke"},
+                },
+            ],
+        }
+    )
+    host2 = build_host(cfg2, config_dir=tmp_path)
+    assert set(host2.specs) == {"local", "ext"}
+    ext = host2.specs["ext"].adapter
+    assert isinstance(ext, WebhookAdapter) and ext.secret is None and ext.timeout_s == 300.0
+
+
+def _ext(**over):
+    entry = {
+        "id": "ext",
+        "name": "Ext",
+        "description": "d",
+        "skills": [{"id": "s", "name": "S", "description": "d"}],
+    }
+    entry.update(over)
+    return {"base_url": "http://gw", "agents": [entry]}
+
+
+def test_external_agent_needs_exactly_one_transport(tmp_path):
+    with pytest.raises(ValueError, match="exactly one transport"):
+        GatewayConfig.model_validate(_ext())
+    p = write(
+        tmp_path,
+        "base_url: http://gw\nagents:\n  - {id: ext, name: E, description: d,\n"
+        "     skills: [{id: s, name: S, description: d}]}\n",
+    )
+    with pytest.raises(ConfigError, match="exactly one transport"):
+        load_config(p, env={})
+    # Other shape problems are rejected at load time too.
+    for bad in (
+        _ext(webhook={"url": "http://x/"}, skills=[]),
+        _ext(webhook={"url": "http://x/"}, id="Bad_ID"),
+        _ext(webhook={"url": "http://x/", "bogus": 1}),
+        _ext(webhook={"url": "ftp://x/"}),
+        _ext(webhook={"url": "http://x/", "timeout_s": 0}),
+        _ext(webhook={"url": "http://x.example.com/", "tier": "public"}),  # needs https
+        _ext(webhook={"url": "http://x/"}, spec="m:a"),
+        _ext(
+            webhook={"url": "http://x/"},
+            skills=[{"id": "s", "name": "S", "description": "d", "extra": 1}],
+        ),
+    ):
+        with pytest.raises(ValueError):
+            GatewayConfig.model_validate(bad)
+    ok = GatewayConfig.model_validate(
+        _ext(webhook={"url": "https://x.example.com/", "tier": "public"})
+    )
+    assert ok.agents[0].webhook.tier == "public"
+
+
+def test_webhook_inline_secret_rejected(tmp_path):
+    p = write(
+        tmp_path,
+        "base_url: http://gw\nagents:\n  - id: ext\n    name: E\n    description: d\n"
+        "    skills: [{id: s, name: S, description: d}]\n"
+        "    webhook: {url: 'http://x/', secret: hunter2-inline}\n",
+    )
+    with pytest.raises(ConfigError) as ei:
+        load_config(p, env={})
+    msg = str(ei.value)
+    assert "agents.0.webhook.secret" in msg and "secret_env" in msg and "hunter2" not in msg
