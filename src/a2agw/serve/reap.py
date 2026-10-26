@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -26,6 +26,9 @@ from a2agw.serve.store import (
 )
 
 if TYPE_CHECKING:
+    from a2a.server.tasks import TaskStore
+    from a2a.types import Task
+
     from a2agw.consult.client import PartnerClient
     from a2agw.consult.handles import OutboundHandleStore as HandleStore
 
@@ -92,6 +95,8 @@ async def reap_agent(
     force: bool = False,
     actor: str = "system",
     cancel_timeout_s: float = 60.0,
+    store: TaskStore | None = None,
+    on_failed: Callable[[str, Task], Awaitable[object]] | None = None,
 ) -> ReapResult:
     async def record(outcome: str, count: int, reason: str | None = None) -> None:
         if audit is not None:
@@ -134,7 +139,13 @@ async def reap_agent(
         raise RecentActivityError(recent)
     try:
         report = await reap_tasks(
-            index, handles, cancel_outbound, agent_id, cancel_timeout_s=cancel_timeout_s
+            index,
+            handles,
+            cancel_outbound,
+            agent_id,
+            cancel_timeout_s=cancel_timeout_s,
+            store=store,
+            on_failed=on_failed,
         )
     except Exception:
         await record("failed", len(rows))
@@ -145,12 +156,15 @@ async def reap_agent(
 
 OUTBOUND_TTL_S = 86400.0
 TTL_REASON = "ttl expired"
+CANCEL_FAILED_REASON = "cancel failed"  # ended by TTL, partner cancel not yet confirmed
+CANCEL_MAX_ATTEMPTS = 3
+CANCEL_CONCURRENCY = 8
 _CANCELED = "TASK_STATE_CANCELED"
 
 
 @dataclass
 class ExpireReport:
-    expired: int = 0  # handles this gateway claimed and ended
+    expired: int = 0  # handles this gateway claimed (ended, or retried a cancel for)
     cancel_failed: int = 0  # of those, partner tasks that could not be confirmed canceled
 
 
@@ -164,32 +178,79 @@ async def expire_outbound(
     limit: int = 100,
     cancel_timeout_s: float = 30.0,
     actor: str = "system",
+    partner_ids: Collection[str] | None = None,
+    agent_ids: Collection[str] | None = None,
+    concurrency: int | None = None,
+    pass_deadline_s: float | None = None,
 ) -> ExpireReport:
     """Spec 8.2: end every non-terminal outbound handle older than ``ttl_s``.
 
+    Scope: with ``partner_ids`` / ``agent_ids`` (``AgentHost.maintain`` passes its registry's
+    partners and its own agents) only handles of known partners whose inbound task belongs
+    to one of those agents are touched, so gateways sharing a database never cancel each
+    other's partner tasks (and never with a partner record they do not have).
+
     Each handle is first claimed with a compare-and-set (``OutboundHandleStore.claim_end``):
     it becomes ``TASK_STATE_CANCELED`` with ``end_reason`` "ttl expired", and only the gateway
-    whose update matched goes on, so gateways sharing a database never expire one handle
-    twice. The partner task is then cancelled best-effort, as the caller it was started for,
-    and an ``outbound.expire`` audit row records the outcome (``canceled`` or
-    ``cancel_failed``). An already-terminal handle is never selected."""
+    whose update matched goes on. The partner task is then cancelled, as the caller it was
+    started for, and an ``outbound.expire`` audit row records the outcome (``canceled`` or
+    ``cancel_failed``) and ``detail.attempt``. A failed cancel leaves ``end_reason`` "cancel
+    failed": the handle stays ended for its partner updates, but later passes claim it again
+    and retry the cancel, up to ``CANCEL_MAX_ATTEMPTS`` attempts in all. An already-terminal
+    handle the partner reported is never selected.
+
+    Cancels run concurrently, at most ``concurrency`` (``CANCEL_CONCURRENCY``) at once, each
+    within ``cancel_timeout_s`` and all within ``pass_deadline_s`` (default: four cancel
+    timeouts): handles not started by then are left unclaimed for the next pass."""
     report = ExpireReport()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + (
+        pass_deadline_s if pass_deadline_s is not None else 4 * cancel_timeout_s
+    )
     cutoff = (time.time() if now is None else now) - ttl_s
-    for h in await handles.older_than(cutoff, limit=limit):
-        claimed = await handles.claim_end(
-            h["partner_id"], h["task_id"], h["state"], _CANCELED, TTL_REASON
-        )
-        if not claimed:
-            continue  # another gateway, or a fresh partner update, got there first
-        report.expired += 1
-        outcome = "canceled"
-        if cancel_outbound is not None:
-            try:
-                async with asyncio.timeout(cancel_timeout_s):
-                    await cancel_outbound(h)
-            except Exception:  # noqa: BLE001 - best effort; the handle stays ended
-                outcome = "cancel_failed"
-                report.cancel_failed += 1
+    rows = await handles.older_than(
+        cutoff,
+        limit=limit,
+        partner_ids=partner_ids,
+        agent_ids=agent_ids,
+        retry_reason=CANCEL_FAILED_REASON,
+        max_attempts=CANCEL_MAX_ATTEMPTS,
+    )
+    gate = asyncio.Semaphore(concurrency or CANCEL_CONCURRENCY)
+
+    async def one(h: dict[str, Any]) -> None:
+        if partner_ids is not None and h["partner_id"] not in partner_ids:
+            return  # never claim a handle of a partner this gateway cannot call
+        async with gate:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return  # out of time for this pass: leave it for the next one
+            attempts = int(h.get("cancel_attempts") or 0)
+            retry = h.get("end_reason") == CANCEL_FAILED_REASON
+            claimed = await handles.claim_end(
+                h["partner_id"],
+                h["task_id"],
+                h["state"],
+                _CANCELED,
+                TTL_REASON,
+                seen_reason=CANCEL_FAILED_REASON if retry else None,
+                seen_attempts=attempts,
+            )
+            if not claimed:
+                return  # another gateway, or a fresh partner update, got there first
+            attempt = attempts + 1
+            report.expired += 1
+            outcome = "canceled"
+            if cancel_outbound is not None:
+                try:
+                    async with asyncio.timeout(min(cancel_timeout_s, remaining)):
+                        await cancel_outbound(h)
+                except Exception:  # noqa: BLE001 - retried by a later pass, up to the cap
+                    outcome = "cancel_failed"
+                    report.cancel_failed += 1
+                    await handles.mark_end_reason(
+                        h["partner_id"], h["task_id"], TTL_REASON, CANCEL_FAILED_REASON, attempt
+                    )
         if audit is not None:
             await audit.emit(
                 AuditEvent(
@@ -198,7 +259,9 @@ async def expire_outbound(
                     partner_id=h["partner_id"],
                     task_id=h["task_id"],
                     outcome=outcome,
-                    detail={"reason": TTL_REASON},
+                    detail={"reason": TTL_REASON, "attempt": attempt},
                 )
             )
+
+    await asyncio.gather(*(one(h) for h in rows))
     return report

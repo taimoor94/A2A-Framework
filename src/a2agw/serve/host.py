@@ -111,6 +111,7 @@ from a2agw.serve.store import (
 
 CARD_PATH = "/.well-known/agent-card.json"
 logger = logging.getLogger(__name__)
+_AGENT_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 _EARLY_AUDIT_MAX = 1000  # registry changes kept for the audit log until startup
 _EXIT_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 # Default bound on uvicorn's wait for open requests at shutdown.
@@ -1161,6 +1162,7 @@ class AgentHost:
             handles=handles,
             cancel_outbound=self._cancel_outbound,
             cancel_timeout_s=self.default_deadline_s,
+            on_failed=self._push_failed,
         )
         foreign = await index.count_active_outside(set(self.specs))
         if foreign:
@@ -1173,8 +1175,12 @@ class AgentHost:
 
     async def maintain(self, *, now: float | None = None) -> ExpireReport:
         """One maintenance pass: end outbound handles older than ``outbound_ttl_s`` (their
-        partner tasks cancelled best-effort, each audited as ``outbound.expire``) and purge
-        inbound message ids past retention. Safe with several gateways on one database."""
+        partner tasks cancelled, a failed cancel retried by later passes; each attempt
+        audited as ``outbound.expire``) and purge inbound message ids past retention.
+
+        Scoped to this gateway: only handles of partners in this host's registry whose
+        inbound task belongs to one of this host's agents, so several gateways can share one
+        database (handles with no inbound task are not expired by any host)."""
         if self.handles is None or self.ledger is None:
             raise RuntimeError("host not started")
         report = await expire_outbound(
@@ -1184,6 +1190,8 @@ class AgentHost:
             ttl_s=self.outbound_ttl_s,
             now=now,
             cancel_timeout_s=self.default_deadline_s,
+            partner_ids={r.id for r in self.partners.all()},
+            agent_ids=set(self.specs),
         )
         await self.ledger.purge(now)
         return report
@@ -1210,20 +1218,59 @@ class AgentHost:
         tasks (see ``a2agw.serve.reap``). Without ``confirm`` it only counts what would be
         reaped. Raises ``AgentServedError`` for an agent of this host and
         ``RecentActivityError`` for tasks touched recently (unless ``force``). Audited."""
-        if self.index is None:
+        if self.index is None or self.engine is None:
             raise RuntimeError("host not started")
-        return await reap_agent(
-            self.index,
-            self.handles,
-            self._cancel_outbound,
-            self.audit,
-            agent_id,
-            served=set(self.specs),
-            confirm=confirm,
-            force=force,
-            actor=actor,
-            cancel_timeout_s=self.default_deadline_s,
-        )
+        store: TaskStore | None = None
+        sender: GuardedPushSender | None = None
+        if confirm and agent_id not in self.specs and _AGENT_ID.fullmatch(agent_id):
+            # The reaped agent's own SDK task table (and push configs): its tasks are failed
+            # there too, and their webhooks get the FAILED update (M2, I6).
+            store = task_store_for(self.engine, agent_id)
+            if self.push is not None and self.push_http is not None:
+                push_store = push_config_store_for(
+                    self.engine,
+                    agent_id,
+                    fernet=self.push.fernet(),
+                    max_configs_per_task=self.push.max_configs_per_task,
+                )
+                sender = GuardedPushSender(
+                    self.push_http,
+                    push_store,
+                    settings=self.push,
+                    agent_id=agent_id,
+                    base_url=self.base_url,
+                )
+
+        async def notify(aid: str, task: Task) -> None:
+            if sender is not None:
+                await sender.send_notification(task.id, task)
+
+        try:
+            return await reap_agent(
+                self.index,
+                self.handles,
+                self._cancel_outbound,
+                self.audit,
+                agent_id,
+                served=set(self.specs),
+                confirm=confirm,
+                force=force,
+                actor=actor,
+                cancel_timeout_s=self.default_deadline_s,
+                store=store,
+                on_failed=notify,
+            )
+        finally:
+            if sender is not None:
+                await sender.aclose(DRAIN_TIMEOUT_S)
+
+    async def _push_failed(self, agent_id: str, task: Task) -> None:
+        """Queue a task's FAILED state on its agent's push sender (restart recovery). The
+        sender deletes the task's webhook configs once that terminal update is delivered
+        (at once when it has none)."""
+        sender = self.push_senders.get(agent_id)
+        if sender is not None:
+            await sender.send_notification(task.id, task)
 
     def _audit_registry_change(self, rec: PartnerRecord, event: str) -> None:
         """Registry listener: one audit row per partner lifecycle change."""

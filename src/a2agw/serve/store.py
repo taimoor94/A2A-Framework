@@ -16,7 +16,7 @@ from typing import Any, Protocol
 from a2a.server.context import ServerCallContext
 from a2a.server.models import create_task_model
 from a2a.server.tasks import DatabaseTaskStore, TaskStore
-from a2a.types import Message, Part, Role, TaskState
+from a2a.types import Message, Part, Role, Task, TaskState
 from sqlalchemy import (
     Column,
     Float,
@@ -52,6 +52,8 @@ _index_table = Table(
     Column("updated_at", Float, nullable=False),
     Column("origin", String, nullable=True),
 )
+
+INDEX_TABLE = _index_table  # joined by the outbound TTL scoping (consult.handles)
 
 # Inbound message ids already acted on (spec 8.5): a re-sent message is answered with the task
 # the first one created instead of running the agent again. One row per (agent, tenant,
@@ -324,11 +326,13 @@ async def recover_on_startup(
     cancel_outbound: Callable[..., Awaitable[object]] | None,
     *,
     cancel_timeout_s: float = 60.0,
+    on_failed: OnFailed | None = None,
 ) -> RecoveryReport:
     """Spec 11a item 5: fail orphaned in-flight tasks, keep durable input-required ones.
 
     Only the tasks of agents in ``stores`` are touched: gateways sharing one database each
-    recover their own agents.
+    recover their own agents. ``on_failed(agent_id, task)`` is awaited for each task saved
+    FAILED (the host queues its push notification); its errors are logged, never raised.
 
     The non-terminal outbound handles of every failed task are then cancelled concurrently,
     within ``cancel_timeout_s`` overall. A cancel that raises or times out is reported in
@@ -347,18 +351,7 @@ async def recover_on_startup(
         try:
             store = stores.get(agent_id)
             if store is not None:
-                ctx = _context_for(owner)
-                task = await store.get(task_id, ctx)
-                if task is not None:
-                    task.status.state = TaskState.TASK_STATE_FAILED
-                    task.status.message.CopyFrom(
-                        Message(
-                            message_id=f"recovery-{task_id}",
-                            role=Role.ROLE_AGENT,
-                            parts=[Part(text="gateway restarted")],
-                        )
-                    )
-                    await store.save(task, ctx)
+                await _fail_stored(store, agent_id, task_id, owner, "gateway restarted", on_failed)
             if handles is not None and cancel_outbound is not None:
                 for handle in await handles.by_inbound(task_id):
                     if handle.get("state") not in _TERMINAL_STATES:
@@ -371,6 +364,34 @@ async def recover_on_startup(
     if to_cancel and cancel_outbound is not None:
         await _cancel_all(to_cancel, cancel_outbound, cancel_timeout_s, report)
     return report
+
+
+OnFailed = Callable[[str, Task], Awaitable[object]]
+
+
+async def _fail_stored(
+    store: TaskStore,
+    agent_id: str,
+    task_id: str,
+    owner: str,
+    reason: str,
+    on_failed: OnFailed | None,
+) -> None:
+    """Mark the SDK's stored task FAILED with ``reason`` (if it is stored), then report it."""
+    ctx = _context_for(owner)
+    task = await store.get(task_id, ctx)
+    if task is None:
+        return
+    task.status.state = TaskState.TASK_STATE_FAILED
+    task.status.message.CopyFrom(
+        Message(message_id=f"recovery-{task_id}", role=Role.ROLE_AGENT, parts=[Part(text=reason)])
+    )
+    await store.save(task, ctx)
+    if on_failed is not None:
+        try:
+            await on_failed(agent_id, task)
+        except Exception:
+            logger.exception("failed-task notification for task %s raised", task_id)
 
 
 async def _cancel_all(
@@ -408,10 +429,15 @@ async def reap_tasks(
     agent_id: str,
     *,
     cancel_timeout_s: float = 60.0,
+    store: TaskStore | None = None,
+    on_failed: OnFailed | None = None,
 ) -> RecoveryReport:
     """Mark every non-terminal index row of ``agent_id`` FAILED and cancel their non-terminal
     outbound handles. For agents no gateway serves any more (nobody recovers their tasks).
-    The caller must make sure no gateway is serving the agent."""
+    The caller must make sure no gateway is serving the agent.
+
+    With ``store`` (the agent's SDK task store) the stored task is marked FAILED too
+    ("agent no longer served"), and ``on_failed(agent_id, task)`` is awaited for it."""
     report = RecoveryReport()
     to_cancel: list[tuple[str, dict[str, Any]]] = []
     failed_state = TaskState.Name(TaskState.TASK_STATE_FAILED)
@@ -420,6 +446,8 @@ async def reap_tasks(
             continue
         task_id = row["task_id"]
         try:
+            if store is not None:
+                await _fail_stored(store, agent_id, task_id, row["owner"], REAPED_REASON, on_failed)
             if handles is not None and cancel_outbound is not None:
                 for handle in await handles.by_inbound(task_id):
                     if handle.get("state") not in _TERMINAL_STATES:
@@ -434,6 +462,7 @@ async def reap_tasks(
     return report
 
 
+REAPED_REASON = "agent no longer served"
 MESSAGE_RETENTION_S = 24 * 3600.0  # a message id is a duplicate for this long
 RESERVATION_STALE_S = 60.0  # a reservation never given a task (crashed send) is taken over
 

@@ -722,3 +722,37 @@ async def test_agent_output_with_nul_is_stored(tmp_path, db_url):
         assert row["state"] == "TASK_STATE_COMPLETED"
     finally:
         await e.stop()
+
+
+async def test_reap_marks_the_sdk_task_store_failed(tmp_path, db_url):
+    """M2: reaping fails the agent's stored A2A task too, not only its index row (host and
+    CLI paths)."""
+    from a2a.server.context import ServerCallContext
+    from a2a.types import Task, TaskStatus
+
+    from a2agw.security.principal import Principal, PrincipalUser
+
+    eng = await create_engine(db_url)
+    try:
+        await _seed_orphans(eng)
+        store = task_store_for(eng, "gone")
+        await store.initialize()
+        owner = ServerCallContext(
+            user=PrincipalUser(Principal(id="key:a", kind="api_key", scopes=frozenset()))
+        )
+        await store.save(
+            Task(
+                id="gone-1", context_id="c", status=TaskStatus(state=TaskState.TASK_STATE_WORKING)
+            ),
+            owner,
+        )
+        await _age(eng)
+        r = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: _cli(tmp_path, db_url, "--agent", "gone", "--yes")
+        )
+        assert r.exit_code == 0, r.output
+        task = await task_store_for(eng, "gone").get("gone-1", owner)
+        assert task is not None and task.status.state == TaskState.TASK_STATE_FAILED
+        assert task.status.message.parts[0].text == "agent no longer served"
+    finally:
+        await eng.dispose()

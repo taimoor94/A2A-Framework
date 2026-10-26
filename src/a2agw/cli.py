@@ -792,19 +792,31 @@ async def _reap(
     """Open the database, index, handles and registry directly: no host, no agent adapters
     are started, and no recovery runs. Partner cancels use the configured credentials
     (static and OAuth) and mTLS settings."""
-    from a2agw.config import _load_agent, partner_registry
+    from a2agw.config import _load_agent, _signers, partner_registry
     from a2agw.consult.client import PartnerClient
     from a2agw.consult.handles import OutboundHandleStore
     from a2agw.ops.bus import EventBus
+    from a2agw.serve.push import (
+        DRAIN_TIMEOUT_S,
+        GuardedPushSender,
+        PushSettings,
+        push_config_store_for,
+        push_http_client,
+    )
     from a2agw.serve.reap import make_cancel_outbound, reap_agent
-    from a2agw.serve.store import TaskIndex, create_engine
+    from a2agw.serve.store import TaskIndex, create_engine, task_store_for
 
     # Only the specs are imported (their ids tell which agents this config serves).
     served = {_load_agent(ref.spec, config_dir).id for ref in cfg.agents}
     registry = partner_registry(cfg, config_dir)
     registry.load()
+    push = None
+    if confirm and cfg.push is not None:
+        push = PushSettings(**cfg.push.model_dump(), jwt_signer=_signers(cfg, config_dir)[0])
+        push.fernet()  # a missing or bad key fails here, before anything is changed
     engine = await create_engine(cfg.db_url)
     client = None
+    push_http = sender = None
     try:
         index, handles = TaskIndex(engine), OutboundHandleStore(engine)
         await index.initialize()
@@ -819,6 +831,24 @@ async def _reap(
             agent_id="host",
             tls=registry.tls,
         )
+        # The agent's SDK task table is failed too, and its webhooks get the FAILED update.
+        store = task_store_for(engine, agent) if confirm and agent not in served else None
+        if store is not None and push is not None:
+            push_http = push_http_client(push, slots=push.max_concurrent_deliveries)
+            push_store = push_config_store_for(
+                engine,
+                agent,
+                fernet=push.fernet(),
+                max_configs_per_task=push.max_configs_per_task,
+            )
+            sender = GuardedPushSender(
+                push_http, push_store, settings=push, agent_id=agent, base_url=cfg.base_url
+            )
+
+        async def notify(aid: str, task: Any) -> None:
+            if sender is not None:
+                await sender.send_notification(task.id, task)
+
         return await reap_agent(
             index,
             handles,
@@ -829,8 +859,14 @@ async def _reap(
             confirm=confirm,
             force=force,
             actor="system",
+            store=store,
+            on_failed=notify,
         )
     finally:
+        if sender is not None:
+            await sender.aclose(DRAIN_TIMEOUT_S)
+        if push_http is not None:
+            await push_http.aclose()
         if client is not None:
             await client.aclose()
         await engine.dispose()

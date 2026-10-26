@@ -1077,3 +1077,93 @@ async def test_admin_push_counters(host_env, receiver):
         "pending",
     }
     assert str(receiver.port) not in r.text
+
+
+# -- I6: recovery and reap reach push ---------------------------------------------------
+
+
+async def _input_required_task(tmp_path, receiver, db: str) -> str:
+    """A task left input-required (non-durable adapter) with a webhook, on a stopped host."""
+    host = AgentHost(
+        "https://gw.example",
+        db_url=f"sqlite+aiosqlite:///{tmp_path / db}",
+        push=PushSettings(allow_private=True),
+    )
+    host.add(spec("alpha", AskOnce()))
+    await host.startup()
+    hc = httpx.AsyncClient(transport=httpx.ASGITransport(app=host.app()), base_url="http://t")
+    try:
+        client = ClientFactory(ClientConfig(httpx_client=hc, streaming=False)).create(
+            host.cards["alpha"]
+        )
+        events = await send(
+            client, msg("first"), TaskPushNotificationConfig(id="c1", url=receiver.url())
+        )
+        tid = events[0].task.id
+        await receiver.wait_for(
+            lambda hits: any(_state(h.body) == "TASK_STATE_INPUT_REQUIRED" for h in hits)
+        )
+        await host.push_senders["alpha"].drain(5)
+    finally:
+        await hc.aclose()
+        await host.shutdown()
+    receiver.hits.clear()
+    return tid
+
+
+def _failed_for(tid: str):
+    def pred(hits: list[Hit]) -> bool:
+        return any(
+            _state(h.body) == "TASK_STATE_FAILED" and h.body.get("task", {}).get("id") == tid
+            for h in hits
+        )
+
+    return pred
+
+
+async def test_recovered_task_failure_is_pushed_and_configs_deleted(tmp_path, receiver):
+    tid = await _input_required_task(tmp_path, receiver, "rec.db")
+    host = AgentHost(
+        "https://gw.example",
+        db_url=f"sqlite+aiosqlite:///{tmp_path / 'rec.db'}",
+        push=PushSettings(allow_private=True),
+    )
+    host.add(spec("alpha", AskOnce()))
+    await host.startup()
+    try:
+        assert host.last_recovery.failed == [tid]
+        await receiver.wait_for(_failed_for(tid))
+        await host.push_senders["alpha"].drain(5)
+        assert await host.push_stores["alpha"].get_info_for_dispatch(tid) == []
+    finally:
+        await host.shutdown()
+
+
+async def test_reaped_task_is_failed_in_the_task_store_and_pushed(tmp_path, receiver):
+    from a2a.server.context import ServerCallContext
+
+    from a2agw.security.principal import Principal, PrincipalUser
+    from a2agw.serve.store import task_store_for
+
+    tid = await _input_required_task(tmp_path, receiver, "reap.db")
+    # Another gateway (serving only "beta") reaps the abandoned "alpha" agent.
+    host = AgentHost(
+        "https://gw.example",
+        db_url=f"sqlite+aiosqlite:///{tmp_path / 'reap.db'}",
+        push=PushSettings(allow_private=True),
+    )
+    host.add(spec("beta"))
+    await host.startup()
+    try:
+        result = await host.reap("alpha", confirm=True, force=True)
+        assert result.report is not None and result.report.failed == [tid]
+        await receiver.wait_for(_failed_for(tid))
+        anon = ServerCallContext(
+            user=PrincipalUser(Principal(id="anonymous", kind="anonymous", scopes=frozenset()))
+        )
+        task = await task_store_for(host.engine, "alpha").get(tid, anon)
+        assert task is not None and task.status.state == TaskState.TASK_STATE_FAILED
+        store = push_config_store_for(host.engine, "alpha")
+        assert await store.get_info_for_dispatch(tid) == []
+    finally:
+        await host.shutdown()

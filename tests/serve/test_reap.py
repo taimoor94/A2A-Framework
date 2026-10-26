@@ -65,7 +65,9 @@ async def test_ttl_expiry_cancels_partner_and_marks_handle(env):
     done, young = await handles.get("p", "done"), await handles.get("p", "young")
     assert (done["state"], done["end_reason"]) == (COMPLETED, None)
     assert (young["state"], young["end_reason"]) == (W, None)
-    assert await _expire_rows(audit) == [("p", "old", "canceled", {"reason": TTL_REASON})]
+    assert await _expire_rows(audit) == [
+        ("p", "old", "canceled", {"reason": TTL_REASON, "attempt": 1})
+    ]
     # A second pass finds nothing left to do.
     assert (await expire_outbound(handles, cancel, audit, ttl_s=86400)).expired == 0
     assert len(cancelled) == 1
