@@ -8,7 +8,7 @@ from typing import Annotated, Any, TypedDict
 import httpx
 import pytest
 
-pytest.importorskip("langgraph")
+pytest.importorskip("langgraph.graph")
 
 from a2a.client import ClientConfig, ClientFactory
 from a2a.types import Message, Part, Role, SendMessageRequest, TaskState
@@ -445,5 +445,5 @@ async def test_contract_kit():
     adapter = one_node(remembering, InMemorySaver())
     assert_text_stream(await drive(adapter, "hi"), "heard: hi")
     await assert_multi_turn(adapter, "apples", "pears", "apples")
-    await assert_failure_maps(one_node(boom))
+    await assert_failure_maps(one_node(boom), match="boom")
     await assert_cancellable(one_node(block), started=started, stopped=stopped)

@@ -12,10 +12,13 @@ they mean. ``invoke`` validates every call against the full schema instead.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
+from contextlib import aclosing
+from dataclasses import dataclass, field
 from typing import Any
 
 OPENAI_EXTRA_HINT = (
@@ -41,14 +44,19 @@ from a2agw.security.principal import Principal
 
 __all__ = ["MemorySession", "OpenAIAgentsAdapter", "as_openai_tools"]
 
-MAX_SESSIONS = 1024  # default in-memory sessions kept per adapter (least recently used go)
+MAX_SESSIONS = 1024  # contexts tracked per adapter (least recently used idle ones go)
+MAX_SESSION_ITEMS = 200  # conversation items a default in-memory session keeps per context
 
 
 class MemorySession(SessionABC):
-    """A process-local ``Session``: the conversation items of one A2A context, in memory."""
+    """A process-local ``Session``: the conversation items of one A2A context, in memory.
 
-    def __init__(self, session_id: str) -> None:
+    Keeps the last ``max_items`` items. A trimmed history starts at a user message when the
+    window holds one, so it never opens with a tool output whose call was dropped."""
+
+    def __init__(self, session_id: str, *, max_items: int = MAX_SESSION_ITEMS) -> None:
         self.session_id = session_id
+        self.max_items = max_items
         self._items: list[Any] = []
 
     async def get_items(self, limit: int | None = None) -> list[Any]:
@@ -59,12 +67,28 @@ class MemorySession(SessionABC):
 
     async def add_items(self, items: list[Any]) -> None:
         self._items.extend(copy.deepcopy(items))
+        if len(self._items) > self.max_items:
+            kept = self._items[-self.max_items :]
+            start = next((i for i, it in enumerate(kept) if _is_user(it)), 0)
+            self._items = kept[start:]
 
     async def pop_item(self) -> Any | None:
         return self._items.pop() if self._items else None
 
     async def clear_session(self) -> None:
         self._items.clear()
+
+
+def _is_user(item: Any) -> bool:
+    return isinstance(item, dict) and item.get("role") == "user"
+
+
+@dataclass
+class _Context:
+    """Per-context state: the lock serialising its turns, and its default session."""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    session: MemorySession | None = None
 
 
 def _final_text(output: Any) -> str | None:
@@ -81,7 +105,8 @@ class OpenAIAgentsAdapter:
     Each turn is ``Runner.run_streamed(agent, ctx.text, session=..., max_turns=...)``. The
     session is ``session_factory(ctx.context_id)``; by default a ``MemorySession`` per
     context, so a follow-up message on the same A2A context continues the conversation (the
-    ``MAX_SESSIONS`` most recently used contexts are kept). Pass a factory returning a
+    ``MAX_SESSIONS`` most recently used contexts are kept, each with its last
+    ``MAX_SESSION_ITEMS`` items). Turns on the same context are serialised. Pass a factory returning a
     persistent session (e.g. ``agents.SQLiteSession(context_id, "sessions.db")``) and
     ``durable_sessions=True`` to keep conversations across restarts.
 
@@ -107,28 +132,48 @@ class OpenAIAgentsAdapter:
         run_config: RunConfig | None = None,
     ):
         self.agent = agent
-        self.session_factory = session_factory or self._memory_session
+        self.session_factory = session_factory
         self.durable_sessions = durable_sessions
         self.max_turns = max_turns
         self.run_config = run_config
-        self._sessions: OrderedDict[str, MemorySession] = OrderedDict()
+        self._contexts: OrderedDict[str, _Context] = OrderedDict()
 
-    def _memory_session(self, context_id: str) -> MemorySession:
-        session = self._sessions.get(context_id)
-        if session is None:
-            session = self._sessions[context_id] = MemorySession(context_id)
-            while len(self._sessions) > MAX_SESSIONS:
-                self._sessions.popitem(last=False)
-        self._sessions.move_to_end(context_id)
-        return session
+    def _context(self, context_id: str) -> _Context:
+        """The context's state, most recently used last. Past ``MAX_SESSIONS`` the least
+        recently used idle contexts are dropped with their lock and default session (a
+        context with a turn in flight is never dropped)."""
+        entry = self._contexts.get(context_id)
+        if entry is None:
+            entry = self._contexts[context_id] = _Context()
+            if self.session_factory is None:
+                entry.session = MemorySession(context_id)
+        self._contexts.move_to_end(context_id)
+        excess = len(self._contexts) - MAX_SESSIONS
+        if excess > 0:
+            idle = [k for k, e in self._contexts.items() if not e.lock.locked() and e is not entry]
+            for k in idle[:excess]:
+                del self._contexts[k]
+        return entry
 
     async def run(self, ctx: InboundContext) -> AsyncIterator[AgentEvent]:
+        entry = self._context(ctx.context_id)
+        # Turns on one context run one at a time: each sees the history the last one saved.
+        async with entry.lock, aclosing(self._turn(ctx, entry)) as turn:
+            # ``aclosing``: closing this stream runs ``_turn``'s cleanup now, not at GC.
+            async for ev in turn:
+                yield ev
+
+    async def _turn(self, ctx: InboundContext, entry: _Context) -> AsyncIterator[AgentEvent]:
+        session = entry.session
+        if session is None:
+            assert self.session_factory is not None  # no default session only with a factory
+            session = self.session_factory(ctx.context_id)
         # The run loop is a task the SDK creates here, so it inherits the inbound contextvars
         # (partner calls from tools are linked to this inbound task).
         result = Runner.run_streamed(
             self.agent,
             ctx.text,
-            session=self.session_factory(ctx.context_id),
+            session=session,
             max_turns=self.max_turns,
             run_config=self.run_config,
         )

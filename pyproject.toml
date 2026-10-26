@@ -49,6 +49,8 @@ dev = [
     "langgraph-checkpoint-sqlite>=3.1.2",
     "asyncpg>=0.32.0",
     "mcp>=2.3,<3",
+    "langchain-core>=1.7",
+    "langgraph>=1.2",
     "openai-agents>=0.24",
 ]
 

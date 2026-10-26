@@ -23,7 +23,7 @@ from adapters.contract import (
     make_ctx,
     output_text,
 )
-from agents import Agent, FunctionTool, set_tracing_disabled
+from agents import Agent, FunctionTool
 from agents.models.interface import Model
 from agents.tool_context import ToolContext
 from openai.types.responses import (
@@ -43,15 +43,6 @@ from a2agw.consult.tools import UNTRUSTED_NOTE
 from a2agw.context.call_context import current_inbound_task, use_inbound
 from a2agw.core.events import Done, Status, Usage
 
-
-@pytest.fixture(autouse=True, scope="module")
-def _no_tracing():
-    # No OPENAI_API_KEY in tests, and nothing may reach the network: switch the SDK's trace
-    # exporter off for this module.
-    set_tracing_disabled(True)
-    yield
-
-
 # -- a scripted fake model ----------------------------------------------------------------
 
 
@@ -66,6 +57,10 @@ def tool(name: str, args: dict[str, Any]) -> tuple:
 ECHO = ("echo",)  # answers "heard: <every user message so far>"
 BLOCK = ("block",)  # waits until cancelled
 RAISE = ("raise",)
+
+
+def gate(event: asyncio.Event) -> tuple:
+    return ("gate", event)  # signals ``started``, waits for ``event``, then echoes
 
 
 def _user_texts(items: Any) -> list[str]:
@@ -140,6 +135,9 @@ class FakeModel(Model):
                 await asyncio.Event().wait()
             finally:
                 self.stopped.set()
+        if step[0] == "gate":
+            self.started.set()
+            await step[1].wait()
         if step[0] == "raise":
             raise RuntimeError("model exploded")
         if step[0] == "tool":
@@ -224,6 +222,65 @@ def test_durable_sessions_flag():
     assert OpenAIAgentsAdapter(agent, durable_sessions=True).durable_sessions is True
 
 
+async def test_memory_session_keeps_last_items_from_a_user_message():
+    s = oa.MemorySession("c", max_items=4)
+    await s.add_items([{"role": "user", "content": "u1"}, {"type": "function_call_output"}])
+    await s.add_items([{"role": "assistant", "content": "a1"}, {"role": "user", "content": "u2"}])
+    await s.add_items([{"type": "function_call_output"}, {"role": "assistant", "content": "a2"}])
+    # The last 4 start with an orphan tool output; the kept history starts at "u2".
+    assert await s.get_items() == [
+        {"role": "user", "content": "u2"},
+        {"type": "function_call_output"},
+        {"role": "assistant", "content": "a2"},
+    ]
+    assert oa.MemorySession("c").max_items == oa.MAX_SESSION_ITEMS == 200
+
+
+async def test_default_session_bounded_over_many_turns(monkeypatch):
+    adapter = OpenAIAgentsAdapter(make_agent(FakeModel()))
+    await drive(adapter, "first", context_id="c-long")
+    adapter._contexts["c-long"].session.max_items = 6  # 2 items per turn: 3 turns kept
+    for n in range(5):
+        await drive(adapter, f"turn{n}", context_id="c-long")
+    evs = await drive(adapter, "last", context_id="c-long")
+    assert output_text(evs) == "heard: turn2, turn3, turn4, last"
+
+
+async def test_turns_on_one_context_are_serialised():
+    release = asyncio.Event()
+    model = FakeModel(gate(release))
+    adapter = OpenAIAgentsAdapter(make_agent(model))
+    one = asyncio.create_task(drive(adapter, "one", context_id="c-ser"))
+    await asyncio.wait_for(model.started.wait(), 2)
+    two = asyncio.create_task(drive(adapter, "two", context_id="c-ser"))
+    other = await drive(adapter, "elsewhere", context_id="c-other")  # not blocked
+    assert output_text(other) == "heard: elsewhere"
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert not two.done() and len(model.inputs) == 2  # "two" waits for "one"
+    release.set()
+    await one
+    # "two" ran after "one" was saved, so it sees it.
+    assert output_text(await two) == "heard: one, two"
+
+
+async def test_idle_contexts_evicted_with_their_lock(monkeypatch):
+    monkeypatch.setattr(oa, "MAX_SESSIONS", 2)
+    release = asyncio.Event()
+    model = FakeModel(gate(release))
+    adapter = OpenAIAgentsAdapter(make_agent(model))
+    busy = asyncio.create_task(drive(adapter, "busy", context_id="c-busy"))
+    await asyncio.wait_for(model.started.wait(), 2)
+    for cid in ("c-1", "c-2", "c-3"):
+        await drive(adapter, "x", context_id=cid)
+    # The in-flight context is kept; the oldest idle ones went, lock and session together.
+    assert list(adapter._contexts) == ["c-busy", "c-3"]
+    release.set()
+    await busy
+    evs = await drive(adapter, "again", context_id="c-1")
+    assert output_text(evs) == "heard: again"  # a fresh session
+
+
 async def test_tool_call_reaches_partner_client():
     client = FakePartnerClient()
     model = FakeModel(tool("ask_pinger", {"message": "hi"}), text("pinger said pong"))
@@ -297,7 +354,9 @@ async def test_no_usage_when_zero():
 
 
 async def test_failure_propagates():
-    await assert_failure_maps(OpenAIAgentsAdapter(make_agent(FakeModel(RAISE))))
+    await assert_failure_maps(
+        OpenAIAgentsAdapter(make_agent(FakeModel(RAISE))), match="model exploded"
+    )
 
 
 async def test_cancellable():
@@ -416,7 +475,8 @@ def test_missing_extra_message(monkeypatch):
 
 def test_core_does_not_import_agents():
     code = (
-        "import sys, a2agw, a2agw.serve.host, a2agw.adapters.callable;"
+        "import sys, a2agw, a2agw.serve.host, a2agw.adapters.callable, a2agw.cli, a2agw.config,"
+        " a2agw.gateway.rest;"
         "print([m for m in sys.modules if m.split('.')[0] in ('agents', 'openai')])"
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
@@ -85,7 +86,8 @@ def assert_text_stream(events: list[AgentEvent], expected_text: str) -> None:
         # The streamed text is the answer: a Done must not repeat it.
         assert not dones or not dones[0].text, "text both streamed and in Done"
     else:
-        assert dones and dones[0].text == expected_text, events
+        # ``Done()`` (text None) answers an empty text.
+        assert dones and (dones[0].text or "") == expected_text, events
 
 
 async def assert_multi_turn(
@@ -102,17 +104,22 @@ async def assert_multi_turn(
     assert expect_memory not in output_text(other), "memory leaked across contexts"
 
 
-async def assert_failure_maps(adapter_raising: InboundAdapter) -> None:
+async def assert_failure_maps(adapter_raising: InboundAdapter, *, match: str | None = None) -> None:
     """A framework failure ends the turn as a failure: the exception propagates (the executor
-    fails the task) or the adapter yields ``Failed`` as its final event."""
+    fails the task) or the adapter yields ``Failed`` as its final event. With ``match``, the
+    exception message (or the ``Failed`` error) must match that regex (``re.search``)."""
     try:
         events = await drive(adapter_raising, "fail")
     except asyncio.CancelledError:
         raise AssertionError("a failure must not surface as cancellation") from None
-    except Exception:  # noqa: BLE001 - any framework error is a valid failure
+    except Exception as e:  # noqa: BLE001 - any framework error is a valid failure
+        if match is not None:
+            assert re.search(match, str(e)), f"{type(e).__name__}: {e!s} does not match {match!r}"
         return
     assert events and isinstance(events[-1], Failed), events
     assert not any(isinstance(e, Done) for e in events), events
+    if match is not None:
+        assert re.search(match, events[-1].error), f"{events[-1]} does not match {match!r}"
 
 
 _START_YIELDS = 20  # loop iterations a turn gets to start when no ``started`` event is given
@@ -134,7 +141,9 @@ async def assert_cancellable(
     task = asyncio.create_task(drive(adapter, "block", context_id="c-cancel", task_id="t-cancel"))
     if started is not None:
         waiter = asyncio.create_task(started.wait())
-        done, _ = await asyncio.wait({task, waiter}, timeout=within_s)
+        done, _ = await asyncio.wait(
+            {task, waiter}, timeout=within_s, return_when=asyncio.FIRST_COMPLETED
+        )
         if waiter not in done:
             waiter.cancel()
             task.cancel()
@@ -173,7 +182,8 @@ class _FakeRegistry:
 
 class FakePartnerClient:
     """The ``PartnerClient`` surface ``invoke`` uses: ``consult``, ``check``, ``cancel``,
-    ``wait_any`` and ``registry.active()``. Every call is recorded in ``calls`` as
+    ``wait_any`` (same signatures as ``PartnerClient``; ``test_contract.py`` checks) and
+    ``registry.active()``. Every call is recorded in ``calls`` as
     ``(method, kwargs)``; ``consult`` completes with ``"pong:<message>"``."""
 
     def __init__(self, partners: Iterable[str] = ("pinger",)) -> None:
@@ -189,9 +199,38 @@ class FakePartnerClient:
         return [kw for method, kw in self.calls if method == "consult"]
 
     async def consult(
-        self, partner_id: str, message: str, **kwargs: Any
-    ) -> ToolResult:  # same keywords as PartnerClient.consult
-        self.calls.append(("consult", {"partner_id": partner_id, "message": message, **kwargs}))
+        self,
+        partner_id: str,
+        message: str,
+        *,
+        files: Iterable[tuple[str, bytes, str]] = (),
+        data: dict[str, Any] | None = None,
+        task_id: str | None = None,
+        context_id: str | None = None,
+        wait_seconds: float = 30.0,
+        inbound_task_id: str | None = None,
+        caller: Principal | None = None,
+        classification: str | None = None,
+        owner: str | None = None,
+    ) -> ToolResult:
+        self.calls.append(
+            (
+                "consult",
+                {
+                    "partner_id": partner_id,
+                    "message": message,
+                    "files": list(files),
+                    "data": data,
+                    "task_id": task_id,
+                    "context_id": context_id,
+                    "wait_seconds": wait_seconds,
+                    "inbound_task_id": inbound_task_id,
+                    "caller": caller,
+                    "classification": classification,
+                    "owner": owner,
+                },
+            )
+        )
         return ToolResult(
             partner=partner_id,
             task_id="pt-1",
@@ -203,13 +242,17 @@ class FakePartnerClient:
     async def check(
         self, partner_id: str, task_id: str, *, caller: Principal | None = None
     ) -> ToolResult:
-        self.calls.append(("check", {"partner_id": partner_id, "task_id": task_id}))
+        self.calls.append(
+            ("check", {"partner_id": partner_id, "task_id": task_id, "caller": caller})
+        )
         return ToolResult(partner=partner_id, task_id=task_id, state="completed", text="checked")
 
     async def cancel(
         self, partner_id: str, task_id: str, *, caller: Principal | None = None
     ) -> ToolResult:
-        self.calls.append(("cancel", {"partner_id": partner_id, "task_id": task_id}))
+        self.calls.append(
+            ("cancel", {"partner_id": partner_id, "task_id": task_id, "caller": caller})
+        )
         return ToolResult(partner=partner_id, task_id=task_id, state="canceled")
 
     async def wait_any(self, handles: list[tuple[str, str]], seconds: float) -> list[ToolResult]:

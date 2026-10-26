@@ -257,7 +257,7 @@ async def test_contract_kit():
     adapter = RunnableAdapter(RunnableLambda(remembering))
     assert_text_stream(await drive(adapter, "hi"), "heard: hi")
     await assert_multi_turn(adapter, "apples", "pears", "apples")
-    await assert_failure_maps(RunnableAdapter(RunnableLambda(boom)))
+    await assert_failure_maps(RunnableAdapter(RunnableLambda(boom)), match="boom")
     await assert_cancellable(
         RunnableAdapter(RunnableLambda(block)), started=started, stopped=stopped
     )

@@ -1,3 +1,4 @@
+import os
 from typing import Any
 
 import httpx
@@ -13,6 +14,10 @@ from streaming_asgi import StreamingASGITransport
 from a2agw.consult import client as client_mod
 from a2agw.serve.agent import AgentSpec
 from a2agw.serve.host import AgentHost
+
+# The OpenAI Agents SDK reads this once, on first tracing use: no trace export (and so no
+# network) from any test.
+os.environ.setdefault("OPENAI_AGENTS_DISABLE_TRACING", "1")
 
 # The OTel global provider can be set once per process; ``_span_exporter`` registers its
 # in-memory exporter here so spans never pile up across the session.

@@ -53,6 +53,8 @@ postgres = [
 [package.dev-dependencies]
 dev = [
     { name = "asyncpg" },
+    { name = "langchain-core" },
+    { name = "langgraph" },
     { name = "langgraph-checkpoint-sqlite" },
     { name = "mcp" },
     { name = "mypy" },
@@ -92,6 +94,8 @@ provides-extras = ["langchain", "langgraph", "postgres", "mcp", "openai", "all"]
 [package.metadata.requires-dev]
 dev = [
     { name = "asyncpg", specifier = ">=0.32.0" },
+    { name = "langchain-core", specifier = ">=1.7" },
+    { name = "langgraph", specifier = ">=1.2" },
     { name = "langgraph-checkpoint-sqlite", specifier = ">=3.1.2" },
     { name = "mcp", specifier = ">=2.3,<3" },
     { name = "mypy" },

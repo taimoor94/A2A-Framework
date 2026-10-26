@@ -268,7 +268,7 @@ async def test_contract_kit():
     adapter = CallableAdapter(remembering)
     assert_text_stream(await drive(adapter, "hi"), "heard: hi")
     await assert_multi_turn(adapter, "apples", "pears", "apples")
-    await assert_failure_maps(CallableAdapter(boom))
+    await assert_failure_maps(CallableAdapter(boom), match="boom")
     await assert_cancellable(CallableAdapter(block), started=started, stopped=stopped)
     client = FakePartnerClient()
     fns = as_functions(client.tools(), client)
