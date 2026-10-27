@@ -133,6 +133,8 @@ class FakeClient:
             raise step
         if isinstance(step, ToolCallEvent):
             return self._response(tool_calls=ToolCallsEvent([step]))
+        if isinstance(step, ModelResponse):  # spelled out (e.g. text with tool calls)
+            return step
         if isinstance(step, str):
             message = ModelMessage(step)
             await context.send(message)
@@ -273,7 +275,12 @@ async def test_stream_factory_and_durable_sessions():
     for text in ("x", "y"):
         await drive(adapter, text, principal=caller("key:alice"))
     assert keys == ["key:alice\x1fc1"]  # made once per key, then kept in the registry
-    # A given stream is the caller's: never trimmed.
+    # A given stream is the caller's: never trimmed (history_limit is for default streams).
+    assert user_texts(await streams["key:alice\x1fc1"].history.get_events()) == ["x", "y"]
+    # Another caller on the same context gets a stream of its own key.
+    await drive(adapter, "z", principal=caller("key:bob"))
+    assert keys == ["key:alice\x1fc1", "key:bob\x1fc1"]
+    assert user_texts(await streams["key:bob\x1fc1"].history.get_events()) == ["z"]
     assert user_texts(await streams["key:alice\x1fc1"].history.get_events()) == ["x", "y"]
 
 
@@ -293,6 +300,46 @@ async def test_tool_reaches_partner_client():
     [result] = results.results
     envelope = json.loads(result.result.parts[0].content)
     assert (envelope["state"], envelope["text"]) == ("completed", "pong:hi")
+
+
+def narrated_call(text: str) -> ModelResponse:
+    return ModelResponse(
+        ModelMessage(text), tool_calls=ToolCallsEvent([call("ask_pinger", {"message": "hi"})])
+    )
+
+
+async def test_narration_before_tool_calls_is_status():
+    client = FakePartnerClient()
+    tools = as_ag2_tools(client.tools(), client)
+    # A model that does not stream: the narration is a status, the answer the Done text.
+    config = FakeConfig(narrated_call("Let me ask the pinger."), "pinger said pong")
+    evs = await drive(AG2Adapter(make_agent(config, tools)), "ping")
+    assert evs == [
+        Status("Let me ask the pinger."),
+        Status("calling ask_pinger"),
+        Done("pinger said pong"),
+    ]
+    # Handled the same way after the turn has streamed: the first response streams its
+    # narration with the call; a later one-piece narration is still a status.
+    streaming = FakeConfig(narrated_call("asking again"), "done")
+
+    class StreamedCall(FakeClient):
+        async def __call__(self, messages: Any, context: Any, **kw: Any) -> ModelResponse:
+            if self.config.calls:
+                return await super().__call__(messages, context, **kw)
+            self.config.calls.append((list(messages), []))
+            await context.send(ModelMessageChunk("Looking. "))
+            first = call("ask_pinger", {"message": "a"}, call_id="c0")
+            return self._response(ModelMessage("Looking. "), tool_calls=ToolCallsEvent([first]))
+
+    streaming.create = lambda: StreamedCall(streaming)  # type: ignore[method-assign]
+    evs = await drive(AG2Adapter(make_agent(streaming, tools)), "ping")
+    assert [e for e in evs if isinstance(e, Status)] == [
+        Status("calling ask_pinger"),
+        Status("asking again"),
+        Status("calling ask_pinger"),
+    ]
+    assert_text_stream([e for e in evs if not isinstance(e, Status)], "Looking. done")
 
 
 async def test_unstreamed_reply_after_tool_call_is_done_text():
@@ -344,11 +391,12 @@ async def test_anthropic_cache_tokens_count_as_input():
             )
             return ModelResponse(message, usage=usage, provider=self.config.provider_name, **kw)
 
-    for provider, tokens_in in (("anthropic", 17), ("openai", 4)):
+    # Anthropic and Bedrock Converse report cache reads and writes apart from the input;
+    # OpenAI and Gemini ("google") include cached tokens in it.
+    for provider, tokens_in in (("anthropic", 17), ("bedrock", 17), ("openai", 4), ("google", 4)):
         config = FakeConfig("ok", provider=provider)
         config.create = lambda config=config: Cached(config)  # type: ignore[method-assign]
         evs = await drive(AG2Adapter(make_agent(config)), "hi")
-        # Anthropic reports cache reads and writes apart from the input; OpenAI includes them.
         assert Usage(tokens_in=tokens_in, tokens_out=2) in evs, provider
 
 
@@ -412,6 +460,29 @@ async def test_cancel_mid_tool_closes_the_call():
     assert output_text(await drive(adapter, "again")) == "heard: go, again"
 
 
+async def test_dangling_tool_call_is_repaired_before_the_next_turn():
+    # A history whose last turn left a tool call unanswered (its repair never ran, e.g. the
+    # process died): providers reject that, so the next turn answers it first.
+    stream = MemoryStream()
+    dangling = call("ask_pinger", {"message": "hi"}, call_id="lost")
+    await stream.history.replace(
+        [ModelRequest([TextInput("old")]), ModelResponse(tool_calls=ToolCallsEvent([dangling]))]
+    )
+    config = FakeConfig()
+    adapter = AG2Adapter(make_agent(config), stream_factory=lambda _key: stream)
+    assert output_text(await drive(adapter, "new")) == "heard: old, new"
+    [(messages, _)] = config.calls
+    [results] = [m for m in messages if isinstance(m, ToolResultsEvent)]
+    assert [r.parent_id for r in results.results] == ["lost"]
+    assert messages.index(results) < max(
+        i for i, m in enumerate(messages) if isinstance(m, ModelRequest)
+    )
+    # Idempotent: a healed (or valid) history is not rewritten again.
+    await drive(adapter, "again")
+    events = list(await stream.history.get_events())
+    assert sum(isinstance(e, ToolResultsEvent) for e in events) == 1
+
+
 async def test_tool_calls_run_under_the_inbound_task():
     seen: list[str | None] = []
 
@@ -464,6 +535,26 @@ def test_projected_tool_schemas():
         assert fn.parameters == strip_extensions(p.parameters)
         assert fn.parameters["required"] == p.parameters["required"]
     assert "x-max-json-bytes" in json.dumps(ptools[0].parameters)  # the original is untouched
+
+
+async def test_add_tool_and_with_middleware_copies_share_the_client():
+    client = FakePartnerClient()
+    [first, *_] = as_ag2_tools(client.tools(), client)
+    seen: list[str] = []
+
+    async def hook(inner: Any, event: ToolCallEvent, context: Any) -> Any:
+        seen.append(event.name)
+        return await inner(event, context)
+
+    wrapped = first.with_middleware(hook)  # a deep copy
+    assert wrapped is not first and isinstance(wrapped, FunctionTool)
+    config = FakeConfig(call("ask_pinger", {"message": "hi"}), "ok")
+    agent = make_agent(config)
+    agent.add_tool(wrapped)  # copied again
+    assert agent.tools[0] is not wrapped
+    assert output_text(await drive(AG2Adapter(agent), "go")) == "ok"
+    assert seen == ["ask_pinger"]
+    assert [c["message"] for c in client.consults] == ["hi"]
 
 
 async def test_agent_copies_share_the_client():

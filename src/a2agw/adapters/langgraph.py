@@ -2,10 +2,11 @@
 
 The LangGraph ``thread_id`` is the caller and the A2A ``contextId`` together
 (``"<principal id or anonymous>\\x1f<context id>"``, ``_contexts.context_key``): another caller
-sending the same ``contextId`` gets its own thread. A task paused at an interrupt before this
-change (``thread_id`` = bare ``contextId``) is still resumed from that thread (see
-``GraphAdapter``); other old checkpoints are not continued. A LangGraph ``interrupt()`` becomes
-the A2A ``input-required`` state and the next message on the task resumes the graph. Outbound,
+sending the same ``contextId`` gets its own thread. Checkpoints saved before this change
+(``thread_id`` = bare ``contextId``) are not continued, except that ``legacy_threads=True``
+(a temporary migration aid, see ``GraphAdapter``) resumes tasks paused at an interrupt under
+the old key. A LangGraph ``interrupt()`` becomes the A2A ``input-required`` state and the next
+message on the task resumes the graph. Outbound,
 LangGraph agents use ``a2agw.adapters.langchain.as_langchain_tools`` (re-exported here).
 
 Importing this module requires ``langgraph``; nothing in the core imports it.
@@ -66,10 +67,17 @@ class GraphAdapter:
     Runs with ``thread_id = context_key(ctx)`` (caller and context; see the module
     docstring). On a resumed turn (``ctx.resumed``) the graph is continued with
     ``Command(resume=ctx.text)``, otherwise it gets ``input_mapper(ctx)`` (default
-    ``{"messages": [("user", ctx.text)]}``). A resumed turn with no interrupt pending on that
-    thread resumes the legacy thread (``thread_id`` = the bare ``contextId``, from before the
-    caller keying) if that one is paused at an interrupt. That is safe because inbound tasks
-    are owner-scoped: a resumed task belongs to the caller resuming it.
+    ``{"messages": [("user", ctx.text)]}``).
+
+    ``legacy_threads=True`` is a temporary migration aid for tasks paused at an interrupt
+    before threads were keyed by caller: a resumed turn with no interrupt pending on its own
+    thread then resumes the legacy thread (``thread_id`` = the bare ``contextId``) if that
+    one is paused. Turn it on while draining such tasks after the upgrade, then off. It is
+    not bound to the caller: legacy threads were shared by every caller of a ``contextId``,
+    so another caller that reaches ``input-required`` on the same ``contextId`` would resume
+    that checkpoint. Use it only where ``contextId``s were never shared across callers.
+    After a legacy resume the task's next non-resumed message goes to the caller's own
+    (composite) thread, without the legacy history.
 
     Text of AI message chunks streams as the artifact "output" (``stream_nodes`` limits it to
     chunks from those graph nodes). If nothing was streamed, the text of the last AI message
@@ -99,8 +107,10 @@ class GraphAdapter:
         input_mapper: Callable[[InboundContext], dict] | None = None,
         output_key: str = "messages",
         stream_nodes: set[str] | None = None,
+        legacy_threads: bool = False,
     ):
         self.graph = graph
+        self.legacy_threads = legacy_threads
         self.input_mapper = input_mapper or _default_input
         self.output_key = output_key
         self.stream_nodes = stream_nodes
@@ -154,8 +164,9 @@ class GraphAdapter:
                 legacy = {"configurable": {"thread_id": ctx.context_id}}
                 if await self._has_pending_interrupt(config):
                     payload = Command(resume=ctx.text)
-                elif await self._has_pending_interrupt(legacy):
-                    # Paused before threads were keyed by caller (owner-scoped task: ours).
+                elif self.legacy_threads and await self._has_pending_interrupt(legacy):
+                    # Opt-in migration: paused before threads were keyed by caller. Not
+                    # caller-bound (see the class docstring).
                     config, payload = legacy, Command(resume=ctx.text)
             # The (mode, data) unpack below assumes ``subgraphs=False`` (the default); a
             # subgraph interrupt still surfaces as an ``__interrupt__`` update of the parent.

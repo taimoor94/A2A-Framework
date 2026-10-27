@@ -32,7 +32,7 @@ try:
         ToolResultEvent,
         UsageEvent,
     )
-    from ag2.history import close_unanswered_tool_calls
+    from ag2.history import close_unanswered_tool_calls, unanswered_tool_calls
     from ag2.stream import Stream
     from ag2.tools import tool
     from ag2.tools.final import FunctionTool
@@ -55,6 +55,12 @@ UNFINISHED_TOOL_RESULT = "This tool call was not completed: the turn ended befor
 
 _END = object()  # queued once the turn's drive has finished
 
+# Providers whose input count leaves cache reads and writes out (AG2 maps them to separate
+# fields as reported): Anthropic, and Bedrock Converse (``inputTokens`` apart from
+# ``cacheReadInputTokens`` / ``cacheWriteInputTokens``). Others (OpenAI, Gemini, ...) include
+# cached tokens in the prompt count.
+CACHE_SEPARATE_PROVIDERS = frozenset({"anthropic", "bedrock"})
+
 
 class AG2Adapter:
     """Runs each turn as ``agent.run(ctx.text, stream=<the conversation's stream>)``.
@@ -68,16 +74,23 @@ class AG2Adapter:
     and after each turn the history is trimmed to its last ``history_limit`` messages
     (requests and model responses), cut at a request so a tool call never loses its result.
     Pass ``stream_factory(key)`` returning a stream on persistent ``Storage`` with
-    ``durable_sessions=True`` (it is required then) to keep conversations across restarts;
-    such streams are never trimmed.
+    ``durable_sessions=True`` (it is required then) to keep conversations across restarts.
+    ``history_limit`` applies only to the default in-memory streams: a factory's streams are
+    the caller's data and are never trimmed.
 
-    Text chunks the model streams (``ModelMessageChunk``) become the artifact "output"; a
-    model that does not stream answers with ``Done(<reply text>)``. Each tool call is
-    reported as ``Status("calling <tool>")``. Token usage summed over the turn's model calls
-    becomes one ``Usage`` event, when non-zero; then ``Done``. Errors raised by the agent
-    propagate, so the executor fails the task. Cancelling the turn, or closing its event
-    stream, cancels AG2's drive of it; tool calls it cut short are answered in the history
-    with ``UNFINISHED_TOOL_RESULT``, which keeps the conversation valid for the next turn.
+    Text chunks the model streams (``ModelMessageChunk``) become the artifact "output". A
+    response that comes in one piece is handled the same way wherever it falls in the turn:
+    if it calls tools, its text (narration before the calls) is reported as ``Status(text)``;
+    if it is the final answer, it streams as "output" when the turn has streamed, and is
+    otherwise the ``Done(<reply text>)``. Each tool call is reported as
+    ``Status("calling <tool>")``. Token usage summed over the turn's model calls becomes one
+    ``Usage`` event, when non-zero (cache reads and writes count as input for the
+    ``CACHE_SEPARATE_PROVIDERS``, whose input count leaves them out); then ``Done``. Errors
+    raised by the agent propagate, so the executor fails the task. Cancelling the turn, or
+    closing its event stream, cancels AG2's drive of it; tool calls it cut short are answered
+    in the history with ``UNFINISHED_TOOL_RESULT`` (shielded from a second cancellation), which
+    keeps the conversation valid for the next turn. Each turn also first answers any tool
+    call its history left unanswered, so a conversation that missed that repair heals.
     """
 
     def __init__(
@@ -132,15 +145,20 @@ class AG2Adapter:
                         streamed = chunked = True
                         yield event.content
                 elif isinstance(event, ModelResponse):
-                    # Once the turn streams, a response that came in one piece streams too.
-                    if streamed and not chunked and event.content:
-                        yield event.content
+                    if not chunked and event.content:
+                        if event.tool_calls:
+                            yield Status(event.content)  # narration before its tool calls
+                        elif streamed:
+                            yield event.content  # the final answer of a streamed turn
                     chunked = False
                 elif isinstance(event, ToolCallEvent):
                     yield Status(f"calling {event.name}")
                 elif isinstance(event, UsageEvent):
                     tokens_in, tokens_out = _add_usage(event, tokens_in, tokens_out)
 
+        # A tool call an earlier turn left unanswered (its repair never ran) would make
+        # providers reject this turn: answer it first.
+        await asyncio.shield(_repair(stream, only_unanswered=True))
         finished = False
         # Subscribed before the run opens its scope, so this sees each event before the
         # run's own subscribers act on it (in the order the turn produced them).
@@ -164,8 +182,9 @@ class AG2Adapter:
             finally:
                 if not finished:
                     # Cut short: a tool call left without a result would make providers
-                    # reject the conversation's next turn.
-                    await close_unanswered_tool_calls(stream.history, result=UNFINISHED_TOOL_RESULT)
+                    # reject the conversation's next turn. Shielded: a second cancellation
+                    # must not stop the repair halfway.
+                    await asyncio.shield(_repair(stream, only_unanswered=False))
         if self.stream_factory is None:
             await _trim(stream, self.history_limit)
         if tokens_in or tokens_out:
@@ -173,12 +192,22 @@ class AG2Adapter:
         yield Done() if streamed else Done(reply.body)
 
 
+async def _repair(stream: Stream, *, only_unanswered: bool) -> None:
+    """Answer tool calls left without a result with ``UNFINISHED_TOOL_RESULT``.
+
+    ``only_unanswered``: repair only when some call has no result at all. A turn that ended
+    through a ``final`` tool leaves its result unwrapped, and a valid history must not be
+    rewritten; a turn cut short rebuilds every unsettled batch (``only_unanswered=False``)."""
+    if only_unanswered and not unanswered_tool_calls(list(await stream.history.get_events())):
+        return
+    await close_unanswered_tool_calls(stream.history, result=UNFINISHED_TOOL_RESULT)
+
+
 def _add_usage(event: UsageEvent, tokens_in: int, tokens_out: int) -> tuple[int, int]:
     usage = event.usage
     tokens_in += int(usage.prompt_tokens or 0)
-    if event.provider == "anthropic":
-        # Anthropic counts cache reads and writes apart from the input tokens (OpenAI-style
-        # providers include cached tokens in the prompt count).
+    if event.provider in CACHE_SEPARATE_PROVIDERS:
+        # Counted apart from the input tokens: add them when reported.
         tokens_in += int(usage.cache_read_input_tokens or 0)
         tokens_in += int(usage.cache_creation_input_tokens or 0)
     # Thinking tokens are part of the completion count for every provider.
