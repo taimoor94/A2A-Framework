@@ -31,6 +31,7 @@ openai = ["openai-agents>=0.24"]
 claude = ["claude-agent-sdk>=0.2.174"]
 adk = ["google-adk>=2.13"]
 ag2 = ["ag2>=1.2"]
+llamaindex = ["llama-index-core>=0.14.25"]
 all = [
     "langchain-core>=1.7",
     "langgraph>=1.2",
@@ -39,6 +40,7 @@ all = [
     "openai-agents>=0.24",
     "claude-agent-sdk>=0.2.174",
     "ag2>=1.2",
+    "llama-index-core>=0.14.25",
 ]
 
 [project.scripts]
@@ -60,6 +62,7 @@ dev = [
     "claude-agent-sdk>=0.2.174",
     "google-adk>=2.13",
     "ag2>=1.2",
+    "llama-index-core>=0.14.25",
 ]
 
 [tool.hatch.build.targets.wheel]

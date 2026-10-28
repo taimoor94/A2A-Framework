@@ -24,6 +24,7 @@ DEV_FRAMEWORKS = [
     "claude_agent_sdk",
     "google.adk",
     "ag2",
+    "llama_index.core",
 ]
 
 

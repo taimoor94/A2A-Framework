@@ -5,7 +5,7 @@ A framework-agnostic gateway for the [A2A (Agent2Agent) protocol](https://a2a-pr
 ## Features
 
 - One `AgentHost` serves many agents at `/agents/<id>/`, over JSON-RPC and HTTP+JSON, with streaming, cancel, and multi-turn (`input-required`).
-- Adapters: plain callables (sync, async, generators), LangChain runnables, LangGraph graphs (`interrupt()` becomes `input-required`), and agents from the OpenAI Agents SDK, the Claude Agent SDK, Google ADK and AG2.
+- Adapters: plain callables (sync, async, generators), LangChain runnables, LangGraph graphs (`interrupt()` becomes `input-required`), and agents from the OpenAI Agents SDK, the Claude Agent SDK, Google ADK, AG2 and LlamaIndex.
 - Partner registry with card fetch, pinning, change quarantine, and approval.
 - Partner tools with task handles (`ask_<id>`, `a2a_check_task`, `a2a_cancel_task`, `a2a_wait`), and a discovery mode (`find_partners`, `consult_partner`) above 12 partners.
 - Resilience on outbound calls: deadline, jittered retries, circuit breaker, per-partner bulkhead.
@@ -29,6 +29,7 @@ uv add "a2a-gateway[openai]"       # adds the OpenAI Agents SDK adapter
 uv add "a2a-gateway[claude]"       # adds the Claude Agent SDK adapter
 uv add "a2a-gateway[adk]"          # adds the Google ADK adapter (not part of [all])
 uv add "a2a-gateway[ag2]"          # adds the AG2 (1.x) adapter
+uv add "a2a-gateway[llamaindex]"   # adds the LlamaIndex adapter
 ```
 
 `[all]` installs every extra except `adk`. google-adk caps `opentelemetry-api`/`opentelemetry-sdk` at 1.44 and `websockets` below 16, so installing it can downgrade those packages; add `[adk]` explicitly when you want the ADK adapter.
@@ -247,6 +248,29 @@ assistant = AgentSpec(
 ```
 
 `as_ag2_tools(tools, host.client)` projects partners as AG2 `FunctionTool`s that advertise the partner tool's JSON schema (given to `ag2.tools.tool(..., schema=)`, not inferred from a Python signature) and return the JSON envelope. Add them once the host has started, for example `for t in as_ag2_tools(host.partner_tools("assistant"), host.client): agent.add_tool(t)`. [examples/adapters/ag2_example.py](examples/adapters/ag2_example.py) runs offline with a scripted model.
+
+### A LlamaIndex agent
+
+`LlamaIndexAdapter` runs a LlamaIndex agent workflow (a `FunctionAgent` or another agent such as `ReActAgent`, or an `AgentWorkflow`; import name `llama_index.core`) with `workflow.run(user_msg=..., ctx=..., memory=...)`. A real model needs its LLM integration and key, for example `llama_index.llms.openai.OpenAI(model=...)` with `OPENAI_API_KEY`. There is one conversation per caller and A2A `contextId`, so follow-up messages continue it and another caller sending the same `contextId` starts its own. A conversation is a workflow `Context`, reused across turns, plus its chat memory, which the adapter passes to each run (LlamaIndex cannot carry the memory over in a reused `Context`). The 10,000 most recently used conversations are kept, and by default each memory is a `ChatMemoryBuffer` keeping its last 200 messages (a turn is never split, so a tool call keeps its result). To keep conversations across restarts, pass `memory_factory(key)` returning memory on a persistent chat store, with `durable_sessions=True`; without a `memory_factory`, `durable_sessions=True` is refused. Memories from a factory are never trimmed. Streamed deltas (`AgentStream`) become the `output` artifact; a model that does not stream answers with the final output when the turn ends. Each tool call shows as a `calling <tool>` status; token usage is not reported. Errors fail the task. Cancelling the A2A task cancels the workflow run, and the conversation keeps its memory but continues in a fresh `Context`. The adapter adds no telemetry exporter, and tokenizers come from the copies bundled with `llama-index-core`.
+
+```python
+from llama_index.core.agent.workflow import FunctionAgent
+from llama_index.llms.openai import OpenAI
+
+from a2agw import AgentSpec, SkillSpec
+from a2agw.adapters.llamaindex import LlamaIndexAdapter
+
+agent = FunctionAgent(name="assistant", system_prompt="Answer helpfully.", llm=OpenAI(model="gpt-5-mini"))
+assistant = AgentSpec(
+    id="assistant",
+    name="Assistant",
+    description="A LlamaIndex agent.",
+    skills=[SkillSpec(id="chat", name="Chat", description="Answers questions")],
+    adapter=LlamaIndexAdapter(agent),
+)
+```
+
+`as_llamaindex_tools(tools, host.client)` projects partners as `FunctionTool`s whose `fn_schema` declares the partner tool's JSON schema verbatim (not inferred from a Python signature) and which return the JSON envelope. Give them to the agent once the host has started, for example `agent.tools = as_llamaindex_tools(host.partner_tools("assistant"), host.client)`. [examples/adapters/llamaindex_example.py](examples/adapters/llamaindex_example.py) runs offline with a scripted model.
 
 ### An agent that consults partners
 
