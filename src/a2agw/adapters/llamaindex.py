@@ -29,6 +29,7 @@ LLAMAINDEX_EXTRA_HINT = (
 
 try:
     from llama_index.core.agent.workflow import (
+        AgentOutput,
         AgentStream,
         AgentWorkflow,
         BaseWorkflowAgent,
@@ -46,7 +47,7 @@ from a2agw.adapters._contexts import ContextRegistry, context_key
 from a2agw.adapters._stream import stream_events
 from a2agw.consult.client import PartnerClient
 from a2agw.consult.tools import PartnerTool, invoke, strip_extensions, with_untrusted_note
-from a2agw.core.events import AgentEvent, Done, Status
+from a2agw.core.events import AgentEvent, Done, Status, Usage
 from a2agw.core.spi import InboundContext
 from a2agw.security.principal import Principal
 
@@ -86,8 +87,14 @@ class LlamaIndexAdapter:
     such memories are never trimmed.
 
     ``AgentStream`` deltas become the artifact "output"; each ``ToolCall`` is reported as
-    ``Status("calling <tool>")``. The turn ends with ``Done()`` if it streamed, else with
-    ``Done(<final output text>)``. Errors raised by the workflow propagate, so the executor
+    ``Status("calling <tool>")``. Token usage is best effort: LlamaIndex has no
+    provider-neutral usage, so each model call's ``AgentOutput.raw`` (the provider's raw
+    response) is read for a ``usage`` with ``prompt_tokens``/``completion_tokens`` or
+    ``input_tokens``/``output_tokens`` (attributes or keys), and the turn's sum, when
+    non-zero, is reported as one ``Usage`` (no cost). Providers or integrations that put
+    usage elsewhere, or none in ``raw`` (a stream's last chunk often has none unless the
+    provider is asked for it), report nothing. The turn ends with ``Done()`` if it
+    streamed, else with ``Done(<final output text>)``. Errors raised by the workflow propagate, so the executor
     fails the task. Cancelling the turn, or closing its event stream, cancels the workflow
     run (``handler.cancel_run()``, shielded) so none of its steps keep running; the
     conversation then gets a fresh ``Context`` (the cut-short run's state, such as a
@@ -143,10 +150,13 @@ class LlamaIndexAdapter:
 
     async def _turn(self, ctx: InboundContext, session: _Session) -> AsyncIterator[AgentEvent]:
         streamed = False
+        tokens = [0, 0]  # in, out: summed over the turn's model calls
 
         with warnings.catch_warnings():
             # Synchronous: the reused Context is serialized here, without its memory
-            # (passed below instead).
+            # (passed below instead). ``catch_warnings`` swaps the process-wide filters and
+            # is not thread-safe, but it wraps only this one synchronous call: no await
+            # runs inside it, so no other coroutine on this loop sees the changed filters.
             warnings.simplefilter("ignore", UnserializableKeyWarning)
             handler = self.workflow.run(
                 user_msg=ctx.text, ctx=session.context, memory=session.memory
@@ -162,6 +172,10 @@ class LlamaIndexAdapter:
                             yield event.delta
                     elif isinstance(event, ToolCall):
                         yield Status(f"calling {event.tool_name}")
+                    elif isinstance(event, AgentOutput):
+                        tokens_in, tokens_out = _raw_usage(event.raw)
+                        tokens[0] += tokens_in
+                        tokens[1] += tokens_out
 
         finished = False
         try:
@@ -180,7 +194,32 @@ class LlamaIndexAdapter:
                 session.context = Context(self.workflow)
         if self.memory_factory is None:
             await _trim(session.memory, MAX_HISTORY_MESSAGES)
+        if tokens[0] or tokens[1]:
+            yield Usage(tokens_in=tokens[0], tokens_out=tokens[1])
         yield Done() if streamed else Done(str(result) if result is not None else None)
+
+
+def _count(source: Any, *names: str) -> int:
+    """The first of ``names`` on ``source`` (an attribute or a key) that holds a token
+    count, else 0."""
+    for name in names:
+        value = source.get(name) if isinstance(source, dict) else getattr(source, name, None)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return 0
+
+
+def _raw_usage(raw: Any) -> tuple[int, int]:
+    """(tokens in, tokens out) from a provider's raw response, best effort: its ``usage``
+    (attribute or key) in the OpenAI (``prompt_tokens``/``completion_tokens``) or Anthropic
+    (``input_tokens``/``output_tokens``) shape; (0, 0) when there is none."""
+    usage = raw.get("usage") if isinstance(raw, dict) else getattr(raw, "usage", None)
+    if usage is None:
+        return 0, 0
+    return (
+        _count(usage, "prompt_tokens", "input_tokens"),
+        _count(usage, "completion_tokens", "output_tokens"),
+    )
 
 
 async def _trim(memory: BaseMemory, limit: int) -> None:

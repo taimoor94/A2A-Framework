@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import importlib.util
 import json
 import socket
@@ -8,6 +9,7 @@ import subprocess
 import sys
 import typing
 from collections.abc import AsyncIterator, Sequence
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -38,16 +40,24 @@ from llama_index.core.workflow import Context, StartEvent, StopEvent, Workflow, 
 
 import a2agw.adapters.llamaindex as li_mod
 from a2agw.adapters.llamaindex import LlamaIndexAdapter, as_llamaindex_tools
-from a2agw.consult.tools import UNTRUSTED_NOTE, strip_extensions
+from a2agw.consult.tools import (
+    MAX_DESCRIPTION,
+    UNTRUSTED_NOTE,
+    strip_extensions,
+    with_untrusted_note,
+)
 from a2agw.context.call_context import current_inbound_task, use_inbound
-from a2agw.core.events import ArtifactChunk, Done, Status
+from a2agw.core.events import ArtifactChunk, Done, Status, Usage
 
 # LlamaIndex's workflow classes walk their members with ``inspect.getmembers`` (at
 # construction), touching pydantic's deprecated instance attributes: library noise, not ours.
+# Only those four messages are ignored; any other deprecation still fails the test.
 pytestmark = [
     pytest.mark.filterwarnings(
-        "ignore::pydantic.warnings.PydanticDeprecatedSince20:inspect",
-        "ignore::pydantic.warnings.PydanticDeprecatedSince211:inspect",
+        "ignore:The `__fields(_set)?__` attribute is deprecated"
+        ":pydantic.warnings.PydanticDeprecatedSince20:inspect",
+        "ignore:Accessing the 'model_(computed_)?fields' attribute on the instance is deprecated"
+        ":pydantic.warnings.PydanticDeprecatedSince211:inspect",
     ),
 ]
 
@@ -81,6 +91,10 @@ ECHO = ("echo",)  # answers "heard: <every user message the model was given>"
 BLOCK = ("block",)  # waits until cancelled
 
 
+def with_raw(raw: Any, step: Any) -> tuple:
+    return ("raw", raw, step)  # ``step``, its responses carrying the provider response ``raw``
+
+
 def gate(event: asyncio.Event) -> tuple:
     return ("gate", event)  # signals ``started``, waits for ``event``, then echoes
 
@@ -105,6 +119,9 @@ class Script:
         step = self.steps.pop(0) if self.steps else ECHO
         if isinstance(step, BaseException):
             raise step
+        raw = None
+        if isinstance(step, tuple) and step[0] == "raw":
+            _, raw, step = step
         if isinstance(step, str):
             step = chunks(step)
         if step[0] == "block":
@@ -119,13 +136,15 @@ class Script:
         if step[0] == "call":
             _, name, args, call_id = step
             block = ToolCallBlock(tool_call_id=call_id, tool_name=name, tool_kwargs=args)
-            yield ChatResponse(message=ChatMessage(role="assistant", blocks=[block]), delta="")
+            message = ChatMessage(role="assistant", blocks=[block])
+            yield ChatResponse(message=message, delta="", raw=raw)
             return
         parts = step[1] if step[0] == "chunks" else ["heard: " + ", ".join(user_texts(messages))]
         text = ""
         for part in parts:
             text += part
-            yield ChatResponse(message=ChatMessage(role="assistant", content=text), delta=part)
+            message = ChatMessage(role="assistant", content=text)
+            yield ChatResponse(message=message, delta=part, raw=raw)
 
 
 class ScriptedLLM(MockFunctionCallingLLM):
@@ -141,6 +160,11 @@ class ScriptedLLM(MockFunctionCallingLLM):
     def _prepare_chat_with_tools(
         self, tools: Sequence[Any], user_msg: Any = None, chat_history: Any = None, **kw: Any
     ) -> dict[str, Any]:
+        # ``skip_length_check=True`` as llama-index-llms-openai (0.8) passes it: its
+        # ``_prepare_chat_with_tools`` skips the 1024-character description check, and
+        # llama-index-llms-anthropic (0.12) never calls ``to_openai_tool`` (it reads
+        # ``metadata.description``). Partner descriptions run to ~2000 characters plus the
+        # note (``test_long_description_declared_intact``).
         declared = [t.metadata.to_openai_tool(skip_length_check=True) for t in tools]
         self._script.declared.append(declared)
         return {"messages": list(chat_history or []), "tools": tools}
@@ -343,6 +367,43 @@ async def test_tools_reach_the_model():
         assert f["description"].count(UNTRUSTED_NOTE) == 1
         assert f["parameters"] == strip_extensions(p.parameters)
         assert "x-max-json-bytes" not in json.dumps(f["parameters"])
+
+
+async def test_long_description_declared_intact():
+    # A partner description at the gateway's limit (MAX_DESCRIPTION) reaches the model whole,
+    # with the note once, past ``to_openai_tool``'s 1024-character default check.
+    client = FakePartnerClient()
+    [ptool] = [p for p in client.tools() if p.name == "ask_pinger"]
+    long = dataclasses.replace(ptool, description="d" * MAX_DESCRIPTION)
+    [tool] = as_llamaindex_tools([long], client)
+    assert tool.metadata.description == with_untrusted_note("d" * MAX_DESCRIPTION)
+    script = Script("ok")
+    await drive(LlamaIndexAdapter(make_agent(script, [tool])), "hi")
+    [[declared]] = script.declared
+    description = declared["function"]["description"]
+    assert len(description) > 2000 and description.startswith("d" * MAX_DESCRIPTION)
+    assert description.count(UNTRUSTED_NOTE) == 1
+
+
+async def test_usage_from_raw_responses():
+    # Best effort, summed over the turn's model calls: an OpenAI-shaped dict usage and an
+    # Anthropic-shaped object usage; a call without usage adds nothing.
+    client = FakePartnerClient()
+    script = Script(
+        with_raw(
+            {"usage": {"prompt_tokens": 10, "completion_tokens": 2}},
+            call("ask_pinger", {"message": "hi"}),
+        ),
+        with_raw(SimpleNamespace(usage=SimpleNamespace(input_tokens=5, output_tokens=3)), "ok"),
+    )
+    adapter = LlamaIndexAdapter(make_agent(script, as_llamaindex_tools(client.tools(), client)))
+    evs = await drive(adapter, "hi")
+    usage = [e for e in evs if isinstance(e, Usage)]
+    assert usage == [Usage(tokens_in=15, tokens_out=5)]
+    assert evs.index(usage[0]) == len(evs) - 2 and evs[-1] == Done()
+    # No usage anywhere: no ``Usage`` event.
+    evs = await drive(LlamaIndexAdapter(make_agent(Script(with_raw({"id": "x"}, "ok")))), "hi")
+    assert not any(isinstance(e, Usage) for e in evs)
 
 
 async def test_failure_propagates():
