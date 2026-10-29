@@ -632,7 +632,11 @@ curl http://127.0.0.1:8000/agents/echo/.well-known/agent-card.json
 ```
 
 `EXTRAS` defaults to `postgres,mcp`. `crewai` is refused at build time (it conflicts with other
-extras in the lock); build a separate image for it. Compose (gateway, Postgres 16, Node coder);
+extras in the lock); build a separate image for it. The image installs exactly the versions
+`uv.lock` pins: the build exports the dependencies of the chosen extras from the lock
+(`uv export --frozen`, with hashes), installs them, then the project wheel with `--no-deps`.
+The `python:3.12-slim` base is pinned by digest (`PYTHON_IMAGE` in the Dockerfile; override it
+with `--build-arg PYTHON_IMAGE=...`). Compose (gateway, Postgres 16, Node coder);
 secrets come from your environment, never from the file:
 
 ```bash
@@ -661,7 +665,8 @@ placeholder (no scope is needed to call an agent; the `a2agw:sidecar` scope and 
 as that agent), and send the key as `X-API-Key` (for example
 `A2AGW_API_KEY=<key> a2agw call http://localhost:8000/agents/coder/ "write fizzbuzz" --tier internal`).
 
-The image tests are opt-in: `A2AGW_DOCKER_TESTS=1 uv run pytest tests/docker -q`.
+The image tests are opt-in: `A2AGW_DOCKER_TESTS=1 uv run pytest tests/docker -q` (they also check
+that the image's a2a-sdk, mcp, httpx and starlette match `uv.lock`).
 
 ## Observability
 
@@ -771,6 +776,8 @@ When auth is not configured, every caller is the same principal, `anonymous`: id
                  |  event bus, admin API                         |
                  +-----------------------------------------------+
 ```
+
+CI (`.github/workflows/ci.yml`) runs three jobs: the main gate (`uv sync --frozen`, `uv run ruff check`, `uv run pytest -q -W error`), the CrewAI tests (`scripts/test-crewai.sh`), and a fresh resolution of `.[all]` without the lock against the adapter and gateway tests (ADK and CrewAI excluded), so the combination users install is tested too.
 
 The core never imports a framework; adapters live in `a2agw.adapters.<name>` behind extras. See the [design spec](docs/superpowers/specs/2026-10-25-a2a-gateway-framework-design.md), the [Phase 1 plan](docs/superpowers/plans/2026-10-25-phase1-core.md), the [Phase 2 plan](docs/superpowers/plans/2026-10-26-phase2-hardening.md) and the [Phase 3 plan](docs/superpowers/plans/2026-10-26-phase3-gateway.md).
 

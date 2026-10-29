@@ -116,3 +116,26 @@ def test_config_read_only_data_writable(image):
     ).stdout  # fmt: skip
     assert "cfg-writable" not in out
     assert "data-ok" in out
+
+
+LOCKED = ("a2a-sdk", "mcp", "httpx", "starlette", "asyncpg", "pydantic")
+
+
+def _locked_versions() -> dict[str, str]:
+    import tomllib
+
+    lock = tomllib.loads((ROOT / "uv.lock").read_text())
+    return {p["name"]: p["version"] for p in lock["package"] if p["name"] in LOCKED}
+
+
+def test_image_installs_the_locked_versions(image):
+    """The image installs exactly what uv.lock pins (``uv export --frozen``), not a fresh
+    resolution. Read with importlib.metadata in the image's venv (uv venvs carry no pip)."""
+    import json
+
+    script = (
+        "import importlib.metadata as m, json, sys; "
+        "print(json.dumps({n: m.version(n) for n in sys.argv[1:]}))"
+    )
+    out = _docker("run", "--rm", "--entrypoint", "python", image, "-c", script, *LOCKED).stdout
+    assert json.loads(out) == _locked_versions()

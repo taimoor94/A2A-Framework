@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1
-ARG PYTHON_IMAGE=python:3.12-slim
+# python:3.12-slim, pinned by digest (multi-arch index; refresh with
+# `docker buildx imagetools inspect python:3.12-slim`).
+ARG PYTHON_IMAGE=python:3.12-slim@sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159
 
 FROM ${PYTHON_IMAGE} AS build
 COPY --from=ghcr.io/astral-sh/uv:0.12.13 /uv /bin/uv
@@ -11,14 +13,20 @@ RUN E="$(printf %s "${EXTRAS}" | tr '[:upper:]' '[:lower:]')"; \
       echo "EXTRAS must not contain crewai: it conflicts with mcp/openai/all/adk; build a separate image" >&2; exit 1;; \
     esac
 WORKDIR /src
-COPY pyproject.toml README.md LICENSE ./
+COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
 ENV UV_PYTHON_DOWNLOADS=never
-RUN uv build --wheel --out-dir /dist \
- && uv venv --python /usr/local/bin/python3.12 /opt/venv \
- && W="$(ls /dist/*.whl)" \
- && if [ -n "${EXTRAS}" ]; then SPEC="a2a-gateway[${EXTRAS}] @ file://${W}"; else SPEC="${W}"; fi \
- && VIRTUAL_ENV=/opt/venv uv pip install "${SPEC}"
+# Exactly the versions uv.lock pins (with their hashes): the dependencies are exported from
+# the lock (--frozen: never re-resolved) and installed first; the project wheel goes in
+# after them without dependencies.
+RUN set -e; \
+    ARGS=""; \
+    for x in $(printf %s "${EXTRAS}" | tr '[:upper:]' '[:lower:]' | tr ',' ' '); do ARGS="${ARGS} --extra ${x}"; done; \
+    uv export --frozen --no-dev --no-emit-project ${ARGS} > /tmp/req.txt; \
+    uv venv --python /usr/local/bin/python3.12 /opt/venv; \
+    VIRTUAL_ENV=/opt/venv uv pip install --require-hashes -r /tmp/req.txt; \
+    uv build --wheel --out-dir /dist; \
+    VIRTUAL_ENV=/opt/venv uv pip install --no-deps /dist/*.whl
 
 FROM ${PYTHON_IMAGE}
 RUN useradd --uid 10001 --user-group --no-create-home --shell /usr/sbin/nologin a2agw \

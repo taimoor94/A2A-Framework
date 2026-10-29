@@ -38,7 +38,8 @@ if [ -z "${CREWAI_TEST_ONLINE:-}" ] && [ -f "${MARKER}" ] \
   OFFLINE=(--offline)
 fi
 
-if ! uv lock --check ${OFFLINE[@]+"${OFFLINE[@]}"} >/dev/null 2>&1; then
+if ! LOCK_CHECK="$(uv lock --check ${OFFLINE[@]+"${OFFLINE[@]}"} 2>&1)"; then
+  printf '%s\n' "${LOCK_CHECK}" >&2
   if [ ${#OFFLINE[@]} -gt 0 ]; then
     echo "crewai tests: uv.lock does not match pyproject.toml, or could not be checked offline" \
       "(uv's cache lacks some metadata). Run 'uv lock', or rerun with CREWAI_TEST_ONLINE=1." >&2
