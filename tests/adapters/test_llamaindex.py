@@ -406,6 +406,36 @@ async def test_usage_from_raw_responses():
     assert not any(isinstance(e, Usage) for e in evs)
 
 
+class _RaisingUsage:
+    @property
+    def usage(self) -> Any:
+        raise RuntimeError("provider object broke")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"usage": "lots"},  # a string usage
+        {"usage": None},
+        {"usage": {"prompt_tokens": 1.5, "completion_tokens": 2.0}},  # float counts
+        {"usage": {"prompt_tokens": -3, "output_tokens": -1}},  # negative counts
+        SimpleNamespace(usage=SimpleNamespace(input_tokens="7")),  # a string count
+        _RaisingUsage(),  # a property that raises
+        None,
+        42,
+    ],
+)
+def test_malformed_raw_usage_counts_as_none(raw):
+    assert li_mod._raw_usage(raw) == (0, 0)
+
+
+async def test_malformed_raw_usage_does_not_fail_the_turn():
+    script = Script(with_raw(_RaisingUsage(), "ok"))
+    evs = await drive(LlamaIndexAdapter(make_agent(script)), "hi")
+    assert_text_stream(evs, "ok")
+    assert not any(isinstance(e, Usage) for e in evs)
+
+
 async def test_failure_propagates():
     adapter = LlamaIndexAdapter(make_agent(Script(RuntimeError("model exploded"))))
     await assert_failure_maps(adapter, match="model exploded")

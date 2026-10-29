@@ -6,14 +6,18 @@ crewai into a failure instead of a skip."""
 from __future__ import annotations
 
 import asyncio
+import atexit
+import concurrent.futures
 import importlib.util
 import json
 import os
 import re
+import shutil
 import socket
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import warnings
 from collections.abc import Sequence
@@ -25,6 +29,42 @@ import pytest
 # CrewAI's anonymous telemetry and trace collection: off before crewai is imported.
 os.environ.setdefault("CREWAI_DISABLE_TELEMETRY", "true")
 os.environ.setdefault("CREWAI_TRACING_ENABLED", "false")
+
+# CrewAI writes under the user's home: a credentials key and its settings (crewai_core; the
+# settings path is fixed when crewai is imported) and its kickoff database. The real home
+# (the script passes it as A2AGW_REAL_HOME, having pointed HOME elsewhere) is snapshotted
+# here, and HOME is pointed at a temporary directory before crewai is imported.
+REAL_HOME = os.environ.get("A2AGW_REAL_HOME") or os.path.expanduser("~")
+
+
+def crewai_paths(home: str) -> dict[str, tuple[int, int]]:
+    """Every file under the places CrewAI writes in ``home``: (mtime, size) by path."""
+    roots = [
+        Path(home, "Library", "Application Support", "crewai"),
+        Path(home, "Library", "Application Support", Path.cwd().name),
+        Path(home, ".config", "crewai"),
+        Path(home, ".local", "share", "crewai"),
+        Path(home, ".local", "share", Path.cwd().name),
+    ]
+    found: dict[str, tuple[int, int]] = {}
+    for root in roots:
+        if root.exists():
+            found[str(root)] = (0, 0)
+            for f in root.rglob("*"):
+                st = f.stat()
+                found[str(f)] = (st.st_mtime_ns, st.st_size)
+    return found
+
+
+REAL_HOME_BEFORE = crewai_paths(REAL_HOME)
+
+if os.environ.get("A2AGW_CREWAI_TESTS") or importlib.util.find_spec("crewai") is not None:
+    _home = tempfile.mkdtemp(prefix="a2agw-crewai-home-")
+    atexit.register(shutil.rmtree, _home, True)
+    os.environ["HOME"] = _home
+    os.environ["XDG_CONFIG_HOME"] = os.path.join(_home, ".config")
+    os.environ["XDG_DATA_HOME"] = os.path.join(_home, ".local", "share")
+    os.environ.setdefault("CREWAI_STORAGE_DIR", os.path.join(_home, "storage"))
 
 # ``crewai.rag`` is a module object that refuses attributes, so importing its submodules
 # raises ``ImportWarning("Cannot set an attribute on 'crewai.rag' for child module ...")``
@@ -77,7 +117,8 @@ from a2agw.core.events import Done, Usage
 def _offline(monkeypatch, tmp_path):
     """No test here may reach the network (CrewAI telemetry and tracing, provider clients):
     name resolution and outbound connections fail and are recorded, which fails the test
-    even where CrewAI swallows the error. CrewAI's storage directory is the test's own."""
+    even where CrewAI swallows the error. CrewAI's home, config, data and storage
+    directories are the test's own."""
     attempts: list[Any] = []
 
     def refuse(*args: Any, **kwargs: Any) -> Any:
@@ -88,9 +129,19 @@ def _offline(monkeypatch, tmp_path):
     monkeypatch.setattr(socket.socket, "connect", refuse)
     for var in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY"):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setenv("CREWAI_STORAGE_DIR", str(tmp_path / "crewai"))
+    isolate_home(monkeypatch.setenv, tmp_path)
     yield
     assert attempts == [], f"network attempts: {attempts}"
+
+
+def isolate_home(setenv: Any, tmp_path: Path) -> None:
+    """Point HOME, XDG_CONFIG_HOME, XDG_DATA_HOME and CREWAI_STORAGE_DIR (absolute) at
+    ``tmp_path``. ``setenv(name, value)``: ``monkeypatch.setenv`` or a dict's ``__setitem__``."""
+    home = tmp_path / "home"
+    setenv("HOME", str(home))
+    setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    setenv("XDG_DATA_HOME", str(home / ".local" / "share"))
+    setenv("CREWAI_STORAGE_DIR", str((tmp_path / "crewai").resolve()))
 
 
 # -- a scripted fake model ----------------------------------------------------------------
@@ -411,15 +462,22 @@ async def test_tool_calls_run_under_the_inbound_task():
 
 def strict_form(schema: dict[str, Any]) -> dict[str, Any]:
     """The partner schema as CrewAI's native tool calling declares it (OpenAI strict mode):
-    every property required, the optional ones nullable, every object closed."""
+    every property required, the optional ones nullable, every object closed; a tool taking
+    ``data`` also takes the nullable ``data_json`` string."""
     out = json.loads(json.dumps(schema))
     required = set(schema.get("required", ()))
+    data_json = "data" in out["properties"]
     for name, prop in out["properties"].items():
         if prop.get("type") == "object":
             prop.update(additionalProperties=False, properties={}, required=[])
         if name not in required:
             outer = {k: prop.pop(k) for k in ("description", "default") if k in prop}
             out["properties"][name] = {"anyOf": [prop, {"type": "null"}], **outer}
+    if data_json:
+        out["properties"]["data_json"] = {
+            "anyOf": [{"type": "string"}, {"type": "null"}],
+            "description": crewai_mod.DATA_JSON_DESCRIPTION,
+        }
     out["required"] = list(out["properties"])
     return out
 
@@ -439,6 +497,12 @@ async def test_tools_reach_the_model():
         assert f["description"].count(UNTRUSTED_NOTE) == 1
         assert f["parameters"] == strict_form(strip_extensions(p.parameters))
         assert "x-max-json-bytes" not in json.dumps(f["parameters"])
+    # Structured data goes as a JSON string: strict mode closes the ``data`` object.
+    ask = functions[0]["parameters"]["properties"]
+    closed = ask["data"]["anyOf"][0]
+    assert closed["type"] == "object" and closed["properties"] == {}
+    assert closed["additionalProperties"] is False
+    assert "JSON" in ask["data_json"]["description"]
 
 
 # -- outbound -----------------------------------------------------------------------------
@@ -528,7 +592,66 @@ def test_projected_tool_schemas():
             else:
                 assert {"type": "null"} in schema["properties"][name]["anyOf"]
         assert t.cache_function({}, "") is False  # partner answers are never cached
+        assert ("data_json" in schema["properties"]) == ("data" in stripped["properties"])
     assert "x-max-json-bytes" in json.dumps(ptools[0].parameters)  # the original is untouched
+
+
+async def test_data_json_reaches_invoke_as_data():
+    client = FakePartnerClient()
+    [tool] = as_crewai_tools(client.tools()[:1], client)
+    out = json.loads(await run_tool(tool, {"message": "hi", "data_json": '{"order": 42}'}))
+    assert out["state"] == "completed"
+    assert client.consults[-1]["data"] == {"order": 42}
+    # ``invoke`` still validates the parsed data (here its gateway-only size limit).
+    big = json.dumps({"blob": "x" * 40_000})
+    assert json.loads(await run_tool(tool, {"message": "hi", "data_json": big}))["state"] == (
+        "rejected"
+    )
+    sent = len(client.consults)
+    rejected = {"state": "rejected", "reason": "invalid arguments: data_json"}
+    for bad in ("{not json", "[1, 2]", '"text"'):
+        assert json.loads(await run_tool(tool, {"message": "hi", "data_json": bad})) == rejected
+    both = {"message": "hi", "data": {"a": 1}, "data_json": '{"b": 2}'}
+    assert json.loads(await run_tool(tool, both)) == rejected
+    assert len(client.consults) == sent  # nothing was sent for those
+    # The model's strict-mode empty ``data`` next to ``data_json`` is fine.
+    out = json.loads(await run_tool(tool, {"message": "hi", "data": {}, "data_json": '{"c": 3}'}))
+    assert out["state"] == "completed" and client.consults[-1]["data"] == {"c": 3}
+
+
+def test_turn_submits_under_the_end_lock(monkeypatch):
+    # No partner call is ever submitted after the turn ended: ``submit`` checks ``ended`` and
+    # submits while holding the lock ``end`` takes, and only makes the coroutine then.
+    loop = asyncio.new_event_loop()
+    turn = crewai_mod._Turn(loop)
+    held: list[bool] = []
+    submitted: list[concurrent.futures.Future[Any]] = []
+
+    def fake_submit(coro: Any, target: Any) -> concurrent.futures.Future[Any]:
+        held.append(turn.lock.locked())
+        coro.close()
+        submitted.append(concurrent.futures.Future())
+        return submitted[-1]
+
+    async def work() -> None:
+        return None
+
+    monkeypatch.setattr(crewai_mod.asyncio, "run_coroutine_threadsafe", fake_submit)
+    made: list[int] = []
+
+    def make() -> Any:
+        made.append(1)
+        return work()
+
+    try:
+        assert turn.submit(make, loop) is submitted[0]
+        assert held == [True]
+        turn.end()
+        assert submitted[0].cancelled()  # the call in flight is cancelled
+        assert turn.submit(make, loop) is None  # and none starts afterwards
+        assert made == [1] and len(submitted) == 1
+    finally:
+        loop.close()
 
 
 async def test_contract_kit():
@@ -595,17 +718,21 @@ def test_missing_extra_message(monkeypatch):
         spec.loader.exec_module(module)
 
 
-def test_core_does_not_import_crewai():
+def test_core_does_not_import_crewai(tmp_path):
+    env = dict(os.environ)
+    isolate_home(env.__setitem__, tmp_path)
     code = (
         "import sys, a2agw, a2agw.serve.host, a2agw.adapters.callable, a2agw.cli, a2agw.config,"
         " a2agw.gateway.rest;"
         "print([m for m in sys.modules if m.split('.')[0] in ('crewai', 'crewai_core')])"
     )
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    out = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True, env=env
+    )
     assert out.stdout.strip() == "[]"
 
 
-def test_importing_crewai_is_offline():
+def test_importing_crewai_is_offline(tmp_path):
     # Importing crewai (and the adapter) makes no network call, telemetry left on.
     code = (
         "import socket\n"
@@ -618,7 +745,7 @@ def test_importing_crewai_is_offline():
         "print(tried)\n"
     )
     env = {k: v for k, v in os.environ.items() if not k.startswith(("CREWAI_", "OTEL_"))}
-    env["CREWAI_STORAGE_DIR"] = str(Path(os.environ["CREWAI_STORAGE_DIR"]))
+    isolate_home(env.__setitem__, tmp_path)
     out = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, check=True, env=env
     )
@@ -629,3 +756,14 @@ async def test_example_runs():
     from examples.adapters import crewai_example
 
     assert await crewai_example.main() == "echo: hello from A2A"
+
+
+async def test_real_home_untouched(tmp_path):
+    # Last in the module: after every other test (and one more crew run here), nothing new
+    # or changed under the real home's CrewAI paths.
+    client = FakePartnerClient()
+    script = Script(call("ask_pinger", {"message": "hi"}), "done")
+    crew = make_crew(script, as_crewai_tools(client.tools(), client))
+    await drive(CrewAIAdapter(crew), "go")
+    assert os.path.realpath(os.path.expanduser("~")) != os.path.realpath(REAL_HOME)
+    assert crewai_paths(REAL_HOME) == REAL_HOME_BEFORE

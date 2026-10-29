@@ -9,6 +9,17 @@ Telemetry: CrewAI sends anonymous usage telemetry (to telemetry.crewai.com) and 
 traces unless told not to. Importing crewai makes no network call; running a crew does. Set
 ``CREWAI_DISABLE_TELEMETRY=true`` and ``CREWAI_TRACING_ENABLED=false`` (or
 ``OTEL_SDK_DISABLED=true``) in the gateway's environment to turn both off.
+
+Files: CrewAI keeps an encryption key for platform credentials
+(``<user data dir>/crewai/credentials``), its settings (``~/.config/crewai``) and a database of
+the latest kickoff's task outputs (``<user data dir>/<CREWAI_STORAGE_DIR or the current
+directory's name>``) under the user's home directory; the user data directory is
+``~/Library/Application Support`` on macOS and ``~/.local/share`` (``XDG_DATA_HOME``) on
+Linux. The adapter keeps each turn's task outputs in memory instead, but building a crew
+still creates that database file. To keep all of it out of the user's home, set
+``CREWAI_STORAGE_DIR`` to an absolute directory and run the gateway with ``HOME`` (and
+``XDG_CONFIG_HOME``/``XDG_DATA_HOME``) pointing at a directory of its own; ``HOME`` must be
+set before crewai is imported (its settings path is fixed at import).
 """
 
 from __future__ import annotations
@@ -19,7 +30,7 @@ import copy
 import json
 import keyword
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Coroutine
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal
@@ -51,6 +62,11 @@ __all__ = ["CrewAIAdapter", "as_crewai_tools"]
 MAX_SESSIONS = 10_000  # (caller, context) keys whose turns are serialised (LRU, idle only)
 LOOP_CHECK_S = 1.0  # how often a worker thread waiting for a partner call checks the loop runs
 LOOP_STOPPED = "gateway event loop stopped"
+DATA_JSON = "data_json"  # the string stand-in for ``data`` (see ``as_crewai_tools``)
+DATA_JSON_DESCRIPTION = (
+    "Optional structured data to send, as a JSON object encoded in a string, for example "
+    '{"order": 42}. Pass structured data here, not in data.'
+)
 
 
 # -- the turn a tool call belongs to -------------------------------------------------------
@@ -68,15 +84,20 @@ class _Turn:
     calls: set[concurrent.futures.Future[Any]] = field(default_factory=set)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def start(self, future: concurrent.futures.Future[Any]) -> bool:
-        """Track a partner call; False (and the call cancelled) if the turn has ended."""
+    def submit(
+        self, make: Callable[[], Coroutine[Any, Any, Any]], loop: asyncio.AbstractEventLoop
+    ) -> concurrent.futures.Future[Any] | None:
+        """Run ``make()`` on ``loop`` and track it, or None if the turn has ended. The check
+        and the submission happen under the lock ``end`` takes, so once ``end`` has run no
+        call is submitted (and the coroutine is only made when it is submitted)."""
         with self.lock:
-            if not self.ended:
-                self.calls.add(future)
-                future.add_done_callback(self._done)
-                return True
-        future.cancel()
-        return False
+            if self.ended:
+                return None
+            # ``run_coroutine_threadsafe`` copies this thread's context into the loop's task.
+            future = asyncio.run_coroutine_threadsafe(make(), loop)
+            self.calls.add(future)
+        future.add_done_callback(self._done)
+        return future
 
     def _done(self, future: concurrent.futures.Future[Any]) -> None:
         with self.lock:
@@ -306,6 +327,21 @@ def _loop_stopped() -> str:
     return json.dumps({"state": "unavailable", "reason": LOOP_STOPPED})
 
 
+def _with_data_json(schema: dict[str, Any]) -> dict[str, Any]:
+    """``schema`` plus a nullable ``data_json`` string next to its ``data`` object. CrewAI's
+    strict mode closes every object, so ``data`` can only be sent empty; ``data_json`` carries
+    the structured data as a JSON string instead (parsed before ``invoke``)."""
+    props = schema.get("properties")
+    if not isinstance(props, dict) or "data" not in props or DATA_JSON in props:
+        return schema
+    out = copy.deepcopy(schema)
+    out["properties"][DATA_JSON] = {
+        "anyOf": [{"type": "string"}, {"type": "null"}],
+        "description": DATA_JSON_DESCRIPTION,
+    }
+    return out
+
+
 class _PartnerTool(BaseTool):
     """A partner tool as a CrewAI tool. CrewAI calls ``_run`` in a worker thread; the partner
     call itself runs on the gateway's event loop (the turn's, else the one the tools were
@@ -316,6 +352,7 @@ class _PartnerTool(BaseTool):
     client: Any  # PartnerClient (not validated by pydantic)
     caller: Any = None  # Principal | None
     loop: Any = None  # the event loop the tools were made on, if any
+    takes_data_json: bool = False  # ``data_json`` was added to the declared schema
 
     def __init__(self, **data: Any) -> None:
         super().__init__(**data)
@@ -323,6 +360,17 @@ class _PartnerTool(BaseTool):
 
     async def _call(self, kwargs: dict[str, Any]) -> str:
         args = {k: v for k, v in kwargs.items() if v is not None}
+        if self.takes_data_json and DATA_JSON in args:
+            raw = args.pop(DATA_JSON)
+            try:
+                data = json.loads(raw) if isinstance(raw, str) else None
+            except ValueError:
+                data = None
+            if not isinstance(data, dict) or args.get("data"):
+                # Not a JSON object, or ``data`` given as well: nothing is sent.
+                reason = f"invalid arguments: {DATA_JSON}"
+                return json.dumps({"state": "rejected", "reason": reason})
+            args["data"] = data
         result = await invoke(
             self.ptool, args, self.client, inbound_task_id=None, caller=self.caller
         )
@@ -349,13 +397,10 @@ class _PartnerTool(BaseTool):
                 f"partner tool {self.name!r} was called synchronously on the gateway's event "
                 "loop thread, which it would block; CrewAI calls tools from worker threads"
             )
-        if turn is not None and turn.ended:
-            return _turn_ended()
         if not loop.is_running():
             return _loop_stopped()
-        # ``run_coroutine_threadsafe`` copies this thread's context into the loop's task.
-        future = asyncio.run_coroutine_threadsafe(self._call(kwargs), loop)
-        if turn is not None and not turn.start(future):
+        future = self._submit(kwargs, loop, turn)
+        if future is None:
             return _turn_ended()
         while True:
             try:
@@ -369,14 +414,21 @@ class _PartnerTool(BaseTool):
                     future.cancel()
                     return _loop_stopped()
 
+    def _submit(
+        self, kwargs: dict[str, Any], loop: asyncio.AbstractEventLoop, turn: _Turn | None
+    ) -> concurrent.futures.Future[Any] | None:
+        if turn is None:
+            return asyncio.run_coroutine_threadsafe(self._call(kwargs), loop)
+        return turn.submit(lambda: self._call(kwargs), loop)
+
     async def _arun(self, **kwargs: Any) -> str:
         loop, turn = self._target()
         if turn is not None and turn.ended:
             return _turn_ended()
         if asyncio.get_running_loop() is loop:
-            return await self._call(kwargs)
-        future = asyncio.run_coroutine_threadsafe(self._call(kwargs), loop)
-        if turn is not None and not turn.start(future):
+            return await self._call(kwargs)  # on the loop thread: ``end`` cannot interleave
+        future = self._submit(kwargs, loop, turn)
+        if future is None:
             return _turn_ended()
         try:
             return await asyncio.wrap_future(future)
@@ -394,7 +446,10 @@ def as_crewai_tools(
     ``x-`` limits, its optional properties also accepting ``null`` (CrewAI's native tool
     calling makes every property required), and its description ends with the
     untrusted-data note. Explicit ``null`` arguments are dropped; ``invoke`` validates the rest
-    against the full schema and answers invalid calls with ``rejected``. Inside an inbound run
+    against the full schema and answers invalid calls with ``rejected``. Strict mode also
+    closes the free-form ``data`` object, so tools that take ``data`` declare a nullable
+    ``data_json`` string as well: a JSON object passed there is parsed and sent as ``data``
+    (anything else, or ``data`` given too, is answered ``rejected``). Inside an inbound run
     the inbound task and caller come from the contextvars, as for ``as_langchain_tools``.
 
     Make the tools inside the gateway's event loop (once the host has started, for example
@@ -406,7 +461,8 @@ def as_crewai_tools(
         loop = None
     out: list[BaseTool] = []
     for t in tools:
-        schema = _nullable_optionals(strip_extensions(t.parameters))
+        stripped = _nullable_optionals(strip_extensions(t.parameters))
+        schema = _with_data_json(stripped)
         out.append(
             _PartnerTool(
                 name=t.name,
@@ -416,6 +472,7 @@ def as_crewai_tools(
                 client=client,
                 caller=caller,
                 loop=loop,
+                takes_data_json=schema is not stripped,
             )
         )
     return out
