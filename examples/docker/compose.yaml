@@ -3,6 +3,9 @@
 #   POSTGRES_PASSWORD   database password
 #   CODER_SECRET        webhook signing secret shared by the gateway and the coder
 #                       (e.g. `export CODER_SECRET=$(openssl rand -hex 32)`)
+#   GATEWAY_SELF_KEY    the API key the gateway sends when it calls its own echo agent;
+#                       put its sha256 under auth.api_keys (principal gateway-self) in
+#                       a2agw.compose.yaml
 # Run from the repository root:
 #   docker compose -f examples/docker/compose.yaml up --build
 services:
@@ -17,6 +20,7 @@ services:
       A2AGW_BASE_URL: ${A2AGW_BASE_URL:-http://localhost:8000}
       A2AGW_DB_URL: postgresql+asyncpg://a2agw:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/a2agw
       CODER_SECRET: ${CODER_SECRET:?set CODER_SECRET}
+      GATEWAY_SELF_KEY: ${GATEWAY_SELF_KEY:?set GATEWAY_SELF_KEY}
     command: ["serve", "-c", "/config/a2agw.compose.yaml", "--host", "0.0.0.0", "--port", "8000"]
     volumes:
       - ./:/config:ro
@@ -57,6 +61,7 @@ services:
       PORT: "9000"
       HOST: 0.0.0.0              # reachable from the gateway container
       CODER_SECRET: ${CODER_SECRET:?set CODER_SECRET}   # verifies X-A2AGW-Signature
+      CONSULT_PARTNER: echo      # the partner it consults each turn (default: security)
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9000/healthz').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
       interval: 5s

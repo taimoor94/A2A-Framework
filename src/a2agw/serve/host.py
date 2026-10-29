@@ -17,6 +17,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterable, I
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 import httpx
 from a2a.compat.v0_3.jsonrpc_adapter import JSONRPC03Adapter
@@ -712,6 +713,16 @@ class _BodyLimitMiddleware:
             pass
 
 
+def _consult_url(base_url: str, consult_url: str | None) -> str:
+    """``consult_url`` without a trailing slash, or ``base_url`` + ``REST_PREFIX``."""
+    if consult_url is None:
+        return f"{base_url.rstrip('/')}{REST_PREFIX}"
+    parts = urlsplit(consult_url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise ValueError("consult_url must be an absolute http(s) URL")
+    return consult_url.rstrip("/")
+
+
 class PartnersInUse(Exception):
     """A partner reload would remove partners that still have open outbound tasks."""
 
@@ -1012,6 +1023,7 @@ class AgentHost:
         sidecar_agents: Iterable[str] = (),
         max_open_sidecar_tasks_per_caller: int = DEFAULT_MAX_OPEN_SIDECAR_TASKS,
         mcp_agents: Iterable[str] | None = None,
+        consult_url: str | None = None,
     ) -> None:
         self.base_url = base_url
         # Sidecar agents (spec 7.7) consult partners through the outbound REST API
@@ -1021,7 +1033,10 @@ class AgentHost:
         # agent ids ``sidecar_clients`` maps it to ({principal id: agent ids}).
         # ``sidecar_agents`` names further sidecar identities (MCP clients), whose unlinked
         # partner tasks this host's TTL expiry also covers (``sidecar_agent_ids``).
-        self.consult_tokens = ConsultTokens(url=f"{base_url.rstrip('/')}{REST_PREFIX}")
+        # ``consult_url`` is the REST API's URL as the sidecar agents reach it (``ConsultGrant
+        # .url``), when that differs from ``base_url`` (a container network, say). The gateway
+        # never fetches it; it only hands it out.
+        self.consult_tokens = ConsultTokens(url=_consult_url(base_url, consult_url))
         self.consult_issuer = GrantIssuer(self.consult_tokens)
         self.sidecar_clients: dict[str, frozenset[str]] = {
             principal: frozenset(agents) for principal, agents in (sidecar_clients or {}).items()

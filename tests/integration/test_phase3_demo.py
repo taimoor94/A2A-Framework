@@ -33,7 +33,7 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-async def test_node_and_mcp_agents_join_the_network(spans, fast, monkeypatch, caplog):
+async def test_node_and_mcp_agents_join_the_network(spans, fast, monkeypatch, caplog, capsys):
     monkeypatch.setattr(security, "STEP_DELAY_S", 0.2)
     caplog.set_level(logging.DEBUG)
     tokens: list[str] = []
@@ -70,6 +70,20 @@ async def test_node_and_mcp_agents_join_the_network(spans, fast, monkeypatch, ca
     inbound = {s.attributes.get("a2agw.agent_id") for s in a2a if s.name == "a2agw.inbound"}
     assert inbound >= {"pm", "architect", "coder", "security"}
     assert len({s.context.trace_id for s in a2a}) == 1
+    # The coder's REST consult is a child of the coder's own inbound span (webhook path).
+    [coder_in] = [
+        s
+        for s in a2a
+        if s.name == "a2agw.inbound" and s.attributes.get("a2agw.agent_id") == "coder"
+    ]
+    [coder_call] = [
+        s
+        for s in a2a
+        if s.name == "a2agw.partner_call"
+        and s.parent is not None
+        and s.parent.span_id == coder_in.context.span_id
+    ]
+    assert coder_call.attributes["a2agw.partner_id"] == "security"
 
     # One audit chain, intact, with the coder's linked call in it.
     assert result.chain_ok
@@ -84,8 +98,26 @@ async def test_node_and_mcp_agents_join_the_network(spans, fast, monkeypatch, ca
 
     # No secret, consult token or API key value in any log or audit row.
     assert tokens
+    out = capsys.readouterr()
+    span_text = [
+        json.dumps(
+            {
+                "attributes": dict(s.attributes or {}),
+                "events": [(e.name, dict(e.attributes or {})) for e in s.events],
+            },
+            default=str,
+        )
+        for s in a2a
+    ]
     captured = "\n".join(
-        [caplog.text, *result.coder_output, json.dumps(result.audit_rows, default=str)]
+        [
+            caplog.text,
+            out.out,
+            out.err,
+            *result.coder_output,
+            *span_text,
+            json.dumps(result.audit_rows, default=str),
+        ]
     )
     for value in [*tokens, *result.secrets]:
         assert value and value not in captured
@@ -183,3 +215,39 @@ async def test_node_coder_treats_disconnect_as_cancel(coder):
         while not any("cancelled (client disconnected)" in line for line in node.output):
             await asyncio.sleep(0.05)
     assert not any("t" * 43 in line for line in node.output)
+
+
+async def _raw(port: int, head: bytes, body_chunks: list[bytes]) -> bytes:
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    try:
+        writer.write(head)
+        for chunk in body_chunks:
+            writer.write(chunk)
+        await writer.drain()
+        async with asyncio.timeout(30):
+            return await reader.read()  # until the coder closes the connection
+    finally:
+        writer.close()
+
+
+async def test_node_coder_answers_413_for_an_oversized_body(coder):
+    _, url = coder
+    port = httpx.URL(url).port
+    declared = await _raw(
+        port,
+        b"POST /a2agw/invoke HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+        b"Content-Length: 2097152\r\n\r\n",
+        [],  # refused on the header alone: the client waits for the answer before the body
+    )
+    piece = b"x" * 65536
+    chunked = await _raw(
+        port,
+        b"POST /a2agw/invoke HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+        b"Transfer-Encoding: chunked\r\n\r\n",
+        [b"%x\r\n%s\r\n" % (len(piece), piece)] * 18 + [b"0\r\n\r\n"],  # 1.125 MiB, no length
+    )
+    for answer in (declared, chunked):
+        status, _, rest = answer.partition(b"\r\n")
+        assert status == b"HTTP/1.1 413 Payload Too Large", answer[:200]
+        assert b"connection: close" in rest.lower()
+        assert b'{"error":"payload too large"}' in rest

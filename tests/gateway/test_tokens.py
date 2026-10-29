@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import time
 
+import pytest
+
 from a2agw.context.call_context import CallContext
 from a2agw.gateway.tokens import Binding, ConsultTokens
 from a2agw.security.principal import Principal
@@ -78,3 +80,52 @@ async def test_revocation_cancels_calls_in_flight():
         assert not live
     late.cancel()
     await asyncio.gather(late, return_exceptions=True)
+
+
+async def test_host_consult_url_overrides_the_grant_url(tmp_path):
+    from a2agw.serve.host import AgentHost
+
+    db = f"sqlite+aiosqlite:///{tmp_path / 'g.db'}"
+    default = AgentHost("http://localhost:8000/", db_url=db)
+    assert default.consult_tokens.issue("a", "t", None, None).url == (
+        "http://localhost:8000/a2agw/v1"
+    )
+    host = AgentHost(
+        "http://localhost:8000", db_url=db, consult_url="http://gateway:8000/a2agw/v1/"
+    )
+    grant = host.consult_tokens.issue("coder", "t1", None, None)
+    assert grant.url == "http://gateway:8000/a2agw/v1"
+    # The cards keep advertising base_url.
+    assert host.base_url == "http://localhost:8000"
+    for bad in ("gateway:8000/a2agw/v1", "ftp://gw/a2agw/v1", "http:///a2agw/v1", ""):
+        with pytest.raises(ValueError):
+            AgentHost("http://localhost:8000", db_url=db, consult_url=bad)
+
+
+async def test_grant_issuer_links_the_trace_without_a_call_context(spans):
+    """A turn with no call context still gets a grant whose call carries the turn's span."""
+    from opentelemetry import trace
+
+    from a2agw.core.spi import InboundContext
+    from a2agw.gateway.tokens import GrantIssuer
+
+    issuer = GrantIssuer(ConsultTokens(url="http://gw/a2agw/v1"))
+    ctx = InboundContext(
+        agent_id="coder",
+        task_id="t1",
+        context_id="c1",
+        text="hi",
+        parts=[],
+        message=None,
+        principal=None,
+        call=None,
+        metadata={},
+        resumed=False,
+    )
+    with trace.get_tracer("t").start_as_current_span("a2agw.inbound") as span:
+        grant = await issuer(ctx)
+    binding = issuer.tokens.resolve(grant.token)
+    assert binding.call is not None and binding.call.traceparent
+    ctx_ = span.get_span_context()
+    _, trace_id, span_id, _ = binding.call.traceparent.split("-")
+    assert (trace_id, span_id) == (f"{ctx_.trace_id:032x}", f"{ctx_.span_id:016x}")

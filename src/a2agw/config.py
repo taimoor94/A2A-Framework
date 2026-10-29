@@ -29,6 +29,7 @@ import re
 import sys
 from pathlib import Path
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
 import yaml
 from pydantic import (
@@ -386,13 +387,29 @@ class SidecarConfig(BaseModel):
     ``clients`` maps a principal id (``key:<id>`` for an API key, ``jwt:<sub>`` for a JWT
     subject) to the agent ids it may act as; the principal also needs the ``a2agw:sidecar``
     scope. An agent id here need not be served by this gateway: it is the identity the
-    partner calls are routed, checked and audited as. ``mcp`` configures the MCP server."""
+    partner calls are routed, checked and audited as. ``mcp`` configures the MCP server.
+
+    ``consult_url`` is the REST API's URL as webhook and stdio agents reach it (the
+    ``consult.url`` of every invoke), when that is not ``base_url`` + ``/a2agw/v1``: for
+    example ``http://gateway:8000/a2agw/v1`` on a container network, while the cards keep
+    advertising ``base_url``. The gateway never fetches it. Empty means the default."""
 
     model_config = _FORBID
     clients: dict[
         Annotated[str, Field(min_length=1)], list[Annotated[str, Field(pattern=AGENT_ID_PATTERN)]]
     ] = Field(default_factory=dict)
     mcp: McpConfig = Field(default_factory=McpConfig)
+    consult_url: str | None = None
+
+    @field_validator("consult_url")
+    @classmethod
+    def _consult_url(cls, v: str | None) -> str | None:
+        if not v:
+            return None
+        parts = urlsplit(v)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise ValueError("must be an absolute http(s) URL")
+        return v
 
 
 class ServerTlsConfig(BaseModel):
@@ -887,6 +904,7 @@ def build_host(cfg: GatewayConfig, *, config_dir: Path | str = ".") -> AgentHost
             sidecar_agents=cfg.sidecar.mcp.agents,
             mcp_agents=cfg.sidecar.mcp.agents if cfg.sidecar.mcp.enabled else None,
             max_open_sidecar_tasks_per_caller=cfg.limits.max_open_sidecar_tasks_per_caller,
+            consult_url=cfg.sidecar.consult_url,
         )
     except ValueError as e:  # e.g. a trusted context kid that clashes with the signing kid
         raise ConfigError(str(e)) from None

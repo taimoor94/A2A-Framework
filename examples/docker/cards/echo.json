@@ -1,0 +1,44 @@
+{
+  "name": "Echo",
+  "description": "Echoes the user's message back.",
+  "supportedInterfaces": [
+    {
+      "url": "http://localhost:8000/agents/echo/",
+      "protocolBinding": "JSONRPC",
+      "protocolVersion": "1.0"
+    },
+    {
+      "url": "http://localhost:8000/agents/echo/rest",
+      "protocolBinding": "HTTP+JSON",
+      "protocolVersion": "1.0"
+    }
+  ],
+  "version": "0.1.0",
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false,
+    "extensions": [
+      {
+        "uri": "https://a2agw.dev/ext/call-context/v1"
+      }
+    ]
+  },
+  "defaultInputModes": [
+    "text/plain",
+    "application/json"
+  ],
+  "defaultOutputModes": [
+    "text/plain",
+    "application/json"
+  ],
+  "skills": [
+    {
+      "id": "echo",
+      "name": "Echo",
+      "description": "Echoes the user's message back.",
+      "tags": [
+        "echo"
+      ]
+    }
+  ]
+}

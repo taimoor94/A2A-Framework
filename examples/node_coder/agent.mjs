@@ -9,6 +9,7 @@
 //   HOST        address to listen on (default 127.0.0.1)
 //   SECRET_ENV  name of the variable holding the signing secret (default CODER_SECRET); the
 //               gateway's webhook `secret_env` names the same secret
+//   CONSULT_PARTNER  the partner it asks for a review each turn (default security)
 //
 // On start it prints one line to stdout, {"listening": <port>}. Logs go to stderr, and never
 // include the secret or a consult token.
@@ -18,9 +19,12 @@ import { request as httpsRequest } from "node:https";
 
 const PROTOCOL = "a2agw.invoke/1";
 const MAX_SKEW_S = 300;
-const MAX_BODY_BYTES = 1024 * 1024;
+const MAX_BODY_BYTES = 1024 * 1024; // an invoke body
+const MAX_CONSULT_BYTES = 1024 * 1024; // a consult answer from the gateway
+const DISCARD_BYTES = 16 * 1024 * 1024; // of a refused body, before the connection is dropped
+const DISCARD_WAIT_MS = 5000; // for the rest of a refused body
 const CONSULT_WAIT_S = 30;
-const PARTNER = "security";
+const PARTNER = process.env.CONSULT_PARTNER || "security";
 
 const secretEnv = process.env.SECRET_ENV || "CODER_SECRET";
 const secret = process.env[secretEnv];
@@ -71,7 +75,16 @@ function consult(grant, partner, message, signal) {
       },
       (res) => {
         const chunks = [];
-        res.on("data", (c) => chunks.push(c));
+        let size = 0;
+        res.on("data", (c) => {
+          size += c.length;
+          if (size > MAX_CONSULT_BYTES) {
+            req.destroy();
+            reject(new Error("gateway answer too large"));
+            return;
+          }
+          chunks.push(c);
+        });
         res.on("end", () => {
           if (res.statusCode !== 200) {
             reject(new Error(`gateway answered HTTP ${res.statusCode}`));
@@ -142,15 +155,21 @@ async function turn(invoke, emit, signal) {
   emit({ type: "done" });
 }
 
+const tooLarge = (midBody) => Object.assign(new Error("body too large"), { status: 413, midBody });
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
+    if (Number(req.headers["content-length"]) > MAX_BODY_BYTES) {
+      reject(tooLarge(false)); // refused on the header, before reading a byte
+      return;
+    }
     const chunks = [];
     let size = 0;
     req.on("data", (c) => {
       size += c.length;
       if (size > MAX_BODY_BYTES) {
-        reject(Object.assign(new Error("body too large"), { status: 413 }));
-        req.destroy();
+        req.removeAllListeners("data");
+        reject(tooLarge(true));
         return;
       }
       chunks.push(c);
@@ -170,7 +189,34 @@ async function invokeRoute(req, res) {
   try {
     raw = await readBody(req);
   } catch (e) {
-    if (!res.headersSent && !res.destroyed) refuse(res, e.status || 400, "bad request");
+    if (!res.headersSent && !res.destroyed) {
+      const status = e.status || 400;
+      // Answer at once, with Connection: close. Refused mid-body, the rest of the body is read
+      // and discarded (up to a limit, for a few seconds) before the response ends: closing with
+      // unread data would reset the connection before the client reads the answer.
+      res.writeHead(status, { "content-type": "application/json", connection: "close" });
+      const answer = JSON.stringify({ error: status === 413 ? "payload too large" : "bad request" });
+      if (!e.midBody) {
+        res.end(answer);
+        return;
+      }
+      res.write(answer);
+      const finish = () => {
+        clearTimeout(timer);
+        if (!res.writableEnded) res.end();
+      };
+      const timer = setTimeout(finish, DISCARD_WAIT_MS);
+      let discarded = 0;
+      req.on("data", (c) => {
+        discarded += c.length;
+        if (discarded > DISCARD_BYTES) {
+          clearTimeout(timer);
+          req.destroy();
+        }
+      });
+      req.on("end", finish);
+      req.resume();
+    }
     return;
   }
   if (!verified(req.headers, raw)) {

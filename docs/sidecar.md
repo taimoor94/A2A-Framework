@@ -339,6 +339,11 @@ and is linked to the inbound task:
   turn's `a2agw.inbound` span, though the request itself carries no trace context. The agent
   needs no tracing code for its partner calls to be in the caller's trace.
 
+`url` is `base_url` + `/a2agw/v1` unless `sidecar.consult_url` is set
+(`AgentHost(consult_url=...)`): use it when the agent reaches the gateway at another address,
+for example `http://gateway:8000/a2agw/v1` on a container network while the cards advertise
+`http://localhost:8000`. The gateway never fetches it; it only hands it to the agent.
+
 The token is valid for this turn only. It stops working when the turn ends (however it ends:
 completed, failed, cancelled, or waiting for input; a resumed turn gets a new token), at the
 inbound call's deadline, and after one hour at most (`expires_at`). Keep it in memory only:

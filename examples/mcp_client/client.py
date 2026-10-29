@@ -44,10 +44,29 @@ def mcp_url(base_url: str, agent_id: str = AGENT_ID) -> str:
     return f"{base_url.rstrip('/')}/a2agw/mcp/{agent_id}"
 
 
-def _envelope(result: Any) -> dict[str, Any]:
+class ToolError(RuntimeError):
+    """A tool call the gateway could not answer with a partner envelope."""
+
+
+def _envelope(tool: str, result: Any) -> dict[str, Any]:
+    """The JSON answer of a tool call (``structuredContent``, else its text content).
+
+    An ``isError`` result with an envelope (``failed``, ``rejected``, ``unavailable``) is
+    returned as is, so the caller sees its ``state`` and ``reason``; one without an envelope
+    raises ``ToolError``, as does content that is neither."""
     if result.structured_content is not None:
         return dict(result.structured_content)
-    return json.loads(result.content[0].text)
+    texts = [c.text for c in result.content if getattr(c, "type", None) == "text"]
+    if len(texts) == 1:
+        try:
+            value = json.loads(texts[0])
+        except ValueError:
+            value = None
+        if isinstance(value, dict):
+            return value
+    kinds = ", ".join(sorted({str(getattr(c, "type", "?")) for c in result.content})) or "none"
+    what = "an error" if result.is_error else "no JSON envelope"
+    raise ToolError(f"{tool}: the gateway answered {what} (content: {kinds})")
 
 
 async def consult_pm(base_url: str, api_key: str, goal: str) -> Outcome:
@@ -61,10 +80,9 @@ async def consult_pm(base_url: str, api_key: str, goal: str) -> Outcome:
     ):
         await session.initialize()
         out.tools = [t.name for t in (await session.list_tools()).tools]
+        ask = f"ask_{PARTNER}"
         result = _envelope(
-            await session.call_tool(
-                f"ask_{PARTNER}", {"message": goal, "wait_seconds": FIRST_WAIT_S}
-            )
+            ask, await session.call_tool(ask, {"message": goal, "wait_seconds": FIRST_WAIT_S})
         )
         out.first = result
         for _ in range(MAX_WAITS):
@@ -72,7 +90,8 @@ async def consult_pm(base_url: str, api_key: str, goal: str) -> Outcome:
                 break
             handle = {"partner_id": PARTNER, "task_id": result["task_id"]}
             waited = _envelope(
-                await session.call_tool("a2a_wait", {"tasks": [handle], "seconds": WAIT_SECONDS})
+                "a2a_wait",
+                await session.call_tool("a2a_wait", {"tasks": [handle], "seconds": WAIT_SECONDS}),
             )
             result = waited["results"][0]
         out.final = result

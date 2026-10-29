@@ -1,11 +1,17 @@
-# Config for compose.yaml: the echo agent plus the Node coder as a webhook agent.
+# Config for compose.yaml: the echo agent plus the Node coder as a webhook agent. The coder
+# consults `echo` (its CONSULT_PARTNER) through the gateway's REST API during each turn.
 base_url: ${A2AGW_BASE_URL:-http://localhost:8000}
 db_url: ${A2AGW_DB_URL}   # set by compose; the password comes from POSTGRES_PASSWORD
-auth:                      # admin stays disabled until you replace the placeholder hash
-  api_keys:                # sha256 hex of a key (not secret); no key hashes to all zeros
+partners_file: /data/partners.yaml   # /config is read-only; the registry lives in the volume
+auth:                      # replace the placeholder hashes: sha256 hex of a key (not secret)
+  api_keys:                # nothing hashes to these placeholders, so they match no key
     "0000000000000000000000000000000000000000000000000000000000000000":
       principal_id: admin
       scopes: ["a2agw:admin"]
+    "0000000000000000000000000000000000000000000000000000000000000001":
+      principal_id: caller        # your key for calling agents (key:caller), e.g. coder
+    "0000000000000000000000000000000000000000000000000000000000000002":
+      principal_id: gateway-self  # sha256 of $GATEWAY_SELF_KEY: the gateway calling echo
 
 agents:
   - spec: "echo_agent:echo"
@@ -19,3 +25,21 @@ agents:
     webhook:
       url: http://coder:9000/a2agw/invoke
       secret_env: CODER_SECRET   # HMAC signing secret, shared with the coder service
+
+# The gateway's own echo agent as a partner. Its card (cards/echo.json) points at
+# http://localhost:8000, which inside the gateway container is the gateway itself.
+partners:
+  - id: echo
+    card_file: cards/echo.json
+    tier: internal
+    credential_ref: self
+
+credentials:
+  self:                      # what the gateway sends when it calls echo
+    header: X-API-Key
+    env: GATEWAY_SELF_KEY
+
+sidecar:
+  # The REST API as the coder container reaches it (the consult.url of each invoke). The
+  # cards keep advertising base_url.
+  consult_url: http://gateway:8000/a2agw/v1

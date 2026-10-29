@@ -358,7 +358,10 @@ expires_at}`. With `Authorization: Bearer <token>` the agent calls
 the partner's credentials, audits the call, links it to the inbound task (cancelling the
 task cancels it) and continues the turn's trace. The token is valid for the turn only and
 the agent never holds partner credentials. Processes outside a turn use an API key with the
-`a2agw:sidecar` scope instead, mapped to agent ids under `sidecar.clients`.
+`a2agw:sidecar` scope instead, mapped to agent ids under `sidecar.clients`. When agents reach
+the gateway at another address than `base_url` (a container network), set
+`sidecar.consult_url` (for example `http://gateway:8000/a2agw/v1`); it only changes the
+grant's `url`, never the cards.
 
 **MCP.** The same partner tools are served over MCP, so an MCP-only agent needs no code of its
 own (`pip install 'a2a-gateway[mcp]'`):
@@ -631,7 +634,7 @@ extras in the lock); build a separate image for it. Compose (gateway, Postgres 1
 secrets come from your environment, never from the file:
 
 ```bash
-POSTGRES_PASSWORD=... CODER_SECRET=... docker compose -f examples/docker/compose.yaml up --build
+POSTGRES_PASSWORD=... CODER_SECRET=... GATEWAY_SELF_KEY=... docker compose -f examples/docker/compose.yaml up --build
 ```
 
 The examples ship a placeholder admin key hash (all zeros), so the admin API stays disabled.
@@ -645,9 +648,16 @@ With `auth` set, every call except the agent cards and `/a2agw/admin/healthz` ne
 `Authorization: Bearer <key>` (an API key may also go in `X-API-Key`).
 
 The compose file also needs `CODER_SECRET`, the webhook signing secret that the gateway
-(`secret_env: CODER_SECRET`) and the Node coder share. The coder consults partners at the
-gateway's `base_url`, so set `A2AGW_BASE_URL` to an address the coder container can reach
-(for example `http://gateway:8000`) if it should; otherwise it answers without the review.
+(`secret_env: CODER_SECRET`) and the Node coder share, and `GATEWAY_SELF_KEY`, the key the
+gateway sends when it calls its own `echo` agent as a partner (put its hash under
+`principal_id: gateway-self`). Each turn the coder consults `echo` through the REST API at
+`sidecar.consult_url` (`http://gateway:8000/a2agw/v1`, the gateway as the coder container
+reaches it); the cards keep advertising `base_url`. To call `coder` yourself, generate a key
+and its hash with the one-liner above, put the hash in place of the `principal_id: caller`
+placeholder (no scope is needed to call an agent; the `a2agw:sidecar` scope and a
+`sidecar.clients` entry mapping `key:caller` to an agent id are only for consulting partners
+as that agent), and send the key as `X-API-Key` (for example
+`A2AGW_API_KEY=<key> a2agw call http://localhost:8000/agents/coder/ "write fizzbuzz" --tier internal`).
 
 The image tests are opt-in: `A2AGW_DOCKER_TESTS=1 uv run pytest tests/docker -q`.
 

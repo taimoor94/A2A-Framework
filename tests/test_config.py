@@ -462,3 +462,23 @@ def test_sidecar_clients_config(tmp_path):
     ):
         with pytest.raises(ValueError):
             GatewayConfig.model_validate({"base_url": "http://gw", "sidecar": bad})
+
+
+def test_sidecar_consult_url_config(tmp_path):
+    assert GatewayConfig.model_validate({"base_url": "http://gw"}).sidecar.consult_url is None
+    p = write(
+        tmp_path,
+        f"""\
+        base_url: http://localhost:8000
+        db_url: sqlite+aiosqlite:///{tmp_path / "g.db"}
+        sidecar:
+          consult_url: ${{CONSULT_URL}}
+        """,
+    )
+    cfg = load_config(p, env={"CONSULT_URL": "http://gateway:8000/a2agw/v1"})
+    host = build_host(cfg, config_dir=tmp_path)
+    assert host.consult_tokens.url == "http://gateway:8000/a2agw/v1"
+    assert build_host(load_config(p, env={"CONSULT_URL": ""}), config_dir=tmp_path)
+    for bad in ("gateway:8000", "ftp://gw/a2agw/v1", 5):
+        with pytest.raises(ValueError):
+            GatewayConfig.model_validate({"base_url": "http://gw", "sidecar": {"consult_url": bad}})
