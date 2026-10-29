@@ -25,6 +25,8 @@ from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from opentelemetry import context as otel_context
+
 from a2agw.consult.tools import PartnerTool, invoke, rejection
 from a2agw.context.call_context import (
     CallContext,
@@ -36,6 +38,7 @@ from a2agw.context.call_context import (
 )
 from a2agw.gateway.auth import SidecarAuthError, SidecarIdentity
 from a2agw.ops.audit import AuditEvent
+from a2agw.ops.telemetry import extract_parent
 
 if TYPE_CHECKING:
     from a2agw.serve.host import AgentHost
@@ -78,21 +81,29 @@ def unknown(partner_id: str, reason: str = UNKNOWN_PARTNER) -> dict[str, Any]:
 def _acting_as(ident: SidecarIdentity, grant_id: str | None) -> Iterator[None]:
     """The context an embedded agent's tool call would run in: its call context, inbound
     task, caller and agent id. A standalone call is a fresh root with no inbound task. A
-    linked call's partner calls are audited with ``grant_id``."""
+    linked call's partner calls are audited with ``grant_id``, and continue the turn's trace
+    (the binding's traceparent is the turn's inbound span, see ``GrantIssuer``)."""
     b = ident.binding
+    parent = None
     if b is not None:
         call = b.call or CallContext.new(ident.agent_id)
         task_id, principal = b.inbound_task_id, b.caller
+        parent = extract_parent(call.traceparent)
     else:
         call, task_id, principal = CallContext.new(ident.agent_id), None, ident.principal
-    with (
-        use_call(call),
-        use_inbound(task_id, principal),
-        use_inbound_token(None),
-        use_agent(ident.agent_id),
-        use_grant(grant_id),
-    ):
-        yield
+    attached = otel_context.attach(parent) if parent is not None else None
+    try:
+        with (
+            use_call(call),
+            use_inbound(task_id, principal),
+            use_inbound_token(None),
+            use_agent(ident.agent_id),
+            use_grant(grant_id),
+        ):
+            yield
+    finally:
+        if attached is not None:
+            otel_context.detach(attached)
 
 
 @dataclass

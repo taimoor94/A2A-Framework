@@ -9,7 +9,7 @@ a2agw's inbound side is checked with the official A2A Technology Compatibility K
 | TCK commit | `d4d6fae7887f88ef607fb461c13e3b0e1802f19b` (2026-10-22) |
 | Spec tested | A2A 1.0 (the TCK's `specification/`, A2A commit `1736957`) |
 | a2a-sdk | 1.2.3 |
-| Date | 2026-10-26 (re-run after Phase 2; first run 2026-10-25) |
+| Date | 2026-10-29 (re-run after Phase 3; earlier runs 2026-10-26 and 2026-10-25) |
 | Transports | JSON-RPC, HTTP+JSON (a2agw does not serve gRPC) |
 | SUT | `examples/tck_sut/sut_agent.py`: one `AgentSpec` + `CallableAdapter` on `AgentHost`, port 9999, no auth, push notifications on (`PushSettings(allow_private=True)`) |
 
@@ -21,6 +21,13 @@ a2agw's inbound side is checked with the official A2A Technology Compatibility K
 |---|---|---|---|
 | tests | 155 | 0 | 80 |
 | requirements | 82 | 0 | 11 skipped, 21 not tested |
+
+Re-run on 2026-10-29 at the end of Phase 3 (sidecar webhook and stdio agents, the outbound
+REST API and MCP server, six framework adapters, the Docker image): `scripts/run_tck.sh`
+exits 0 with the same numbers, 155 passed, 0 failed, 80 skipped (30 deselected as non-MUST),
+MUST compatibility 82 of 114 requirements passing, 0 failing, 11 skipped, 21 not tested
+(79.6%). The SUT is unchanged; the sidecar routes (`/a2agw/v1`, `/a2agw/mcp`) are outside
+the A2A surface the TCK tests, and the MCP server is off unless configured.
 
 Re-run on 2026-10-26 at the end of Phase 2 (signed cards, OAuth2, mTLS, policy, audit, push,
 PostgreSQL, guarded network, signed call contexts): `scripts/run_tck.sh` exits 0 with the same

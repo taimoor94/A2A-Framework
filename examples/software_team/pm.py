@@ -5,9 +5,11 @@ from ``as_langchain_tools`` directly, exactly as a tool-calling model would. The
 
 1. asks the architect for a design and, when the architect needs input, answers from its own
    state ("PostgreSQL") on the same task and context;
-2. asks security for a review with a short wait, gets a ``working`` handle back, and calls
+2. with the Node coder on the team (``coder=True``), asks it to implement the design (the
+   coder consults security itself, through the gateway's REST API);
+3. asks security for a review with a short wait, gets a ``working`` handle back, and calls
    ``a2a_wait`` until the review is done;
-3. assembles both answers into one report.
+4. assembles the answers into one report.
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ class PMState(TypedDict, total=False):
     goal: str
     database: str
     design: str
+    code: str
     review: str
 
 
@@ -62,7 +65,7 @@ def _expect_completed(result: dict[str, Any], who: str) -> str:
     return result.get("text") or ""
 
 
-def build_graph(host: AgentHost):
+def build_graph(host: AgentHost, *, coder: bool = False):
     async def ask_architect(state: PMState) -> dict[str, Any]:
         ask = _tools(host)["ask_architect"]
         result = await _call(ask, {"message": f"Design a todo API: {state['goal']}"})
@@ -77,6 +80,11 @@ def build_graph(host: AgentHost):
                 },
             )
         return {"design": _expect_completed(result, "architect")}
+
+    async def ask_coder(state: PMState) -> dict[str, Any]:
+        ask = _tools(host)["ask_coder"]
+        result = await _call(ask, {"message": f"Implement the design:\n{state['design']}"})
+        return {"code": _expect_completed(result, "coder")}
 
     async def ask_security(state: PMState) -> dict[str, Any]:
         tools = _tools(host)
@@ -93,7 +101,10 @@ def build_graph(host: AgentHost):
         return {"review": _expect_completed(result, "security")}
 
     async def assemble(state: PMState) -> dict[str, Any]:
-        report = f"## Architecture\n\n{state['design']}\n\n## Security review\n\n{state['review']}"
+        code = f"## Code\n\n{state['code']}\n\n" if state.get("code") else ""
+        report = (
+            f"## Architecture\n\n{state['design']}\n\n{code}## Security review\n\n{state['review']}"
+        )
         return {"messages": [AIMessage(content=report)]}
 
     graph = StateGraph(PMState)
@@ -101,7 +112,12 @@ def build_graph(host: AgentHost):
     graph.add_node("ask_security", ask_security)
     graph.add_node("assemble", assemble)
     graph.add_edge(START, "ask_architect")
-    graph.add_edge("ask_architect", "ask_security")
+    if coder:
+        graph.add_node("ask_coder", ask_coder)
+        graph.add_edge("ask_architect", "ask_coder")
+        graph.add_edge("ask_coder", "ask_security")
+    else:
+        graph.add_edge("ask_architect", "ask_security")
     graph.add_edge("ask_security", "assemble")
     graph.add_edge("assemble", END)
     return graph.compile(checkpointer=InMemorySaver())
@@ -111,7 +127,7 @@ def _input(ctx: InboundContext) -> dict[str, Any]:
     return {"messages": [("user", ctx.text)], "goal": ctx.text, "database": DATABASE}
 
 
-def pm_agent(host: AgentHost) -> AgentSpec:
+def pm_agent(host: AgentHost, *, coder: bool = False) -> AgentSpec:
     return AgentSpec(
         id="pm",
         name="PM",
@@ -124,5 +140,5 @@ def pm_agent(host: AgentHost) -> AgentSpec:
                 examples=["Build a todo API"],
             )
         ],
-        adapter=GraphAdapter(build_graph(host), input_mapper=_input),
+        adapter=GraphAdapter(build_graph(host, coder=coder), input_mapper=_input),
     )

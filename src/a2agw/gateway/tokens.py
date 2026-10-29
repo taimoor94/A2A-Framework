@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from a2agw.gateway.protocol import ConsultGrant
+from a2agw.ops.telemetry import with_current_traceparent
 
 if TYPE_CHECKING:
     from a2agw.context.call_context import CallContext
@@ -190,7 +191,10 @@ class GrantIssuer:
         return f"GrantIssuer({self.tokens!r})"
 
     async def __call__(self, ctx: InboundContext) -> ConsultGrant:
-        return self.tokens.issue(ctx.agent_id, ctx.task_id, ctx.call, ctx.principal)
+        # Issued inside the turn's ``a2agw.inbound`` span: the binding's call context carries
+        # that span as its traceparent, so the turn's linked calls continue its trace.
+        call = with_current_traceparent(ctx.call) if ctx.call is not None else None
+        return self.tokens.issue(ctx.agent_id, ctx.task_id, call, ctx.principal)
 
     def revoke(self, grant: ConsultGrant) -> None:
         self.tokens.revoke(grant)

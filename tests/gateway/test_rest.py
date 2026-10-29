@@ -94,6 +94,39 @@ async def test_linked_consult_links_inbound_task(env):
     assert handle["caller_id"] == "anonymous" and handle["owner"] is None
 
 
+async def test_linked_consult_continues_the_turn_trace(env, spans):
+    """A linked call is a child of the turn's inbound span, even though the request arrives
+    with no trace context of its own (a sidecar agent in another process)."""
+    from opentelemetry import context as otel_context
+
+    async def a_run(ctx):
+        grant = await e.host.consult_issuer(ctx)
+        detached = otel_context.attach(otel_context.Context())  # as from another process
+        try:
+            await e.hc.post(
+                f"{V1}/partners/b/messages", json={"message": "hi"}, headers=bearer(grant)
+            )
+        finally:
+            otel_context.detach(detached)
+        yield Done(text="ok")
+
+    e = await env(spec("a", Fn(a_run)), spec("b", Fn(echo)))
+    await e.register("b")
+    await e.send("a", "go")
+    done = [s for s in spans.get_finished_spans() if s.name.startswith("a2agw.")]
+    [a_in] = [
+        s for s in done if s.name == "a2agw.inbound" and s.attributes["a2agw.agent_id"] == "a"
+    ]
+    [call] = [s for s in done if s.name == "a2agw.partner_call"]
+    [b_in] = [
+        s for s in done if s.name == "a2agw.inbound" and s.attributes["a2agw.agent_id"] == "b"
+    ]
+    assert call.parent is not None and call.parent.span_id == a_in.context.span_id
+    assert {a_in.context.trace_id, call.context.trace_id, b_in.context.trace_id} == {
+        a_in.context.trace_id
+    }
+
+
 async def test_cancel_inbound_cascades_to_token_started_partner_task(env):
     b = Blocker()
     seen: dict[str, Any] = {}

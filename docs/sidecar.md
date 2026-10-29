@@ -160,6 +160,24 @@ if body.protocol != "a2agw.invoke/1":      reject 400
 Parse the body only after the check, and compare in constant time. Keep the endpoint on a
 loopback or private address; the signature proves the request came from your gateway.
 
+The same check in Node (standard library), from
+[`examples/node_coder/agent.mjs`](../examples/node_coder/agent.mjs):
+
+```js
+import { createHmac, timingSafeEqual } from "node:crypto";
+
+function verified(headers, raw /* Buffer, as received */) {
+  const ts = headers["x-a2agw-timestamp"];
+  const sig = headers["x-a2agw-signature"];
+  if (typeof ts !== "string" || typeof sig !== "string" || !/^\d{1,12}$/.test(ts)) return false;
+  if (Math.abs(Date.now() / 1000 - Number(ts)) > 300) return false;
+  const mac = createHmac("sha256", secret).update(`${ts}.`).update(raw).digest("hex");
+  const expected = Buffer.from(`v1=${mac}`);
+  const given = Buffer.from(sig);
+  return given.length === expected.length && timingSafeEqual(given, expected);
+}
+```
+
 ## Stdio transport
 
 The agent is a long-lived local process that the gateway starts and supervises. It reads
@@ -317,6 +335,9 @@ and is linked to the inbound task:
   token's SHA-256, so they can be traced to the grant (never the token itself).
 - The call context is propagated: the partner sees this task's hop count, path, deadline and
   budget, so loops and runaway recursion are caught as for any other call.
+- The call continues the turn's trace: its `a2agw.partner_call` span is a child of the
+  turn's `a2agw.inbound` span, though the request itself carries no trace context. The agent
+  needs no tracing code for its partner calls to be in the caller's trace.
 
 The token is valid for this turn only. It stops working when the turn ends (however it ends:
 completed, failed, cancelled, or waiting for input; a resumed turn gets a new token), at the
@@ -543,3 +564,30 @@ instead.
   }
 }
 ```
+
+## Worked example
+
+`examples/software_team` runs the whole sidecar surface in one network
+(`uv run python examples/software_team/run_demo.py`, Node 24 needed):
+
+- [`examples/node_coder`](../examples/node_coder/README.md) is a webhook agent in Node's
+  standard library. It verifies the signature and timestamp, streams `status`, `text` and
+  `done`, consults `security` with its consult token during the turn (a linked call: its
+  handle's `inbound_task_id` is the coder's task), and stops when the gateway disconnects.
+- [`examples/mcp_client/client.py`](../examples/mcp_client/client.py) is an MCP-only agent.
+  It connects to `/a2agw/mcp/pm-desk` with an API key scoped `a2agw:sidecar` (mapped to
+  `pm-desk` in `sidecar.clients`), lists the tools, calls `ask_pm` and waits with `a2a_wait`.
+
+The run is one trace and one audit chain; `tests/integration/test_phase3_demo.py` checks both,
+and that no secret, consult token or API key reaches a log.
+
+## Limitations
+
+- **No push to sidecar agents (spec §11a.7).** The optional authenticated webhook receiver
+  for partner push notifications is deferred to Phase 4+. A sidecar agent follows a long
+  partner task by polling: `GET .../tasks/{task_id}`, `POST /wait`, or the MCP tools
+  `a2a_check_task` and `a2a_wait`.
+- **Token-exchange partners** cannot be consulted from a sidecar (see
+  [Consulting partners](#consulting-partners)).
+- **One gateway per SQLite file:** don't run `a2agw mcp` (stdio) next to an `a2agw serve` on
+  the same SQLite database (see [Stdio](#stdio)).

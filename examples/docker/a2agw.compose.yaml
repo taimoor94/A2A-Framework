@@ -11,10 +11,11 @@ agents:
   - spec: "echo_agent:echo"
   - id: coder
     name: Coder
-    description: Placeholder Node coder agent (examples/node_coder).
+    description: Writes code from a design (a Node webhook agent, examples/node_coder).
     skills:
       - id: code
         name: Code
         description: Writes code.
     webhook:
       url: http://coder:9000/a2agw/invoke
+      secret_env: CODER_SECRET   # HMAC signing secret, shared with the coder service

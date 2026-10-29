@@ -6,6 +6,7 @@ A framework-agnostic gateway for the [A2A (Agent2Agent) protocol](https://a2a-pr
 
 - One `AgentHost` serves many agents at `/agents/<id>/`, over JSON-RPC and HTTP+JSON, with streaming, cancel, and multi-turn (`input-required`).
 - Adapters: plain callables (sync, async, generators), LangChain runnables, LangGraph graphs (`interrupt()` becomes `input-required`), and agents from the OpenAI Agents SDK, the Claude Agent SDK, Google ADK, AG2, LlamaIndex and CrewAI.
+- Sidecar for agents in any language: the gateway serves an HTTP endpoint (webhook) or a supervised process (stdio) as an A2A agent, and agents consult partners through an outbound REST API or an MCP server (Claude Code, Cursor and other MCP clients). See [Sidecar: agents in any language](#sidecar-agents-in-any-language).
 - Partner registry with card fetch, pinning, change quarantine, and approval.
 - Partner tools with task handles (`ask_<id>`, `a2a_check_task`, `a2a_cancel_task`, `a2a_wait`), and a discovery mode (`find_partners`, `consult_partner`) above 12 partners.
 - Resilience on outbound calls: deadline, jittered retries, circuit breaker, per-partner bulkhead.
@@ -14,7 +15,8 @@ A framework-agnostic gateway for the [A2A (Agent2Agent) protocol](https://a2a-pr
 - OpenTelemetry tracing, JSON logs, and a read-only admin API with an SSE event stream.
 - SQLite or PostgreSQL (`pip install a2a-gateway[postgres]`) task store, with recovery of in-flight tasks on restart. Several gateways can share one PostgreSQL database if each serves different agent ids (one gateway per agent id per database); the audit chain is serialized across them by an advisory lock. SQLite is for a single process.
 - Security hardening (all configurable in `a2agw.yaml`): signed Agent Cards (ours signed, partners' verified and quarantined on a key change), OAuth2 client credentials and token exchange, mTLS both ways, a policy engine (authz, egress classification ceilings, routing), a hash-chained audit log, signed call contexts between gateways, and guarded push notifications. See [Security hardening](#security-hardening).
-- A CLI: `init [--secure]`, `serve`, `partners`, `card validate`, `call`, `audit export|verify`, `tasks reap`.
+- A CLI: `init [--secure]`, `serve`, `mcp`, `partners`, `card validate`, `call`, `audit export|verify`, `tasks reap`.
+- A Docker image and a compose example (gateway, PostgreSQL, a Node webhook agent). See [Docker](#docker).
 - **Conformance:** the inbound side passes the A2A TCK at MUST level. See [docs/conformance.md](docs/conformance.md).
 
 ## Install
@@ -31,6 +33,7 @@ uv add "a2a-gateway[adk]"          # adds the Google ADK adapter (not part of [a
 uv add "a2a-gateway[ag2]"          # adds the AG2 (1.x) adapter
 uv add "a2a-gateway[llamaindex]"   # adds the LlamaIndex adapter
 uv add "a2a-gateway[crewai]"       # adds the CrewAI adapter (own environment, not part of [all])
+uv add "a2a-gateway[mcp]"          # adds the outbound MCP server (/a2agw/mcp, `a2agw mcp`)
 ```
 
 `[all]` installs every extra except `adk`. google-adk caps `opentelemetry-api`/`opentelemetry-sdk` at 1.44 and `websockets` below 16, so installing it can downgrade those packages; add `[adk]` explicitly when you want the ADK adapter.
@@ -321,9 +324,101 @@ def tools_for_this_run():
 
 Give those tools to a tool-calling model, a LangGraph `ToolNode`, or call them directly. A partner call that outlasts `wait_seconds` returns a `working` result with a task handle; poll it with `a2a_check_task` or `a2a_wait`. If a partner needs input, the result has state `input_required` and a `question`; answer by calling the same tool again with that `task_id` and `context_id`. Without LangChain, `a2agw.adapters.callable.as_functions(tools, client)` gives plain async functions.
 
+## Sidecar: agents in any language
+
+An agent need not be Python, nor run inside the gateway. The gateway speaks A2A for it (cards,
+tasks, streaming, cancel, auth, audit) and hands it each turn over a small local contract,
+the invoke protocol `a2agw.invoke/1`. The full contract is in [docs/sidecar.md](docs/sidecar.md);
+[`examples/node_coder`](examples/node_coder/README.md) is a complete agent in Node's standard
+library.
+
+**Webhook.** The agent is an HTTP endpoint. Each turn is one signed `POST` (`X-A2AGW-Signature`:
+HMAC-SHA256 over the timestamp and the body); the agent answers with NDJSON events (`status`,
+`text`, ..., then `done`, `failed` or `need_input`), and closing the connection is the cancel
+signal.
+
+```yaml
+agents:
+  - id: coder
+    name: Coder
+    description: Writes code
+    skills: [{id: code, name: Code, description: Writes code}]
+    webhook:
+      url: http://127.0.0.1:9000/a2agw/invoke
+      secret_env: CODER_SECRET       # the signing secret, from the environment
+```
+
+**Stdio.** The gateway starts the agent as a process (`stdio: {command: [node, agent.js]}`),
+supervises and restarts it, and multiplexes turns over JSON lines on stdin and stdout.
+
+**Consulting partners (REST).** Every invoke carries a consult grant, `{url, token,
+expires_at}`. With `Authorization: Bearer <token>` the agent calls
+`POST {url}/partners/{partner_id}/messages` (and `GET /partners`, `.../tasks/{id}`, `/wait`,
+`/find` under `/a2agw/v1`). The gateway applies the agent's routing and egress policy, uses
+the partner's credentials, audits the call, links it to the inbound task (cancelling the
+task cancels it) and continues the turn's trace. The token is valid for the turn only and
+the agent never holds partner credentials. Processes outside a turn use an API key with the
+`a2agw:sidecar` scope instead, mapped to agent ids under `sidecar.clients`.
+
+**MCP.** The same partner tools are served over MCP, so an MCP-only agent needs no code of its
+own (`pip install 'a2a-gateway[mcp]'`):
+
+```yaml
+auth:
+  api_keys:
+    "<sha256 hex of the key>": {principal_id: claude-code, scopes: [a2agw:sidecar]}
+sidecar:
+  clients:
+    "key:claude-code": [pm-desk]     # this key may act as agent id pm-desk
+  mcp:
+    enabled: true                    # serves /a2agw/mcp/{agent_id}
+    agents: [pm-desk]
+```
+
+Claude Code (`.mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "a2agw": {
+      "type": "http",
+      "url": "https://gw.example.com/a2agw/mcp/pm-desk",
+      "headers": {"X-API-Key": "${A2AGW_API_KEY}"}
+    }
+  }
+}
+```
+
+Cursor (`.cursor/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "a2agw": {
+      "url": "https://gw.example.com/a2agw/mcp/pm-desk",
+      "headers": {"X-API-Key": "${env:A2AGW_API_KEY}"}
+    }
+  }
+}
+```
+
+The tools are `ask_<partner>` (or `find_partners` and `consult_partner` with many partners),
+`a2a_check_task`, `a2a_cancel_task` and `a2a_wait`. Clients that start servers as processes
+can run `a2agw mcp -c a2agw.yaml --agent pm-desk` (stdio) instead.
+[`examples/mcp_client/client.py`](examples/mcp_client/client.py) is a minimal MCP client
+doing what Claude Code would.
+
 ## Demo
 
-[`examples/software_team`](examples/software_team/README.md) runs three agents built with different frameworks (LangGraph, LangChain, plain Python) from one host. It shows `input-required` across agents, a long task polled through a handle, and one distributed trace. Run it with `uv run python examples/software_team/run_demo.py`.
+[`examples/software_team`](examples/software_team/README.md) is the demo network. An MCP-only
+agent (`pm-desk`) asks the PM (LangGraph) for a todo API through the gateway's MCP server and
+waits on the handle with `a2a_wait`. The PM gets a design from the architect (LangChain, with an
+`input-required` round trip), code from the Node coder (a webhook agent, started as a `node`
+subprocess), which itself consults security through the REST API with its consult token, and a
+long security review (plain Python) polled through a handle. The whole run is one distributed
+trace and one audit chain, both checked at the end. Run it with
+`uv run python examples/software_team/run_demo.py` (needs Node 24; `--phase1` runs the
+Python-only network without Node or MCP).
 
 ## Security defaults
 
@@ -536,7 +631,7 @@ extras in the lock); build a separate image for it. Compose (gateway, Postgres 1
 secrets come from your environment, never from the file:
 
 ```bash
-POSTGRES_PASSWORD=... docker compose -f examples/docker/compose.yaml up --build
+POSTGRES_PASSWORD=... CODER_SECRET=... docker compose -f examples/docker/compose.yaml up --build
 ```
 
 The examples ship a placeholder admin key hash (all zeros), so the admin API stays disabled.
@@ -545,6 +640,14 @@ Generate a key and its hash, then put the hash under `auth.api_keys` (or use `a2
 ```bash
 python -c "import secrets,hashlib;k=secrets.token_urlsafe(32);print(k,hashlib.sha256(k.encode()).hexdigest())"
 ```
+
+With `auth` set, every call except the agent cards and `/a2agw/admin/healthz` needs
+`Authorization: Bearer <key>` (an API key may also go in `X-API-Key`).
+
+The compose file also needs `CODER_SECRET`, the webhook signing secret that the gateway
+(`secret_env: CODER_SECRET`) and the Node coder share. The coder consults partners at the
+gateway's `base_url`, so set `A2AGW_BASE_URL` to an address the coder container can reach
+(for example `http://gateway:8000`) if it should; otherwise it answers without the review.
 
 The image tests are opt-in: `A2AGW_DOCKER_TESTS=1 uv run pytest tests/docker -q`.
 
@@ -647,6 +750,8 @@ When auth is not configured, every caller is the same principal, `anonymous`: id
                  |                      (callable / LangChain /  |
                  |                       LangGraph)              |
                  |                           │ partner tools     |
+                 |  Sidecar: webhook / stdio agents, REST        |
+                 |  /a2agw/v1, MCP /a2agw/mcp (any language)     |
    outbound A2A  |  Consult: registry, PartnerClient             |
   ◀───────────── |  (deadline, retry, breaker, SSRF guard)       |
                  |                                               |
@@ -655,7 +760,7 @@ When auth is not configured, every caller is the same principal, `anonymous`: id
                  +-----------------------------------------------+
 ```
 
-The core never imports a framework; adapters live in `a2agw.adapters.<name>` behind extras. See the [design spec](docs/superpowers/specs/2026-10-25-a2a-gateway-framework-design.md), the [Phase 1 plan](docs/superpowers/plans/2026-10-25-phase1-core.md) and the [Phase 2 plan](docs/superpowers/plans/2026-10-26-phase2-hardening.md).
+The core never imports a framework; adapters live in `a2agw.adapters.<name>` behind extras. See the [design spec](docs/superpowers/specs/2026-10-25-a2a-gateway-framework-design.md), the [Phase 1 plan](docs/superpowers/plans/2026-10-25-phase1-core.md), the [Phase 2 plan](docs/superpowers/plans/2026-10-26-phase2-hardening.md) and the [Phase 3 plan](docs/superpowers/plans/2026-10-26-phase3-gateway.md).
 
 ## Upgrading from Phase 1
 
@@ -669,7 +774,7 @@ The core never imports a framework; adapters live in `a2agw.adapters.<name>` beh
 ## Known limitations
 
 - Card trust is global: any trusted key (or allowlisted JWKS) may sign any partner's first card. Per-partner expected key ids are planned.
-- A signed call context can be replayed within its lifetime; a `jti` replay cache is Phase 3.
+- A signed call context can be replayed within its lifetime; a `jti` replay cache is planned (Phase 4+).
 - Some negative tests still wait a fixed time ("nothing happened within N ms").
 - SIGTERM is swallowed after the host exits when the process had no Python-level SIGTERM handler before (see `AgentHost.run`).
 - The per-caller cap is per host process, and all unauthenticated callers share one count. A send answered before its turn starts (`return_immediately`) can let a caller briefly exceed the cap by the sends racing it.
@@ -679,11 +784,15 @@ The core never imports a framework; adapters live in `a2agw.adapters.<name>` beh
 - Reaping an agent creates its (empty) `push_configs_<agent>` table when push is configured and the table does not exist yet.
 - TTL expiry only covers partner tasks started for an inbound task of one of the host's agents, or by one of its sidecar agents outside any inbound task (a standalone call to the outbound REST API, see [docs/sidecar.md](docs/sidecar.md)); a partner task started by other code outside any inbound task (a direct `host.client.consult(...)`) is not expired by any host.
 
+- **Partner push to sidecar agents (spec §11a.7, deferred to Phase 4+).** The optional authenticated webhook receiver for partner push notifications is not implemented: a sidecar or embedded agent learns about a long partner task by polling (`a2a_check_task`, `a2a_wait`, or the REST routes), not by push. Inbound push notifications to A2A callers are implemented.
+- A sidecar call never carries the inbound caller's own token, so a partner whose credentials come from an RFC 8693 token exchange cannot be consulted from a webhook, stdio or MCP agent (it fails closed with `credential error`).
+- `a2agw mcp` (stdio) opens the config's database: with SQLite, do not run it next to an `a2agw serve` on the same file; point the MCP client at that gateway's HTTP endpoint instead.
+- The CrewAI adapter needs an environment of its own (crewai pins `mcp<2` and `openai<3`), so a CrewAI crew and the MCP server cannot share one gateway process.
+
 ## Roadmap
 
-Phase 1 (the core) and Phase 2 (hardening: signed cards and quarantine, OAuth2 client credentials and token exchange, mTLS, the policy engine with classification, the audit log, push notifications, PostgreSQL, the SSRF guard with DNS-rebinding pinning, signed call contexts, and the boundary/attack test matrix in [docs/boundary-conditions.md](docs/boundary-conditions.md)) are implemented and described above. Everything below is planned and not implemented yet.
+Phase 1 (the core), Phase 2 (hardening: signed cards and quarantine, OAuth2 client credentials and token exchange, mTLS, the policy engine with classification, the audit log, push notifications, PostgreSQL, the SSRF guard with DNS-rebinding pinning, signed call contexts, and the boundary/attack test matrix in [docs/boundary-conditions.md](docs/boundary-conditions.md)) and Phase 3 (the gateway: the sidecar with webhook and stdio agents, the outbound REST API and MCP server, adapters for the OpenAI Agents SDK, the Claude Agent SDK, ADK, AG2, LlamaIndex and CrewAI, and the Docker image; done when a Node agent and an MCP-only agent joined the demo network) are implemented and described above. The optional partner-push receiver for sidecar agents (§11a.7) is deferred to Phase 4+ (see [Known limitations](#known-limitations)). Everything below is planned and not implemented yet.
 
-- **Phase 3, gateway:** a sidecar service for agents in any language, an MCP gateway, adapters for CrewAI, OpenAI Agents, Claude Agent SDK, ADK, AG2 and LlamaIndex, and a Docker image.
 - **Phase 4, control plane:** a central registry, and the Console (a web UI to register and approve partners, edit policy, and inspect cross-agent traces), with SSO and RBAC.
 - **Phase 5, clusters and projects:** agent teams (Clusters) with an orchestrator, a project board, and human-in-the-loop in the Console.
 

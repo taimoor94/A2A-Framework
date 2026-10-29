@@ -118,7 +118,7 @@ def _free_port() -> int:
 
 def test_run_demo_smoke(capsys, monkeypatch):
     monkeypatch.setattr(security, "STEP_DELAY_S", 0.3)
-    code = run_demo.main(["--no-trace", "--port", str(_free_port())])
+    code = run_demo.main(["--phase1", "--no-trace", "--port", str(_free_port())])
     out = capsys.readouterr().out
     assert code == 0
     assert "COMPLETED" in out
