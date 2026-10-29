@@ -16,6 +16,7 @@ jobs:
   gate:
     # The main gate: the locked dev environment, every test with warnings as errors, lint.
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -32,6 +33,7 @@ jobs:
   crewai:
     # CrewAI conflicts with the dev group: its tests run in their own environment.
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -44,6 +46,7 @@ jobs:
     # What users get: a fresh resolution of the published extras (no lock), against the
     # adapter and gateway tests. ADK is not in [all] and CrewAI conflicts with it.
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -53,7 +56,7 @@ jobs:
       - run: uv venv --python ${{ env.PYTHON_VERSION }} .venv-fresh
       - run: >-
           VIRTUAL_ENV=.venv-fresh uv pip install '.[all]'
-          pytest pytest-asyncio respx langgraph-checkpoint-sqlite
+          pytest pytest-asyncio pytest-timeout respx langgraph-checkpoint-sqlite
       - run: >-
           .venv-fresh/bin/python -m pytest -q -W error
           tests/adapters tests/gateway tests/test_dev_env.py

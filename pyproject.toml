@@ -67,8 +67,9 @@ dev = [
     "google-adk>=2.13",
     "ag2>=1.2",
     "llama-index-core>=0.14.25",
+    "pytest-timeout>=2.4.0",
 ]
-crewai-test = ["pytest", "pytest-asyncio", "crewai>=1.15"]
+crewai-test = ["pytest", "pytest-asyncio", "pytest-timeout>=2.4.0", "crewai>=1.15"]
 
 [tool.uv]
 # crewai pins mcp<2 and openai<3, which the mcp/openai extras (and so all, and the dev group)
@@ -93,6 +94,8 @@ packages = ["src/a2agw"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+# A hung test fails with its stack instead of stalling the run (CI jobs are also capped).
+timeout = 120
 addopts = "--import-mode=importlib"
 testpaths = ["tests"]
 pythonpath = ["tests", "."]  # shared helpers (streaming_asgi) and examples/

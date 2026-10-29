@@ -31,6 +31,28 @@ def test_ci_workflow_jobs():
         assert path in fresh
     assert "--ignore=tests/adapters/test_adk.py" in fresh
     assert "--ignore=tests/adapters/test_crewai.py" in fresh
+    # pyproject sets pytest-timeout's ``timeout``: without the plugin, -W error fails on it.
+    assert "pytest-timeout" in fresh
+
+
+def test_ci_jobs_are_time_capped():
+    """A hung test must not hold a runner for GitHub's 6-hour default."""
+    jobs = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())["jobs"]
+    assert {name: job.get("timeout-minutes") for name, job in jobs.items()} == {
+        "gate": 20,
+        "crewai": 20,
+        "fresh-resolution": 20,
+    }
+
+
+def test_tests_have_a_per_test_timeout():
+    import tomllib
+
+    cfg = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    assert cfg["tool"]["pytest"]["ini_options"]["timeout"] == 120
+    groups = cfg["dependency-groups"]
+    for group in ("dev", "crewai-test"):
+        assert any(d.startswith("pytest-timeout") for d in groups[group]), group
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
