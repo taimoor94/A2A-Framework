@@ -32,6 +32,10 @@ claude = ["claude-agent-sdk>=0.2.174"]
 adk = ["google-adk>=2.13"]
 ag2 = ["ag2>=1.2"]
 llamaindex = ["llama-index-core>=0.14.25"]
+# Not in ``all`` and not in the dev group: crewai pins ``mcp<2`` and ``openai<3`` (see
+# [tool.uv] conflicts below and the README); its tests run in their own environment
+# (scripts/test-crewai.sh).
+crewai = ["crewai>=1.15"]
 all = [
     "langchain-core>=1.7",
     "langgraph>=1.2",
@@ -63,6 +67,24 @@ dev = [
     "google-adk>=2.13",
     "ag2>=1.2",
     "llama-index-core>=0.14.25",
+]
+crewai-test = ["pytest", "pytest-asyncio", "crewai>=1.15"]
+
+[tool.uv]
+# crewai pins mcp<2 and openai<3, which the mcp/openai extras (and so all, and the dev group)
+# cannot satisfy; current crewai also needs opentelemetry-api>=1.45.1, above google-adk's
+# <=1.44 cap. uv resolves the crewai extra and the crewai-test group on their own.
+conflicts = [
+    [{ extra = "crewai" }, { extra = "mcp" }],
+    [{ extra = "crewai" }, { extra = "openai" }],
+    [{ extra = "crewai" }, { extra = "all" }],
+    [{ extra = "crewai" }, { extra = "adk" }],
+    [{ extra = "crewai" }, { group = "dev" }],
+    [{ group = "crewai-test" }, { group = "dev" }],
+    [{ group = "crewai-test" }, { extra = "mcp" }],
+    [{ group = "crewai-test" }, { extra = "openai" }],
+    [{ group = "crewai-test" }, { extra = "all" }],
+    [{ group = "crewai-test" }, { extra = "adk" }],
 ]
 
 [tool.hatch.build.targets.wheel]

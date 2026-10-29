@@ -5,7 +5,7 @@ A framework-agnostic gateway for the [A2A (Agent2Agent) protocol](https://a2a-pr
 ## Features
 
 - One `AgentHost` serves many agents at `/agents/<id>/`, over JSON-RPC and HTTP+JSON, with streaming, cancel, and multi-turn (`input-required`).
-- Adapters: plain callables (sync, async, generators), LangChain runnables, LangGraph graphs (`interrupt()` becomes `input-required`), and agents from the OpenAI Agents SDK, the Claude Agent SDK, Google ADK, AG2 and LlamaIndex.
+- Adapters: plain callables (sync, async, generators), LangChain runnables, LangGraph graphs (`interrupt()` becomes `input-required`), and agents from the OpenAI Agents SDK, the Claude Agent SDK, Google ADK, AG2, LlamaIndex and CrewAI.
 - Partner registry with card fetch, pinning, change quarantine, and approval.
 - Partner tools with task handles (`ask_<id>`, `a2a_check_task`, `a2a_cancel_task`, `a2a_wait`), and a discovery mode (`find_partners`, `consult_partner`) above 12 partners.
 - Resilience on outbound calls: deadline, jittered retries, circuit breaker, per-partner bulkhead.
@@ -30,9 +30,12 @@ uv add "a2a-gateway[claude]"       # adds the Claude Agent SDK adapter
 uv add "a2a-gateway[adk]"          # adds the Google ADK adapter (not part of [all])
 uv add "a2a-gateway[ag2]"          # adds the AG2 (1.x) adapter
 uv add "a2a-gateway[llamaindex]"   # adds the LlamaIndex adapter
+uv add "a2a-gateway[crewai]"       # adds the CrewAI adapter (own environment, not part of [all])
 ```
 
 `[all]` installs every extra except `adk`. google-adk caps `opentelemetry-api`/`opentelemetry-sdk` at 1.44 and `websockets` below 16, so installing it can downgrade those packages; add `[adk]` explicitly when you want the ADK adapter.
+
+`crewai` is not part of `[all]` either, and cannot be installed next to it: crewai pins `mcp<2` and `openai<3`, while the `mcp` extra needs `mcp>=2.3` and the `openai` extra's `openai-agents` needs `openai>=3` (current crewai also needs `opentelemetry-api>=1.45.1`, above google-adk's cap). Serve CrewAI crews from a gateway in an environment of its own, with `[crewai]` and without `[mcp]`, `[openai]`, `[adk]` or `[all]`. The project declares these as uv conflicts; in this repository the CrewAI tests run in their own virtualenv with `scripts/test-crewai.sh`.
 
 `pip install a2a-gateway` works the same way.
 
@@ -251,7 +254,7 @@ assistant = AgentSpec(
 
 ### A LlamaIndex agent
 
-`LlamaIndexAdapter` runs a LlamaIndex agent workflow (a `FunctionAgent` or another agent such as `ReActAgent`, or an `AgentWorkflow`; import name `llama_index.core`) with `workflow.run(user_msg=..., ctx=..., memory=...)`. A real model needs its LLM integration and key, for example `llama_index.llms.openai.OpenAI(model=...)` with `OPENAI_API_KEY`. There is one conversation per caller and A2A `contextId`, so follow-up messages continue it and another caller sending the same `contextId` starts its own. A conversation is a workflow `Context`, reused across turns, plus its chat memory, which the adapter passes to each run (LlamaIndex cannot carry the memory over in a reused `Context`). The 10,000 most recently used conversations are kept, and by default each memory is a `ChatMemoryBuffer` keeping its last 200 messages (a turn is never split, so a tool call keeps its result). To keep conversations across restarts, pass `memory_factory(key)` returning memory on a persistent chat store, with `durable_sessions=True`; without a `memory_factory`, `durable_sessions=True` is refused. Memories from a factory are never trimmed. Streamed deltas (`AgentStream`) become the `output` artifact; a model that does not stream answers with the final output when the turn ends. Each tool call shows as a `calling <tool>` status; token usage is not reported. Errors fail the task. Cancelling the A2A task cancels the workflow run, and the conversation keeps its memory but continues in a fresh `Context`. The adapter adds no telemetry exporter, and tokenizers come from the copies bundled with `llama-index-core`.
+`LlamaIndexAdapter` runs a LlamaIndex agent workflow (a `FunctionAgent` or another agent such as `ReActAgent`, or an `AgentWorkflow`; import name `llama_index.core`) with `workflow.run(user_msg=..., ctx=..., memory=...)`. A real model needs its LLM integration and key, for example `llama_index.llms.openai.OpenAI(model=...)` with `OPENAI_API_KEY`. There is one conversation per caller and A2A `contextId`, so follow-up messages continue it and another caller sending the same `contextId` starts its own. A conversation is a workflow `Context`, reused across turns, plus its chat memory, which the adapter passes to each run (LlamaIndex cannot carry the memory over in a reused `Context`). The 10,000 most recently used conversations are kept, and by default each memory is a `ChatMemoryBuffer` keeping its last 200 messages (a turn is never split, so a tool call keeps its result). To keep conversations across restarts, pass `memory_factory(key)` returning memory on a persistent chat store, with `durable_sessions=True`; without a `memory_factory`, `durable_sessions=True` is refused. Memories from a factory are never trimmed. Streamed deltas (`AgentStream`) become the `output` artifact; a model that does not stream answers with the final output when the turn ends. Each tool call shows as a `calling <tool>` status. Token usage is best effort: LlamaIndex has no provider-neutral usage, so the adapter reads each model call's raw provider response for OpenAI-style (`prompt_tokens`/`completion_tokens`) or Anthropic-style (`input_tokens`/`output_tokens`) usage and reports the turn's sum; providers that put usage elsewhere, or streams whose last chunk has none, report nothing. Errors fail the task. Cancelling the A2A task cancels the workflow run, and the conversation keeps its memory but continues in a fresh `Context`. The adapter adds no telemetry exporter, and tokenizers come from the copies bundled with `llama-index-core`.
 
 ```python
 from llama_index.core.agent.workflow import FunctionAgent
@@ -271,6 +274,31 @@ assistant = AgentSpec(
 ```
 
 `as_llamaindex_tools(tools, host.client)` projects partners as `FunctionTool`s whose `fn_schema` declares the partner tool's JSON schema verbatim (not inferred from a Python signature) and which return the JSON envelope. Give them to the agent once the host has started, for example `agent.tools = as_llamaindex_tools(host.partner_tools("assistant"), host.client)`. [examples/adapters/llamaindex_example.py](examples/adapters/llamaindex_example.py) runs offline with a scripted model.
+
+### A CrewAI crew
+
+`CrewAIAdapter` runs a CrewAI `Crew` with `await crew.akickoff(inputs={"input": <message text>, "context_id": <contextId>})` and answers with `str(result)`. CrewAI needs its own environment (see [Install](#install)). The crew is a template: a task or agent names `{input}` (or the `input_key` you pass), which CrewAI fills with the message text, and may name `{context_id}`. A crew whose tasks and agents never mention `{input}` is refused. Each turn kicks off its own copy of the crew, so turns on different contexts run at once; turns on one caller and `contextId` run one at a time. A crew holds nothing between kickoffs, so a follow-up message is a fresh run that does not see the previous one. CrewAI memory (`memory=` on the crew or an agent) is refused: it is one store shared by every kickoff, so callers and contexts would read each other's memories. CrewAI's record of each kickoff's inputs and task outputs, which it normally writes to one SQLite file in the user data directory, stays in memory per turn. Token usage from `crew.usage_metrics` is reported per turn. The answer is not streamed: CrewAI's stream carries the raw model output of every task and agent, intermediate tasks and tool-call scaffolding included, without marking the final answer. Errors fail the task. Cancelling the A2A task stops the kickoff at its next step: CrewAI runs each model or tool call in a worker thread, and the one in flight finishes there and is dropped. Partner calls in flight are cancelled, and a partner call started after that is answered `unavailable`.
+
+CrewAI sends anonymous telemetry to telemetry.crewai.com and can collect traces when a crew runs (importing it makes no network call). Set `CREWAI_DISABLE_TELEMETRY=true` and `CREWAI_TRACING_ENABLED=false` (or `OTEL_SDK_DISABLED=true`) in the gateway's environment to turn both off.
+
+```python
+from crewai import LLM, Agent, Crew, Task
+
+from a2agw import AgentSpec, SkillSpec
+from a2agw.adapters.crewai import CrewAIAdapter
+
+helper = Agent(role="Assistant", goal="Answer helpfully", backstory="You help.", llm=LLM(model="openai/gpt-5-mini"))
+crew = Crew(agents=[helper], tasks=[Task(description="{input}", expected_output="An answer", agent=helper)])
+assistant = AgentSpec(
+    id="assistant",
+    name="Assistant",
+    description="A CrewAI crew.",
+    skills=[SkillSpec(id="chat", name="Chat", description="Answers questions")],
+    adapter=CrewAIAdapter(crew),
+)
+```
+
+`as_crewai_tools(tools, host.client)` projects partners as CrewAI `BaseTool`s that return the JSON envelope. Their `args_schema` declares the partner tool's JSON schema, with optional properties also accepting `null`: CrewAI declares tools to models in OpenAI strict mode, where every property is required and every object closed, so `null` is how a model leaves an optional argument out (the adapter drops nulls). A side effect of strict mode is that the free-form `data` object can only be sent empty. Answers are never cached. CrewAI calls tools from worker threads, and the partner call runs on the gateway's event loop, so make the tools inside that loop once the host has started, for example `crew.agents[0].tools = as_crewai_tools(host.partner_tools("assistant"), host.client)`. [examples/adapters/crewai_example.py](examples/adapters/crewai_example.py) runs offline with a scripted model.
 
 ### An agent that consults partners
 
