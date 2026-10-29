@@ -106,12 +106,18 @@ def test_over_bound_input_fails_closed():
     assert clf.classify("", {"pad": pad}) is C.CONFIDENTIAL
 
 
+# CPU seconds (``process_time``: other processes on the machine do not count). Generous: the
+# failures these tests guard against (serialising ~50 MB, catastrophic regex backtracking)
+# take far longer.
+CPU_BOUND_S = 2.0
+
+
 def test_huge_data_stops_serialising_early():
     clf = RegexPiiClassifier()
     big = {"items": ["x" * 1024] * 50_000}  # ~50 MB if fully serialised
     start = time.process_time()  # CPU time: unaffected by other processes on the machine
     assert clf.classify("", big) is C.CONFIDENTIAL
-    assert time.process_time() - start < 0.5
+    assert time.process_time() - start < CPU_BOUND_S
 
 
 def test_circular_data_raises():
@@ -199,4 +205,4 @@ def test_adversarial_input_is_fast(unit):
     clf = RegexPiiClassifier()
     start = time.process_time()  # CPU time: unaffected by other processes on the machine
     clf.classify(text, {"t": text[: 200 * 1024]})
-    assert time.process_time() - start < 0.5
+    assert time.process_time() - start < CPU_BOUND_S

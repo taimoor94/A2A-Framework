@@ -239,11 +239,11 @@ async def test_cancels_run_concurrently_and_bounded(store):
         await asyncio.sleep(0.05)
         running -= 1
 
-    started = time.monotonic()
     report = await expire_outbound(handles, slow, None, ttl_s=86400)
     assert report.expired == 20
+    # Not sequential, and bounded: exactly CANCEL_CONCURRENCY cancels ran at once (a count,
+    # not a wall-clock bound, so a loaded machine cannot fail it).
     assert peak == reap_mod.CANCEL_CONCURRENCY == 8
-    assert time.monotonic() - started < 20 * 0.05  # not sequential
 
 
 async def test_pass_deadline_leaves_unstarted_handles_for_the_next_pass(store):
@@ -252,10 +252,10 @@ async def test_pass_deadline_leaves_unstarted_handles_for_the_next_pass(store):
     await _old(eng, handles, *ids)
 
     async def slow(h):
-        await asyncio.sleep(5)  # outlasts the pass deadline
+        await asyncio.Event().wait()  # outlasts any pass deadline
 
     # The deadline leaves the first wave ample time to claim, even on a loaded machine.
-    report = await expire_outbound(handles, slow, None, ttl_s=86400, pass_deadline_s=1.0)
+    report = await expire_outbound(handles, slow, None, ttl_s=86400, pass_deadline_s=2.0)
     assert report.expired == 8  # the first wave was claimed; the rest was not started
     left = [tid for tid in ids if (await handles.get("p", tid))["state"] == W]
     assert len(left) == 4

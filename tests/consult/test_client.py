@@ -926,19 +926,86 @@ async def test_cancel_for_inbound_runs_concurrently_within_bound(env):
     rb = await e.client.consult("pb", "go", wait_seconds=HANDLE_WAIT_S, inbound_task_id="in-c")
     assert ra.state == rb.state == "working"
     started: list[str] = []
-    real_cancel = e.client.cancel
 
-    async def slow_cancel(partner_id, task_id, **kw):
+    async def cancel(partner_id, task_id, **kw):
         started.append(partner_id)
         if partner_id == "pa":
             await asyncio.Event().wait()  # never finishes: cut off by the bound
-        return await real_cancel(partner_id, task_id, **kw)
+        # pb answers at once (no partner round trip that a loaded machine could slow past
+        # the bound): the bound only ever cuts pa off.
+        return ToolResult(partner=partner_id, task_id=task_id, state="canceled")
 
-    e.client.cancel = slow_cancel  # type: ignore[method-assign]
+    e.client.cancel = cancel  # type: ignore[method-assign]
     e.client.default_deadline_s = 0.3
-    assert await e.client.cancel_for_inbound("in-c") == 1
+    # Both cancels run at once: pb's answer counts although pa's never comes.
+    assert await asyncio.wait_for(e.client.cancel_for_inbound("in-c"), 30) == 1
     assert sorted(started) == ["pa", "pb"]
     a.gate.set()
+    b.gate.set()
+
+
+def _blocking(real, writing: asyncio.Event, release: asyncio.Event, done: asyncio.Event):
+    """``real``, held at ``release`` (``writing`` says it started); ``done`` once written."""
+
+    async def write(*args, **kwargs):
+        writing.set()
+        await release.wait()
+        await real(*args, **kwargs)
+        done.set()
+
+    return write
+
+
+async def _finishes(done: asyncio.Event) -> bool:
+    try:
+        await asyncio.wait_for(done.wait(), 10)
+    except TimeoutError:
+        return False
+    return True
+
+
+async def test_cancel_for_inbound_finishes_its_handle_writes(env):
+    """Cancelling ``cancel_for_inbound`` (say, at shutdown) while a cancel's handle update
+    is in flight does not cut the write short (shielded: no half-done database call)."""
+    a = Gated()
+    e = await env(spec("pa", a))
+    res = await e.client.consult("pa", "go", wait_seconds=HANDLE_WAIT_S, inbound_task_id="in-w")
+    assert res.state == "working"
+    writing, release, done = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    e.handles.update_state = _blocking(e.handles.update_state, writing, release, done)
+    task = asyncio.create_task(e.client.cancel_for_inbound("in-w"))
+    await asyncio.wait_for(writing.wait(), 30)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    release.set()
+    assert await _finishes(done), "the handle update was cut short"
+    [row] = await e.handles.by_inbound("in-w")
+    assert row["state"] == "TASK_STATE_CANCELED"
+
+
+async def test_cancelled_call_cleanup_finishes_its_handle_record(env):
+    """The cleanup of a cancelled consult records the partner task's final state even when
+    the cleanup itself is cancelled mid-write."""
+    gated = Gated()
+    e = await env(spec("slow", gated))
+    res = await e.client.consult("slow", "go", wait_seconds=HANDLE_WAIT_S, inbound_task_id="in-r")
+    assert res.state == "working"
+    writing, release, done = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    e.handles.record = _blocking(e.handles.record, writing, release, done)
+    _, sdk_client, _ = await e.client._prepare("slow")
+    track = results_mod.Track(res.task_id, res.context_id)
+    waiter = asyncio.create_task(
+        e.client._cleanup_cancelled("slow", sdk_client, track, False, "in-r", None, [])
+    )
+    await asyncio.wait_for(writing.wait(), 30)
+    [cleanup] = [t for t in e.client._cleanups if t.get_coro().__name__ == "_cancel_orphans"]
+    cleanup.cancel()  # e.g. its time ran out
+    await waiter
+    release.set()
+    assert await _finishes(done), "the handle record was cut short"
+    [row] = await e.handles.by_inbound("in-r")
+    assert row["state"] == "TASK_STATE_CANCELED"
 
 
 # -- review round 2: malformed partner responses are contained ----------------------

@@ -681,6 +681,16 @@ class PartnerClient:
         except Exception:
             logger.exception("could not record outbound handle for partner %s", partner_id)
 
+    async def _shielded(self, write: Awaitable[None]) -> None:
+        """Run a handle-store write to completion even if the caller is cancelled meanwhile
+        (a write cut short mid-statement leaves its database connection to the garbage
+        collector). The write is tracked like the cancellation cleanups, so ``aclose``
+        waits for it before the engine goes away."""
+        task = asyncio.ensure_future(write)
+        self._cleanups.add(task)
+        task.add_done_callback(self._cleanups.discard)
+        await asyncio.shield(task)
+
     async def _update_handle(self, partner_id: str, track: Track) -> None:
         state = track.state_name()
         if self.handles is None or track.task_id is None or state is None:
@@ -1240,14 +1250,17 @@ class PartnerClient:
                         )
                         state = TaskState.Name(TaskState.TASK_STATE_WORKING)
                     if self.handles is not None:
-                        await self.handles.record(
-                            tid,
-                            partner_id,
-                            track.context_id,
-                            inbound_task_id,
-                            origin,
-                            state,
-                            **_handle_ids(),
+                        # Shielded: the cleanup's own deadline must not cut the write short.
+                        await self._shielded(
+                            self.handles.record(
+                                tid,
+                                partner_id,
+                                track.context_id,
+                                inbound_task_id,
+                                origin,
+                                state,
+                                **_handle_ids(),
+                            )
                         )
         except TimeoutError:
             logger.warning("cleanup of cancelled call to partner %s timed out", partner_id)
@@ -1664,7 +1677,8 @@ class PartnerClient:
             return self._unavailable(partner_id, rec, "busy", task_id=task_id)
         finally:
             _caller.reset(token)
-        await self._update_handle(partner_id, track)
+        # Shielded: cancel_for_inbound cancels the cancels still running at its deadline.
+        await self._shielded(self._update_handle(partner_id, track))
         return build_result(partner_id, self._provenance(partner_id, rec), track)
 
     async def _fetch_reauth(

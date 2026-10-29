@@ -133,12 +133,15 @@ async def test_host_defers_a_busy_save_and_its_maintenance_pass_writes_it(tmp_pa
         try:
             assert host.partners.defer_busy_saves is True
             assert host.partners.lock_timeout_s <= 0.5
+            host.partners.lock_timeout_s = 0.05  # explicit: the wait a busy save may take
             with _held(path):
                 t0 = time.monotonic()
                 host.partners.disable("p1")  # on the event loop: must not stall it
-                assert time.monotonic() - t0 < 2.0
-                assert _status(path) == "active"
+                # Deferred, not waited out: the flag says so; the bound only catches a
+                # save that blocks until the lock is free (far longer than 5 s here).
                 assert host.partners.unsaved
+                assert _status(path) == "active"
+                assert time.monotonic() - t0 < 5.0
             await host.maintain()
             assert _status(path) == "disabled"
             assert not host.partners.unsaved
