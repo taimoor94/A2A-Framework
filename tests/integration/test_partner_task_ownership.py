@@ -284,3 +284,33 @@ async def test_message_only_partner_conversation_continues_for_its_owner_only(en
     assert (await host.maintain(now=time.time() + 30 * 86400)).expired == 0
     after = await host.handles.by_inbound(seen["a_task"])
     assert {(r["end_reason"], r["cancel_attempts"]) for r in after} == {("message reply", 0)}
+
+
+async def test_reused_partner_message_ids_never_share_a_conversation_record(env):
+    """A partner that reuses a message id across callers (or issues task ids starting
+    ``msg:``) must not hand one caller's conversation to another: each Message reply gets
+    its own record."""
+    from a2a.types import Message
+
+    from a2agw.consult.results import Track
+
+    e = await env(spec("a", Fn(replier)), spec("m", Fn(replier), direct_replies=True))
+    host = e.host
+    await e.register("m")
+    for inbound, ctx_id in (("in-a", "ctx-a"), ("in-b", "ctx-b")):
+        track = Track(None, ctx_id)
+        track.message = Message(message_id="dup", context_id=ctx_id)
+        await host.client._record_conversation("m", track, inbound, None)
+
+    rows = await host.handles.by_inbound("in-a") + await host.handles.by_inbound("in-b")
+    assert len({r["task_id"] for r in rows}) == 2, rows
+    assert all(r["task_id"] != "msg:dup" for r in rows)
+
+    def owns(ctx_id: str, inbound: str):
+        return host.client.owns_context(
+            "m", ctx_id, inbound_task_id=inbound, caller_id=None, owner=None
+        )
+
+    assert await owns("ctx-b", "in-b")
+    assert not await owns("ctx-b", "in-a")
+    assert await owns("ctx-a", "in-a")

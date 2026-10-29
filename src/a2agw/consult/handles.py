@@ -67,7 +67,7 @@ OUTBOUND_TABLE = _outbound  # read by the inbound side's re-entry check (serve.s
 
 # A partner that answers with a plain Message (no task) still started a conversation the
 # caller owns: it is recorded as a terminal handle with a synthetic task id
-# (``msg:<message id>``), state ``TASK_STATE_COMPLETED`` and this ``end_reason``. Being
+# (``msg:<fresh uuid>``), state ``TASK_STATE_COMPLETED`` and this ``end_reason``. Being
 # terminal and ended by a2agw, the cascade, recovery and the TTL expiry never touch it, a
 # partner state update cannot revive it, and ``PartnerClient.owns`` says it is no task.
 MESSAGE_TASK_PREFIX = "msg:"

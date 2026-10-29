@@ -702,10 +702,12 @@ class PartnerClient:
     ) -> None:
         """A plain Message reply (no task): record the conversation the caller now owns, so
         its own later consults with that context id pass ``owns_context``. The row is a
-        terminal, a2agw-ended handle with a synthetic task id (see ``MESSAGE_REPLY``)."""
+        terminal, a2agw-ended handle with a synthetic task id (see ``MESSAGE_REPLY``). The id
+        is always fresh, never the partner's message id: a partner reusing message ids (or
+        issuing ``msg:`` task ids) must not merge two callers' records into one."""
         if self.handles is None or track.message is None or track.context_id is None:
             return
-        mid = track.message.message_id or uuid.uuid4().hex
+        mid = uuid.uuid4().hex
         try:
             await self._shielded(
                 self.handles.record(
