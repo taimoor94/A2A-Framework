@@ -13,7 +13,9 @@ from a2agw.consult.client import PartnerClient
 from a2agw.core.events import Done, Failed
 
 
-@pytest.mark.parametrize("method", ["consult", "check", "cancel", "wait_any", "owns"])
+@pytest.mark.parametrize(
+    "method", ["consult", "check", "cancel", "wait_any", "owns", "owns_context"]
+)
 def test_fake_partner_client_mirrors_partner_client(method):
     def shape(fn):
         return [(p.name, p.kind, p.default) for p in inspect.signature(fn).parameters.values()]

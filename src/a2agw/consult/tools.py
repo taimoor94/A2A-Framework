@@ -564,6 +564,8 @@ async def _wait(
 UNKNOWN_PARTNER = "unknown partner"
 # Also a partner task the caller does not own: whether it exists is not revealed.
 UNKNOWN_TASK = "unknown task"
+# A partner conversation (context id) the caller did not take part in, or none recorded.
+UNKNOWN_CONTEXT = "unknown context"
 
 
 def _unknown(partner_id: str, reason: str) -> dict[str, Any]:
@@ -593,8 +595,10 @@ async def invoke(
     Partner tasks belong to whoever started them (``PartnerClient.owns``, for the inbound
     task ``inbound_task_id``, else the current one; with none, for ``owner`` and the
     caller): checking, cancelling, waiting on or replying to any other task answers
-    ``unknown task``, exactly like one that does not exist, and nothing is sent. A partner
-    the tool cannot reach answers ``unknown partner``."""
+    ``unknown task``, exactly like one that does not exist, and nothing is sent. So do
+    partner conversations: a consult with ``context_id`` continues only one whose every
+    handle the caller owns (``PartnerClient.owns_context``), else ``unknown context``. A
+    partner the tool cannot reach answers ``unknown partner``."""
     try:
         a = _check_object(args, tool.parameters, "") if isinstance(args, dict) else _bad("args")
     except _Invalid as e:
@@ -602,14 +606,14 @@ async def invoke(
     inbound = inbound_task_id if inbound_task_id is not None else current_inbound_task.get()
     principal = caller if caller is not None else current_principal.get()
 
+    ids = {
+        "inbound_task_id": inbound,
+        "caller_id": principal.id if principal is not None else None,
+        "owner": owner,
+    }
+
     async def owns(pid: str, tid: str) -> bool:
-        return await client.owns(
-            pid,
-            tid,
-            inbound_task_id=inbound,
-            caller_id=principal.id if principal is not None else None,
-            owner=owner,
-        )
+        return await client.owns(pid, tid, **ids)
 
     try:
         if tool.kind in ("consult", "consult_any"):
@@ -621,6 +625,12 @@ async def invoke(
                     return _unknown(pid, UNKNOWN_PARTNER)
             if a.get("task_id") is not None and not await owns(pid, a["task_id"]):
                 return _unknown(pid, UNKNOWN_TASK)
+            # A conversation the caller did not take part in (say, an id leaked in a partner
+            # result) is not continued: the partner may see one service identity for every
+            # caller, and would carry another caller's history into this one.
+            ctx = a.get("context_id")
+            if ctx is not None and not await client.owns_context(pid, ctx, **ids):
+                return _unknown(pid, UNKNOWN_CONTEXT)
             return _cap(
                 await client.consult(
                     pid,

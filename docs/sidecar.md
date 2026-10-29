@@ -420,8 +420,11 @@ under the same inbound task (by any of its turns); standalone, a task started by
 principal acting as the same agent id. Any other task, like one that does not exist, answers
 `{"partner": "<id>", "state": "unavailable", "reason": "unknown task"}`, and nothing is sent
 to the partner.
-Embedded agents' partner tools follow the same rule (`PartnerClient.owns` is the one
-predicate both paths use).
+Partner conversations too: a consult with `context_id` (and no `task_id`) continues only a
+conversation whose partner tasks the caller owns under the same rule; any other, or one no
+handle records, answers `{"partner": "<id>", "state": "unavailable", "reason": "unknown
+context"}`, and nothing is sent. Embedded agents' partner tools follow the same rules
+(`PartnerClient.owns` and `owns_context` are the predicates both paths use).
 
 A body that is not a JSON object is a `400`; one larger than 256 KiB is a `413`. Any other
 path under `/a2agw/v1` is a `404` (`405` for a known path with another method).

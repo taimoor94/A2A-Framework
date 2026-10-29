@@ -27,7 +27,14 @@ from typing import TYPE_CHECKING, Any
 
 from opentelemetry import context as otel_context
 
-from a2agw.consult.tools import UNKNOWN_PARTNER, UNKNOWN_TASK, PartnerTool, invoke, rejection
+from a2agw.consult.tools import (
+    UNKNOWN_CONTEXT,
+    UNKNOWN_PARTNER,
+    UNKNOWN_TASK,
+    PartnerTool,
+    invoke,
+    rejection,
+)
 from a2agw.context.call_context import (
     CallContext,
     use_agent,
@@ -47,6 +54,7 @@ __all__ = [
     "INBOUND_ENDED",
     "TOKEN_REVOKED",
     "TOO_MANY_OPEN",
+    "UNKNOWN_CONTEXT",
     "UNKNOWN_PARTNER",
     "UNKNOWN_TASK",
     "SidecarCalls",

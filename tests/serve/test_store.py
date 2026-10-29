@@ -443,3 +443,34 @@ async def test_message_ledger_supersede_is_won_once(engine):
     assert sum(wins) == 1
     assert (await ledger.get(key))["task_id"] is None  # held by the winner
     assert not await ledger.supersede(key, "t1", "f")  # stale task id: no effect
+
+
+async def test_handles_by_context(db_url):
+    """``by_context`` lists one partner's handles in one partner conversation (sqlite and
+    Postgres), the input of the context-ownership check."""
+    from a2agw.consult.handles import owned_context
+
+    eng = await create_engine(db_url)
+    try:
+        h = OutboundHandleStore(eng)
+        await h.initialize()
+        w = TaskState.Name(TaskState.TASK_STATE_WORKING)
+        await h.record("t1", "pa", "c1", "in-a", "o", w, caller_id="key:a")
+        await h.record("t2", "pa", "c1", "in-a", "o", w, caller_id="key:a")
+        await h.record("t3", "pb", "c1", "in-b", "o", w)  # another partner, same id
+        await h.record("t4", "pa", "c2", None, "o", w, caller_id="key:b", owner="sidecar:x")
+        rows = await h.by_context("pa", "c1")
+        assert [r["task_id"] for r in rows] == ["t1", "t2"]
+        assert await h.by_context("pa", "nope") == []
+        mine = {"inbound_task_id": "in-a", "caller_id": "key:a", "owner": None}
+        assert owned_context(rows, **mine)
+        assert not owned_context(rows, **{**mine, "inbound_task_id": "in-b"})
+        assert not owned_context([], **mine)
+        unlinked = await h.by_context("pa", "c2")
+        assert owned_context(unlinked, inbound_task_id=None, caller_id="key:b", owner="sidecar:x")
+        assert not owned_context(unlinked, inbound_task_id=None, caller_id="key:b", owner=None)
+        # One foreign handle in the conversation refuses it.
+        await h.record("t5", "pa", "c1", "in-b", "o", w)
+        assert not owned_context(await h.by_context("pa", "c1"), **mine)
+    finally:
+        await eng.dispose()

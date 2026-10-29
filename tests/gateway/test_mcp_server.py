@@ -279,6 +279,23 @@ async def test_task_ops_bound_to_the_owner(env):
     assert structured(r)["state"] == "canceled"
 
 
+async def test_context_continuation_bound_to_the_owner(env):
+    e, owner = await linked(env, spec("b", Blocker()))
+    await e.register("b")
+    other = bearer(e.host.consult_tokens.issue("a", "T2", None, None))
+    async with session(e, "a", owner) as s:
+        r = await s.call_tool("ask_b", {"message": "go", "wait_seconds": HANDLE_WAIT_S})
+        ctx = structured(r)["context_id"]
+    unknown_context = {"partner": "b", "state": "unavailable", "reason": "unknown context"}
+    args = {"message": "more", "context_id": ctx, "wait_seconds": HANDLE_WAIT_S}
+    async with session(e, "a", other) as s:
+        assert structured(await s.call_tool("ask_b", args)) == unknown_context
+    assert await b_states(e) == [WORKING]
+    async with session(e, "a", owner) as s:
+        assert structured(await s.call_tool("ask_b", args))["state"] == "working"
+    assert await b_states(e) == [WORKING, WORKING]
+
+
 async def test_consult_token_session_links_inbound_task(env):
     seen: dict[str, Any] = {}
 

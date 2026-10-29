@@ -154,3 +154,64 @@ async def test_direct_calls_outside_a_run_keep_their_follow_ups(env):
     assert await invoke(tool(host, "check"), handle, host.client, "other-inbound") == UNKNOWN_TASK
     out = await invoke(tool(host, "cancel"), handle, host.client, None)
     assert out["state"] == "canceled"
+
+
+async def test_another_inbound_task_cannot_continue_a_partner_conversation(env):
+    """Caller B's embedded agent handed A's partner context id starts nothing in that
+    conversation (``unknown context``); A's own run continues it."""
+    from a2a.types import SendMessageRequest
+    from cascade_support import msg
+
+    b = Blocker()
+    seen: dict[str, Any] = {}
+    unknown_context = {**UNKNOWN_TASK, "reason": "unknown context"}
+
+    async def a_run(ctx):
+        ask = tool(host, "consult")
+        if ctx.text == "start":
+            seen["open"] = await invoke(
+                ask, {"message": "go", "wait_seconds": HANDLE_WAIT_S}, host.client, None
+            )
+            yield NeedInput("waiting")
+            return
+        if ctx.resumed:  # A's own follow-up in the conversation it started
+            seen["own"] = await invoke(
+                ask,
+                {
+                    "message": "again",
+                    "context_id": seen["open"]["context_id"],
+                    "wait_seconds": HANDLE_WAIT_S,
+                },
+                host.client,
+                None,
+            )
+            yield Done(text="a done")
+            return
+        seen["stolen"] = await invoke(  # B, with the stolen context id
+            ask,
+            {"message": "tell me", "context_id": ctx.text, "wait_seconds": HANDLE_WAIT_S},
+            host.client,
+            None,
+        )
+        yield Done(text="b done")
+
+    e = await env(spec("a", Fn(a_run)), spec("b", b))
+    host = e.host
+    await e.register("b")
+    [ev] = await e.send("a", "start")
+    assert ev.task.status.state == TaskState.TASK_STATE_INPUT_REQUIRED
+    a_task, a_ctx = ev.task.id, ev.task.context_id
+    pctx = seen["open"]["context_id"]
+    assert pctx
+
+    [other] = await e.send("a", pctx)
+    assert other.task.status.state == TaskState.TASK_STATE_COMPLETED
+    assert seen["stolen"] == unknown_context
+    assert b.texts == ["go"], "the stolen context reached the partner"
+
+    m = msg("now")
+    m.task_id, m.context_id = a_task, a_ctx
+    [ev] = [x async for x in e.client("a").send_message(SendMessageRequest(message=m))]
+    assert ev.task.status.state == TaskState.TASK_STATE_COMPLETED
+    assert seen["own"]["reason"] != "unknown context", seen["own"]
+    assert b.texts == ["go", "again"]

@@ -69,7 +69,7 @@ from a2agw.consult.credentials import (
     CredentialProvider,
 )
 from a2agw.consult.guarded_net import guarded_async_client, is_unsafe_address
-from a2agw.consult.handles import OutboundHandleStore, owned
+from a2agw.consult.handles import OutboundHandleStore, owned, owned_context
 from a2agw.consult.netguard import Tier, UnsafeURL, check_url_syntax
 from a2agw.consult.registry import CardFetchError, PartnerRecord, PartnerRegistry
 from a2agw.consult.resilience import Bulkhead, Busy, CircuitBreaker, with_retry
@@ -1608,6 +1608,26 @@ class PartnerClient:
             return False
         handle = await self.handles.get(partner_id, task_id)
         return owned(handle, inbound_task_id=inbound_task_id, caller_id=caller_id, owner=owner)
+
+    async def owns_context(
+        self,
+        partner_id: str,
+        context_id: str,
+        *,
+        inbound_task_id: str | None,
+        caller_id: str | None,
+        owner: str | None,
+    ) -> bool:
+        """Whether a caller may continue partner conversation ``context_id`` of
+        ``partner_id`` (see ``consult.handles.owned_context``): some handle records it, and
+        the caller owns every one of them (``owns``). With no handle store, nothing is
+        owned. ``consult.tools.invoke`` checks this before a consult with ``context_id``."""
+        if self.handles is None:
+            return False
+        handles = await self.handles.by_context(partner_id, context_id)
+        return owned_context(
+            handles, inbound_task_id=inbound_task_id, caller_id=caller_id, owner=owner
+        )
 
     # -- check / cancel ----------------------------------------------------------------
 

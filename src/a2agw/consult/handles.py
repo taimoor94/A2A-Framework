@@ -93,6 +93,22 @@ def owned(
     )
 
 
+def owned_context(
+    handles: Collection[dict[str, Any]],
+    *,
+    inbound_task_id: str | None,
+    caller_id: str | None,
+    owner: str | None,
+) -> bool:
+    """Whether a caller may continue the partner conversation (context) the ``handles``
+    record (every handle of one partner with that context id): only one it took part in
+    alone. At least one handle, and every one ``owned`` by the caller (a partner may reuse a
+    context id across callers: any foreign handle refuses it)."""
+    return bool(handles) and all(
+        owned(h, inbound_task_id=inbound_task_id, caller_id=caller_id, owner=owner) for h in handles
+    )
+
+
 class OutboundHandleStore:
     def __init__(self, engine: AsyncEngine) -> None:
         self._engine = engine
@@ -198,6 +214,16 @@ class OutboundHandleStore:
         async with self._engine.connect() as conn:
             row = (await conn.execute(stmt)).first()
         return dict(row._mapping) if row is not None else None
+
+    async def by_context(self, partner_id: str, context_id: str) -> list[dict[str, Any]]:
+        """Every handle of ``partner_id`` in partner conversation ``context_id``."""
+        stmt = (
+            select(_outbound)
+            .where(_outbound.c.partner_id == partner_id, _outbound.c.context_id == context_id)
+            .order_by(_outbound.c.created_at)
+        )
+        async with self._engine.connect() as conn:
+            return [dict(r._mapping) for r in (await conn.execute(stmt)).all()]
 
     async def by_inbound(self, inbound_task_id: str) -> list[dict[str, Any]]:
         stmt = (

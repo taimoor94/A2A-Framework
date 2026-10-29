@@ -585,6 +585,32 @@ async def test_standalone_task_ops_need_owner_and_caller(env):
     assert check.json()["state"] == "working"
 
 
+async def test_context_continuation_needs_an_owned_conversation(env):
+    """A consult with ``context_id`` continues only a partner conversation the caller owns,
+    standalone or linked; any other answers ``unknown context`` and nothing is sent."""
+    e = await standalone_env(env, Blocker())
+    ask = {"message": "go", "wait_seconds": HANDLE_WAIT_S}
+    mine = (await e.hc.post(f"{V1}/partners/b/messages", json=ask, headers=as_svc(SVC))).json()
+    linked = bearer(e.host.consult_tokens.issue("a", "T1", None, None))
+    r = await e.hc.post(f"{V1}/partners/b/messages", json=ask, headers=linked)
+    theirs = r.json()
+    unknown_context = {"partner": "b", "state": "unavailable", "reason": "unknown context"}
+
+    async def continue_(headers, ctx):
+        body = {"message": "more", "context_id": ctx, "wait_seconds": HANDLE_WAIT_S}
+        r = await e.hc.post(f"{V1}/partners/b/messages", json=body, headers=headers)
+        return r.json()
+
+    assert await continue_(as_svc(SVC2), mine["context_id"]) == unknown_context
+    assert await continue_(as_svc(SVC), theirs["context_id"]) == unknown_context
+    assert await continue_(linked, mine["context_id"]) == unknown_context
+    assert await continue_(linked, "never-seen") == unknown_context
+    assert await b_states(e) == [WORKING, WORKING]  # nothing new was sent
+    own = await continue_(as_svc(SVC), mine["context_id"])
+    assert own.get("reason") != "unknown context", own
+    assert len(await b_states(e)) == 3
+
+
 async def test_standalone_open_task_cap(env):
     e = await standalone_env(env, Blocker(), max_open_sidecar_tasks_per_caller=1)
     ask = {"message": "go", "wait_seconds": HANDLE_WAIT_S}
