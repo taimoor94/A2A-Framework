@@ -611,6 +611,28 @@ async def test_context_continuation_needs_an_owned_conversation(env):
     assert len(await b_states(e)) == 3
 
 
+async def test_message_only_partner_context_continues_for_its_owner(env):
+    """A partner answering with a Message (no task): the linked caller continues the
+    conversation; another inbound task's token gets ``unknown context``."""
+    from a2agw.core.events import Reply
+
+    async def reply(ctx):
+        yield Reply(f"heard: {ctx.text}")
+
+    e = await env(spec("a", Fn(echo)), spec("m", Fn(reply), direct_replies=True))
+    await e.register("m")
+    mine = bearer(e.host.consult_tokens.issue("a", "T1", None, None))
+    other = bearer(e.host.consult_tokens.issue("a", "T2", None, None))
+    r = await e.hc.post(f"{V1}/partners/m/messages", json={"message": "hi"}, headers=mine)
+    first = r.json()
+    assert (first["state"], first["task_id"]) == ("completed", None)
+    body = {"message": "again", "context_id": first["context_id"]}
+    r = await e.hc.post(f"{V1}/partners/m/messages", json=body, headers=other)
+    assert r.json() == {"partner": "m", "state": "unavailable", "reason": "unknown context"}
+    r = await e.hc.post(f"{V1}/partners/m/messages", json=body, headers=mine)
+    assert (r.json()["state"], r.json().get("text")) == ("completed", "heard: again"), r.json()
+
+
 async def test_standalone_open_task_cap(env):
     e = await standalone_env(env, Blocker(), max_open_sidecar_tasks_per_caller=1)
     ask = {"message": "go", "wait_seconds": HANDLE_WAIT_S}

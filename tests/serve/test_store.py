@@ -474,3 +474,28 @@ async def test_handles_by_context(db_url):
         assert not owned_context(await h.by_context("pa", "c1"), **mine)
     finally:
         await eng.dispose()
+
+
+async def test_handles_have_a_partner_context_index(db_url):
+    """``by_context`` runs on every consult carrying a context id: (partner_id, context_id)
+    is indexed, on new tables and on ones created before the index (sqlite and Postgres)."""
+    from sqlalchemy import inspect, text
+
+    eng = await create_engine(db_url)
+    try:
+        h = OutboundHandleStore(eng)
+        await h.initialize()
+
+        def indexes(sync):
+            return {tuple(i["column_names"]) for i in inspect(sync).get_indexes("a2agw_outbound")}
+
+        async with eng.connect() as conn:
+            assert ("partner_id", "context_id") in await conn.run_sync(indexes)
+        async with eng.begin() as conn:  # an older table: no such index yet
+            await conn.execute(text("DROP INDEX ix_a2agw_outbound_partner_context"))
+        await OutboundHandleStore(eng).initialize()
+        await OutboundHandleStore(eng).initialize()  # idempotent
+        async with eng.connect() as conn:
+            assert ("partner_id", "context_id") in await conn.run_sync(indexes)
+    finally:
+        await eng.dispose()

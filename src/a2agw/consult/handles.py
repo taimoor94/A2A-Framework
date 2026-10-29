@@ -65,6 +65,15 @@ _ADDED_COLUMNS = {
 }
 OUTBOUND_TABLE = _outbound  # read by the inbound side's re-entry check (serve.store)
 
+# A partner that answers with a plain Message (no task) still started a conversation the
+# caller owns: it is recorded as a terminal handle with a synthetic task id
+# (``msg:<message id>``), state ``TASK_STATE_COMPLETED`` and this ``end_reason``. Being
+# terminal and ended by a2agw, the cascade, recovery and the TTL expiry never touch it, a
+# partner state update cannot revive it, and ``PartnerClient.owns`` says it is no task.
+MESSAGE_TASK_PREFIX = "msg:"
+PARTNER_CONTEXT_INDEX = "ix_a2agw_outbound_partner_context"
+MESSAGE_REPLY = "message reply"
+
 
 def owned(
     handle: dict[str, Any] | None,
@@ -124,6 +133,15 @@ class OutboundHandleStore:
                 for name in _ADDED_COLUMNS:  # added after Phase 1
                     if name not in columns:
                         await self._add_column(conn, name)
+                # ``by_context`` (the context-ownership check) runs on every consult that
+                # carries a context id. Created here, not in the table metadata, so tables
+                # made before it gain it too (IF NOT EXISTS: sqlite and postgres alike).
+                await conn.execute(
+                    text(
+                        f"CREATE INDEX IF NOT EXISTS {PARTNER_CONTEXT_INDEX} "
+                        "ON a2agw_outbound (partner_id, context_id)"
+                    )
+                )
 
         await retry_ddl(migrate)
 
@@ -159,9 +177,10 @@ class OutboundHandleStore:
         *,
         caller_id: str | None = None,
         owner: str | None = None,
+        end_reason: str | None = None,
     ) -> None:
         """Insert a handle, or update its state. Known links (inbound task, origin, caller,
-        owner) are kept."""
+        owner) are kept. ``end_reason`` is set on insert only (``MESSAGE_REPLY``)."""
         insert = (
             sqlite_dialect.insert if self._engine.dialect.name == "sqlite" else postgresql.insert
         )
@@ -175,6 +194,7 @@ class OutboundHandleStore:
             created_at=time.time(),
             caller_id=caller_id,
             owner=owner,
+            end_reason=end_reason,
         )
         ex, t = stmt.excluded, _outbound.c
         stmt = stmt.on_conflict_do_update(

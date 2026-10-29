@@ -69,7 +69,13 @@ from a2agw.consult.credentials import (
     CredentialProvider,
 )
 from a2agw.consult.guarded_net import guarded_async_client, is_unsafe_address
-from a2agw.consult.handles import OutboundHandleStore, owned, owned_context
+from a2agw.consult.handles import (
+    MESSAGE_REPLY,
+    MESSAGE_TASK_PREFIX,
+    OutboundHandleStore,
+    owned,
+    owned_context,
+)
 from a2agw.consult.netguard import Tier, UnsafeURL, check_url_syntax
 from a2agw.consult.registry import CardFetchError, PartnerRecord, PartnerRegistry
 from a2agw.consult.resilience import Bulkhead, Busy, CircuitBreaker, with_retry
@@ -691,6 +697,31 @@ class PartnerClient:
         task.add_done_callback(self._cleanups.discard)
         await asyncio.shield(task)
 
+    async def _record_conversation(
+        self, partner_id: str, track: Track, inbound_task_id: str | None, origin: str | None
+    ) -> None:
+        """A plain Message reply (no task): record the conversation the caller now owns, so
+        its own later consults with that context id pass ``owns_context``. The row is a
+        terminal, a2agw-ended handle with a synthetic task id (see ``MESSAGE_REPLY``)."""
+        if self.handles is None or track.message is None or track.context_id is None:
+            return
+        mid = track.message.message_id or uuid.uuid4().hex
+        try:
+            await self._shielded(
+                self.handles.record(
+                    MESSAGE_TASK_PREFIX + mid,
+                    partner_id,
+                    track.context_id,
+                    inbound_task_id,
+                    origin,
+                    TaskState.Name(TaskState.TASK_STATE_COMPLETED),
+                    end_reason=MESSAGE_REPLY,
+                    **_handle_ids(),
+                )
+            )
+        except Exception:
+            logger.exception("could not record the conversation with partner %s", partner_id)
+
     async def _update_handle(self, partner_id: str, track: Track) -> None:
         state = track.state_name()
         if self.handles is None or track.task_id is None or state is None:
@@ -1078,7 +1109,10 @@ class PartnerClient:
             )
             if isinstance(outcome, ToolResult):
                 return outcome
-            return await self._finish(partner_id, rec, track, outcome, task_id, ctx_id, note)
+            result = await self._finish(partner_id, rec, track, outcome, task_id, ctx_id, note)
+            if track.task is None and track.message is not None:
+                await self._record_conversation(partner_id, track, inbound_task_id, cc.origin)
+            return result
         except asyncio.CancelledError:
             # The inbound task was cancelled mid-call, possibly before the partner task's
             # handle was recorded: cancel_for_inbound could not find it, so clean up here.
@@ -1607,6 +1641,8 @@ class PartnerClient:
         if self.handles is None:
             return False
         handle = await self.handles.get(partner_id, task_id)
+        if handle is not None and handle.get("end_reason") == MESSAGE_REPLY:
+            return False  # a recorded Message reply, not a task: nothing to act on
         return owned(handle, inbound_task_id=inbound_task_id, caller_id=caller_id, owner=owner)
 
     async def owns_context(

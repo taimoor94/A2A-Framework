@@ -215,3 +215,72 @@ async def test_another_inbound_task_cannot_continue_a_partner_conversation(env):
     assert ev.task.status.state == TaskState.TASK_STATE_COMPLETED
     assert seen["own"]["reason"] != "unknown context", seen["own"]
     assert b.texts == ["go", "again"]
+
+
+async def replier(ctx):
+    from a2agw.core.events import Reply
+
+    yield Reply(f"heard: {ctx.text}")
+
+
+async def test_message_only_partner_conversation_continues_for_its_owner_only(env):
+    """A partner that answers with a plain Message (no task): the conversation is still the
+    caller's. Its own turn continues it; another inbound task gets ``unknown context``. The
+    record of it is no task: never checked, cancelled by the cascade, or expired."""
+    import time
+
+    seen: dict[str, Any] = {}
+
+    async def a_run(ctx):
+        ask = tool(host, "consult")
+        if ctx.text == "start":
+            seen["a_task"] = ctx.task_id
+            seen["first"] = await invoke(
+                ask, {"message": "hi", "wait_seconds": 5}, host.client, None
+            )
+            ctx_id = seen["first"]["context_id"]
+            seen["again"] = await invoke(
+                ask,
+                {"message": "again", "context_id": ctx_id, "wait_seconds": 5},
+                host.client,
+                None,
+            )
+            yield Done(text="a done")
+            return
+        seen["stolen"] = await invoke(
+            ask,
+            {"message": "tell me", "context_id": ctx.text, "wait_seconds": 5},
+            host.client,
+            None,
+        )
+        yield Done(text="b done")
+
+    e = await env(spec("a", Fn(a_run)), spec("m", Fn(replier), direct_replies=True))
+    host = e.host
+    await e.register("m")
+    [ev] = await e.send("a", "start")
+    assert ev.task.status.state == TaskState.TASK_STATE_COMPLETED
+    first, again = seen["first"], seen["again"]
+    assert (first["state"], first["task_id"], first["text"]) == ("completed", None, "heard: hi")
+    assert first["context_id"]
+    assert (again["state"], again.get("text")) == ("completed", "heard: again"), again
+
+    [ev] = await e.send("a", first["context_id"])  # another inbound task
+    assert seen["stolen"] == {"partner": "m", "state": "unavailable", "reason": "unknown context"}
+
+    rows = await host.handles.by_inbound(seen["a_task"])
+    assert rows and all(r["task_id"].startswith("msg:") for r in rows), rows
+    assert {r["state"] for r in rows} == {"TASK_STATE_COMPLETED"}
+    # Recorded as a2agw-ended Message replies; the cascade (the run completed) left them.
+    assert {r["end_reason"] for r in rows} == {"message reply"}
+    assert {r["cancel_attempts"] for r in rows} == {0}
+    # Not a task: check answers unknown task (nothing sent to the partner)...
+    out = await invoke(
+        tool(host, "check"), {"partner_id": "m", "task_id": rows[0]["task_id"]}, host.client,
+        seen["a_task"],
+    )  # fmt: skip
+    assert out == {"partner": "m", "state": "unavailable", "reason": "unknown task"}
+    # ...and the TTL never expires one.
+    assert (await host.maintain(now=time.time() + 30 * 86400)).expired == 0
+    after = await host.handles.by_inbound(seen["a_task"])
+    assert {(r["end_reason"], r["cancel_attempts"]) for r in after} == {("message reply", 0)}
