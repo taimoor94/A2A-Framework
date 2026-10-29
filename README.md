@@ -170,7 +170,7 @@ host.add(deployer)
 
 `OpenAIAgentsAdapter` runs an `agents.Agent` with `Runner.run_streamed`. Each caller and A2A `contextId` pair gets its own SDK session, so follow-up messages continue the conversation and another caller sending the same `contextId` does not. The default is an in-memory session per pair. `session_factory` receives the pair as one key string, `"<principal id or anonymous>\x1f<contextId>"`; pass `session_factory=lambda key: SQLiteSession(key, "sessions.db")` and `durable_sessions=True` to keep conversations across restarts. Model text streams as the `output` artifact, each tool call shows as a `calling <tool>` status, and token usage is reported. Cancelling the A2A task cancels the run.
 
-When the model writes several messages in one turn (say, "Let me ask the pinger." before a tool call, then the answer), the OpenAI, Claude, AG2 and LlamaIndex adapters stream them as one `output` artifact with a blank line (`\n\n`) between consecutive messages' text, so they never run together.
+When the model writes several messages in one turn (say, "Let me ask the pinger." before a tool call, then the answer), the OpenAI, Claude, AG2 and LlamaIndex adapters stream them as one `output` artifact with a blank line (`\n\n`) between consecutive messages' text, so they never run together. The text blocks of one message are not split (Claude: blocks that share a `message_id`).
 
 ```python
 from agents import Agent, RunConfig
@@ -326,7 +326,7 @@ def tools_for_this_run():
 
 Give those tools to a tool-calling model, a LangGraph `ToolNode`, or call them directly. A partner call that outlasts `wait_seconds` returns a `working` result with a task handle; poll it with `a2a_check_task` or `a2a_wait`. If a partner needs input, the result has state `input_required` and a `question`; answer by calling the same tool again with that `task_id` and `context_id`. Without LangChain, `a2agw.adapters.callable.as_functions(tools, client)` gives plain async functions.
 
-Partner tasks belong to whoever started them, for embedded tools exactly as for the sidecar (one predicate, `PartnerClient.owns`). Inside a run, `a2a_check_task`, `a2a_cancel_task`, `a2a_wait` and a reply (`task_id`) work only on partner tasks the same inbound task started; outside any run (operator code), only on tasks started outside a run by the same caller. Any other task id, say one a prompt injection handed the model, answers `{"partner": "<id>", "state": "unavailable", "reason": "unknown task"}` and nothing is sent; a partner the agent's routing hides answers `unknown partner`. The client's own `check`, `cancel` and `wait_any` methods are not checked: they are for trusted operator code.
+Partner tasks belong to whoever started them, for embedded tools exactly as for the sidecar (one predicate, `PartnerClient.owns`). Inside a run, `a2a_check_task`, `a2a_cancel_task`, `a2a_wait` and a reply (`task_id`) work only on partner tasks the same inbound task started; outside any run (operator code), only on tasks started outside a run by the same caller. Any other task id, say one a prompt injection handed the model, answers `{"partner": "<id>", "state": "unavailable", "reason": "unknown task"}` and nothing is sent; a partner the agent's routing hides answers `unknown partner`. The client's own `check`, `cancel` and `wait_any` methods are not checked: they are for trusted operator code. Partner conversations follow the same rule: a consult with `context_id` continues only a conversation whose partner tasks the caller owns; any other, or one no handle records, answers `unknown context` and nothing is sent.
 
 ## Sidecar: agents in any language
 
@@ -636,7 +636,7 @@ curl http://127.0.0.1:8000/agents/echo/.well-known/agent-card.json
 `EXTRAS` defaults to `postgres,mcp`. `crewai` is refused at build time (it conflicts with other
 extras in the lock); build a separate image for it. The image installs exactly the versions
 `uv.lock` pins: the build exports the dependencies of the chosen extras from the lock
-(`uv export --frozen`, with hashes), installs them, then the project wheel with `--no-deps`.
+(`uv export --locked`, with hashes; a lock that no longer matches `pyproject.toml` fails the build), installs them, then the project wheel with `--no-deps`.
 The `python:3.12-slim` base is pinned by digest (`PYTHON_IMAGE` in the Dockerfile; override it
 with `--build-arg PYTHON_IMAGE=...`). Compose (gateway, Postgres 16, Node coder);
 secrets come from your environment, never from the file:
@@ -779,7 +779,7 @@ When auth is not configured, every caller is the same principal, `anonymous`: id
                  +-----------------------------------------------+
 ```
 
-CI (`.github/workflows/ci.yml`) runs three jobs: the main gate (`uv sync --frozen`, `uv run ruff check`, `uv run pytest -q -W error`), the CrewAI tests (`scripts/test-crewai.sh`), and a fresh resolution of `.[all]` without the lock against the adapter and gateway tests (ADK and CrewAI excluded), so the combination users install is tested too.
+CI (`.github/workflows/ci.yml`) runs three jobs: the main gate (`uv sync --locked`, `uv run ruff check`, `uv run pytest -q -W error`), the CrewAI tests (`scripts/test-crewai.sh`), and a fresh resolution of `.[all]` without the lock against the adapter and gateway tests (ADK and CrewAI excluded), so the combination users install is tested too.
 
 The core never imports a framework; adapters live in `a2agw.adapters.<name>` behind extras. See the [design spec](docs/superpowers/specs/2026-10-25-a2a-gateway-framework-design.md), the [Phase 1 plan](docs/superpowers/plans/2026-10-25-phase1-core.md), the [Phase 2 plan](docs/superpowers/plans/2026-10-26-phase2-hardening.md) and the [Phase 3 plan](docs/superpowers/plans/2026-10-26-phase3-gateway.md).
 
@@ -809,6 +809,8 @@ The core never imports a framework; adapters live in `a2agw.adapters.<name>` beh
 - A sidecar call never carries the inbound caller's own token, so a partner whose credentials come from an RFC 8693 token exchange cannot be consulted from a webhook, stdio or MCP agent (it fails closed with `credential error`).
 - `a2agw mcp` (stdio) opens the config's database: with SQLite, do not run it next to an `a2agw serve` on the same file; point the MCP client at that gateway's HTTP endpoint instead.
 - The CrewAI adapter needs an environment of its own (crewai pins `mcp<2` and `openai<3`), so a CrewAI crew and the MCP server cannot share one gateway process.
+- Embedded partner-task follow-ups belong to the inbound task that started them: a new A2A task in the same `contextId` (a new message rather than an input-required reply) cannot check, cancel, wait on, reply to or continue the previous task's partner tasks and conversations (`unknown task` / `unknown context`); they are cascade-cancelled when that task ends anyway.
+- A `PartnerClient` used without a handle store (library use outside `AgentHost`) records no handles, so every embedded follow-up (check, cancel, wait, reply, `context_id`) answers `unknown task` or `unknown context`: fail closed. Give it an `OutboundHandleStore` to use follow-ups.
 - Consult tokens live in the memory of the gateway process that issued them (only their digests, never persisted): a webhook or stdio agent's call to `consult_url` must reach that same process. Behind a load balancer, route `consult_url` to the issuing replica (sticky routing, e.g. a per-replica `consult_url`) or run one replica; another replica answers `401`.
 
 ## Roadmap

@@ -60,9 +60,19 @@ def delta(text: str, sid: str = "s", *, parent: str | None = None) -> StreamEven
     return StreamEvent(uuid="u", session_id=sid, event=event, parent_tool_use_id=parent)
 
 
-def assistant(*blocks: Any, parent: str | None = None) -> AssistantMessage:
+def assistant(
+    *blocks: Any, parent: str | None = None, message_id: str | None = None
+) -> AssistantMessage:
     content = [TextBlock(text=b) if isinstance(b, str) else b for b in blocks]
-    return AssistantMessage(content=content, model="claude-fake", parent_tool_use_id=parent)
+    return AssistantMessage(
+        content=content, model="claude-fake", parent_tool_use_id=parent, message_id=message_id
+    )
+
+
+def start(message_id: str, sid: str = "s") -> StreamEvent:
+    """The partial-message event that opens API message ``message_id``."""
+    event = {"type": "message_start", "message": {"id": message_id}}
+    return StreamEvent(uuid="u", session_id=sid, event=event, parent_tool_use_id=None)
 
 
 def result(
@@ -158,14 +168,14 @@ async def test_streams_text_blocks_without_partial_messages():
     # One chunk per text block when the CLI sends no partial messages.
     fake = FakeClaude([init("s"), assistant("Hello", " world"), assistant("!"), result()])
     evs = await drive(ClaudeAgentAdapter(query=fake), "hi")
-    assert_text_stream(evs, "Hello world\n\n!")
+    assert_text_stream(evs, "Hello world!")
     assert sum(1 for e in evs if isinstance(e, ArtifactChunk)) == 3
 
 
 async def test_partial_and_complete_messages_mixed():
     # Deltas stand for the AssistantMessage that follows them, and only for that one.
     fake = FakeClaude([init("s"), delta("one "), assistant("one "), assistant("two"), result()])
-    assert_text_stream(await drive(ClaudeAgentAdapter(query=fake), "hi"), "one \n\ntwo")
+    assert_text_stream(await drive(ClaudeAgentAdapter(query=fake), "hi"), "one two")
 
 
 async def test_tool_use_is_status_and_subagent_text_is_not_output():
@@ -182,7 +192,7 @@ async def test_tool_use_is_status_and_subagent_text_is_not_output():
     )
     evs = await drive(ClaudeAgentAdapter(query=fake), "hi")
     assert Status("calling mcp__a2a_partners__ask_pinger") in evs
-    assert output_text(evs) == "Asking. \n\nDone."
+    assert output_text(evs) == "Asking. Done."
 
 
 async def test_result_text_when_nothing_streamed():
@@ -694,19 +704,23 @@ async def test_owned_tasks_only():
 
 
 async def test_messages_are_separated():
-    # Each AssistantMessage is one model message: their texts are joined by a blank line,
-    # streamed as deltas or not.
+    # The CLI sends one AssistantMessage per content block; blocks of one API message share
+    # its message_id. Text of distinct messages is joined by a blank line, the blocks of one
+    # message are not split; streamed or not.
     from adapters.contract import assert_messages_separated
 
     use = ToolUseBlock(id="tu-1", name="mcp__a2a_partners__ask_pinger", input={"message": "x"})
     streamed = FakeClaude(
         [
             init("s"),
+            start("m1"),
             delta("Let me ask."),
-            assistant("Let me ask.", use),
+            assistant("Let me ask.", message_id="m1"),
+            assistant(use, message_id="m1"),
+            start("m2"),
             delta("It is "),
             delta("42."),
-            assistant("It is 42."),
+            assistant("It is 42.", message_id="m2"),
             result(),
         ]
     )
@@ -714,5 +728,14 @@ async def test_messages_are_separated():
     assert_messages_separated(
         [e for e in evs if not isinstance(e, Status)], "Let me ask.", "It is 42."
     )
-    whole = FakeClaude([init("s"), assistant("one"), assistant("two"), result()])
-    assert_messages_separated(await drive(ClaudeAgentAdapter(query=whole), "hi"), "one", "two")
+    whole = FakeClaude(
+        [
+            init("s"),
+            assistant("one", message_id="m1"),
+            assistant(" more", message_id="m1"),  # another block of the same message
+            assistant("two", message_id="m2"),
+            result(),
+        ]
+    )
+    evs = await drive(ClaudeAgentAdapter(query=whole), "hi")
+    assert_messages_separated(evs, "one more", "two")

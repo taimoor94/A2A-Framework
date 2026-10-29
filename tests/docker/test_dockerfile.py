@@ -12,7 +12,7 @@ DOCKERFILE = (Path(__file__).resolve().parents[2] / "Dockerfile").read_text()
 def test_installs_from_the_lock():
     # Dependencies come from uv.lock (exported, frozen), the project wheel without deps.
     assert "COPY pyproject.toml uv.lock" in DOCKERFILE
-    assert re.search(r"uv export --frozen --no-dev --no-emit-project", DOCKERFILE)
+    assert re.search(r"uv export --locked --no-dev --no-emit-project", DOCKERFILE)
     assert re.search(r"uv pip install[^\n]*--no-deps", DOCKERFILE)
 
 

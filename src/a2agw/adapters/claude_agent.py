@@ -169,7 +169,19 @@ class ClaudeAgentAdapter:
         async def source(messages: AsyncIterator[Any]) -> AsyncIterator[str | AgentEvent]:
             nonlocal final, streamed
             partial = False  # deltas streamed for the assistant message in progress
-            texts = MessageTexts()  # each AssistantMessage is one model message
+            # The CLI sends one AssistantMessage per content block, and the blocks of one API
+            # message share its id: only a new id starts a new message (no id: the same one).
+            texts = MessageTexts()
+            current: str | None = None
+
+            def message(message_id: Any) -> None:
+                nonlocal current
+                if not isinstance(message_id, str) or not message_id:
+                    return
+                if current is not None and message_id != current:
+                    texts.end_message()
+                current = message_id
+
             async for msg in messages:
                 session_id = _session_id(msg)
                 if session_id:
@@ -177,11 +189,13 @@ class ClaudeAgentAdapter:
                 if getattr(msg, "parent_tool_use_id", None):
                     continue  # a subagent's messages are not this agent's answer
                 if isinstance(msg, StreamEvent):
+                    message(_started_id(msg.event))
                     text = _delta_text(msg.event)
                     if text:
                         partial = streamed = True
                         yield texts.text(text)
                 elif isinstance(msg, AssistantMessage):
+                    message(msg.message_id)
                     for block in msg.content:
                         if isinstance(block, TextBlock) and block.text and not partial:
                             streamed = True
@@ -189,7 +203,6 @@ class ClaudeAgentAdapter:
                         elif isinstance(block, ToolUseBlock):
                             yield Status(f"calling {block.name}")
                     partial = False
-                    texts.end_message()
                 elif isinstance(msg, ResultMessage):
                     final = msg
 
@@ -227,6 +240,15 @@ def _check_options(options: ClaudeAgentOptions) -> None:
 
 def _log(ctx: InboundContext) -> logging.Logger:
     return logging.getLogger(f"a2agw.agent.{ctx.agent_id}")
+
+
+def _started_id(event: Any) -> str | None:
+    """The API message id a ``message_start`` partial event opens, else None."""
+    if not isinstance(event, dict) or event.get("type") != "message_start":
+        return None
+    message = event.get("message")
+    mid = message.get("id") if isinstance(message, dict) else None
+    return mid if isinstance(mid, str) else None
 
 
 def _session_id(msg: Any) -> str | None:

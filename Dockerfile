@@ -17,12 +17,12 @@ COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
 ENV UV_PYTHON_DOWNLOADS=never
 # Exactly the versions uv.lock pins (with their hashes): the dependencies are exported from
-# the lock (--frozen: never re-resolved) and installed first; the project wheel goes in
-# after them without dependencies.
+# the lock (--locked: a lock that no longer matches pyproject.toml fails the build) and
+# installed first; the project wheel goes in after them without dependencies.
 RUN set -e; \
     ARGS=""; \
     for x in $(printf %s "${EXTRAS}" | tr '[:upper:]' '[:lower:]' | tr ',' ' '); do ARGS="${ARGS} --extra ${x}"; done; \
-    uv export --frozen --no-dev --no-emit-project ${ARGS} > /tmp/req.txt; \
+    uv export --locked --no-dev --no-emit-project ${ARGS} > /tmp/req.txt; \
     uv venv --python /usr/local/bin/python3.12 /opt/venv; \
     VIRTUAL_ENV=/opt/venv uv pip install --require-hashes -r /tmp/req.txt; \
     uv build --wheel --out-dir /dist; \
