@@ -619,6 +619,16 @@ async def test_data_json_reaches_invoke_as_data():
     assert out["state"] == "completed" and client.consults[-1]["data"] == {"c": 3}
 
 
+async def test_deeply_nested_data_json_is_rejected():
+    # json.loads raises RecursionError (not ValueError) on deep nesting: still an answer.
+    client = FakePartnerClient()
+    [tool] = as_crewai_tools(client.tools()[:1], client)
+    deep = "[" * 100_000 + "]" * 100_000
+    out = json.loads(await run_tool(tool, {"message": "hi", "data_json": deep}))
+    assert out == {"state": "rejected", "reason": "invalid arguments: data_json"}
+    assert client.consults == []
+
+
 def test_turn_submits_under_the_end_lock(monkeypatch):
     # No partner call is ever submitted after the turn ended: ``submit`` checks ``ended`` and
     # submits while holding the lock ``end`` takes, and only makes the coroutine then.

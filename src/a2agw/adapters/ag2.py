@@ -40,7 +40,7 @@ except ImportError as e:  # pragma: no cover - exercised by a test that hides th
     raise ImportError(AG2_EXTRA_HINT) from e
 
 from a2agw.adapters._contexts import ContextRegistry, context_key
-from a2agw.adapters._stream import stream_events
+from a2agw.adapters._stream import MessageTexts, stream_events
 from a2agw.consult.client import PartnerClient
 from a2agw.consult.tools import PartnerTool, invoke, strip_extensions, with_untrusted_note
 from a2agw.core.events import AgentEvent, Done, Status, Usage
@@ -139,18 +139,20 @@ class AG2Adapter:
         async def source() -> AsyncIterator[str | AgentEvent]:
             nonlocal tokens_in, tokens_out, streamed
             chunked = False  # chunks streamed for the model response in progress
+            texts = MessageTexts()  # each ModelResponse ends one model message
             while (event := await queue.get()) is not _END:
                 if isinstance(event, ModelMessageChunk):
                     if event.content:
                         streamed = chunked = True
-                        yield event.content
+                        yield texts.text(event.content)
                 elif isinstance(event, ModelResponse):
                     if not chunked and event.content:
                         if event.tool_calls:
                             yield Status(event.content)  # narration before its tool calls
                         elif streamed:
-                            yield event.content  # the final answer of a streamed turn
+                            yield texts.text(event.content)  # the final answer, streamed turn
                     chunked = False
+                    texts.end_message()
                 elif isinstance(event, ToolCallEvent):
                     yield Status(f"calling {event.name}")
                 elif isinstance(event, UsageEvent):

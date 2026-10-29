@@ -373,7 +373,8 @@ then. Instead, one principal may have at most `limits.max_open_sidecar_tasks_per
 
 Anything else gets `401` (`{"error": "unauthenticated"}`, `WWW-Authenticate: Bearer`): no
 credentials, an unknown, revoked or expired token, a principal without the scope, or no
-`X-A2AGW-Agent`. An agent id the principal is not mapped to gets `403`
+`X-A2AGW-Agent` (a value that is not a valid agent id, lower-case letters, digits and `-`,
+counts as none and is never audited). An agent id the principal is not mapped to gets `403`
 (`{"error": "forbidden"}`). Each refusal is audited as `sidecar.denied`, with the reason and
 the agent id.
 
@@ -491,10 +492,13 @@ that an id is not served over MCP (`404`).
   scope that `sidecar.clients` maps to the agent id. The path names the agent: no
   `X-A2AGW-Agent` header is needed.
 
-Refusals are `401`/`403` and audited as `sidecar.denied`, as for the REST API. A session can
-only be used with the credentials that opened it (another caller gets `404`, as for an
-unknown session). DNS-rebinding protection accepts only requests whose `Host` (and `Origin`,
-when sent) is the host of `base_url`; behind a proxy, keep the original `Host`.
+Refusals are `401`/`403` and audited as `sidecar.denied`, as for the REST API; a path that
+is not a valid agent id is a `401` (no agent id), and a consult token revoked while its
+request was being set up is a `401` too. A session can only be used with the credentials
+that opened it (another caller gets `404`, as for an unknown session). DNS-rebinding
+protection accepts only requests whose `Host` (and `Origin`, when sent) is the host of
+`base_url` or of `sidecar.consult_url` (the gateway as sidecar agents reach it); behind a
+proxy, keep the original `Host`.
 
 On an exit signal (SIGTERM, SIGINT) the gateway ends the open sessions at once, so the server
 does not wait for their notification streams. An application that embeds the host and stops

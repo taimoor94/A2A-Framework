@@ -704,3 +704,25 @@ async def test_wait_bounds_handle_lookups(env, monkeypatch):
     r = await e.hc.post(f"{V1}/wait", json={"tasks": [item] * 20, "seconds": 0}, headers=h)
     assert [x["state"] for x in r.json()["results"]] == ["working"]
     assert lookups == 1  # the same handle is looked up once
+
+
+async def test_agent_header_must_be_a_valid_agent_id(env):
+    """An ``X-A2AGW-Agent`` that is not a valid agent id (``AGENT_ID_PATTERN``) counts as no
+    agent id: refused before any mapping check, and audited without the value."""
+    e = await env(
+        spec("a", Fn(echo)),
+        auth=auth_config(),
+        # Host kwargs are not validated like the config: a bad id must still never match.
+        sidecar_clients={"key:svc": ["a", "Bad_Agent"]},
+    )
+
+    async def status(agent: str) -> int:
+        headers = {"X-API-Key": SVC, "X-A2AGW-Agent": agent}
+        return (await e.hc.get(f"{V1}/partners", headers=headers)).status_code
+
+    assert await status("a") == 200
+    for bad in ("Bad_Agent", "../../etc/passwd", "a" * 64, "-a"):
+        assert await status(bad) == 401, bad
+    denied = await audit_rows(e.host, "sidecar.denied")
+    assert denied and all(r["agent_id"] is None for r in denied), denied
+    assert {r["detail"]["reason"] for r in denied} == {"no agent id"}

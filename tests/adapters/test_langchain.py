@@ -32,7 +32,7 @@ from streaming_asgi import StreamingASGITransport
 
 from a2agw.adapters.callable import agent
 from a2agw.adapters.langchain import RunnableAdapter, as_langchain_tools
-from a2agw.consult.tools import UNTRUSTED_NOTE, partner_tools
+from a2agw.consult.tools import UNTRUSTED_NOTE, partner_tools, strip_extensions
 from a2agw.core.events import ArtifactChunk, Usage
 from a2agw.core.spi import InboundContext
 from a2agw.serve.agent import AgentSpec, SkillSpec
@@ -185,8 +185,8 @@ async def test_tools_have_schema_and_untrusted_note(world):
     for t, p in zip(tools, ptools, strict=True):
         assert isinstance(t, StructuredTool)
         assert t.name == p.name
-        assert t.description.endswith("\n\n" + UNTRUSTED_NOTE)
-        assert t.args_schema == p.parameters
+        assert t.description.endswith(UNTRUSTED_NOTE)
+        assert t.args_schema == strip_extensions(p.parameters)
         assert t.handle_tool_error is True
         assert t.tool_call_schema is not None
 
@@ -291,3 +291,21 @@ async def test_owned_tasks_only():
     await assert_owned_tasks_only(
         as_langchain_tools(client.tools(), client), lambda t, args: t.ainvoke(args), client
     )
+
+
+def test_projection_notes_once_and_copies_a_stripped_schema():
+    from adapters.contract import FakePartnerClient
+
+    client = FakePartnerClient()
+    ptools = client.tools()
+    tools = as_langchain_tools(ptools, client)
+    for t, p in zip(tools, ptools, strict=True):
+        # Partner tool descriptions already end with the note: never twice.
+        assert t.description.count(UNTRUSTED_NOTE) == 1
+        assert t.description.endswith(UNTRUSTED_NOTE)
+        # Gateway-only ``x-`` limits are not shown to the model; ``invoke`` enforces them.
+        assert "x-max-json-bytes" not in json.dumps(t.args_schema)
+        assert t.args_schema == strip_extensions(p.parameters)
+    # A copy: changing a tool's schema never changes the partner tool's.
+    tools[0].args_schema["properties"]["message"]["description"] = "changed"
+    assert ptools[0].parameters["properties"]["message"]["description"] != "changed"

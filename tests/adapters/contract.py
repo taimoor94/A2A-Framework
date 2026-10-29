@@ -33,6 +33,7 @@ __all__ = [
     "assert_cancellable",
     "assert_failure_maps",
     "assert_isolated_callers",
+    "assert_messages_separated",
     "assert_multi_turn",
     "assert_owned_tasks_only",
     "assert_projection",
@@ -103,7 +104,8 @@ def assert_text_stream(events: list[AgentEvent], expected_text: str) -> None:
         assert events[-1] is dones[0], "Done must be the last event"
     chunks = [e for e in events if isinstance(e, ArtifactChunk) and e.artifact_id == "output"]
     if chunks:
-        assert "".join(_chunk_text(c) for c in chunks) == expected_text
+        streamed = "".join(_chunk_text(c) for c in chunks)
+        assert streamed == expected_text, (streamed, expected_text)
         assert [c.last for c in chunks] == [False] * (len(chunks) - 1) + [True]
         assert chunks[0].append is False and all(c.append for c in chunks[1:])
         assert all(c.name == "output" for c in chunks)
@@ -112,6 +114,17 @@ def assert_text_stream(events: list[AgentEvent], expected_text: str) -> None:
     else:
         # ``Done()`` (text None) answers an empty text.
         assert dones and (dones[0].text or "") == expected_text, events
+
+
+def assert_messages_separated(events: list[AgentEvent], *messages: str) -> None:
+    """The streamed answer of a turn whose model wrote several messages (say, a narration,
+    then the answer after a tool call) is their texts joined by one ``MESSAGE_SEPARATOR``
+    ("\\n\\n"), streamed as one "output" artifact."""
+    from a2agw.adapters._stream import MESSAGE_SEPARATOR
+
+    assert len(messages) >= 2, "give the text of each model message"
+    assert_text_stream(events, MESSAGE_SEPARATOR.join(messages))
+    assert any(isinstance(e, ArtifactChunk) for e in events), "nothing streamed"
 
 
 async def assert_multi_turn(

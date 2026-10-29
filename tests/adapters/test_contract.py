@@ -92,3 +92,17 @@ async def test_owned_tasks_only_catches_a_missing_ownership_check(monkeypatch):
         await assert_owned_tasks_only(
             as_functions(client.tools(), client), lambda f, a: f(**a), client
         )
+
+
+def test_messages_separated_needs_the_blank_line():
+    from adapters.contract import assert_messages_separated
+
+    def stream(*texts):
+        n = len(texts)
+        return [text_chunk(t, first=i == 0, last=i == n - 1) for i, t in enumerate(texts)]
+
+    assert_messages_separated(stream("Let me ask.", "\n\nIt is 42."), "Let me ask.", "It is 42.")
+    with pytest.raises(AssertionError):
+        assert_messages_separated(stream("Let me ask.", "It is 42."), "Let me ask.", "It is 42.")
+    with pytest.raises(AssertionError):  # nothing streamed
+        assert_messages_separated([Done(text="a\n\nb")], "a", "b")

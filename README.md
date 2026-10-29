@@ -170,6 +170,8 @@ host.add(deployer)
 
 `OpenAIAgentsAdapter` runs an `agents.Agent` with `Runner.run_streamed`. Each caller and A2A `contextId` pair gets its own SDK session, so follow-up messages continue the conversation and another caller sending the same `contextId` does not. The default is an in-memory session per pair. `session_factory` receives the pair as one key string, `"<principal id or anonymous>\x1f<contextId>"`; pass `session_factory=lambda key: SQLiteSession(key, "sessions.db")` and `durable_sessions=True` to keep conversations across restarts. Model text streams as the `output` artifact, each tool call shows as a `calling <tool>` status, and token usage is reported. Cancelling the A2A task cancels the run.
 
+When the model writes several messages in one turn (say, "Let me ask the pinger." before a tool call, then the answer), the OpenAI, Claude, AG2 and LlamaIndex adapters stream them as one `output` artifact with a blank line (`\n\n`) between consecutive messages' text, so they never run together.
+
 ```python
 from agents import Agent, RunConfig
 
@@ -807,6 +809,7 @@ The core never imports a framework; adapters live in `a2agw.adapters.<name>` beh
 - A sidecar call never carries the inbound caller's own token, so a partner whose credentials come from an RFC 8693 token exchange cannot be consulted from a webhook, stdio or MCP agent (it fails closed with `credential error`).
 - `a2agw mcp` (stdio) opens the config's database: with SQLite, do not run it next to an `a2agw serve` on the same file; point the MCP client at that gateway's HTTP endpoint instead.
 - The CrewAI adapter needs an environment of its own (crewai pins `mcp<2` and `openai<3`), so a CrewAI crew and the MCP server cannot share one gateway process.
+- Consult tokens live in the memory of the gateway process that issued them (only their digests, never persisted): a webhook or stdio agent's call to `consult_url` must reach that same process. Behind a load balancer, route `consult_url` to the issuing replica (sticky routing, e.g. a per-replica `consult_url`) or run one replica; another replica answers `401`.
 
 ## Roadmap
 

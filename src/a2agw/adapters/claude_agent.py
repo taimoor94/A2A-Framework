@@ -48,7 +48,7 @@ except ImportError as e:  # pragma: no cover - exercised by a test that hides th
     raise ImportError(CLAUDE_EXTRA_HINT) from e
 
 from a2agw.adapters._contexts import ContextRegistry, context_key
-from a2agw.adapters._stream import stream_events
+from a2agw.adapters._stream import MessageTexts, stream_events
 from a2agw.consult.client import PartnerClient
 from a2agw.consult.tools import PartnerTool, invoke, strip_extensions, with_untrusted_note
 from a2agw.core.events import AgentEvent, Done, Failed, Status, Usage
@@ -169,6 +169,7 @@ class ClaudeAgentAdapter:
         async def source(messages: AsyncIterator[Any]) -> AsyncIterator[str | AgentEvent]:
             nonlocal final, streamed
             partial = False  # deltas streamed for the assistant message in progress
+            texts = MessageTexts()  # each AssistantMessage is one model message
             async for msg in messages:
                 session_id = _session_id(msg)
                 if session_id:
@@ -179,15 +180,16 @@ class ClaudeAgentAdapter:
                     text = _delta_text(msg.event)
                     if text:
                         partial = streamed = True
-                        yield text
+                        yield texts.text(text)
                 elif isinstance(msg, AssistantMessage):
                     for block in msg.content:
                         if isinstance(block, TextBlock) and block.text and not partial:
                             streamed = True
-                            yield block.text
+                            yield texts.text(block.text)
                         elif isinstance(block, ToolUseBlock):
                             yield Status(f"calling {block.name}")
                     partial = False
+                    texts.end_message()
                 elif isinstance(msg, ResultMessage):
                     final = msg
 

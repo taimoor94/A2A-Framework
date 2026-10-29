@@ -364,7 +364,7 @@ class _PartnerTool(BaseTool):
             raw = args.pop(DATA_JSON)
             try:
                 data = json.loads(raw) if isinstance(raw, str) else None
-            except ValueError:
+            except (ValueError, RecursionError):  # RecursionError: nested too deep
                 data = None
             if not isinstance(data, dict) or args.get("data"):
                 # Not a JSON object, or ``data`` given as well: nothing is sent.

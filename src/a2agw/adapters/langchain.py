@@ -5,6 +5,7 @@ Importing this module requires ``langchain-core``; nothing in the core imports i
 
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import AsyncIterator
 from typing import Any
@@ -18,7 +19,7 @@ from langchain_core.tools import StructuredTool
 from a2agw.adapters._contexts import context_key
 from a2agw.adapters._stream import content_text, stream_events
 from a2agw.consult.client import PartnerClient
-from a2agw.consult.tools import UNTRUSTED_NOTE, PartnerTool, invoke
+from a2agw.consult.tools import PartnerTool, invoke, strip_extensions, with_untrusted_note
 from a2agw.core.events import AgentEvent, ArtifactChunk, Usage
 from a2agw.core.spi import InboundContext
 from a2agw.security.principal import Principal
@@ -103,9 +104,10 @@ def as_langchain_tools(
         return StructuredTool.from_function(
             coroutine=call,
             name=tool.name,
-            description=tool.description + "\n\n" + UNTRUSTED_NOTE,
-            # A dict args_schema is not validated by LangChain; ``invoke`` validates instead.
-            args_schema=tool.parameters,
+            description=with_untrusted_note(tool.description),
+            # A dict args_schema is not validated by LangChain; ``invoke`` validates instead
+            # (gateway-only ``x-`` limits included). A copy: LangChain may change it.
+            args_schema=copy.deepcopy(strip_extensions(tool.parameters)),
             handle_tool_error=True,
         )
 

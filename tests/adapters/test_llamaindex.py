@@ -30,7 +30,7 @@ from adapters.contract import (
     output_text,
 )
 from llama_index.core.agent.workflow import AgentWorkflow, FunctionAgent
-from llama_index.core.base.llms.types import ChatResponse, ToolCallBlock
+from llama_index.core.base.llms.types import ChatResponse, TextBlock, ToolCallBlock
 from llama_index.core.bridge.pydantic import PrivateAttr
 from llama_index.core.llms import ChatMessage
 from llama_index.core.llms.mock import MockFunctionCallingLLM
@@ -137,6 +137,15 @@ class Script:
             _, name, args, call_id = step
             block = ToolCallBlock(tool_call_id=call_id, tool_name=name, tool_kwargs=args)
             message = ChatMessage(role="assistant", blocks=[block])
+            yield ChatResponse(message=message, delta="", raw=raw)
+            return
+        if step[0] == "narrate":  # streamed text, then a tool call in the same message
+            _, narration, (_, name, args, call_id) = step
+            yield ChatResponse(
+                message=ChatMessage(role="assistant", content=narration), delta=narration
+            )
+            block = ToolCallBlock(tool_call_id=call_id, tool_name=name, tool_kwargs=args)
+            message = ChatMessage(role="assistant", blocks=[TextBlock(text=narration), block])
             yield ChatResponse(message=message, delta="", raw=raw)
             return
         parts = step[1] if step[0] == "chunks" else ["heard: " + ", ".join(user_texts(messages))]
@@ -671,3 +680,17 @@ async def test_owned_tasks_only():
 
     client = FakePartnerClient()
     await assert_owned_tasks_only(as_llamaindex_tools(client.tools(), client), run_tool, client)
+
+
+async def test_messages_are_separated():
+    # The narration streamed before a tool call and the answer after it are two messages.
+    from adapters.contract import assert_messages_separated
+
+    client = FakePartnerClient()
+    narrated = ("narrate", "Let me ask.", call("ask_pinger", {"message": "hi"}))
+    script = Script(narrated, chunks("pinger ", "said pong"))
+    adapter = LlamaIndexAdapter(make_agent(script, as_llamaindex_tools(client.tools(), client)))
+    evs = await drive(adapter, "ping")
+    assert_messages_separated(
+        [e for e in evs if not isinstance(e, Status)], "Let me ask.", "pinger said pong"
+    )

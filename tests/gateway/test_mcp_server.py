@@ -391,9 +391,12 @@ async def test_unknown_agent_404_only_after_auth(env):
     for agent in ("zzz", "b", "a/extra", "a"):
         assert await status(agent, {}) == 401, agent
         assert await status(agent, {"X-API-Key": "wrong"}) == 401, agent
-    for agent in ("zzz", "b", "a/extra"):
+    for agent in ("zzz", "b"):
         assert await status(agent, {"X-API-Key": SVC}) == 403, agent  # not mapped
         assert await status(agent, token_a) == 403, agent  # the token is for a
+    # Not a valid agent id at all: no agent id (401), whatever the credentials.
+    assert await status("a/extra", {"X-API-Key": SVC}) == 401
+    assert await status("a/extra", token_a) == 401
     assert await status("b", {"X-API-Key": SVC2}) == 404  # mapped, not served over MCP
     assert await status("a", {"X-API-Key": SVC2}) == 200
 
@@ -502,3 +505,43 @@ def test_core_does_not_import_mcp(tmp_path, enabled):
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=60, check=True
     )
     assert out.stdout.split() == [str(enabled), str(enabled)]
+
+
+async def test_rebinding_protection_allows_the_consult_url_host(env):
+    """Sidecar agents reach the gateway at ``consult_url`` (e.g. a compose service name), so
+    its host and origin are allowed as well as the base URL's; others still are not."""
+    e, h = await linked(env, consult_url="http://gateway:8000/a2agw/v1")
+    for host in ("gateway:8000", "t"):
+        r = await e.hc.post(f"{MCP}/a", json=INIT, headers={**ACCEPT, **h, "Host": host})
+        assert r.status_code == 200, (host, r.status_code)
+    origin = {"Host": "gateway:8000", "Origin": "http://gateway:8000"}
+    r = await e.hc.post(f"{MCP}/a", json=INIT, headers={**ACCEPT, **h, **origin})
+    assert r.status_code == 200
+    r = await e.hc.post(f"{MCP}/a", json=INIT, headers={**ACCEPT, **h, "Host": "evil.example"})
+    assert r.status_code == 421
+
+
+async def test_path_agent_must_be_a_valid_agent_id(env):
+    """An MCP path segment that is not a valid agent id counts as no agent id (401), audited
+    without the value, whatever the credentials."""
+    e, h = await linked(env)
+    for bad in ("Bad_Agent", "a" * 64):
+        r = await e.hc.post(f"{MCP}/{bad}", json=INIT, headers={**ACCEPT, **h})
+        assert r.status_code == 401, (bad, r.status_code)
+    await e.host.audit.drain()
+    rows, _ = await e.host.audit.query({"action": "sidecar.denied"}, 10)
+    assert rows and all(r["agent_id"] is None for r in rows), rows
+    assert {r["detail"]["reason"] for r in rows} == {"no agent id"}
+
+
+async def test_binding_revoked_before_registration_is_refused(env, monkeypatch):
+    """A consult token revoked between authentication and session registration gets 401;
+    no session is registered under ``grant:None``."""
+    e, h = await linked(env)
+    monkeypatch.setattr(e.host.consult_tokens, "grant_id", lambda binding: None)
+    r = await e.hc.post(f"{MCP}/a", json=INIT, headers={**ACCEPT, **h})
+    assert r.status_code == 401
+    app = e.host._mcp
+    assert app is not None
+    assert all(s.owner != "grant:None" for s in app._sessions.values())
+    assert app._sessions == {}

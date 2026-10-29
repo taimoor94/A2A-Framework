@@ -34,7 +34,7 @@ except ImportError as e:  # pragma: no cover - exercised by a test that hides th
     raise ImportError(OPENAI_EXTRA_HINT) from e
 
 from a2agw.adapters._contexts import ContextRegistry, context_key
-from a2agw.adapters._stream import stream_events
+from a2agw.adapters._stream import MessageTexts, stream_events
 from a2agw.consult.client import PartnerClient
 from a2agw.consult.tools import PartnerTool, invoke, strip_extensions, with_untrusted_note
 from a2agw.core.events import AgentEvent, Done, Status, Usage
@@ -175,11 +175,18 @@ class OpenAIAgentsAdapter:
 
         async def source() -> AsyncIterator[str | AgentEvent]:
             nonlocal streamed
+            texts = MessageTexts()  # a new output item, or the response's end, ends a message
+            item: str | None = None
             async for ev in result.stream_events():
                 if ev.type == "raw_response_event":
                     if isinstance(ev.data, ResponseTextDeltaEvent) and ev.data.delta:
+                        if ev.data.item_id != item:
+                            texts.end_message()
+                            item = ev.data.item_id
                         streamed = True
-                        yield ev.data.delta
+                        yield texts.text(ev.data.delta)
+                    elif getattr(ev.data, "type", None) == "response.completed":
+                        texts.end_message()
                 elif ev.type == "run_item_stream_event" and ev.name == "tool_called":
                     name = getattr(ev.item, "tool_name", None)
                     if name:

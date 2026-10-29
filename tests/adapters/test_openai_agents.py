@@ -141,6 +141,36 @@ class FakeModel(Model):
             await step[1].wait()
         if step[0] == "raise":
             raise RuntimeError("model exploded")
+        if step[0] == "narrate":  # streamed text, then a function call, in one response
+            _, narration, name, args = step
+            yield ResponseTextDeltaEvent(
+                type="response.output_text.delta",
+                item_id="msg-n",
+                output_index=0,
+                content_index=0,
+                delta=narration,
+                logprobs=[],
+                sequence_number=0,
+            )
+            msg = ResponseOutputMessage(
+                id="msg-n",
+                type="message",
+                role="assistant",
+                status="completed",
+                content=[
+                    ResponseOutputText(
+                        text=narration, type="output_text", annotations=[], logprobs=[]
+                    )
+                ],
+            )
+            call = ResponseFunctionToolCall(
+                id="fc-n", call_id="call-n", type="function_call", name=name,
+                arguments=json.dumps(args),
+            )  # fmt: skip
+            yield ResponseCompletedEvent(
+                type="response.completed", response=self._response([msg, call]), sequence_number=1
+            )
+            return
         if step[0] == "tool":
             call = ResponseFunctionToolCall(
                 id="fc-1",
@@ -508,3 +538,18 @@ async def test_owned_tasks_only():
         return await t.on_invoke_tool(ctx, raw)
 
     await assert_owned_tasks_only(as_openai_tools(client.tools(), client), call, client)
+
+
+async def test_messages_are_separated():
+    # The narration of the response that calls a tool, and the answer of the next response.
+    from adapters.contract import assert_messages_separated
+
+    client = FakePartnerClient()
+    model = FakeModel(
+        ("narrate", "Let me ask.", "ask_pinger", {"message": "hi"}), text("pinger ", "said pong")
+    )
+    agent = make_agent(model, as_openai_tools(client.tools(), client))
+    evs = await drive(OpenAIAgentsAdapter(agent), "ping")
+    assert_messages_separated(
+        [e for e in evs if not isinstance(e, Status)], "Let me ask.", "pinger said pong"
+    )

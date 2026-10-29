@@ -246,7 +246,15 @@ async def test_node_coder_answers_413_for_an_oversized_body(coder):
         b"Transfer-Encoding: chunked\r\n\r\n",
         [b"%x\r\n%s\r\n" % (len(piece), piece)] * 18 + [b"0\r\n\r\n"],  # 1.125 MiB, no length
     )
-    for answer in (declared, chunked):
+    # A client that sends the declared body anyway still reads the answer (the coder drains
+    # the body instead of closing on unread data, which would reset the connection).
+    eager = await _raw(
+        port,
+        b"POST /a2agw/invoke HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+        b"Content-Length: 2097152\r\n\r\n",
+        [piece] * 32,  # the whole 2 MiB, written without waiting for the answer
+    )
+    for answer in (declared, chunked, eager):
         status, _, rest = answer.partition(b"\r\n")
         assert status == b"HTTP/1.1 413 Payload Too Large", answer[:200]
         assert b"connection: close" in rest.lower()

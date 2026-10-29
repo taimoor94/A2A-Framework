@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -44,10 +45,29 @@ async def test_compose_config_loads_and_registers_echo(tmp_path, monkeypatch):
     assert echo.tier == "internal" and echo.credential_ref == "self"
 
 
-def test_echo_card_file_is_the_echo_agents_card(monkeypatch):
-    monkeypatch.syspath_prepend(str(DOCKER))
+def _echo_agent(mp: pytest.MonkeyPatch):
+    """Import examples/docker/echo_agent.py; ``mp`` undoes the import (and the path)."""
+    mp.syspath_prepend(str(DOCKER))
+    # Recorded as absent first (``setitem``), then removed for the import (``delitem``):
+    # undoing both leaves no ``echo_agent`` in ``sys.modules``, whatever was there before.
+    mp.setitem(sys.modules, "echo_agent", None)
+    mp.delitem(sys.modules, "echo_agent")
     import echo_agent
 
+    return echo_agent
+
+
+def test_echo_agent_import_leaves_no_module_behind():
+    with pytest.MonkeyPatch.context() as outer:
+        outer.delitem(sys.modules, "echo_agent", raising=False)  # an earlier test's import
+        with pytest.MonkeyPatch.context() as mp:
+            _echo_agent(mp)
+            assert "echo_agent" in sys.modules
+        assert "echo_agent" not in sys.modules
+
+
+def test_echo_card_file_is_the_echo_agents_card(monkeypatch):
+    echo_agent = _echo_agent(monkeypatch)
     served = MessageToDict(build_card(echo_agent.echo, "http://localhost:8000", security=None))
     assert json.loads((DOCKER / "cards" / "echo.json").read_text()) == served
 
@@ -71,3 +91,11 @@ def test_compose_file_is_valid():
     assert services["coder"]["environment"]["CONSULT_PARTNER"] == "echo"
     assert services["coder"]["environment"]["CODER_SECRET"] == ENV["CODER_SECRET"]
     assert services["gateway"]["environment"]["GATEWAY_SELF_KEY"] == ENV["GATEWAY_SELF_KEY"]
+
+
+def test_compose_explains_the_internal_tier():
+    lines = (DOCKER / "a2agw.compose.yaml").read_text().splitlines()
+    i = next(n for n, line in enumerate(lines) if line.strip() == "tier: internal")
+    comment = " ".join(line.strip() for line in lines[max(i - 3, 0) : i])
+    assert "trusted" in comment and "no address vetting" in comment
+    assert "partner or public" in comment

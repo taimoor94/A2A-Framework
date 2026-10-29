@@ -46,3 +46,16 @@ def test_no_envelope_is_a_clear_error(content, is_error, message):
     with pytest.raises(ToolError) as ei:
         _envelope("ask_pm", t.CallToolResult(content=content, is_error=is_error))
     assert str(ei.value) == message
+
+
+def test_wait_answer_without_results_goes_through_the_error_path():
+    from examples.mcp_client.client import _wait_result
+
+    done = {"partner": "pm", "state": "completed", "text": "ok"}
+    assert _wait_result({"results": [done]}) == done
+    # An envelope instead of results (say, the task is not ours): returned, not a KeyError.
+    unknown = {"partner": "pm", "state": "unavailable", "reason": "unknown task"}
+    assert _wait_result(unknown) == unknown
+    for bad in ({}, {"results": []}, {"results": ["x"]}, {"results": None}):
+        with pytest.raises(ToolError, match="a2a_wait: the gateway answered no JSON envelope"):
+            _wait_result(bad)

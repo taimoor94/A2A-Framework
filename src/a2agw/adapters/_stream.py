@@ -28,6 +28,35 @@ def content_text(content: Any) -> str:
     return ""
 
 
+MESSAGE_SEPARATOR = "\n\n"
+
+
+class MessageTexts:
+    """Joins the text of consecutive model messages in one streamed answer: the first text
+    after a message that had text is prefixed with ``MESSAGE_SEPARATOR``, so a narration and
+    the answer after its tool call ("Let me check." / "It is 42.") do not run together.
+
+    Pass every text through ``text``; call ``end_message`` when a model message ends (or a
+    new one starts: calling it more than once in a row, or before any text, is harmless)."""
+
+    def __init__(self) -> None:
+        self._wrote = False  # some message had text
+        self._pending = False  # a message with text ended since the last text
+
+    def end_message(self) -> None:
+        if self._wrote:
+            self._pending = True
+
+    def text(self, text: str) -> str:
+        if not text:
+            return text
+        if self._pending:
+            text = MESSAGE_SEPARATOR + text
+            self._pending = False
+        self._wrote = True
+        return text
+
+
 def text_chunk(text: str, *, first: bool, last: bool) -> ArtifactChunk:
     return ArtifactChunk(
         parts=[Part(text=text)], name="output", artifact_id="output", append=not first, last=last

@@ -69,6 +69,18 @@ def _envelope(tool: str, result: Any) -> dict[str, Any]:
     raise ToolError(f"{tool}: the gateway answered {what} (content: {kinds})")
 
 
+def _wait_result(waited: dict[str, Any]) -> dict[str, Any]:
+    """The first result of an ``a2a_wait`` answer. An envelope instead of results (say
+    ``unavailable``: the task is unknown) is returned as is, so the caller sees its
+    ``state`` and ``reason``; anything else raises ``ToolError``, like ``_envelope``."""
+    results = waited.get("results")
+    if isinstance(results, list) and results and isinstance(results[0], dict):
+        return results[0]
+    if "results" not in waited and isinstance(waited.get("state"), str):
+        return waited
+    raise ToolError("a2a_wait: the gateway answered no JSON envelope (content: results)")
+
+
 async def consult_pm(base_url: str, api_key: str, goal: str) -> Outcome:
     """List the tools, ask ``pm`` for ``goal``, then ``a2a_wait`` until it is done."""
     out = Outcome()
@@ -93,7 +105,7 @@ async def consult_pm(base_url: str, api_key: str, goal: str) -> Outcome:
                 "a2a_wait",
                 await session.call_tool("a2a_wait", {"tasks": [handle], "seconds": WAIT_SECONDS}),
             )
-            result = waited["results"][0]
+            result = _wait_result(waited)
         out.final = result
     return out
 

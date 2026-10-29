@@ -58,13 +58,15 @@ from a2agw.gateway.auth import (
     AGENT_HEADER,
     MCP_EXTRA_HINT,
     MCP_PREFIX,
+    NO_AGENT,
     OTHER_AGENT,
     SidecarAuthError,
     SidecarIdentity,
     audit_denied,
     from_headers,
+    valid_agent_id,
 )
-from a2agw.gateway.calls import INBOUND_ENDED, Work, unknown
+from a2agw.gateway.calls import INBOUND_ENDED, TOKEN_REVOKED, Work, unknown
 from a2agw.security.principal import Principal, PrincipalUser
 
 try:
@@ -295,10 +297,16 @@ class _Session:
 
 def _owner(ident: SidecarIdentity, host: AgentHost) -> str:
     """Who a session belongs to: the grant of a consult token (the session ends with it),
-    or the standalone principal."""
+    or the standalone principal. Raises ``SidecarAuthError`` (401) for a consult token
+    revoked since the call was authenticated."""
     b = ident.binding
     if b is not None:
-        return f"grant:{host.consult_tokens.grant_id(b)}"
+        grant_id = host.consult_tokens.grant_id(b)
+        if grant_id is None:
+            raise SidecarAuthError(
+                401, TOKEN_REVOKED, agent_id=ident.agent_id, principal=ident.principal
+            )
+        return f"grant:{grant_id}"
     p = ident.principal
     return f"principal:{p.id if p is not None else 'anonymous'}"
 
@@ -319,15 +327,24 @@ class McpHttpApp:
     def __init__(self, host: AgentHost) -> None:
         self.host = host
         url = urlsplit(host.base_url)
-        hostname = url.hostname or ""
-        if ":" in hostname:  # IPv6
-            hostname = f"[{hostname}]"
         self._netloc = url.netloc
         self._scheme = url.scheme
+        # DNS-rebinding protection: the base URL's host, and the consult URL's (the gateway
+        # as sidecar agents reach it, e.g. a compose service name).
+        hosts: list[str] = []
+        origins: list[str] = []
+        for u in (url, urlsplit(host.consult_tokens.url or host.base_url)):
+            hostname = u.hostname or ""
+            if ":" in hostname:  # IPv6
+                hostname = f"[{hostname}]"
+            for h in (u.netloc, f"{hostname}:*"):
+                if h not in hosts:
+                    hosts.append(h)
+            for o in (f"{u.scheme}://{u.netloc}", f"{u.scheme}://{hostname}:*"):
+                if o not in origins:
+                    origins.append(o)
         self.security = TransportSecuritySettings(
-            enable_dns_rebinding_protection=True,
-            allowed_hosts=[url.netloc, f"{hostname}:*"],
-            allowed_origins=[f"{url.scheme}://{url.netloc}", f"{url.scheme}://{hostname}:*"],
+            enable_dns_rebinding_protection=True, allowed_hosts=hosts, allowed_origins=origins
         )
         self._agents: dict[str, _AgentServer] = {}
         self._managers: dict[str, StreamableHTTPSessionManager] = {}
@@ -470,6 +487,8 @@ class McpHttpApp:
         headers = dict(Headers(scope=scope).items())
         headers[AGENT_HEADER] = agent_id  # the path names the agent
         try:
+            if not valid_agent_id(agent_id):  # never used, nor audited
+                raise SidecarAuthError(401, NO_AGENT, principal=principal)
             ident = from_headers(headers, principal, self.host)
             if ident.agent_id != agent_id:
                 raise SidecarAuthError(
@@ -502,7 +521,12 @@ class McpHttpApp:
     ) -> None:
         """Hand the request to the session manager, which binds each session to the caller
         that opened it; keep track of the sessions (see ``_Session``)."""
-        owner = _owner(ident, self.host)
+        try:
+            owner = _owner(ident, self.host)
+        except SidecarAuthError as e:
+            await audit_denied(self.host, e)
+            await _respond(scope, receive, send, 401, "unauthenticated", **_BEARER)
+            return
         session_user = AuthenticatedUser(AccessToken(token="", client_id=owner, scopes=[]))
         sid = Headers(scope=scope).get("mcp-session-id")
         info = self._sessions.get((agent_id, sid)) if sid else None

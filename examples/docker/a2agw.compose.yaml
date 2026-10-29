@@ -31,6 +31,9 @@ agents:
 partners:
   - id: echo
     card_file: cards/echo.json
+    # internal = trusted: loopback and private addresses are allowed, no address vetting.
+    # Right for a partner you run yourself (here, the gateway itself); use partner or public
+    # for any partner you do not run.
     tier: internal
     credential_ref: self
 

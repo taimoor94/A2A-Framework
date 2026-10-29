@@ -44,7 +44,7 @@ except ImportError as e:  # pragma: no cover - exercised by a test that hides th
     raise ImportError(LLAMAINDEX_EXTRA_HINT) from e
 
 from a2agw.adapters._contexts import ContextRegistry, context_key
-from a2agw.adapters._stream import stream_events
+from a2agw.adapters._stream import MessageTexts, stream_events
 from a2agw.consult.client import PartnerClient
 from a2agw.consult.tools import PartnerTool, invoke, strip_extensions, with_untrusted_note
 from a2agw.core.events import AgentEvent, Done, Status, Usage
@@ -164,15 +164,17 @@ class LlamaIndexAdapter:
 
         async def source() -> AsyncIterator[str | AgentEvent]:
             nonlocal streamed
+            texts = MessageTexts()  # one ``AgentOutput`` per model call ends its message
             async with aclosing(handler.stream_events()) as events:
                 async for event in events:
                     if isinstance(event, AgentStream):
                         if event.delta:
                             streamed = True
-                            yield event.delta
+                            yield texts.text(event.delta)
                     elif isinstance(event, ToolCall):
                         yield Status(f"calling {event.tool_name}")
                     elif isinstance(event, AgentOutput):
+                        texts.end_message()
                         tokens_in, tokens_out = _raw_usage(event.raw)
                         tokens[0] += tokens_in
                         tokens[1] += tokens_out

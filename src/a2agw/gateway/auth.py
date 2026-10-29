@@ -11,11 +11,12 @@ A sidecar call acts as one agent id, established in one of two ways:
 
 Anything else is refused: 401, or 403 for an agent id the principal is not mapped to. Each
 refusal is audited as ``sidecar.denied`` with the reason and the agent id only (never a
-token or a key).
+token or a key). An agent id that is not a valid one (``AGENT_ID_PATTERN``) counts as none.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -23,6 +24,7 @@ from typing import TYPE_CHECKING, Literal
 from a2agw.ops.admin import SIDECAR_SCOPE
 from a2agw.ops.audit import AuditEvent
 from a2agw.security.principal import Principal, PrincipalUser
+from a2agw.serve.agent import AGENT_ID_PATTERN
 
 if TYPE_CHECKING:
     from starlette.requests import Request
@@ -39,6 +41,7 @@ __all__ = [
     "audit_denied",
     "from_headers",
     "resolve_sidecar",
+    "valid_agent_id",
 ]
 
 AGENT_HEADER = "x-a2agw-agent"
@@ -51,6 +54,15 @@ MISSING_SCOPE = "missing a2agw:sidecar scope"
 NO_AGENT = "no agent id"
 AGENT_NOT_ALLOWED = "agent not allowed for principal"
 OTHER_AGENT = "consult token for another agent"  # MCP: the path names the agent
+
+_AGENT_ID = re.compile(AGENT_ID_PATTERN)
+
+
+def valid_agent_id(value: str) -> bool:
+    """Whether ``value`` is a valid agent id (``AGENT_ID_PATTERN``). A sidecar agent id from
+    a request (the ``X-A2AGW-Agent`` header, the MCP path) that is not counts as none
+    (``NO_AGENT``): it is never used, nor audited."""
+    return _AGENT_ID.fullmatch(value) is not None
 
 
 @dataclass(frozen=True)
@@ -100,6 +112,8 @@ def from_headers(
         if binding is not None:
             return SidecarIdentity(binding.agent_id, binding, binding.caller)
     agent_id = headers.get(AGENT_HEADER) or None
+    if agent_id is not None and not valid_agent_id(agent_id):
+        agent_id = None  # counts as no agent id: never used, nor audited
     if principal is None or principal.kind == "anonymous":
         raise SidecarAuthError(401, NOT_AUTHENTICATED, agent_id=agent_id, principal=principal)
     if SIDECAR_SCOPE not in principal.scopes:

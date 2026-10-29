@@ -18,6 +18,7 @@ from adapters.contract import (
     assert_cancellable,
     assert_failure_maps,
     assert_isolated_callers,
+    assert_messages_separated,
     assert_multi_turn,
     assert_projection,
     assert_text_stream,
@@ -339,7 +340,8 @@ async def test_narration_before_tool_calls_is_status():
         Status("asking again"),
         Status("calling ask_pinger"),
     ]
-    assert_text_stream([e for e in evs if not isinstance(e, Status)], "Looking. done")
+    # Two model messages (the streamed narration, the answer): separated by a blank line.
+    assert_messages_separated([e for e in evs if not isinstance(e, Status)], "Looking. ", "done")
 
 
 async def test_unstreamed_reply_after_tool_call_is_done_text():

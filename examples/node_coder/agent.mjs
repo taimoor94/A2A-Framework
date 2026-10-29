@@ -155,12 +155,12 @@ async function turn(invoke, emit, signal) {
   emit({ type: "done" });
 }
 
-const tooLarge = (midBody) => Object.assign(new Error("body too large"), { status: 413, midBody });
+const tooLarge = () => Object.assign(new Error("body too large"), { status: 413, drain: true });
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
     if (Number(req.headers["content-length"]) > MAX_BODY_BYTES) {
-      reject(tooLarge(false)); // refused on the header, before reading a byte
+      reject(tooLarge()); // refused on the header, before reading a byte (then drained)
       return;
     }
     const chunks = [];
@@ -169,7 +169,7 @@ function readBody(req) {
       size += c.length;
       if (size > MAX_BODY_BYTES) {
         req.removeAllListeners("data");
-        reject(tooLarge(true));
+        reject(tooLarge());
         return;
       }
       chunks.push(c);
@@ -191,12 +191,13 @@ async function invokeRoute(req, res) {
   } catch (e) {
     if (!res.headersSent && !res.destroyed) {
       const status = e.status || 400;
-      // Answer at once, with Connection: close. Refused mid-body, the rest of the body is read
-      // and discarded (up to a limit, for a few seconds) before the response ends: closing with
-      // unread data would reset the connection before the client reads the answer.
+      // Answer at once, with Connection: close. A body refused as too large (on its declared
+      // length or mid-body) is then read and discarded (up to a limit, for a few seconds)
+      // before the response ends: closing with unread data would reset the connection before
+      // the client reads the answer.
       res.writeHead(status, { "content-type": "application/json", connection: "close" });
       const answer = JSON.stringify({ error: status === 413 ? "payload too large" : "bad request" });
-      if (!e.midBody) {
+      if (!e.drain) {
         res.end(answer);
         return;
       }
