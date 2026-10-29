@@ -539,6 +539,13 @@ secrets come from your environment, never from the file:
 POSTGRES_PASSWORD=... docker compose -f examples/docker/compose.yaml up --build
 ```
 
+The examples ship a placeholder admin key hash (all zeros), so the admin API stays disabled.
+Generate a key and its hash, then put the hash under `auth.api_keys` (or use `a2agw init --secure`):
+
+```bash
+python -c "import secrets,hashlib;k=secrets.token_urlsafe(32);print(k,hashlib.sha256(k.encode()).hexdigest())"
+```
+
 The image tests are opt-in: `A2AGW_DOCKER_TESTS=1 uv run pytest tests/docker -q`.
 
 ## Observability

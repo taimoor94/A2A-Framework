@@ -99,10 +99,20 @@ def test_runs_as_non_root(image):
     assert out == "10001"
 
 
-def test_crewai_extra_is_refused():
+@pytest.mark.parametrize("extras", ["postgres,crewai", "postgres,CrewAI"])
+def test_crewai_extra_is_refused(extras):
     r = _docker(
-        "build", "--build-arg", "EXTRAS=postgres,crewai", "-t", f"a2agw-neg:{uuid.uuid4().hex[:8]}",
+        "build", "--build-arg", f"EXTRAS={extras}", "-t", f"a2agw-neg:{uuid.uuid4().hex[:8]}",
         str(ROOT), timeout=BUILD_TIMEOUT_S, check=False,
     )  # fmt: skip
     assert r.returncode != 0
     assert "must not contain crewai" in r.stderr + r.stdout
+
+
+def test_config_read_only_data_writable(image):
+    out = _docker(
+        "run", "--rm", "-v", f"{CONFIG_DIR}:/config:ro", "--entrypoint", "sh", image, "-c",
+        "touch /config/x 2>/dev/null && echo cfg-writable; touch /data/x && echo data-ok",
+    ).stdout  # fmt: skip
+    assert "cfg-writable" not in out
+    assert "data-ok" in out

@@ -25,7 +25,7 @@ services:
       postgres:
         condition: service_healthy
       coder:
-        condition: service_started
+        condition: service_started   # the coder has no healthcheck (placeholder agent)
 
   postgres:
     image: postgres:16-alpine
@@ -44,6 +44,10 @@ services:
   coder:
     image: node:24-alpine
     working_dir: /app
+    user: node
+    read_only: true
+    cap_drop: [ALL]
+    # Task 12 adds a webhook `secret_env` (HMAC) for requests from the gateway.
     command: ["node", "agent.mjs"]
     volumes:
       - ../node_coder:/app:ro

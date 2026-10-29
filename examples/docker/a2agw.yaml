@@ -3,7 +3,11 @@
 base_url: ${A2AGW_BASE_URL:-http://localhost:8000}
 # State lives in the /data volume; /config can stay read-only.
 db_url: ${A2AGW_DB_URL:-sqlite+aiosqlite:////data/a2agw.db}
-admin_without_auth: true   # example only: configure `auth` before exposing the port
+auth:                      # admin stays disabled until you replace the placeholder hash
+  api_keys:                # sha256 hex of a key (not secret); no key hashes to all zeros
+    "0000000000000000000000000000000000000000000000000000000000000000":
+      principal_id: admin
+      scopes: ["a2agw:admin"]
 
 agents:
   - spec: "echo_agent:echo"

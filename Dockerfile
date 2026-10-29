@@ -6,14 +6,16 @@ COPY --from=ghcr.io/astral-sh/uv:0.12.13 /uv /bin/uv
 # Extras to install; default postgres,mcp. Adapters add e.g. EXTRAS=postgres,mcp,langgraph.
 # crewai is refused: it conflicts with other extras in the lock (see pyproject uv conflicts).
 ARG EXTRAS=postgres,mcp
-RUN case ",${EXTRAS}," in *crewai*) \
+RUN E="$(printf %s "${EXTRAS}" | tr '[:upper:]' '[:lower:]')"; \
+    case ",${E}," in *crewai*) \
       echo "EXTRAS must not contain crewai: it conflicts with mcp/openai/all/adk; build a separate image" >&2; exit 1;; \
     esac
 WORKDIR /src
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
+ENV UV_PYTHON_DOWNLOADS=never
 RUN uv build --wheel --out-dir /dist \
- && uv venv /opt/venv \
+ && uv venv --python /usr/local/bin/python3.12 /opt/venv \
  && W="$(ls /dist/*.whl)" \
  && if [ -n "${EXTRAS}" ]; then SPEC="a2a-gateway[${EXTRAS}] @ file://${W}"; else SPEC="${W}"; fi \
  && VIRTUAL_ENV=/opt/venv uv pip install "${SPEC}"
