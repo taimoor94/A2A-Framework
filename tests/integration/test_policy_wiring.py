@@ -363,6 +363,30 @@ async def test_discovery_mode_respects_routing(env):
     assert res["state"] == "unavailable"
 
 
+async def test_task_tools_respect_routing(env):
+    """check, cancel and wait reach only partners the agent's routing leaves visible, like
+    consult: a hidden partner answers ``unknown partner`` and nothing is sent."""
+    policy = engine_for(routing=[{"agent": "a", "partners": ["c"], "mode": "forbid"}])
+    e = await env(spec("a", Fn(echo)), spec("b", Fn(echo)), spec("c", Fn(echo)), policy=policy)
+    await e.register("b", "c")
+    sent: list[str] = []
+
+    async def spy(pid, tid, **kw):
+        sent.append(pid)
+        raise AssertionError("must not be called")
+
+    e.host.client.check = spy  # type: ignore[method-assign]
+    e.host.client.cancel = spy  # type: ignore[method-assign]
+    tools = {t.kind: t for t in partner_tools(e.host.partners, policy=policy, agent_id="a")}
+    handle = {"partner_id": "c", "task_id": "t1"}
+    hidden = {"partner": "c", "state": "unavailable", "reason": "unknown partner"}
+    assert await invoke(tools["check"], handle, e.host.client, None) == hidden
+    assert await invoke(tools["cancel"], handle, e.host.client, None) == hidden
+    waited = await invoke(tools["wait"], {"tasks": [handle], "seconds": 0}, e.host.client, None)
+    assert waited == hidden
+    assert sent == []
+
+
 async def test_invoke_passes_classification(env):
     policy = engine_for(egress={"partner_ceilings": {"b": "internal"}})
     e = await env(spec("a", Fn(echo)), spec("b", Fn(echo)), policy=policy)

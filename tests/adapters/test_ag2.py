@@ -647,3 +647,11 @@ async def test_example_runs():
     from examples.adapters import ag2_example
 
     assert await ag2_example.main() == "echo: hello from A2A"
+
+
+async def test_owned_tasks_only():
+    # Partner tasks belong to whoever started them: a foreign task id answers "unknown task".
+    from adapters.contract import FakePartnerClient, assert_owned_tasks_only
+
+    client = FakePartnerClient()
+    await assert_owned_tasks_only(as_ag2_tools(client.tools(), client), run_tool, client)

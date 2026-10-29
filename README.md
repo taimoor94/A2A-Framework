@@ -324,6 +324,8 @@ def tools_for_this_run():
 
 Give those tools to a tool-calling model, a LangGraph `ToolNode`, or call them directly. A partner call that outlasts `wait_seconds` returns a `working` result with a task handle; poll it with `a2a_check_task` or `a2a_wait`. If a partner needs input, the result has state `input_required` and a `question`; answer by calling the same tool again with that `task_id` and `context_id`. Without LangChain, `a2agw.adapters.callable.as_functions(tools, client)` gives plain async functions.
 
+Partner tasks belong to whoever started them, for embedded tools exactly as for the sidecar (one predicate, `PartnerClient.owns`). Inside a run, `a2a_check_task`, `a2a_cancel_task`, `a2a_wait` and a reply (`task_id`) work only on partner tasks the same inbound task started; outside any run (operator code), only on tasks started outside a run by the same caller. Any other task id, say one a prompt injection handed the model, answers `{"partner": "<id>", "state": "unavailable", "reason": "unknown task"}` and nothing is sent; a partner the agent's routing hides answers `unknown partner`. The client's own `check`, `cancel` and `wait_any` methods are not checked: they are for trusted operator code.
+
 ## Sidecar: agents in any language
 
 An agent need not be Python, nor run inside the gateway. The gateway speaks A2A for it (cards,

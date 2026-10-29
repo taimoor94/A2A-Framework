@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from a2agw.consult.client import WAIT_ANY_INTERVAL_S, PartnerClient
 from a2agw.consult.registry import PartnerRecord, PartnerRegistry
 from a2agw.consult.results import TEXT_CAP_BYTES, cut_utf8
+from a2agw.context.call_context import current_inbound_task, current_principal
 from a2agw.security.principal import Principal
 
 if TYPE_CHECKING:
@@ -76,8 +77,8 @@ class PartnerTool:
     parameters: dict[str, Any]
     partner_id: str | None
     kind: Kind
-    # Discovery tools (find / consult_any) only: the partner ids the routing policy leaves
-    # visible. None means every active partner.
+    # Discovery and task tools (find, consult_any, check, cancel, wait): the partner ids the
+    # routing policy leaves visible. None means every active partner.
     allowed: frozenset[str] | None = None
 
 
@@ -136,7 +137,7 @@ _STR = {"type": "string", "maxLength": 256}
 _HANDLE = {"partner_id": dict(_STR), "task_id": dict(_STR)}
 
 
-def _companions() -> list[PartnerTool]:
+def _companions(allowed: frozenset[str] | None) -> list[PartnerTool]:
     handle = _schema({k: dict(v) for k, v in _HANDLE.items()}, ["partner_id", "task_id"])
     wait = _schema(
         {
@@ -159,6 +160,7 @@ def _companions() -> list[PartnerTool]:
             handle,
             None,
             "check",
+            allowed,
         ),
         PartnerTool(
             "a2a_cancel_task",
@@ -166,6 +168,7 @@ def _companions() -> list[PartnerTool]:
             handle,
             None,
             "cancel",
+            allowed,
         ),
         PartnerTool(
             "a2a_wait",
@@ -174,6 +177,7 @@ def _companions() -> list[PartnerTool]:
             wait,
             None,
             "wait",
+            allowed,
         ),
     ]
 
@@ -345,7 +349,7 @@ def partner_tools(
                         "consult",
                     )
                 )
-    return tools + _companions()
+    return tools + _companions(allowed)
 
 
 # -- native projections ------------------------------------------------------------------
@@ -557,6 +561,22 @@ async def _wait(
         await asyncio.sleep(min(WAIT_ANY_INTERVAL_S, remaining))
 
 
+UNKNOWN_PARTNER = "unknown partner"
+# Also a partner task the caller does not own: whether it exists is not revealed.
+UNKNOWN_TASK = "unknown task"
+
+
+def _unknown(partner_id: str, reason: str) -> dict[str, Any]:
+    return {"partner": partner_id, "state": "unavailable", "reason": reason}
+
+
+def _visible(tool: PartnerTool, client: PartnerClient) -> set[str]:
+    """The partner ids ``tool`` may reach: the active partners, narrowed to ``tool.allowed``
+    (the routing plan of the agent the tools were built for)."""
+    visible = {r.id for r in client.registry.active()}
+    return visible if tool.allowed is None else visible & tool.allowed
+
+
 async def invoke(
     tool: PartnerTool,
     args: dict[str, Any],
@@ -568,22 +588,39 @@ async def invoke(
 ) -> dict[str, Any]:
     """Run one tool call. Never raises; invalid arguments are answered with ``rejected``.
     ``owner`` is recorded on the handle of a partner task a consult starts (see
-    ``PartnerClient.consult``)."""
+    ``PartnerClient.consult``).
+
+    Partner tasks belong to whoever started them (``PartnerClient.owns``, for the inbound
+    task ``inbound_task_id``, else the current one; with none, for ``owner`` and the
+    caller): checking, cancelling, waiting on or replying to any other task answers
+    ``unknown task``, exactly like one that does not exist, and nothing is sent. A partner
+    the tool cannot reach answers ``unknown partner``."""
     try:
         a = _check_object(args, tool.parameters, "") if isinstance(args, dict) else _bad("args")
     except _Invalid as e:
         return _rejected(e)
+    inbound = inbound_task_id if inbound_task_id is not None else current_inbound_task.get()
+    principal = caller if caller is not None else current_principal.get()
+
+    async def owns(pid: str, tid: str) -> bool:
+        return await client.owns(
+            pid,
+            tid,
+            inbound_task_id=inbound,
+            caller_id=principal.id if principal is not None else None,
+            owner=owner,
+        )
+
     try:
         if tool.kind in ("consult", "consult_any"):
             if tool.kind == "consult":
                 pid = tool.partner_id
             else:
                 pid = a["partner_id"]
-                visible = {r.id for r in client.registry.active()}
-                if tool.allowed is not None:
-                    visible &= tool.allowed
-                if pid not in visible:
-                    return {"partner": pid, "state": "unavailable", "reason": "unknown partner"}
+                if pid not in _visible(tool, client):
+                    return _unknown(pid, UNKNOWN_PARTNER)
+            if a.get("task_id") is not None and not await owns(pid, a["task_id"]):
+                return _unknown(pid, UNKNOWN_TASK)
             return _cap(
                 await client.consult(
                     pid,
@@ -598,12 +635,22 @@ async def invoke(
                     owner=owner,
                 )
             )
-        if tool.kind == "check":
-            return _cap(await client.check(a["partner_id"], a["task_id"], caller=caller))
-        if tool.kind == "cancel":
-            return _cap(await client.cancel(a["partner_id"], a["task_id"], caller=caller))
+        if tool.kind in ("check", "cancel"):
+            pid, tid = a["partner_id"], a["task_id"]
+            if pid not in _visible(tool, client):
+                return _unknown(pid, UNKNOWN_PARTNER)
+            if not await owns(pid, tid):
+                return _unknown(pid, UNKNOWN_TASK)
+            op = client.check if tool.kind == "check" else client.cancel
+            return _cap(await op(pid, tid, caller=caller))
         if tool.kind == "wait":
             handles = list(dict.fromkeys((t["partner_id"], t["task_id"]) for t in a["tasks"]))
+            visible = _visible(tool, client)
+            for pid, tid in handles:
+                if pid not in visible:
+                    return _unknown(pid, UNKNOWN_PARTNER)
+                if not await owns(pid, tid):
+                    return _unknown(pid, UNKNOWN_TASK)
             results = await _wait(client, handles, a["seconds"], caller)
             share = TEXT_CAP_BYTES // len(results)
             return {"results": [_cap(r, share) for r in results]}

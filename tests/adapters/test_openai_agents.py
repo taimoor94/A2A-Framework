@@ -494,3 +494,17 @@ async def test_isolated_callers():
     # Another caller sending the same contextId does not continue this one's conversation.
     adapter = OpenAIAgentsAdapter(make_agent(FakeModel()))
     await assert_isolated_callers(adapter, "apples", "pears", "apples")
+
+
+async def test_owned_tasks_only():
+    # Partner tasks belong to whoever started them: a foreign task id answers "unknown task".
+    from adapters.contract import FakePartnerClient, assert_owned_tasks_only
+
+    client = FakePartnerClient()
+
+    async def call(t, args):
+        raw = json.dumps(args)
+        ctx = ToolContext(context=None, tool_name=t.name, tool_call_id="c1", tool_arguments=raw)
+        return await t.on_invoke_tool(ctx, raw)
+
+    await assert_owned_tasks_only(as_openai_tools(client.tools(), client), call, client)

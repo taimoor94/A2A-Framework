@@ -678,3 +678,16 @@ async def test_isolated_callers():
     await assert_isolated_callers(
         ClaudeAgentAdapter(query=FakeClaude()), "apples", "pears", "apples"
     )
+
+
+async def test_owned_tasks_only():
+    # Partner tasks belong to whoever started them: a foreign task id answers "unknown task".
+    from adapters.contract import FakePartnerClient, assert_owned_tasks_only
+
+    client = FakePartnerClient()
+    server = as_claude_tools(client.tools(), client)
+
+    async def call(tool, args):
+        return (await call_tool(server, tool.name, args))[0]
+
+    await assert_owned_tasks_only(client.tools(), call, client)

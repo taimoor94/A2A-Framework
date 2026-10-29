@@ -273,3 +273,15 @@ async def test_contract_kit():
     client = FakePartnerClient()
     fns = as_functions(client.tools(), client)
     await assert_projection(fns, lambda fn, args: fn(**args), client=client)
+
+
+async def test_owned_tasks_only():
+    # Partner tasks belong to whoever started them: a foreign task id answers "unknown task".
+    from adapters.contract import FakePartnerClient, assert_owned_tasks_only
+
+    from a2agw.adapters.callable import as_functions
+
+    client = FakePartnerClient()
+    await assert_owned_tasks_only(
+        as_functions(client.tools(), client), lambda fn, args: fn(**args), client
+    )

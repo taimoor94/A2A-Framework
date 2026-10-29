@@ -279,3 +279,15 @@ async def test_isolated_callers():
 
     adapter = RunnableAdapter(RunnableLambda(remembering))
     await assert_isolated_callers(adapter, "apples", "pears", "apples")
+
+
+async def test_owned_tasks_only():
+    # Partner tasks belong to whoever started them: a foreign task id answers "unknown task".
+    from adapters.contract import FakePartnerClient, assert_owned_tasks_only
+
+    from a2agw.adapters.langchain import as_langchain_tools
+
+    client = FakePartnerClient()
+    await assert_owned_tasks_only(
+        as_langchain_tools(client.tools(), client), lambda t, args: t.ainvoke(args), client
+    )

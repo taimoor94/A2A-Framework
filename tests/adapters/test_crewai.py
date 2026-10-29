@@ -767,3 +767,11 @@ async def test_real_home_untouched(tmp_path):
     await drive(CrewAIAdapter(crew), "go")
     assert os.path.realpath(os.path.expanduser("~")) != os.path.realpath(REAL_HOME)
     assert crewai_paths(REAL_HOME) == REAL_HOME_BEFORE
+
+
+async def test_owned_tasks_only():
+    # Partner tasks belong to whoever started them: a foreign task id answers "unknown task".
+    from adapters.contract import FakePartnerClient, assert_owned_tasks_only
+
+    client = FakePartnerClient()
+    await assert_owned_tasks_only(as_crewai_tools(client.tools(), client), run_tool, client)

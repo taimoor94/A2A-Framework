@@ -69,7 +69,7 @@ from a2agw.consult.credentials import (
     CredentialProvider,
 )
 from a2agw.consult.guarded_net import guarded_async_client, is_unsafe_address
-from a2agw.consult.handles import OutboundHandleStore
+from a2agw.consult.handles import OutboundHandleStore, owned
 from a2agw.consult.netguard import Tier, UnsafeURL, check_url_syntax
 from a2agw.consult.registry import CardFetchError, PartnerRecord, PartnerRegistry
 from a2agw.consult.resilience import Bulkhead, Busy, CircuitBreaker, with_retry
@@ -1571,6 +1571,30 @@ class PartnerClient:
                 return
             await asyncio.sleep(sleep)
             delay = min(delay * 2, POLL_MAX_S)
+
+    # -- ownership ---------------------------------------------------------------------
+
+    async def owns(
+        self,
+        partner_id: str,
+        task_id: str,
+        *,
+        inbound_task_id: str | None,
+        caller_id: str | None,
+        owner: str | None,
+    ) -> bool:
+        """Whether a caller may act on partner task ``task_id`` of ``partner_id`` (see
+        ``consult.handles.owned``): a linked caller owns the partner tasks of its inbound
+        task; an unlinked one owns the unlinked tasks it started with the same ``owner`` and
+        ``caller_id``. With no handle store, or no handle, nothing is owned.
+
+        ``consult.tools.invoke`` (the LLM-callable path, embedded or sidecar) checks this
+        before check, cancel, wait or a reply; the direct ``check`` / ``cancel`` /
+        ``wait_any`` methods do not (operator and maintenance code is trusted)."""
+        if self.handles is None:
+            return False
+        handle = await self.handles.get(partner_id, task_id)
+        return owned(handle, inbound_task_id=inbound_task_id, caller_id=caller_id, owner=owner)
 
     # -- check / cancel ----------------------------------------------------------------
 

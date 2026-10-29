@@ -66,6 +66,33 @@ _ADDED_COLUMNS = {
 OUTBOUND_TABLE = _outbound  # read by the inbound side's re-entry check (serve.store)
 
 
+def owned(
+    handle: dict[str, Any] | None,
+    *,
+    inbound_task_id: str | None,
+    caller_id: str | None,
+    owner: str | None,
+) -> bool:
+    """Whether a caller may act on the partner task of ``handle`` (check, cancel, wait on or
+    reply to it): partner tasks belong to whoever started them.
+
+    - **Linked** (an inbound task is running): the handle belongs to the same inbound task.
+    - **Unlinked** (no inbound task: a standalone sidecar call, or operator code calling
+      outside a run): the handle has no inbound task, and the same ``owner`` and
+      ``caller_id`` (None matches None).
+
+    A missing handle is not owned."""
+    if handle is None:
+        return False
+    if inbound_task_id is not None:
+        return handle.get("inbound_task_id") == inbound_task_id
+    return (
+        handle.get("inbound_task_id") is None
+        and handle.get("owner") == owner
+        and handle.get("caller_id") == caller_id
+    )
+
+
 class OutboundHandleStore:
     def __init__(self, engine: AsyncEngine) -> None:
         self._engine = engine

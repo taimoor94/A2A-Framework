@@ -576,3 +576,11 @@ async def test_example_runs():
 
 async def test_isolated_callers():
     await assert_isolated_callers(AdkAdapter(make_agent(FakeLlm())), "apples", "pears", "apples")
+
+
+async def test_owned_tasks_only():
+    # Partner tasks belong to whoever started them: a foreign task id answers "unknown task".
+    from adapters.contract import FakePartnerClient, assert_owned_tasks_only
+
+    client = FakePartnerClient()
+    await assert_owned_tasks_only(as_adk_tools(client.tools(), client), run_tool, client)

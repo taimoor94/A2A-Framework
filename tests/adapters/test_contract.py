@@ -13,7 +13,7 @@ from a2agw.consult.client import PartnerClient
 from a2agw.core.events import Done, Failed
 
 
-@pytest.mark.parametrize("method", ["consult", "check", "cancel", "wait_any"])
+@pytest.mark.parametrize("method", ["consult", "check", "cancel", "wait_any", "owns"])
 def test_fake_partner_client_mirrors_partner_client(method):
     def shape(fn):
         return [(p.name, p.kind, p.default) for p in inspect.signature(fn).parameters.values()]
@@ -73,3 +73,22 @@ async def test_isolated_callers_catches_memory_keyed_on_context_alone():
     with pytest.raises(AssertionError):  # no memory at all proves nothing
         forgetful = CallableAdapter(lambda c: f"heard: {c.text}")
         await assert_isolated_callers(forgetful, "apples", "pears", "apples")
+
+
+async def test_owned_tasks_only_catches_a_missing_ownership_check(monkeypatch):
+    from adapters.contract import assert_owned_tasks_only
+
+    from a2agw.adapters.callable import as_functions
+
+    client = FakePartnerClient()
+    await assert_owned_tasks_only(as_functions(client.tools(), client), lambda f, a: f(**a), client)
+
+    async def everything(self, *args, **kwargs):  # an ownership check that lets all through
+        return True
+
+    monkeypatch.setattr(FakePartnerClient, "owns", everything)
+    client = FakePartnerClient()
+    with pytest.raises(AssertionError):
+        await assert_owned_tasks_only(
+            as_functions(client.tools(), client), lambda f, a: f(**a), client
+        )

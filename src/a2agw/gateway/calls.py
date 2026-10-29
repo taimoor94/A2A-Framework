@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 from opentelemetry import context as otel_context
 
-from a2agw.consult.tools import PartnerTool, invoke, rejection
+from a2agw.consult.tools import UNKNOWN_PARTNER, UNKNOWN_TASK, PartnerTool, invoke, rejection
 from a2agw.context.call_context import (
     CallContext,
     use_agent,
@@ -53,8 +53,6 @@ __all__ = [
     "unknown",
 ]
 
-UNKNOWN_PARTNER = "unknown partner"
-UNKNOWN_TASK = "unknown task"  # also a task the caller does not own: existence is not revealed
 TOO_MANY_OPEN = "too many open tasks"
 INBOUND_ENDED = "inbound task ended"  # the consult token was revoked while the call ran
 TOKEN_REVOKED = "consult token revoked"
@@ -150,22 +148,19 @@ class SidecarCalls:
 
     async def owns(self, ident: SidecarIdentity, pid: str, tid: str) -> bool:
         """Whether the caller may act on partner task ``tid``: tasks belong to whoever
-        started them. A linked call owns the partner tasks of its inbound task; a standalone
-        call owns the unlinked ones its agent id started for the same principal."""
+        started them (``PartnerClient.owns``, the predicate embedded tool calls use too). A
+        linked call owns the partner tasks of its inbound task; a standalone call owns the
+        unlinked ones its agent id started for the same principal."""
         host = self.host
-        if host.handles is None:
-            return False
-        h = await host.handles.get(pid, tid)
-        if h is None:
-            return False
         b, p = ident.binding, ident.principal
-        if b is not None:
-            return h["inbound_task_id"] == b.inbound_task_id
-        return (
-            h["inbound_task_id"] is None
-            and h.get("owner") == host.sidecar_owner(ident.agent_id)
-            and p is not None
-            and h.get("caller_id") == p.id
+        if host.client is None or (b is None and p is None):
+            return False
+        return await host.client.owns(
+            pid,
+            tid,
+            inbound_task_id=b.inbound_task_id if b is not None else None,
+            caller_id=p.id if p is not None else None,
+            owner=None if b is not None else host.sidecar_owner(ident.agent_id),
         )
 
     @asynccontextmanager
@@ -265,15 +260,12 @@ class SidecarCalls:
     ) -> dict[str, Any]:
         """Consult partner ``pid`` with ``tool`` (its ``consult`` tool, or ``consult_any``
         with ``partner_id`` in ``args``; the caller checked ``pid`` is visible). A reply
-        (``task_id``) goes only into a task the caller owns; a new task needs a free
-        standalone slot."""
+        (``task_id``) goes only into a task the caller owns (``invoke`` checks, with
+        ``owns``); a new task needs a free standalone slot."""
         rejected = rejection(tool, args)
         if rejected is not None:
             return rejected
-        tid = args.get("task_id")
-        if tid is not None:
-            if not await self.owns(ident, pid, tid):
-                return unknown(pid, UNKNOWN_TASK)
+        if args.get("task_id") is not None:
             return await self.run(ident, tool, args)
         async with self._open_slot(ident, pid) as free:
             if not free:
@@ -283,29 +275,18 @@ class SidecarCalls:
     async def task_op(
         self, ident: SidecarIdentity, tools: list[PartnerTool], kind: str, pid: str, tid: str
     ) -> dict[str, Any]:
-        """``check`` or ``cancel`` partner task ``tid`` of ``pid``."""
-        if pid not in self.visible(tools):
-            return unknown(pid)
-        if not await self.owns(ident, pid, tid):
-            return unknown(pid, UNKNOWN_TASK)
+        """``check`` or ``cancel`` partner task ``tid`` of ``pid``: ``invoke`` answers
+        ``unknown partner`` for a partner the tools cannot reach and ``unknown task`` for a
+        task the caller does not own (``owns``)."""
         tool = next(t for t in tools if t.kind == kind)
         return await self.run(ident, tool, {"partner_id": pid, "task_id": tid})
 
     async def wait(
         self, ident: SidecarIdentity, tools: list[PartnerTool], args: Any
     ) -> dict[str, Any]:
-        """Wait on several partner tasks, every one of them the caller's. The arguments are
-        checked first (at most 20 tasks), and each distinct task is looked up once."""
+        """Wait on several partner tasks, every one of them the caller's. ``invoke`` checks
+        the arguments first (at most 20 tasks), then looks each distinct task up once."""
         tool = next(t for t in tools if t.kind == "wait")
-        rejected = rejection(tool, args)
-        if rejected is not None:
-            return rejected
-        visible = self.visible(tools)
-        for pid, tid in dict.fromkeys((t["partner_id"], t["task_id"]) for t in args["tasks"]):
-            if pid not in visible:
-                return unknown(pid)
-            if not await self.owns(ident, pid, tid):
-                return unknown(pid, UNKNOWN_TASK)
         return await self.run(ident, tool, args)
 
     async def find(

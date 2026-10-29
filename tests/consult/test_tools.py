@@ -11,11 +11,14 @@ from a2agw.consult.registry import PartnerRecord, PartnerRegistry, card_hash
 from a2agw.consult.results import TEXT_CAP_BYTES, ToolResult, Track, build_result
 from a2agw.consult.tools import (
     FRAMING,
+    UNKNOWN_TASK,
     UNTRUSTED_NOTE,
     invoke,
     partner_tools,
     rank_partners,
 )
+from a2agw.context.call_context import use_inbound
+from a2agw.security.principal import Principal
 
 
 def _rec(
@@ -141,11 +144,21 @@ def test_rank_partners_keyword():
 
 
 class StubClient:
-    def __init__(self, reg: PartnerRegistry, result: ToolResult | None = None, exc=None):
+    """Owns every partner task unless ``owned`` names the ones it owns."""
+
+    def __init__(
+        self, reg: PartnerRegistry, result: ToolResult | None = None, exc=None, owned=None
+    ):
         self.registry = reg
         self.result = result
         self.exc = exc
+        self.owned = owned
         self.calls: list[tuple] = []
+        self.ownership: list[tuple] = []
+
+    async def owns(self, pid, tid, *, inbound_task_id, caller_id, owner):
+        self.ownership.append((pid, tid, inbound_task_id, caller_id, owner))
+        return self.owned is None or (pid, tid) in self.owned
 
     async def consult(self, pid, message, **kw):
         self.calls.append(("consult", pid, message, kw))
@@ -279,14 +292,13 @@ async def test_unexpected_client_error_is_contained(caplog):
 async def test_caller_is_passed_through():
     reg = _registry(_rec("alpha"))
     c = StubClient(reg, _res(state="completed"))
-    who = object()
+    who = Principal(id="key:who", kind="api_key", scopes=frozenset())
     tools = partner_tools(reg)
     await invoke(tools[0], {"message": "x"}, c, None, caller=who)
-    await invoke(_tool(tools, "a2a_check_task"), {"partner_id": "a", "task_id": "t"}, c, None, who)
-    await invoke(_tool(tools, "a2a_cancel_task"), {"partner_id": "a", "task_id": "t"}, c, None, who)
-    await invoke(
-        _tool(tools, "a2a_wait"), {"tasks": [{"partner_id": "a", "task_id": "t"}]}, c, None, who
-    )
+    handle = {"partner_id": "alpha", "task_id": "t"}
+    await invoke(_tool(tools, "a2a_check_task"), handle, c, None, who)
+    await invoke(_tool(tools, "a2a_cancel_task"), handle, c, None, who)
+    await invoke(_tool(tools, "a2a_wait"), {"tasks": [handle]}, c, None, who)
     assert c.calls[0][3]["caller"] is who
     assert all(call[-1]["caller"] is who if call[0] != "consult" else True for call in c.calls)
     assert [call[0] for call in c.calls] == ["consult", "check", "cancel", "check"]
@@ -366,3 +378,34 @@ async def test_integer_accepts_whole_floats():
     assert (await invoke(find, {"need": "finance", "k": 2.5}, c, None))["state"] == "rejected"
     assert (await invoke(find, {"need": "finance", "k": True}, c, None))["state"] == "rejected"
     assert find.description.endswith(UNTRUSTED_NOTE)
+
+
+async def test_task_tools_act_only_on_owned_tasks():
+    """check, cancel, wait and a reply (consult with ``task_id``) ask ``client.owns`` first,
+    for the given inbound task (else the current one), the caller and ``owner``; a task the
+    caller does not own answers ``unknown task`` and nothing is sent."""
+    reg = _registry(_rec("alpha"))
+    c = StubClient(reg, _res(task_id="mine"), owned={("alpha", "mine")})
+    tools = partner_tools(reg)
+    theirs = {"partner_id": "alpha", "task_id": "theirs"}
+    unknown = {"partner": "alpha", "state": "unavailable", "reason": UNKNOWN_TASK}
+    who = Principal(id="key:who", kind="api_key", scopes=frozenset())
+    assert await invoke(_tool(tools, "a2a_check_task"), theirs, c, "in-1") == unknown
+    assert await invoke(_tool(tools, "a2a_cancel_task"), theirs, c, "in-1") == unknown
+    wait = {"tasks": [{"partner_id": "alpha", "task_id": "mine"}, theirs], "seconds": 0}
+    assert await invoke(_tool(tools, "a2a_wait"), wait, c, "in-1") == unknown
+    reply = {"message": "x", "task_id": "theirs"}
+    assert await invoke(tools[0], reply, c, "in-1") == unknown
+    assert c.calls == []
+    # The inbound task comes from the context when not given; unlinked calls pass owner.
+    with use_inbound("in-ctx", who):
+        await invoke(_tool(tools, "a2a_check_task"), theirs, c, None)
+    await invoke(_tool(tools, "a2a_check_task"), theirs, c, None, who, owner="sidecar:x")
+    assert c.ownership[-2:] == [
+        ("alpha", "theirs", "in-ctx", "key:who", None),
+        ("alpha", "theirs", None, "key:who", "sidecar:x"),
+    ]
+    mine = {"partner_id": "alpha", "task_id": "mine"}
+    assert (await invoke(_tool(tools, "a2a_check_task"), mine, c, "in-1"))["task_id"] == "mine"
+    assert (await invoke(tools[0], {"message": "x", "task_id": "mine"}, c, "in-1"))["state"]
+    assert [call[0] for call in c.calls] == ["check", "consult"]

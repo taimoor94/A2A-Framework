@@ -19,9 +19,11 @@ from typing import Any
 
 from a2a.types import Message, Part, Role
 
+from a2agw.consult.handles import owned
 from a2agw.consult.registry import PartnerRecord
 from a2agw.consult.results import ToolResult
 from a2agw.consult.tools import PartnerTool, partner_tools
+from a2agw.context.call_context import current_inbound_task, current_principal, use_inbound
 from a2agw.core.events import AgentEvent, ArtifactChunk, Done, Failed
 from a2agw.core.spi import InboundAdapter, InboundContext
 from a2agw.security.principal import Principal
@@ -32,6 +34,7 @@ __all__ = [
     "assert_failure_maps",
     "assert_isolated_callers",
     "assert_multi_turn",
+    "assert_owned_tasks_only",
     "assert_projection",
     "assert_text_stream",
     "caller",
@@ -221,13 +224,50 @@ class _FakeRegistry:
 
 class FakePartnerClient:
     """The ``PartnerClient`` surface ``invoke`` uses: ``consult``, ``check``, ``cancel``,
-    ``wait_any`` (same signatures as ``PartnerClient``; ``test_contract.py`` checks) and
-    ``registry.active()``. Every call is recorded in ``calls`` as
-    ``(method, kwargs)``; ``consult`` completes with ``"pong:<message>"``."""
+    ``wait_any``, ``owns`` (same signatures as ``PartnerClient``; ``test_contract.py``
+    checks) and ``registry.active()``. Every call except ``owns`` is recorded in ``calls``
+    as ``(method, kwargs)``; ``consult`` completes with ``"pong:<message>"`` as task
+    ``pt-1`` and records its handle in ``handles`` like ``PartnerClient`` does (inbound
+    task, caller id and owner), so ``owns`` answers with the real predicate."""
 
     def __init__(self, partners: Iterable[str] = ("pinger",)) -> None:
         self.registry = _FakeRegistry([_record(p) for p in partners])
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.handles: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def add_handle(
+        self,
+        partner_id: str,
+        task_id: str,
+        *,
+        inbound_task_id: str | None = None,
+        caller_id: str | None = None,
+        owner: str | None = None,
+    ) -> None:
+        """Record a partner task's handle, as if someone else had started it."""
+        self.handles[(partner_id, task_id)] = {
+            "partner_id": partner_id,
+            "task_id": task_id,
+            "inbound_task_id": inbound_task_id,
+            "caller_id": caller_id,
+            "owner": owner,
+        }
+
+    async def owns(
+        self,
+        partner_id: str,
+        task_id: str,
+        *,
+        inbound_task_id: str | None,
+        caller_id: str | None,
+        owner: str | None,
+    ) -> bool:
+        return owned(
+            self.handles.get((partner_id, task_id)),
+            inbound_task_id=inbound_task_id,
+            caller_id=caller_id,
+            owner=owner,
+        )
 
     def tools(self) -> list[PartnerTool]:
         """``partner_tools`` for this client's partners (the consult tools first)."""
@@ -270,6 +310,15 @@ class FakePartnerClient:
                 },
             )
         )
+        if (partner_id, "pt-1") not in self.handles:
+            principal = caller if caller is not None else current_principal.get()
+            self.add_handle(
+                partner_id,
+                "pt-1",
+                inbound_task_id=inbound_task_id or current_inbound_task.get(),
+                caller_id=principal.id if principal is not None else None,
+                owner=owner,
+            )
         return ToolResult(
             partner=partner_id,
             task_id="pt-1",
@@ -319,3 +368,54 @@ async def assert_projection(
     if client is not None:
         assert [c["message"] for c in client.consults] == ["hi"]
         assert client.consults[0]["partner_id"] == "pinger"
+
+
+def _envelope(out: Any) -> dict[str, Any]:
+    envelope = json.loads(out) if isinstance(out, str) else out
+    assert isinstance(envelope, dict), f"envelope is {type(out).__name__}"
+    return envelope
+
+
+async def assert_owned_tasks_only(
+    tools: list[Any],
+    call: Callable[[Any, dict], Awaitable[Any]],
+    client: FakePartnerClient,
+) -> None:
+    """Partner tasks belong to whoever started them. ``tools`` are the projection of
+    ``client.tools()`` (same order), called through ``call(tool, args)``.
+
+    Inside inbound task ``t-owner``, checking, cancelling, waiting on or replying to a
+    partner task another inbound task started answers ``unknown task`` (the same envelope
+    the sidecar gives) and nothing reaches the client; a partner the tools cannot reach
+    answers ``unknown partner``. The task this turn started itself can be checked and
+    replied to."""
+    ptools = client.tools()
+    assert len(tools) == len(ptools), "the projection must keep client.tools() in order"
+    by_kind = {p.kind: t for p, t in zip(ptools, tools, strict=True) if p.kind != "consult"}
+    consult = next(t for p, t in zip(ptools, tools, strict=True) if p.kind == "consult")
+    pid = next(p.partner_id for p in ptools if p.kind == "consult")
+    assert pid is not None
+    client.add_handle(pid, "foreign", inbound_task_id="t-other", caller_id="key:other")
+    foreign = {"partner_id": pid, "task_id": "foreign"}
+    unknown_task = {"partner": pid, "state": "unavailable", "reason": "unknown task"}
+    with use_inbound("t-owner", caller("key:owner")):
+        sent = len(client.calls)
+        attempts = [
+            (by_kind["check"], foreign),
+            (by_kind["cancel"], foreign),
+            (by_kind["wait"], {"tasks": [foreign], "seconds": 0}),
+            (consult, {"message": "hijack", "task_id": "foreign"}),
+        ]
+        for tool, args in attempts:
+            assert _envelope(await call(tool, args)) == unknown_task, args
+        hidden = {"partner_id": "no-such-partner", "task_id": "foreign"}
+        out = _envelope(await call(by_kind["check"], hidden))
+        assert out == {**unknown_task, "partner": "no-such-partner", "reason": "unknown partner"}
+        assert client.calls[sent:] == [], "a foreign partner task reached the client"
+        # The turn's own partner task: started here, so follow-ups go through.
+        first = _envelope(await call(consult, {"message": "hi"}))
+        own = {"partner_id": pid, "task_id": first["task_id"]}
+        assert _envelope(await call(by_kind["check"], own))["state"] == "completed"
+        reply = {"message": "more", "task_id": own["task_id"]}
+        assert _envelope(await call(consult, reply))["state"] == "completed"
+        assert [m for m, _ in client.calls[sent:]] == ["consult", "check", "consult"]
