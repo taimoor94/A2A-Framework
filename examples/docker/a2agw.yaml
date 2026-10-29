@@ -1,0 +1,9 @@
+# Mounted at /config in the image. echo_agent.py sits next to this file and is importable
+# because the config directory is on sys.path.
+base_url: ${A2AGW_BASE_URL:-http://localhost:8000}
+# State lives in the /data volume; /config can stay read-only.
+db_url: ${A2AGW_DB_URL:-sqlite+aiosqlite:////data/a2agw.db}
+admin_without_auth: true   # example only: configure `auth` before exposing the port
+
+agents:
+  - spec: "echo_agent:echo"

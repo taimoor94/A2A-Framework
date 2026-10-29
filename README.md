@@ -518,6 +518,29 @@ db_url: postgresql+asyncpg://gw:${GW_DB_PASSWORD}@db.internal:5432/gw   # needs 
 
 Write the password as `${VAR}` (or the whole URL as `${DB_URL}`): a literal password in `db_url` is refused. The CLI turns database failures (bad URL, connection refused, authentication failed) into one line on stderr with the URL's userinfo shown as `***@`, and `a2agw serve` checks the database before it starts listening.
 
+## Docker
+
+The image runs `a2agw serve` as uid 10001 (no shell login). Mount your config at `/config`
+(read-only is fine); state lives in the `/data` volume (default `db_url` is
+`sqlite+aiosqlite:////data/a2agw.db`). The healthcheck calls `/a2agw/admin/healthz` with
+Python (no curl in the image).
+
+```bash
+docker build -t a2agw .                       # extras: --build-arg EXTRAS=postgres,mcp,langgraph
+docker run --rm -p 127.0.0.1:8000:8000 -v "$PWD/examples/docker:/config:ro" a2agw
+curl http://127.0.0.1:8000/agents/echo/.well-known/agent-card.json
+```
+
+`EXTRAS` defaults to `postgres,mcp`. `crewai` is refused at build time (it conflicts with other
+extras in the lock); build a separate image for it. Compose (gateway, Postgres 16, Node coder);
+secrets come from your environment, never from the file:
+
+```bash
+POSTGRES_PASSWORD=... docker compose -f examples/docker/compose.yaml up --build
+```
+
+The image tests are opt-in: `A2AGW_DOCKER_TESTS=1 uv run pytest tests/docker -q`.
+
 ## Observability
 
 ```python

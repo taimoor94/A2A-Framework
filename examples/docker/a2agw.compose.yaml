@@ -1,0 +1,16 @@
+# Config for compose.yaml: the echo agent plus the Node coder as a webhook agent.
+base_url: ${A2AGW_BASE_URL:-http://localhost:8000}
+db_url: ${A2AGW_DB_URL}   # set by compose; the password comes from POSTGRES_PASSWORD
+admin_without_auth: true  # example only: the port is published on 127.0.0.1; configure `auth`
+
+agents:
+  - spec: "echo_agent:echo"
+  - id: coder
+    name: Coder
+    description: Placeholder Node coder agent (examples/node_coder).
+    skills:
+      - id: code
+        name: Code
+        description: Writes code.
+    webhook:
+      url: http://coder:9000/a2agw/invoke

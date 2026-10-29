@@ -96,6 +96,7 @@ addopts = "--import-mode=importlib"
 testpaths = ["tests"]
 pythonpath = ["tests", "."]  # shared helpers (streaming_asgi) and examples/
 markers = [
+    "docker: builds the real image; needs A2AGW_DOCKER_TESTS=1 and a Docker daemon",
     "postgres: needs a throwaway PostgreSQL 16 (tests/postgres_support.py); skipped without one",
 ]
 
