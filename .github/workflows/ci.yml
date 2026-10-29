@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.12.13"
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  gate:
+    # The main gate: the locked dev environment, every test with warnings as errors, lint.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"  # the demo's Node webhook agent
+      - run: uv python install ${{ env.PYTHON_VERSION }}
+      - run: uv sync --locked
+      - run: uv run ruff check
+      - run: uv run pytest -q -W error
+
+  crewai:
+    # CrewAI conflicts with the dev group: its tests run in their own environment.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+      - run: uv python install ${{ env.PYTHON_VERSION }}
+      - run: scripts/test-crewai.sh
+
+  fresh-resolution:
+    # What users get: a fresh resolution of the published extras (no lock), against the
+    # adapter and gateway tests. ADK is not in [all] and CrewAI conflicts with it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+      - run: uv python install ${{ env.PYTHON_VERSION }}
+      - run: uv venv --python ${{ env.PYTHON_VERSION }} .venv-fresh
+      - run: >-
+          VIRTUAL_ENV=.venv-fresh uv pip install '.[all]'
+          pytest pytest-asyncio respx langgraph-checkpoint-sqlite
+      - run: >-
+          .venv-fresh/bin/python -m pytest -q -W error
+          tests/adapters tests/gateway tests/test_dev_env.py
+          --ignore=tests/adapters/test_adk.py
+          --ignore=tests/adapters/test_crewai.py
+          --deselect "tests/test_dev_env.py::test_framework_installed[google.adk]"

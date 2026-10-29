@@ -779,7 +779,7 @@ When auth is not configured, every caller is the same principal, `anonymous`: id
                  +-----------------------------------------------+
 ```
 
-CI is not yet in the repository. Until it is, the gate is `uv sync --locked`, `uv run ruff check` and `uv run pytest -q -W error`, plus `scripts/test-crewai.sh` for the CrewAI adapter.
+CI (`.github/workflows/ci.yml`) runs three jobs: the main gate (`uv sync --locked`, `uv run ruff check`, `uv run pytest -q -W error`), the CrewAI tests (`scripts/test-crewai.sh`), and a fresh resolution of `.[all]` without the lock against the adapter and gateway tests (ADK and CrewAI excluded), so the combination users install is tested too.
 
 The core never imports a framework; adapters live in `a2agw.adapters.<name>` behind extras. See the [design spec](docs/superpowers/specs/2026-10-25-a2a-gateway-framework-design.md), the [Phase 1 plan](docs/superpowers/plans/2026-10-25-phase1-core.md), the [Phase 2 plan](docs/superpowers/plans/2026-10-26-phase2-hardening.md) and the [Phase 3 plan](docs/superpowers/plans/2026-10-26-phase3-gateway.md).
 
