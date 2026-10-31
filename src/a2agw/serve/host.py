@@ -16,7 +16,7 @@ import time
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterable, Iterator, Mapping
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlsplit
 
 import httpx
@@ -78,7 +78,7 @@ from a2agw.gateway.rest import REST_PREFIX, rest_routes
 from a2agw.gateway.tokens import ConsultTokens, GrantIssuer
 from a2agw.ops.admin import ADMIN_PREFIX, HEALTH_PATH, admin_routes
 from a2agw.ops.audit import AuditEvent, AuditLog, registry_audit_event
-from a2agw.ops.bus import EventBus
+from a2agw.ops.bus import EventBus, GatewayEvent
 from a2agw.security.auth import (
     AuthConfig,
     GatewayAuthBackend,
@@ -88,7 +88,7 @@ from a2agw.security.auth import (
     on_auth_error,
 )
 from a2agw.security.cardsign import CardSigner, CardVerifier
-from a2agw.security.policy import PolicyEngine
+from a2agw.security.policy import Policy, PolicyEngine, policy_hash
 from a2agw.security.principal import Principal, PrincipalUser
 from a2agw.serve.agent import AgentSpec, build_card
 from a2agw.serve.executor import AdapterExecutor
@@ -137,6 +137,20 @@ REFRESH_MAX_PER_PASS = 20  # partner cards refreshed per maintenance pass
 REFRESH_CONCURRENCY = 4
 PARTNERS_LOCK_TIMEOUT_S = 0.25  # longest a save on the event loop waits for the file lock
 _EARLY_AUDIT_MAX = 1000  # registry changes kept for the audit log until startup
+# Audited refusals that are also published on the bus as ``security.denied``.
+_DENIED_ACTIONS = frozenset({"authz.deny", "egress.deny", "sidecar.denied"})
+_DENIED_MAX_CHARS = 256
+
+
+def _principal_kind(actor: str) -> str:
+    """The kind of principal behind an audit actor id (never the id itself)."""
+    if actor.startswith("key:"):
+        return "api_key"
+    if actor.startswith("jwt:"):
+        return "jwt"
+    return "anonymous" if actor == "anonymous" else "system"
+
+
 _EXIT_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 # Default bound on uvicorn's wait for open requests at shutdown.
 GRACEFUL_TIMEOUT_S = 10.0
@@ -1094,7 +1108,11 @@ class AgentHost:
         self.push_senders: dict[str, GuardedPushSender] = {}
         self.push_stores: dict[str, GatewayPushConfigStore] = {}
         # Authz (authorizer and executor), egress (partner client) and routing (tools).
+        # ``set_policy`` swaps it live; the engine object is kept (with its classifier)
+        # while no policy is in force, so a later policy reuses it.
         self.policy = policy
+        self._policy_engine: PolicyEngine | None = policy
+        self._authorizers: list[_AgentAuthorizer] = []  # mounted at startup
         # audit=False disables the audit log entirely (no table, no events).
         self.audit_enabled = audit
         self.audit: AuditLog | None = None  # created at startup
@@ -1152,6 +1170,7 @@ class AgentHost:
         self._early_audit: list[AuditEvent] = []
         if audit:
             self.partners.add_listener(self._audit_registry_change)
+        self.partners.add_listener(self._publish_partner_state)
         self._app_built = False
         self._app: Starlette | None = None
 
@@ -1201,6 +1220,7 @@ class AgentHost:
         audit: AuditLog | None = None
         if self.audit_enabled:
             audit = self.audit = AuditLog(engine)
+            audit.add_listener(self._publish_denied)
             await audit.initialize()
             early, self._early_audit = self._early_audit, []
             for ev in early:
@@ -1225,6 +1245,7 @@ class AgentHost:
         )
         stores: dict[str, TaskStore] = {}
         routes: list[BaseRoute] = []
+        self._authorizers = []
         push_validator = None
         if push is not None:
             push_validator = make_push_url_validator(push.allow_private)
@@ -1319,18 +1340,15 @@ class AgentHost:
             sub_routes += create_rest_routes(
                 handler, context_builder=builder, enable_v0_3_compat=True, path_prefix="/rest"
             )
-            routes.append(
-                Mount(
-                    f"/agents/{agent_id}",
-                    app=_AgentAuthorizer(
-                        _RestConformance(Starlette(routes=sub_routes)),
-                        spec,
-                        enforce=self.auth is not None,
-                        policy=self.policy,
-                        audit=audit,
-                    ),
-                )
+            authorizer = _AgentAuthorizer(
+                _RestConformance(Starlette(routes=sub_routes)),
+                spec,
+                enforce=self.auth is not None,
+                policy=self.policy,
+                audit=audit,
             )
+            self._authorizers.append(authorizer)
+            routes.append(Mount(f"/agents/{agent_id}", app=authorizer))
         routes.append(Mount("/agents", app=_agent_not_found))
         # External agents consult partners with a grant this host issues for each turn. An
         # issuer another host installed (the adapter is shared) is replaced; a consult
@@ -1524,6 +1542,81 @@ class AgentHost:
             self._early_audit.append(ev)
         else:
             logger.warning("partner change before startup not audited (buffer full)")
+
+    def _publish_partner_state(self, rec: PartnerRecord, event: str) -> None:
+        """Registry listener: a ``partner.state`` bus event per partner lifecycle change."""
+        self.bus.publish(
+            GatewayEvent(
+                kind="partner.state",
+                agent_id="host",
+                data={"partner_id": rec.id, "status": rec.status, "event": event},
+            )
+        )
+
+    def _publish_denied(self, ev: AuditEvent) -> None:
+        """Audit listener: a ``security.denied`` bus event for every audited refusal
+        (``authz.deny``, ``egress.deny``, ``sidecar.denied``). The event carries the reason,
+        the rule and the kind of principal only: never a principal id, message text or card
+        content (the bus feeds the admin SSE stream and the control plane)."""
+        if ev.action not in _DENIED_ACTIONS:
+            return
+        detail = ev.detail or {}
+        data: dict[str, Any] = {"reason": str(detail.get("reason") or "")[:_DENIED_MAX_CHARS]}
+        if detail.get("rule"):
+            data["rule"] = str(detail["rule"])[:_DENIED_MAX_CHARS]
+        data["principal_kind"] = str(detail.get("principal_kind") or _principal_kind(ev.actor))
+        self.bus.publish(
+            GatewayEvent(kind="security.denied", agent_id=ev.agent_id or "host", data=data)
+        )
+
+    def set_policy(
+        self,
+        policy: Policy | None,
+        *,
+        actor: str,
+        source: Literal["file", "control_plane", "admin"],
+    ) -> None:
+        """Put ``policy`` in force at once, for every consumer (the agents' authorizers and
+        executors, the partner client, partner tools built from now on). The swap is one
+        attribute assignment on the shared ``PolicyEngine``: each decision reads
+        ``engine.policy`` once, so a decision in flight uses the old policy or the new one,
+        never a mix. Without an engine yet, one is created (and kept). ``None`` restores
+        no-policy (Phase 1 behaviour). Audited as ``policy.update`` (``detail.reason`` =
+        ``source``, ``detail.hash`` = sha256 of the policy document)."""
+        if policy is None:
+            engine: PolicyEngine | None = None
+        else:
+            engine = self._policy_engine
+            if engine is None:
+                engine = self._policy_engine = PolicyEngine(policy)
+            else:
+                engine.policy = policy
+        self.policy = engine
+        for authorizer in self._authorizers:
+            authorizer.policy = engine
+        for executor in self.executors.values():
+            executor.policy = engine
+        if self.client is not None:
+            self.client.policy = engine
+        self._warn_unknown_routing_partners()
+        detail: dict[str, Any] = {"reason": source}
+        if policy is not None:
+            detail["hash"] = policy_hash(policy)
+        self._audit_soon(
+            AuditEvent(
+                actor=actor,
+                action="policy.update",
+                outcome="applied" if policy is not None else "cleared",
+                detail=detail,
+            )
+        )
+
+    def _audit_soon(self, ev: AuditEvent) -> None:
+        """Audit from sync code: submitted to the log, or kept until startup creates it."""
+        if self.audit is not None:
+            self.audit.submit(ev)
+        elif self.audit_enabled and len(self._early_audit) < _EARLY_AUDIT_MAX:
+            self._early_audit.append(ev)
 
     def _warn_unknown_routing_partners(self) -> None:
         if self.policy is None:

@@ -436,6 +436,8 @@ Python-only network without Node or MCP).
   a2agw partners verify acme            # reports "unchanged" or "quarantined"
   a2agw partners list                   # shows the PENDING flag and the hash
   a2agw partners approve acme --hash <hash-from-list>
+  a2agw partners reject acme            # or: keep the old card and disable the partner
+  a2agw partners remove acme            # drop it from the partners file
   ```
 - **Access control needs `auth`.** Without an `auth` section every caller is anonymous and `AgentAccess` is not enforced, so that setup is for local development only. Once `auth` is set, anonymous callers are always denied on agent endpoints. Agent cards and healthz are public either way, so `allow_anonymous: true` opens nothing extra: it only changes the answer to a request without credentials on an agent route from 401 (unauthenticated) to 403 (forbidden).
 - **Principals are prefixed.** `AgentAccess(allowed_principals=...)` takes `key:<principal_id>` for API keys and `jwt:<sub>` for JWTs. An unprefixed id matches nothing.

@@ -486,6 +486,26 @@ class PartnerRegistry:
         self._changed(rec, "disabled")
         return rec
 
+    def reject(self, id: str) -> PartnerRecord:
+        """Refuse a quarantined card change: the pending card (and its key id) is dropped,
+        the approved card is kept, and the partner is disabled (event "rejected"), so it is
+        not called until an operator re-enables it. ValueError when nothing is pending."""
+        rec = self.get(id)
+        if rec.pending_card is None:
+            raise ValueError(f"partner {id!r} has no pending card to reject")
+        rec.pending_card = rec.pending_key_id = None
+        rec.status = "disabled"
+        self._changed(rec, "rejected")
+        return rec
+
+    def remove(self, id: str) -> None:
+        """Remove a partner from the registry and the partners file (event "removed").
+        KeyError for an unknown id. Open outbound tasks are the caller's concern
+        (``AgentHost`` refuses removals that would orphan them unless forced)."""
+        rec = self.get(id)
+        del self._records[id]
+        self._changed(rec, "removed")
+
     def enable(self, id: str) -> PartnerRecord:
         rec = self.get(id)
         if rec.status != "disabled":

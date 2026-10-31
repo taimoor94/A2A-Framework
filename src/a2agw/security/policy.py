@@ -67,6 +67,8 @@ error", None, None)`` (or an empty ``RoutePlan``) and is logged by exception cla
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -255,7 +257,7 @@ class PolicyEngine:
             pid, anonymous = principal.id, principal.kind == "anonymous"
         mentioned = False
         allow: str | None = None
-        for i, rule in enumerate(self.policy.authz):
+        for i, rule in enumerate(self.policy.authz):  # one read of the (swappable) policy
             if not _mentions(rule.agents, agent_id):
                 continue
             mentioned = True
@@ -307,7 +309,8 @@ class PolicyEngine:
         data: dict[str, Any] | None,
         has_files: bool = False,
     ) -> Decision:
-        defaults = self.policy.defaults
+        policy = self.policy  # read once: a live swap (AgentHost.set_policy) never mixes
+        defaults = policy.defaults
         # Raise-only: the floor is the agent default, else unknown_classification.
         eff = defaults.agent_classification.get(agent_id, defaults.unknown_classification)
         if classification is not None:
@@ -317,7 +320,7 @@ class PolicyEngine:
             if has_files:  # the classifier cannot see attachments: never below confidential
                 eff = max(eff, Classification.CONFIDENTIAL)
 
-        egress = self.policy.egress
+        egress = policy.egress
         if partner.id in egress.partner_ceilings:
             ceiling = egress.partner_ceilings[partner.id]
             rule = f"egress.partner_ceilings[{partner.id}]"
@@ -349,7 +352,7 @@ class PolicyEngine:
         forbidden: set[str] = set()
         forced: list[str] = []
         preferred: list[str] = []
-        for rule in self.policy.routing:
+        for rule in self.policy.routing:  # one read of the (swappable) policy
             if rule.agent != agent_id:
                 continue
             for pid in rule.partners:
@@ -411,6 +414,24 @@ def _describe_errors(exc: ValidationError) -> str:
             detail = err["msg"].removeprefix("Value error, ")
         parts.append(f"{loc} ({detail})")
     return "; ".join(parts)
+
+
+def parse_policy(doc: Any) -> Policy:
+    """Validate a policy document (a parsed mapping, e.g. from the control plane or the
+    admin API); any problem raises ``PolicyError`` naming field paths, never values."""
+    if not isinstance(doc, dict):
+        raise PolicyError("policy must be a mapping")
+    try:
+        return Policy.model_validate(doc)
+    except ValidationError as exc:
+        raise PolicyError(f"invalid policy: {_describe_errors(exc)}") from None
+
+
+def policy_hash(policy: Policy) -> str:
+    """sha256 of the policy document (sorted-key compact JSON): which policy is in force,
+    for audit rows and the control plane, without the document itself."""
+    blob = json.dumps(policy.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode()).hexdigest()
 
 
 def load_policy(path: Path) -> Policy:

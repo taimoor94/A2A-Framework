@@ -35,6 +35,8 @@ from a2agw.consult.guarded_net import fixed_tier, guarded_async_client
 from a2agw.consult.netguard import UnsafeURL, check_url
 from a2agw.consult.registry import MAX_CARD_BYTES, CardFetchError, PartnerRegistry
 from a2agw.gateway.auth import MCP_EXTRA_HINT
+from a2agw.ops import actions
+from a2agw.ops.actions import RegistryHost
 from a2agw.ops.audit import ACTIONS, AuditLog, parse_since, registry_audit_event
 from a2agw.serve.host import GRACEFUL_TIMEOUT_S
 
@@ -622,11 +624,18 @@ def partners_add(
         if tls_ref is not None and tls_ref not in reg.tls:
             raise ConfigError(f"unknown tls_ref {tls_ref!r} (not in the config's tls section)")
         rec = asyncio.run(
-            reg.add_from_url(
-                id, url, t, credential_ref=credential_ref, tags=tag or (), tls_ref=tls_ref
+            actions.add_partner(
+                RegistryHost(reg),
+                actor=_cli_actor(),
+                id=id,
+                card_url=url,
+                tier=t,
+                credential_ref=credential_ref,
+                tags=tag or (),
+                tls_ref=tls_ref,
             )
         )
-    typer.echo(f"added {rec.id} ({rec.tier}) hash {rec.card_hash[:12]}")
+    typer.echo(f"added {rec['id']} ({rec['tier']}) hash {rec['card_hash'][:12]}")
     typer.echo(
         "a running gateway picks it up after POST /a2agw/admin/partners/reload "
         "(admin scope, header X-A2AGW-Admin: 1) or on its next start"
@@ -667,13 +676,15 @@ def partners_verify(
 ) -> None:
     """Refresh one partner (or all) and report unchanged or quarantined."""
     failed = False
+    actor = _cli_actor()
     with _partners(config, partners_file) as reg:
         ids = [id] if id else [r.id for r in reg.all()]
         if id:
             reg.get(id)
         for pid in ids:
             try:
-                typer.echo(f"{pid}: {asyncio.run(reg.refresh(pid))}")
+                out = asyncio.run(actions.refresh_partner(RegistryHost(reg), pid, actor=actor))
+                typer.echo(f"{pid}: {out['result']}")
             except (CardFetchError, UnsafeURL) as e:
                 if id:
                     raise
@@ -693,8 +704,36 @@ def partners_approve(
 ) -> None:
     """Approve a quarantined card change."""
     with _partners(config, partners_file) as reg:
-        rec = reg.approve(id, expected_hash=hash)
-    typer.echo(f"approved {rec.id} hash {rec.card_hash[:12]}")
+        rec = asyncio.run(
+            actions.approve_partner(RegistryHost(reg), id, actor=_cli_actor(), expected_hash=hash)
+        )
+    typer.echo(f"approved {rec['id']} hash {rec['card_hash'][:12]}")
+
+
+@partners_app.command("reject")
+@guarded
+def partners_reject(
+    id: str, config: ConfigOpt = Path("a2agw.yaml"), partners_file: PartnersFileOpt = None
+) -> None:
+    """Reject a quarantined card change: keep the approved card and disable the partner."""
+    with _partners(config, partners_file) as reg:
+        rec = asyncio.run(actions.reject_partner(RegistryHost(reg), id, actor=_cli_actor()))
+    typer.echo(f"rejected {rec['id']} ({rec['status']})")
+
+
+@partners_app.command("remove")
+@guarded
+def partners_remove(
+    id: str, config: ConfigOpt = Path("a2agw.yaml"), partners_file: PartnersFileOpt = None
+) -> None:
+    """Remove a partner from the partners file."""
+    with _partners(config, partners_file) as reg:
+        asyncio.run(actions.remove_partner(RegistryHost(reg), id, actor=_cli_actor()))
+    typer.echo(f"removed {id}")
+    typer.echo(
+        "a running gateway drops it after POST /a2agw/admin/partners/reload (refused while "
+        "the partner has open outbound tasks, unless force=true) or on its next start"
+    )
 
 
 @partners_app.command("disable")
@@ -704,7 +743,7 @@ def partners_disable(
 ) -> None:
     """Disable a partner."""
     with _partners(config, partners_file) as reg:
-        reg.disable(id)
+        asyncio.run(actions.disable_partner(RegistryHost(reg), id, actor=_cli_actor()))
     typer.echo(f"disabled {id}")
 
 
@@ -715,7 +754,8 @@ def partners_enable(
 ) -> None:
     """Re-enable a disabled partner."""
     with _partners(config, partners_file) as reg:
-        status = reg.enable(id).status
+        rec = asyncio.run(actions.enable_partner(RegistryHost(reg), id, actor=_cli_actor()))
+        status = rec["status"]
     typer.echo(f"enabled {id}" if status == "active" else f"enabled {id} ({status})")
 
 

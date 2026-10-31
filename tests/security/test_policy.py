@@ -533,3 +533,25 @@ def test_load_full_policy(tmp_path):
 def test_classification_rejects_integers():
     with pytest.raises(ValidationError):
         _policy(defaults={"unknown_classification": 3})
+
+
+def test_policy_swap_during_a_decision_uses_one_consistent_policy():
+    """``AgentHost.set_policy`` swaps ``engine.policy`` live: a decision in flight reads it
+    once, so it never mixes the old defaults with the new ceilings."""
+    old = _policy(defaults={"unknown_classification": "public"})
+    new = _policy(
+        egress={"partner_ceilings": {"p1": "public"}},
+        defaults={"unknown_classification": "restricted"},
+    )
+
+    class Swapping:
+        def classify(self, text, data):
+            engine.policy = new  # a swap lands while the decision is being made
+            return C.PUBLIC
+
+    engine = PolicyEngine(old, Swapping())
+    d = engine.egress("a", _partner("p1"), None, "hi", None)
+    assert d.allowed and d.rule == "egress.tier_ceilings[partner]"  # all from `old`
+    assert engine.policy is new  # later decisions see the new one
+    d = engine.egress("a", _partner("p1"), None, "hi", None)
+    assert not d.allowed and d.rule == "egress.partner_ceilings[p1]"

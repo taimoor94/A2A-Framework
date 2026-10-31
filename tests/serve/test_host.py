@@ -1017,3 +1017,100 @@ async def test_v03_request_keeps_the_a2a_error_code(env):
     assert err["code"] == -32005 and "image/png" in err["message"]
     err = await error_of([{"kind": "text", "text": "a"}, {"kind": "text", "text": "b"}])
     assert err["code"] == -32602 and err["message"] == "too many parts"
+
+
+# -- live policy and the partner.state / security.denied events ---------------------------
+
+LOCKDOWN = {
+    "version": 1,
+    "authz": [{"id": "lock", "principal": "*", "agents": ["alpha"], "effect": "deny"}],
+}
+
+
+def _policy(doc):
+    from a2agw.security.policy import Policy
+
+    return Policy.model_validate(doc)
+
+
+async def _audit_rows(host, action):
+    await host.audit.drain()
+    rows, _ = await host.audit.query({"action": action})
+    return rows
+
+
+async def test_set_policy_swaps_live_and_audits(env):
+    from a2agw.security.policy import PolicyEngine
+
+    engine = PolicyEngine(_policy({"version": 1}))
+    e = await env(spec("alpha"), auth=key_auth(a="secret-a"), policy=engine)
+    hc = e.http(**{"X-API-Key": "secret-a"})
+    client = e.client("alpha", **{"X-API-Key": "secret-a"})
+    assert (await send_one(client, msg()))[0].task.status.state == TaskState.TASK_STATE_COMPLETED
+
+    e.host.set_policy(_policy(LOCKDOWN), actor="key:ops", source="admin")
+    assert e.host.policy is engine  # swapped on the shared engine
+    assert engine.policy.authz[0].id == "lock"
+    r = await hc.post("/agents/alpha/", json={})
+    assert r.status_code == 403  # the mounted authorizer sees the new policy at once
+
+    e.host.set_policy(_policy({"version": 1}), actor="cp", source="control_plane")
+    assert (await send_one(client, msg()))[0].task.status.state == TaskState.TASK_STATE_COMPLETED
+    rows = await _audit_rows(e.host, "policy.update")
+    assert [(r["actor"], r["detail"]["reason"]) for r in rows] == [
+        ("cp", "control_plane"),
+        ("key:ops", "admin"),
+    ]
+    assert all(len(r["detail"]["hash"]) == 64 for r in rows)
+
+
+async def test_set_policy_none_restores_open(env):
+    e = await env(spec("alpha"), auth=key_auth(a="secret-a"))
+    assert e.host.policy is None
+    hc = e.http(**{"X-API-Key": "secret-a"})
+    client = e.client("alpha", **{"X-API-Key": "secret-a"})
+    # No policy at startup: setting one creates the engine every consumer then uses.
+    e.host.set_policy(_policy(LOCKDOWN), actor="key:ops", source="file")
+    assert e.host.policy is not None
+    assert (await hc.post("/agents/alpha/", json={})).status_code == 403
+    assert e.host.executors["alpha"].policy is e.host.policy
+    assert e.host.client.policy is e.host.policy
+
+    e.host.set_policy(None, actor="key:ops", source="admin")
+    assert e.host.policy is None
+    assert e.host.executors["alpha"].policy is None and e.host.client.policy is None
+    assert (await send_one(client, msg()))[0].task.status.state == TaskState.TASK_STATE_COMPLETED
+    rows = await _audit_rows(e.host, "policy.update")
+    assert [(r["outcome"], r["detail"]["reason"]) for r in rows] == [
+        ("cleared", "admin"),
+        ("applied", "file"),
+    ]
+
+
+async def test_partner_state_and_security_denied_are_published(env):
+    from google.protobuf.json_format import MessageToDict
+
+    e = await env(spec("alpha"), auth=key_auth(a="secret-a", b="secret-b"))
+    _, sub = e.host.bus.subscribe_with_replay(0)
+    card = MessageToDict(e.host.cards["alpha"])
+    await e.host.partners.add_from_card("p1", card, "internal")
+    e.host.partners.disable("p1")
+
+    e.host.set_policy(_policy(LOCKDOWN), actor="key:ops", source="admin")
+    r = await e.http(**{"X-API-Key": "secret-b"}).post("/agents/alpha/", json={"m": "hello"})
+    assert r.status_code == 403
+    await e.host.audit.drain()
+
+    got = []
+    async with sub:
+        while len(got) < 3:
+            got.append(await asyncio.wait_for(sub.__anext__(), 5))
+    assert [(ev.kind, ev.data) for ev in got[:2]] == [
+        ("partner.state", {"partner_id": "p1", "status": "active", "event": "added"}),
+        ("partner.state", {"partner_id": "p1", "status": "disabled", "event": "disabled"}),
+    ]
+    denied = got[2]
+    assert denied.kind == "security.denied" and denied.agent_id == "alpha"
+    assert denied.data == {"reason": "denied by rule", "rule": "lock", "principal_kind": "api_key"}
+    text = repr(denied)
+    assert "key:b" not in text and "secret-b" not in text and "hello" not in text

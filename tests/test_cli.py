@@ -367,3 +367,31 @@ def test_mcp_command_refuses_unlisted_agent(tmp_path, monkeypatch):
     assert r.exit_code == 1, r.output
     assert "error: agent 'other' is not in sidecar.mcp.agents" in r.output
     assert "Traceback" not in r.output and started == []
+
+
+@respx.mock
+def test_partners_remove_and_reject(pf):
+    route = respx.get(URL + "/.well-known/agent-card.json").respond(200, json=CARD)
+    run("partners", "add", "acme", URL, "--tier", "partner", "--partners-file", pf)
+    run("partners", "add", "other", URL, "--tier", "partner", "--partners-file", pf)
+    r = run("partners", "reject", "acme", "--partners-file", pf)
+    assert r.exit_code == 1 and "no pending card" in r.output
+    route.respond(200, json={**CARD, "description": "now evil"})
+    assert "acme: quarantined" in run("partners", "verify", "acme", "--partners-file", pf).output
+    r = run("partners", "reject", "acme", "--partners-file", pf)
+    assert r.exit_code == 0, r.output
+    assert r.output.strip() == "rejected acme (disabled)"
+    reg = PartnerRegistry(Path(pf))
+    reg.load()
+    rec = reg.get("acme")
+    assert rec.status == "disabled" and rec.pending_card is None
+    assert rec.card["description"] == "does things"
+
+    r = run("partners", "remove", "acme", "--partners-file", pf)
+    assert r.exit_code == 0, r.output
+    assert r.output.splitlines()[0] == "removed acme"
+    reg = PartnerRegistry(Path(pf))
+    reg.load()
+    assert [p.id for p in reg.all()] == ["other"]
+    r = run("partners", "remove", "acme", "--partners-file", pf)
+    assert r.exit_code == 1 and "unknown partner" in r.output

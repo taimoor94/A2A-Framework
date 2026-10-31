@@ -799,3 +799,51 @@ async def test_v03_only_partner_is_flagged():
     )
     assert (await reg.add_from_card("mixed", mixed, "partner")).v03_only is False
     assert "v03_only" not in legacy.model_dump()
+
+
+async def test_remove_partner_emits_removed_and_persists(tmp_path):
+    p = tmp_path / "partners.yaml"
+    reg = PartnerRegistry(p)
+    await reg.add_from_card("p1", CARD, "partner")
+    await reg.add_from_card("p2", CARD, "public")
+    events = []
+    reg.add_listener(lambda r, e: events.append((r.id, e, (reg.change_info or {}).get("actor"))))
+    with reg.acting_as("admin:ops"):
+        reg.remove("p1")
+    assert events == [("p1", "removed", "admin:ops")]
+    assert [r.id for r in reg.all()] == ["p2"]
+    with pytest.raises(KeyError):
+        reg.get("p1")
+    with pytest.raises(KeyError):
+        reg.remove("p1")
+    assert [e["id"] for e in yaml.safe_load(p.read_text())["partners"]] == ["p2"]
+    reg2 = PartnerRegistry(p)
+    reg2.load()
+    assert [r.id for r in reg2.all()] == ["p2"]
+
+
+@respx.mock
+async def test_reject_clears_pending_and_disables():
+    route = respx.get(CARD_URL).respond(200, json=CARD)
+    reg = PartnerRegistry()
+    await reg.add_from_url("p1", URL, "public")
+    approved_hash = reg.get("p1").card_hash
+    route.respond(200, json=variant(description="now evil"))
+    assert await reg.refresh("p1") == "quarantined"
+    events = []
+    reg.on_change = lambda r, e: events.append(e)
+    reg.reject("p1")
+    rec = reg.get("p1")
+    assert rec.status == "disabled" and rec.pending_card is None and rec.pending_key_id is None
+    assert rec.card_hash == approved_hash and rec.card["description"] == "does things"
+    assert events == ["rejected"]
+
+
+async def test_reject_without_pending_raises():
+    reg = PartnerRegistry()
+    await reg.add_from_card("p1", CARD, "public")
+    with pytest.raises(ValueError, match="no pending card"):
+        reg.reject("p1")
+    assert reg.get("p1").status == "active"
+    with pytest.raises(KeyError):
+        reg.reject("ghost")

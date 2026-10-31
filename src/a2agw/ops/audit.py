@@ -49,6 +49,7 @@ import logging
 import math
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal, get_args
@@ -80,6 +81,14 @@ Action = Literal[
     "outbound.expire",
     "limit.exceeded",
     "sidecar.denied",
+    "partner.reject",
+    "policy.update",
+    "task.cancel",
+    "task.answer",
+    "cp.connect",
+    "cp.apply",
+    "cp.reject",
+    "cp.command",
 ]
 ACTIONS: frozenset[str] = frozenset(get_args(Action))
 DETAIL_KEYS = frozenset(
@@ -98,6 +107,10 @@ DETAIL_KEYS = frozenset(
         "attempt",  # outbound.expire: which cancel attempt this row reports
         "limit",  # limit.exceeded: which limit
         "grant",  # sidecar consult grant id: 12 hex chars of the token hash, never the token
+        "version",  # control plane: desired-state version applied or rejected
+        "command",  # control plane: the command kind (e.g. "partner.approve")
+        "source",  # control plane: where a change came from
+        "hash",  # policy.update / cp.apply: sha256 of the applied document, never its body
     }
 )
 # PartnerRegistry change events -> audit actions (``registry_audit_action``).
@@ -109,6 +122,7 @@ REGISTRY_ACTIONS: dict[str, Action] = {
     "enabled": "partner.enable",
     "updated": "partner.update",
     "removed": "partner.remove",
+    "rejected": "partner.reject",
 }
 
 
@@ -301,6 +315,14 @@ class AuditLog:
         # emit_coalesced: key -> [window start (monotonic), suppressed count, last event]
         self._coalesce: dict[tuple[str, str], list[Any]] = {}
         self.audit_errors = 0  # failed emits since start (admin /healthz)
+        self._listeners: list[Callable[[AuditEvent], None]] = []
+
+    def add_listener(self, fn: Callable[[AuditEvent], None]) -> None:
+        """Call ``fn(ev)`` (sync, on the loop) for every event passed to ``emit``, whether or
+        not its append succeeds; coalesced-away events never reach it. ``AgentHost`` uses it
+        to publish ``security.denied`` bus events. A listener that raises is logged and
+        ignored."""
+        self._listeners.append(fn)
 
     async def initialize(self) -> None:
         async def create() -> None:
@@ -364,12 +386,18 @@ class AuditLog:
             raise
 
     async def emit(self, ev: AuditEvent) -> None:
-        """Append, never raising: failures are logged and counted (fail-open)."""
+        """Append, never raising: failures are logged and counted (fail-open). Listeners
+        (``add_listener``) are called either way."""
         try:
             await self.append(ev)
         except Exception as exc:  # noqa: BLE001 - audit must not break the request
             self.audit_errors += 1
             log.warning("audit append failed for %s: %s", ev.action, type(exc).__name__)
+        for fn in self._listeners:
+            try:
+                fn(ev)
+            except Exception as exc:  # noqa: BLE001 - a listener must not break the request
+                log.warning("audit listener failed for %s: %s", ev.action, type(exc).__name__)
 
     async def emit_coalesced(self, ev: AuditEvent, category: str) -> None:
         """Like ``emit``, but at most one row per (action, category) per window; the row
