@@ -409,7 +409,14 @@ async def test_partners_reload_makes_cli_added_partner_usable(make, tmp_path):
         assert (await hc.post(url, headers={**USER, "X-A2AGW-Admin": "1"})).status_code == 403
         r = await hc.post(url, headers=ADMIN_POST)
         assert r.status_code == 200
-        assert r.json() == {"added": ["echo"], "updated": [], "removed": [], "open_handles": 0}
+        assert r.json() == {
+            "added": ["echo"],
+            "updated": [],
+            "removed": [],
+            "open_handles": 0,
+            "cancelled": 0,
+            "cancel_errors": 0,
+        }
         assert host.client is client  # same running client
         res = await client.consult("echo", "hi", wait_seconds=5)
         assert res.state == "completed" and res.text == "echo: hi"
@@ -430,7 +437,7 @@ async def test_partners_reload_makes_cli_added_partner_usable(make, tmp_path):
         assert "echo" in pf_before
         pf.write_text("partners: []\n")
         r = await hc.post(url, headers=ADMIN_POST)
-        assert r.json() == {"added": [], "updated": [], "removed": ["echo"], "open_handles": 0}
+        assert r.json()["removed"] == ["echo"] and r.json()["open_handles"] == 0
         assert (await client.consult("echo", "hi", wait_seconds=5)).reason == "unknown partner"
     finally:
         await outbound.aclose()
@@ -459,7 +466,9 @@ async def test_partners_reload_refuses_removing_partner_with_open_handles(make, 
 
     pf = tmp_path / "partners.yaml"
     pf.write_text("partners: []\n")
-    host, hc = await make(spec(), auth=auth(), partners_path=pf)
+    # The ghost partner answers nothing: the forced reload's cancel fails, the removal holds.
+    down = httpx.AsyncClient(transport=httpx.MockTransport(lambda req: httpx.Response(503)))
+    host, hc = await make(spec(), auth=auth(), partners_path=pf, partner_http=down)
     cli = PartnerRegistry(pf)
     cli.load()
     await cli.add_from_card("ghost", to_dict(host.cards["alpha"]), "internal")
@@ -475,8 +484,18 @@ async def test_partners_reload_refuses_removing_partner_with_open_handles(make, 
     assert (await hc.post(url + "?force=maybe", headers=ADMIN_POST)).status_code == 400
     r = await hc.post(url + "?force=true", headers=ADMIN_POST)
     assert r.status_code == 200
-    assert r.json() == {"added": [], "updated": [], "removed": ["ghost"], "open_handles": 1}
+    assert r.json() == {
+        "added": [],
+        "updated": [],
+        "removed": ["ghost"],
+        "open_handles": 1,
+        "cancelled": 0,
+        "cancel_errors": 1,
+    }
     assert host.partners.all() == []
+    h = await host.handles.get("ghost", "t1")
+    assert (h["state"], h["end_reason"]) == ("TASK_STATE_CANCELED", "partner removed")
+    await down.aclose()
     rows = (await hc.get("/a2agw/admin/audit?action=partner.reload", headers=ADMIN)).json()
     assert [e["outcome"] for e in rows["events"]][:2] == ["ok", "refused"]
 

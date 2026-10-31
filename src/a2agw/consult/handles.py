@@ -254,6 +254,24 @@ class OutboundHandleStore:
         async with self._engine.connect() as conn:
             return [dict(r._mapping) for r in (await conn.execute(stmt)).all()]
 
+    async def open_for_partners(self, partner_ids: list[str]) -> list[dict[str, Any]]:
+        """Non-terminal handles of the given partners, oldest first (a forced partner
+        removal cancels them)."""
+        if not partner_ids:
+            return []
+        from a2agw.consult.results import TERMINAL_NAMES
+
+        stmt = (
+            select(_outbound)
+            .where(
+                _outbound.c.partner_id.in_(sorted(partner_ids)),
+                _outbound.c.state.notin_(sorted(TERMINAL_NAMES)),
+            )
+            .order_by(_outbound.c.created_at)
+        )
+        async with self._engine.connect() as conn:
+            return [dict(r._mapping) for r in (await conn.execute(stmt)).all()]
+
     async def count_open(self, partner_ids: list[str]) -> dict[str, int]:
         """Non-terminal handles per partner, for the given partners (absent: none)."""
         if not partner_ids:

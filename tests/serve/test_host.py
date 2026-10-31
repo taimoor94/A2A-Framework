@@ -1114,3 +1114,44 @@ async def test_partner_state_and_security_denied_are_published(env):
     assert denied.data == {"reason": "denied by rule", "rule": "lock", "principal_kind": "api_key"}
     text = repr(denied)
     assert "key:b" not in text and "secret-b" not in text and "hello" not in text
+
+
+async def test_security_denied_published_with_audit_disabled(env):
+    e = await env(spec("alpha"), auth=key_auth(b="secret-b"), audit=False)
+    assert e.host.audit is None
+    _, sub = e.host.bus.subscribe_with_replay(0)
+    e.host.set_policy(_policy(LOCKDOWN), actor="key:ops", source="admin")
+    hc = e.http(**{"X-API-Key": "secret-b"})
+    for _ in range(3):  # never coalesced on the bus
+        assert (await hc.post("/agents/alpha/", json={})).status_code == 403
+    got = []
+    async with sub:
+        while len(got) < 3:
+            got.append(await asyncio.wait_for(sub.__anext__(), 5))
+    assert [(ev.kind, ev.agent_id, ev.data) for ev in got] == [
+        (
+            "security.denied",
+            "alpha",
+            {"reason": "denied by rule", "rule": "lock", "principal_kind": "api_key"},
+        )
+    ] * 3
+
+
+async def test_security_denied_bus_events_are_not_coalesced(env):
+    """Anonymous refusals are coalesced in the audit log, never on the (bounded) bus."""
+    auth = key_auth(b="secret-b").model_copy(update={"allow_anonymous": True})
+    e = await env(spec("alpha"), auth=auth)
+    _, sub = e.host.bus.subscribe_with_replay(0)
+    hc = e.http()
+    for _ in range(3):
+        assert (await hc.post("/agents/alpha/", json={})).status_code == 403
+    got = []
+    async with sub:
+        while len(got) < 3:
+            got.append(await asyncio.wait_for(sub.__anext__(), 5))
+    assert [ev.data for ev in got] == [
+        {"reason": "agent access: authentication required", "principal_kind": "anonymous"}
+    ] * 3
+    await e.host.audit.drain()
+    rows, _ = await e.host.audit.query({"action": "authz.deny"})
+    assert len(rows) == 1  # coalesced

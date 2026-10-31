@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 
@@ -236,10 +237,11 @@ async def test_remove_with_open_handles_needs_force(gw):
     assert [(r["actor"], r["outcome"]) for r in rows] == [(ACTOR, "refused")]
 
     out = await actions.remove_partner(gw, "p1", force=True, actor=ACTOR)
-    assert out == {"id": "p1", "removed": True, "open_handles": 1}
+    assert out["removed"] is True and out["open_handles"] == 1
     assert gw.partners.all() == []
     await gw.audit.drain()
     rows, _ = await gw.audit.query({"action": "partner.remove"})
+    rows = [r for r in rows if r["task_id"] is None]  # one row per cancelled task besides
     assert [(r["actor"], r["outcome"]) for r in rows] == [(ACTOR, "active"), (ACTOR, "refused")]
 
 
@@ -257,3 +259,111 @@ async def test_set_policy_action_validates_without_echoing_values(gw):
     assert gw.policy is not None
     assert await actions.set_policy(gw, None, actor=ACTOR) == {"applied": True, "hash": None}
     assert gw.policy is None
+
+
+# -- forced removal cancels the partner's open tasks ----------------------------------------
+
+
+class Blocker:
+    durable_sessions = False
+
+    async def run(self, ctx):
+        from a2agw.core.events import Done
+
+        await asyncio.Event().wait()
+        yield Done(text="never")
+
+
+@pytest.fixture
+async def linked(tmp_path):
+    """A gateway whose partner "blk" (a real in-process host) has one open task."""
+    from google.protobuf.json_format import MessageToDict
+    from streaming_asgi import StreamingASGITransport
+
+    partner = AgentHost("http://p", db_url=f"sqlite+aiosqlite:///{tmp_path / 'p.db'}")
+    partner.add(
+        AgentSpec(
+            id="blk",
+            name="Blk",
+            description="d",
+            skills=[SkillSpec(id="s", name="S", description="d")],
+            adapter=Blocker(),
+        )
+    )
+    await partner.startup()
+    outbound = httpx.AsyncClient(transport=StreamingASGITransport({"p": partner.app()}))
+    pf = tmp_path / "partners.yaml"
+    host = AgentHost(
+        "http://t",
+        db_url=f"sqlite+aiosqlite:///{tmp_path / 'h.db'}",
+        partners_path=pf,
+        partner_http=outbound,
+    )
+    await host.startup()
+    try:
+        await host.partners.add_from_card("blk", MessageToDict(partner.cards["blk"]), "internal")
+        res = await host.client.consult("blk", "go", wait_seconds=0.2)
+        assert res.state == "working", res
+        host.test_partner = partner  # type: ignore[attr-defined]
+        host.test_task = res.task_id  # type: ignore[attr-defined]
+        yield host
+    finally:
+        await host.shutdown()
+        await outbound.aclose()
+        await partner.shutdown()
+
+
+async def _partner_task_state(host: AgentHost) -> str:
+    rows, _ = await host.test_partner.index.list(limit=10)  # type: ignore[attr-defined]
+    (row,) = [r for r in rows if r["task_id"] == host.test_task]  # type: ignore[attr-defined]
+    return row["state"]
+
+
+async def test_remove_force_cancels_open_partner_tasks(linked):
+    out = await actions.remove_partner(linked, "blk", force=True, actor=ACTOR)
+    assert out == {
+        "id": "blk",
+        "removed": True,
+        "open_handles": 1,
+        "cancelled": 1,
+        "cancel_errors": 0,
+    }
+    assert linked.partners.all() == []
+    h = await linked.handles.get("blk", linked.test_task)
+    assert (h["state"], h["end_reason"]) == ("TASK_STATE_CANCELED", "partner removed")
+    assert await _partner_task_state(linked) == "TASK_STATE_CANCELED"  # the partner got it
+    rows, _ = await linked.audit.query({"action": "partner.remove"})
+    cancels = [r for r in rows if r["task_id"] == linked.test_task]
+    assert [(r["actor"], r["outcome"], r["detail"]["reason"]) for r in cancels] == [
+        (ACTOR, "canceled", "partner removed")
+    ]
+
+
+async def test_reload_force_cancels_open_partner_tasks(linked):
+    linked.partners.path.write_text("partners: []\n")
+    with pytest.raises(PartnersInUse):
+        await linked.reload_partners()
+    out = await linked.reload_partners(force=True)
+    assert out == {
+        "added": [],
+        "updated": [],
+        "removed": ["blk"],
+        "open_handles": 1,
+        "cancelled": 1,
+        "cancel_errors": 0,
+    }
+    h = await linked.handles.get("blk", linked.test_task)
+    assert (h["state"], h["end_reason"]) == ("TASK_STATE_CANCELED", "partner removed")
+    assert await _partner_task_state(linked) == "TASK_STATE_CANCELED"
+
+
+async def test_remove_force_cancel_error_still_removes(gw):
+    # p1's endpoint is not served (respx has no route for it): the cancel fails.
+    await gw.handles.record("t9", "p1", "c1", None, None, "TASK_STATE_WORKING")
+    out = await actions.remove_partner(gw, "p1", force=True, actor=ACTOR)
+    assert out["open_handles"] == 1 and out["cancelled"] == 0 and out["cancel_errors"] == 1
+    assert gw.partners.all() == []
+    h = await gw.handles.get("p1", "t9")
+    assert (h["state"], h["end_reason"]) == ("TASK_STATE_CANCELED", "partner removed")
+    rows, _ = await gw.audit.query({"action": "partner.remove"})
+    assert ("cancel_failed", "t9") in [(r["outcome"], r["task_id"]) for r in rows]

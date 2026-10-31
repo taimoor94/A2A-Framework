@@ -25,8 +25,9 @@ from typing import Any, Literal, Self
 # - task.state: {task_id, context_id, state} (AdapterExecutor)
 # - partner.call: {partner_id, task_id, state, duration_ms} (PartnerClient)
 # - partner.state: {partner_id, status, event} (AgentHost, on every registry change)
-# - security.denied: {reason, rule?, principal_kind} (AgentHost, on every audited
-#   authz.deny / egress.deny / sidecar.denied); never a principal id.
+# - security.denied: {reason, rule?, principal_kind} (AgentHost.report_denied, at every
+#   refusal: authz at the mount, admin and executor, egress, sidecar; with or without the
+#   audit log, never coalesced); never a principal id.
 EventKind = Literal["task.state", "partner.call", "partner.state", "security.denied"]
 
 # Pushed into a subscriber's queue on close so a pending __anext__ wakes up.

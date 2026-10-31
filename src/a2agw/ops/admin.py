@@ -19,7 +19,8 @@ changed within 10 minutes (unless ``force=true``). Every attempt is audited as `
 ``POST /partners/reload`` re-reads the partners file into the running registry (partners added
 with ``a2agw partners add`` become usable without a restart) and returns the ids added,
 updated and removed plus ``open_handles``; 400 if the file is invalid, 409 if removed partners
-still have open outbound tasks (unless ``force=true``). Nothing changes on an error. Every
+still have open outbound tasks (unless ``force=true``, which cancels those partner tasks
+first, best effort). Nothing changes on an error. Every
 attempt is audited as ``partner.reload``.
 
 The POST handlers only parse and map errors to responses: the operations themselves are
@@ -109,9 +110,6 @@ def _str_param(request: Request, name: str) -> str | None:
 
 def admin_routes(host: AgentHost) -> list[Route]:
     async def audit(request: Request, action: Any, outcome: str, reason: str) -> None:
-        log = getattr(host, "audit", None)
-        if log is None:
-            return
         user = request.scope.get("user")
         principal = user.principal if isinstance(user, PrincipalUser) else None
         ev = AuditEvent(
@@ -120,9 +118,14 @@ def admin_routes(host: AgentHost) -> list[Route]:
             outcome=outcome,
             detail={"reason": reason},
         )
-        if action == "authz.deny" and (principal is None or principal.kind == "anonymous"):
-            await log.emit_coalesced(ev, reason)  # one row per admin category per window
-        else:
+        if action == "authz.deny":
+            # A security.denied bus event too; the audit row of an anonymous caller is
+            # coalesced (one row per admin category per window), the event never.
+            anonymous = principal is None or principal.kind == "anonymous"
+            await host.report_denied(ev, coalesce=reason if anonymous else None)
+            return
+        log = getattr(host, "audit", None)
+        if log is not None:
             await log.emit(ev)
 
     def guarded(category: str, fn: Handler, *, read: bool = True) -> Handler:

@@ -126,11 +126,9 @@ def from_headers(
 
 
 async def audit_denied(host: AgentHost, err: SidecarAuthError) -> None:
-    """One ``sidecar.denied`` row: the reason and the agent id. Refusals of callers the
-    gateway could not authenticate are coalesced (one row per reason per window)."""
-    log = host.audit
-    if log is None:
-        return
+    """One ``sidecar.denied`` row (the reason and the agent id) and a ``security.denied`` bus
+    event. Audit rows of callers the gateway could not authenticate are coalesced (one row
+    per reason per window)."""
     p = err.principal
     authenticated = p is not None and p.kind != "anonymous"
     ev = AuditEvent(
@@ -140,10 +138,9 @@ async def audit_denied(host: AgentHost, err: SidecarAuthError) -> None:
         outcome="forbidden" if err.status == 403 else "unauthenticated",
         detail={"reason": err.reason},
     )
-    if authenticated:
-        await log.emit(ev)
-    else:
-        await log.emit_coalesced(ev, f"sidecar:{err.reason}")
+    # The bus event (security.denied) is never coalesced; the audit row of an
+    # unauthenticated caller is.
+    await host.report_denied(ev, coalesce=None if authenticated else f"sidecar:{err.reason}")
 
 
 async def resolve_sidecar(request: Request, host: AgentHost) -> SidecarIdentity:

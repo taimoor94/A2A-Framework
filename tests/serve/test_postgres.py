@@ -762,3 +762,22 @@ async def test_reap_marks_the_sdk_task_store_failed(tmp_path, db_url):
         assert task.status.message.parts[0].text == "agent no longer served"
     finally:
         await eng.dispose()
+
+
+async def test_open_for_partners_lists_only_open_handles_of_those_partners(db_url):
+    eng = await create_engine(db_url)
+    try:
+        store = OutboundHandleStore(eng)
+        await store.initialize()
+        await store.record("t1", "p1", "c1", None, None, "TASK_STATE_WORKING")
+        await store.record("t2", "p1", "c1", None, None, "TASK_STATE_COMPLETED")
+        await store.record("t3", "p2", "c2", None, None, "TASK_STATE_INPUT_REQUIRED")
+        await store.record("t4", "p3", "c3", None, None, "TASK_STATE_WORKING")
+        rows = await store.open_for_partners(["p1", "p2"])
+        assert sorted((r["partner_id"], r["task_id"]) for r in rows) == [
+            ("p1", "t1"),
+            ("p2", "t3"),
+        ]
+        assert await store.open_for_partners([]) == []
+    finally:
+        await eng.dispose()

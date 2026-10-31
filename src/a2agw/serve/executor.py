@@ -209,6 +209,9 @@ class AdapterExecutor(AgentExecutor):
         # so it is evaluated with skill_id=None (deny rules then match conservatively).
         self.policy = policy
         self.audit = audit
+        # Set by AgentHost (``report_denied``): a policy refusal is published on the bus as
+        # ``security.denied`` and audited there. None: only the audit row is written.
+        self.on_denied: Callable[..., Awaitable[None]] | None = None
         self.index = index
         self.bus = bus
         self.local_max_hops = local_max_hops
@@ -356,6 +359,7 @@ class AdapterExecutor(AgentExecutor):
                     "rejected",
                     reason=f"policy: {decision.reason}",
                     rule=decision.rule,
+                    denied=True,
                 )
                 return
             if run.cancelled:
@@ -444,20 +448,24 @@ class AdapterExecutor(AgentExecutor):
         run: _Run,
         principal: Principal | None,
         outcome: str,
+        *,
+        denied: bool = False,
         **detail: Any,
     ) -> None:
-        if self.audit is None:
-            return
-        await self.audit.emit(
-            AuditEvent(
-                actor=principal.id if principal is not None else "anonymous",
-                action=action,
-                agent_id=self.spec.id,
-                task_id=run.updater.task_id,
-                outcome=outcome,
-                detail=detail,
-            )
+        """One audit row; ``denied`` (a security refusal) goes through ``on_denied`` when
+        set, which also publishes ``security.denied`` (with the audit log disabled too)."""
+        ev = AuditEvent(
+            actor=principal.id if principal is not None else "anonymous",
+            action=action,
+            agent_id=self.spec.id,
+            task_id=run.updater.task_id,
+            outcome=outcome,
+            detail=detail,
         )
+        if denied and self.on_denied is not None:
+            await self.on_denied(ev)
+        elif self.audit is not None:
+            await self.audit.emit(ev)
 
     def _admit(self, message: Message) -> tuple[CallContext | None, str]:
         """Parse, clamp and admit the caller's call context. Returns (cc, "") or (None, reason)."""

@@ -422,6 +422,9 @@ class PartnerClient:
         self.context_signer = context_signer  # signs the call context of every consult
         self.policy = policy  # egress checks in consult(), before any network activity
         self.audit = audit
+        # Set by AgentHost (``report_denied``): an egress refusal is published on the bus as
+        # ``security.denied`` and audited there. None: only the audit row is written.
+        self.on_denied: Callable[..., Awaitable[None]] | None = None
         self.tls: dict[str, TlsClientConfig] = dict(tls or {})
         for cfg in self.tls.values():  # load certificates now, not on the event loop later
             cfg.ssl_context()
@@ -1021,25 +1024,25 @@ class PartnerClient:
         agent_id: str,
         inbound_task_id: str | None,
     ) -> None:
-        if self.audit is None:
-            return
-        await self.audit.emit(
-            AuditEvent(
-                actor=principal.id if principal is not None else "system",
-                action="egress.deny",
-                agent_id=agent_id,
-                partner_id=result.partner,
-                task_id=inbound_task_id,
-                classification=decision.classification if decision is not None else None,
-                outcome="rejected",
-                detail={
-                    "reason": decision.reason if decision is not None else result.reason,
-                    "rule": decision.rule if decision is not None else None,
-                    "tier": (result.provenance or {}).get("tier"),
-                    **_grant_detail(),
-                },
-            )
+        ev = AuditEvent(
+            actor=principal.id if principal is not None else "system",
+            action="egress.deny",
+            agent_id=agent_id,
+            partner_id=result.partner,
+            task_id=inbound_task_id,
+            classification=decision.classification if decision is not None else None,
+            outcome="rejected",
+            detail={
+                "reason": decision.reason if decision is not None else result.reason,
+                "rule": decision.rule if decision is not None else None,
+                "tier": (result.provenance or {}).get("tier"),
+                **_grant_detail(),
+            },
         )
+        if self.on_denied is not None:
+            await self.on_denied(ev)
+        elif self.audit is not None:
+            await self.audit.emit(ev)
 
     async def _consult(
         self,

@@ -16,7 +16,7 @@ audited here or by the host method they call. Errors are the underlying ones
 The CLI has no running gateway: it passes ``RegistryHost(registry)``, which supports the
 partner operations. Without a handle store the open outbound tasks of a removed partner
 are not counted there; a running gateway checks them again on its next partners reload
-(``POST partners/reload`` refuses unless forced).
+(``POST partners/reload`` refuses unless forced, and a forced reload cancels them).
 """
 
 from __future__ import annotations
@@ -49,6 +49,13 @@ class RegistryHost:
     partners: PartnerRegistry
     handles: OutboundHandleStore | None = None
     audit: AuditLog | None = None
+
+    async def cancel_partner_tasks(
+        self, partner_ids: list[str], *, actor: str = "system"
+    ) -> tuple[int, int]:
+        """No partner client here: nothing to cancel with (a running gateway cancels them
+        when its reload is forced)."""
+        return 0, 0
 
 
 def _summary(rec: PartnerRecord) -> dict[str, Any]:
@@ -140,14 +147,14 @@ async def remove_partner(
     host: AgentHost | RegistryHost, id: str, *, actor: str, force: bool = False
 ) -> dict[str, Any]:
     """Remove a partner. If it still has open outbound tasks the removal is refused with
-    ``PartnersInUse`` (audited ``partner.remove`` / ``refused``) unless ``force``; forced, the
-    partner goes and its open handles are left as they are, exactly like
-    ``AgentHost.reload_partners(force=True)`` (logged)."""
+    ``PartnersInUse`` (audited ``partner.remove`` / ``refused``) unless ``force``; forced,
+    those tasks are cancelled first, best effort (``AgentHost.cancel_partner_tasks``, as
+    ``reload_partners(force=True)`` does), then the partner goes."""
     from a2agw.serve.host import PartnersInUse
 
     reg = host.partners
     reg.get(id)  # KeyError before anything else
-    open_handles = 0
+    open_handles = cancelled = cancel_errors = 0
     if host.handles is not None:
         open_handles = (await host.handles.count_open([id])).get(id, 0)
     if open_handles and not force:
@@ -162,11 +169,25 @@ async def remove_partner(
             ),
         )
         raise PartnersInUse(open_handles)
+    if open_handles:
+        cancelled, cancel_errors = await host.cancel_partner_tasks([id], actor=actor)
     with reg.acting_as(actor):
         reg.remove(id)
     if open_handles:
-        logger.warning("partner %s removed with %d open outbound task(s)", id, open_handles)
-    return {"id": id, "removed": True, "open_handles": open_handles}
+        logger.warning(
+            "partner %s removed with %d open outbound task(s) (%d cancelled, %d cancel errors)",
+            id,
+            open_handles,
+            cancelled,
+            cancel_errors,
+        )
+    return {
+        "id": id,
+        "removed": True,
+        "open_handles": open_handles,
+        "cancelled": cancelled,
+        "cancel_errors": cancel_errors,
+    }
 
 
 async def refresh_partner(host: AgentHost | RegistryHost, id: str, *, actor: str) -> dict[str, Any]:
@@ -215,7 +236,7 @@ async def reload_partners(host: AgentHost, *, actor: str, force: bool = False) -
         )
 
     try:
-        changes = await host.reload_partners(force=force)
+        changes = await host.reload_partners(force=force, actor=actor)
     except PartnersInUse as exc:
         await record("refused", f"open handles {exc.open_handles}")
         raise

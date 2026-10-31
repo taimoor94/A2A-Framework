@@ -49,7 +49,6 @@ import logging
 import math
 import re
 import time
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal, get_args
@@ -315,14 +314,6 @@ class AuditLog:
         # emit_coalesced: key -> [window start (monotonic), suppressed count, last event]
         self._coalesce: dict[tuple[str, str], list[Any]] = {}
         self.audit_errors = 0  # failed emits since start (admin /healthz)
-        self._listeners: list[Callable[[AuditEvent], None]] = []
-
-    def add_listener(self, fn: Callable[[AuditEvent], None]) -> None:
-        """Call ``fn(ev)`` (sync, on the loop) for every event passed to ``emit``, whether or
-        not its append succeeds; coalesced-away events never reach it. ``AgentHost`` uses it
-        to publish ``security.denied`` bus events. A listener that raises is logged and
-        ignored."""
-        self._listeners.append(fn)
 
     async def initialize(self) -> None:
         async def create() -> None:
@@ -386,18 +377,12 @@ class AuditLog:
             raise
 
     async def emit(self, ev: AuditEvent) -> None:
-        """Append, never raising: failures are logged and counted (fail-open). Listeners
-        (``add_listener``) are called either way."""
+        """Append, never raising: failures are logged and counted (fail-open)."""
         try:
             await self.append(ev)
         except Exception as exc:  # noqa: BLE001 - audit must not break the request
             self.audit_errors += 1
             log.warning("audit append failed for %s: %s", ev.action, type(exc).__name__)
-        for fn in self._listeners:
-            try:
-                fn(ev)
-            except Exception as exc:  # noqa: BLE001 - a listener must not break the request
-                log.warning("audit listener failed for %s: %s", ev.action, type(exc).__name__)
 
     async def emit_coalesced(self, ev: AuditEvent, category: str) -> None:
         """Like ``emit``, but at most one row per (action, category) per window; the row

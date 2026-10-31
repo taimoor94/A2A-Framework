@@ -13,7 +13,15 @@ import re
 import signal
 import threading
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Iterable, Iterator, Mapping
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+)
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -108,6 +116,7 @@ from a2agw.serve.push import (
     push_http_client,
 )
 from a2agw.serve.reap import (
+    CANCEL_CONCURRENCY,
     OUTBOUND_TTL_S,
     AgentServedError,
     ExpireReport,
@@ -136,10 +145,21 @@ _AGENT_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 REFRESH_MAX_PER_PASS = 20  # partner cards refreshed per maintenance pass
 REFRESH_CONCURRENCY = 4
 PARTNERS_LOCK_TIMEOUT_S = 0.25  # longest a save on the event loop waits for the file lock
+PARTNER_REMOVED_REASON = "partner removed"  # end_reason of handles a forced removal ended
 _EARLY_AUDIT_MAX = 1000  # registry changes kept for the audit log until startup
-# Audited refusals that are also published on the bus as ``security.denied``.
-_DENIED_ACTIONS = frozenset({"authz.deny", "egress.deny", "sidecar.denied"})
 _DENIED_MAX_CHARS = 256
+
+
+def security_denied_event(ev: AuditEvent) -> GatewayEvent:
+    """The ``security.denied`` bus event for a refusal's audit row: the reason, the rule
+    and the kind of principal only. Never a principal id, message text or card content (the
+    bus feeds the admin SSE stream and the control plane)."""
+    detail = ev.detail or {}
+    data: dict[str, Any] = {"reason": str(detail.get("reason") or "")[:_DENIED_MAX_CHARS]}
+    if detail.get("rule"):
+        data["rule"] = str(detail["rule"])[:_DENIED_MAX_CHARS]
+    data["principal_kind"] = str(detail.get("principal_kind") or _principal_kind(ev.actor))
+    return GatewayEvent(kind="security.denied", agent_id=ev.agent_id or "host", data=data)
 
 
 def _principal_kind(actor: str) -> str:
@@ -944,18 +964,18 @@ class _AgentAuthorizer:
         enforce: bool,
         *,
         policy: PolicyEngine | None = None,
-        audit: AuditLog | None = None,
+        report: Callable[..., Awaitable[None]] | None = None,
     ) -> None:
         self.app = app
         self.spec = spec
         self.enforce = enforce
         self.policy = policy
-        self.audit = audit
+        self.report = report  # AgentHost.report_denied: bus event + audit row
 
     async def _deny(
         self, scope: Scope, receive: Receive, send: Send, principal: Principal | None, **detail: Any
     ) -> None:
-        if self.audit is not None:
+        if self.report is not None:
             ev = AuditEvent(
                 actor=principal.id if principal is not None else "anonymous",
                 action="authz.deny",
@@ -966,11 +986,9 @@ class _AgentAuthorizer:
                     **detail,
                 },
             )
-            if principal is None or principal.kind == "anonymous":
-                # Unauthenticated callers cannot flood the log: one row per agent per window.
-                await self.audit.emit_coalesced(ev, f"agent:{self.spec.id}")
-            else:
-                await self.audit.emit(ev)
+            anonymous = principal is None or principal.kind == "anonymous"
+            # Unauthenticated callers cannot flood the log: one row per agent per window.
+            await self.report(ev, coalesce=f"agent:{self.spec.id}" if anonymous else None)
         await JSONResponse({"error": "forbidden"}, status_code=403)(scope, receive, send)
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -1220,7 +1238,6 @@ class AgentHost:
         audit: AuditLog | None = None
         if self.audit_enabled:
             audit = self.audit = AuditLog(engine)
-            audit.add_listener(self._publish_denied)
             await audit.initialize()
             early, self._early_audit = self._early_audit, []
             for ev in early:
@@ -1243,6 +1260,7 @@ class AgentHost:
             context_signer=self.context_signer,
             max_consults_per_task=self.max_consults_per_task,
         )
+        self.client.on_denied = self.report_denied  # egress refusals: bus + audit
         stores: dict[str, TaskStore] = {}
         routes: list[BaseRoute] = []
         self._authorizers = []
@@ -1268,6 +1286,7 @@ class AgentHost:
             # Cancelling an inbound task cancels the partner tasks it started (and ends the
             # consult tokens of its runs, with their REST calls in flight).
             executor.on_cancel = self._end_inbound
+            executor.on_denied = self.report_denied  # policy refusals: bus + audit
             card = build_card(spec, self.base_url, security=self.auth, push=push is not None)
             if self.card_signer is not None:
                 card = self.card_signer.sign(card)
@@ -1345,7 +1364,7 @@ class AgentHost:
                 spec,
                 enforce=self.auth is not None,
                 policy=self.policy,
-                audit=audit,
+                report=self.report_denied,
             )
             self._authorizers.append(authorizer)
             routes.append(Mount(f"/agents/{agent_id}", app=authorizer))
@@ -1553,21 +1572,19 @@ class AgentHost:
             )
         )
 
-    def _publish_denied(self, ev: AuditEvent) -> None:
-        """Audit listener: a ``security.denied`` bus event for every audited refusal
-        (``authz.deny``, ``egress.deny``, ``sidecar.denied``). The event carries the reason,
-        the rule and the kind of principal only: never a principal id, message text or card
-        content (the bus feeds the admin SSE stream and the control plane)."""
-        if ev.action not in _DENIED_ACTIONS:
+    async def report_denied(self, ev: AuditEvent, *, coalesce: str | None = None) -> None:
+        """A security refusal (an ``authz.deny`` at an agent mount or the admin API, a policy
+        refusal in an executor, an ``egress.deny``, a ``sidecar.denied``): publish a
+        ``security.denied`` bus event, then, when the audit log is enabled, write ``ev``
+        (coalesced under ``coalesce`` when given). The bus event is never suppressed or
+        coalesced (the bus is bounded) and does not depend on the audit log."""
+        self.bus.publish(security_denied_event(ev))
+        if self.audit is None:
             return
-        detail = ev.detail or {}
-        data: dict[str, Any] = {"reason": str(detail.get("reason") or "")[:_DENIED_MAX_CHARS]}
-        if detail.get("rule"):
-            data["rule"] = str(detail["rule"])[:_DENIED_MAX_CHARS]
-        data["principal_kind"] = str(detail.get("principal_kind") or _principal_kind(ev.actor))
-        self.bus.publish(
-            GatewayEvent(kind="security.denied", agent_id=ev.agent_id or "host", data=data)
-        )
+        if coalesce is not None:
+            await self.audit.emit_coalesced(ev, coalesce)
+        else:
+            await self.audit.emit(ev)
 
     def set_policy(
         self,
@@ -1627,14 +1644,74 @@ class AgentHost:
         if unknown:
             logger.warning("policy routing rules name unknown partner ids: %s", ", ".join(unknown))
 
-    async def reload_partners(self, *, force: bool = False) -> dict[str, Any]:
+    async def cancel_partner_tasks(
+        self, partner_ids: list[str], *, actor: str = "system"
+    ) -> tuple[int, int]:
+        """Before a forced removal: end and cancel every open outbound task of these
+        partners, best effort, the way the TTL pass does. Each handle is first claimed
+        (``claim_end``: ``TASK_STATE_CANCELED``, ``end_reason`` "partner removed", so later
+        partner updates no longer move it), then the partner task is cancelled as the caller
+        it was started for, within ``default_deadline_s``. One ``partner.remove`` audit row
+        per handle (outcome ``canceled`` or ``cancel_failed``, ``detail.reason``). A failed
+        cancel never blocks the removal; it is logged by exception class only.
+        Returns (cancelled, cancel_errors)."""
+        if self.handles is None or self.client is None or not partner_ids:
+            return 0, 0
+        handles = self.handles
+        rows = await handles.open_for_partners(partner_ids)
+        gate = asyncio.Semaphore(CANCEL_CONCURRENCY)
+        counts = {"cancelled": 0, "errors": 0}
+
+        async def one(h: dict[str, Any]) -> None:
+            async with gate:
+                claimed = await handles.claim_end(
+                    h["partner_id"],
+                    h["task_id"],
+                    h["state"],
+                    "TASK_STATE_CANCELED",
+                    PARTNER_REMOVED_REASON,
+                )
+                if not claimed:
+                    return  # ended meanwhile (a partner update, another gateway)
+                outcome = "canceled"
+                try:
+                    async with asyncio.timeout(self.default_deadline_s):
+                        await self._cancel_outbound(h)
+                    counts["cancelled"] += 1
+                except Exception as exc:  # noqa: BLE001 - best effort: the removal goes on
+                    outcome = "cancel_failed"
+                    counts["errors"] += 1
+                    logger.warning(
+                        "cancel of partner %s task before removal failed: %s",
+                        h["partner_id"],
+                        type(exc).__name__,
+                    )
+            if self.audit is not None:
+                await self.audit.emit(
+                    AuditEvent(
+                        actor=actor,
+                        action="partner.remove",
+                        partner_id=h["partner_id"],
+                        task_id=h["task_id"],
+                        outcome=outcome,
+                        detail={"reason": PARTNER_REMOVED_REASON},
+                    )
+                )
+
+        await asyncio.gather(*(one(h) for h in rows))
+        return counts["cancelled"], counts["errors"]
+
+    async def reload_partners(
+        self, *, force: bool = False, actor: str = "system"
+    ) -> dict[str, Any]:
         """Re-read the partners file into the running registry, so partners added with the
         CLI are usable without a restart (``PartnerRegistry.prepare_reload``/``apply_reload``).
 
         Removing a partner that still has non-terminal outbound tasks (handles) would orphan
-        them: that is refused with ``PartnersInUse`` unless ``force``. The result has the ids
-        per change and ``open_handles``, the open handles of removed partners (logged when
-        not zero). ValueError if there is no partners file or it is invalid; ReloadConflict
+        them: that is refused with ``PartnersInUse`` unless ``force``; forced, those tasks
+        are cancelled first (``cancel_partner_tasks``, best effort). The result has the ids
+        per change, ``open_handles`` (the open handles of removed partners, logged when not
+        zero), ``cancelled`` and ``cancel_errors``. ValueError if there is no partners file or it is invalid; ReloadConflict
         if the registry changed meanwhile. In every failure case the registry is unchanged.
 
         Known window: the open handles are counted while awaiting ``count_open``; a partner
@@ -1646,13 +1723,26 @@ class AgentHost:
             open_handles = sum((await self.handles.count_open(plan.removed)).values())
         if open_handles and not force:
             raise PartnersInUse(open_handles)
+        cancelled = cancel_errors = 0
+        if open_handles:
+            # Cancelled while the partners are still registered (the client needs them).
+            cancelled, cancel_errors = await self.cancel_partner_tasks(plan.removed, actor=actor)
         changes: dict[str, Any] = self.partners.apply_reload(plan)
         if open_handles:
             logger.warning(
-                "partner reload removed partners with %d open outbound task(s)", open_handles
+                "partner reload removed partners with %d open outbound task(s) "
+                "(%d cancelled, %d cancel errors)",
+                open_handles,
+                cancelled,
+                cancel_errors,
             )
         self._warn_unknown_routing_partners()
-        return {**changes, "open_handles": open_handles}
+        return {
+            **changes,
+            "open_handles": open_handles,
+            "cancelled": cancelled,
+            "cancel_errors": cancel_errors,
+        }
 
     @staticmethod
     def sidecar_owner(agent_id: str) -> str:
