@@ -36,6 +36,8 @@ llamaindex = ["llama-index-core>=0.14.25"]
 # [tool.uv] conflicts below and the README); its tests run in their own environment
 # (scripts/test-crewai.sh).
 crewai = ["crewai>=1.15"]
+# The control plane (a2agw control): FastAPI, imported only by a2agw.control.app.
+control = ["fastapi>=0.115,<1"]
 all = [
     "langchain-core>=1.7",
     "langgraph>=1.2",
@@ -45,6 +47,7 @@ all = [
     "claude-agent-sdk>=0.2.174",
     "ag2>=1.2",
     "llama-index-core>=0.14.25",
+    "fastapi>=0.115,<1",
 ]
 
 [project.scripts]
@@ -68,6 +71,7 @@ dev = [
     "ag2>=1.2",
     "llama-index-core>=0.14.25",
     "pytest-timeout>=2.4.0",
+    "fastapi>=0.115,<1",
 ]
 crewai-test = ["pytest", "pytest-asyncio", "pytest-timeout>=2.4.0", "crewai>=1.15"]
 

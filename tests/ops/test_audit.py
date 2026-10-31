@@ -315,3 +315,35 @@ async def test_emit_coalesced_one_row_per_window_with_count(log, monkeypatch):
     assert counts == [0, 0, 4, 0]
     assert len(rows) + sum(counts) == 8  # every event is accounted for
     assert await log.verify_chain() is None
+
+
+# -- configurable table name (control plane: cp_audit) ---------------------------------------
+
+
+async def test_custom_table_name_chain_verifies(engine):
+    gw = AuditLog(engine)
+    cp = AuditLog(engine, table_name="cp_audit")
+    await gw.initialize()
+    await cp.initialize()
+    await cp.initialize()  # idempotent
+    await gw.append(ev())
+    for i in range(3):
+        await cp.append(ev("cp.gateway.create", detail={"gateway": f"g{i}"}))
+    async with engine.connect() as conn:
+        n_cp = (await conn.execute(text("SELECT count(*) FROM cp_audit"))).scalar_one()
+        n_gw = (await conn.execute(text("SELECT count(*) FROM a2agw_audit"))).scalar_one()
+        first = (
+            await conn.execute(text("SELECT prev_hash FROM cp_audit ORDER BY seq LIMIT 1"))
+        ).scalar_one()
+    assert (n_cp, n_gw) == (3, 1) and first == GENESIS_HASH  # its own chain
+    assert await cp.verify_chain() is None and await gw.verify_chain() is None
+    rows, _ = await cp.query({"action": "cp.gateway.create"})
+    assert [r["detail"]["gateway"] for r in rows] == ["g2", "g1", "g0"]
+    async with engine.begin() as conn:
+        await conn.execute(text("UPDATE cp_audit SET actor = 'mallory' WHERE seq = 2"))
+    assert await cp.verify_chain() == 2 and await gw.verify_chain() is None
+
+
+async def test_table_name_must_be_an_identifier(engine):
+    with pytest.raises(ValueError, match="table name"):
+        AuditLog(engine, table_name="cp_audit; DROP TABLE x")

@@ -89,6 +89,22 @@ Action = Literal[
     "cp.apply",
     "cp.reject",
     "cp.command",
+    # The control plane's own log (``AuditLog(engine, table_name="cp_audit")``).
+    "cp.login",
+    "cp.logout",
+    "cp.gateway.create",
+    "cp.gateway.revoke",
+    "cp.partner.register",
+    "cp.partner.approve",
+    "cp.partner.reject",
+    "cp.partner.quarantine",
+    "cp.assign",
+    "cp.policy.save",
+    "cp.policy.dryrun",
+    "cp.user.update",
+    "cp.apikey.create",
+    "cp.apikey.revoke",
+    "cp.denied",
 ]
 ACTIONS: frozenset[str] = frozenset(get_args(Action))
 DETAIL_KEYS = frozenset(
@@ -111,6 +127,8 @@ DETAIL_KEYS = frozenset(
         "command",  # control plane: the command kind (e.g. "partner.approve")
         "source",  # control plane: where a change came from
         "hash",  # policy.update / cp.apply: sha256 of the applied document, never its body
+        "gateway",  # control plane: the gateway id a row is about
+        "role",  # control plane: the role given to an API key or user
     }
 )
 # PartnerRegistry change events -> audit actions (``registry_audit_action``).
@@ -181,25 +199,55 @@ COALESCE_WINDOW_S = 60.0
 _BATCH = 500
 _ADVISORY_KEY = 0x61326177_61756469  # 'a2aw' 'audi': one chain per database
 
+DEFAULT_TABLE = "a2agw_audit"
+_TABLE_NAME = re.compile(r"^[a-z_][a-z0-9_]{0,62}$")
+
+
+def _audit_table(name: str, metadata: MetaData) -> Table:
+    return Table(
+        name,
+        metadata,
+        Column("seq", Integer, primary_key=True, autoincrement=True),
+        Column("ts", Float, nullable=False, index=True),
+        Column("actor", String(256), nullable=False),
+        Column("action", String(64), nullable=False, index=True),
+        Column("agent_id", String(256), nullable=True, index=True),
+        Column("partner_id", String(256), nullable=True, index=True),
+        Column("task_id", String(256), nullable=True),
+        Column("classification", String(32), nullable=True),
+        Column("outcome", String(256), nullable=False),
+        Column("detail_json", Text, nullable=False),
+        Column("prev_hash", String(64), nullable=False),
+        Column("hash", String(64), nullable=False),
+        # sqlite: never reuse the seq of a deleted last row.
+        sqlite_autoincrement=True,
+    )
+
+
 _metadata = MetaData()
-AUDIT_TABLE = Table(
-    "a2agw_audit",
-    _metadata,
-    Column("seq", Integer, primary_key=True, autoincrement=True),
-    Column("ts", Float, nullable=False, index=True),
-    Column("actor", String(256), nullable=False),
-    Column("action", String(64), nullable=False, index=True),
-    Column("agent_id", String(256), nullable=True, index=True),
-    Column("partner_id", String(256), nullable=True, index=True),
-    Column("task_id", String(256), nullable=True),
-    Column("classification", String(32), nullable=True),
-    Column("outcome", String(256), nullable=False),
-    Column("detail_json", Text, nullable=False),
-    Column("prev_hash", String(64), nullable=False),
-    Column("hash", String(64), nullable=False),
-    # sqlite: never reuse the seq of a deleted last row.
-    sqlite_autoincrement=True,
-)
+AUDIT_TABLE = _audit_table(DEFAULT_TABLE, _metadata)
+# Other chains (``AuditLog(table_name=...)``), one MetaData each so ``initialize`` creates
+# only its own table.
+_TABLES: dict[str, tuple[MetaData, Table]] = {DEFAULT_TABLE: (_metadata, AUDIT_TABLE)}
+
+
+def _table_for(name: str) -> tuple[MetaData, Table]:
+    if not _TABLE_NAME.match(name):
+        raise ValueError("audit table name must be a lowercase SQL identifier")
+    if name not in _TABLES:
+        metadata = MetaData()
+        _TABLES[name] = (metadata, _audit_table(name, metadata))
+    return _TABLES[name]
+
+
+def _advisory_key(name: str) -> int:
+    """The pg advisory lock key of a chain: the historical key for the gateway's table, a
+    signed 64-bit value derived from the name for any other."""
+    if name == DEFAULT_TABLE:
+        return _ADVISORY_KEY
+    return int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "big", signed=True)
+
+
 _HASHED = (
     "ts",
     "actor",
@@ -308,7 +356,13 @@ def _with_count(ev: AuditEvent, count: int) -> AuditEvent:
 
 
 class AuditLog:
-    def __init__(self, engine: AsyncEngine) -> None:
+    """One hash chain in ``table_name`` (the gateway's ``a2agw_audit`` by default; the
+    control plane keeps its own in ``cp_audit``). Each table is an independent chain with its
+    own genesis and its own cross-process lock."""
+
+    def __init__(self, engine: AsyncEngine, *, table_name: str = DEFAULT_TABLE) -> None:
+        self._metadata, self._table = _table_for(table_name)
+        self._advisory = _advisory_key(table_name)
         self._engine = engine
         self._lock = asyncio.Lock()
         self._pending: set[asyncio.Task[None]] = set()
@@ -319,7 +373,7 @@ class AuditLog:
     async def initialize(self) -> None:
         async def create() -> None:
             async with self._engine.begin() as conn:
-                await conn.run_sync(_metadata.create_all, checkfirst=True)
+                await conn.run_sync(self._metadata.create_all, checkfirst=True)
 
         await retry_ddl(create)
 
@@ -339,7 +393,7 @@ class AuditLog:
             "outcome": _cut(ev.outcome) or "",
             "detail_json": canonical_json(sanitize_detail(ev.detail)),
         }
-        t = AUDIT_TABLE
+        t = self._table
         try:
             async with asyncio.timeout(LOCK_TIMEOUT_S):
                 await self._lock.acquire()
@@ -348,12 +402,12 @@ class AuditLog:
         try:
             async with self._engine.begin() as conn:
                 if conn.dialect.name == "postgresql":
-                    await self._advisory_lock(conn)
+                    await self._advisory_lock(conn, self._advisory)
                 elif conn.dialect.name == "sqlite":
                     # A no-op write first: it opens the transaction and takes SQLite's write
                     # lock, so another process cannot read the same last hash meanwhile
                     # (it waits on busy_timeout instead).
-                    await conn.execute(text("UPDATE a2agw_audit SET seq = seq WHERE 0"))
+                    await conn.execute(t.update().values(seq=t.c.seq).where(text("0")))
                 last = (
                     await conn.execute(select(t.c.hash).order_by(t.c.seq.desc()).limit(1))
                 ).scalar_one_or_none()
@@ -367,12 +421,12 @@ class AuditLog:
             self._lock.release()
 
     @staticmethod
-    async def _advisory_lock(conn: Any) -> None:
+    async def _advisory_lock(conn: Any, key: int) -> None:
         """Serialize writers across processes (the asyncio lock covers only this one); held
         until the transaction ends. The wait is bounded like the in-process lock."""
         await conn.execute(text(f"SET LOCAL lock_timeout = '{int(LOCK_TIMEOUT_S * 1000)}ms'"))
         try:
-            await conn.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _ADVISORY_KEY})
+            await conn.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": key})
         except DBAPIError as exc:
             code = getattr(exc.orig, "sqlstate", None) or getattr(exc.orig, "pgcode", None)
             if code == "55P03":  # lock_not_available
@@ -442,7 +496,7 @@ class AuditLog:
         """Rows matching ``filters`` (``action``, ``agent``, ``partner``, ``since`` epoch
         seconds), newest first unless ``ascending``. ``cursor`` is the opaque value returned
         as the second item; ``ValueError`` if it is malformed."""
-        t = AUDIT_TABLE
+        t = self._table
         stmt = select(t)
         if filters.get("action"):
             stmt = stmt.where(t.c.action == filters["action"])
@@ -469,7 +523,7 @@ class AuditLog:
 
     async def verify_chain(self) -> int | None:
         """The seq of the first row whose link or hash does not match, or None."""
-        t = AUDIT_TABLE
+        t = self._table
         prev, after = GENESIS_HASH, None
         async with self._engine.connect() as conn:
             while True:

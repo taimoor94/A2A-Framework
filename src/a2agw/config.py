@@ -490,22 +490,25 @@ def _interpolate_tree(node: Any, env: dict[str, str], source: str) -> Any:
     return node
 
 
-def _reject_inline_secrets(node: Any, source: str, path: str = "") -> None:
-    """Before interpolation: no secret-looking key anywhere, no literal password in db_url."""
+def _reject_inline_secrets(
+    node: Any, source: str, path: str = "", name_maps: frozenset[str] = _NAME_MAPS
+) -> None:
+    """Before interpolation: no secret-looking key anywhere, no literal password in db_url.
+    ``name_maps``: dotted paths of mappings whose keys are names chosen by the operator."""
     if isinstance(node, dict):
         for k, v in node.items():
             key = str(k)
             where = f"{path}.{key}" if path else key
-            named = path in _NAME_MAPS or _NAME_MAP_PATHS.match(path)
+            named = path in name_maps or _NAME_MAP_PATHS.match(path)
             if not named and key.lower() in _SECRET_KEYS:
                 raise ConfigError(
                     f"{source}: {where}: inline secrets are not allowed in config; name an "
                     f"environment variable with {key}_env (or put key material in a *_file)"
                 )
-            _reject_inline_secrets(v, source, where)
+            _reject_inline_secrets(v, source, where, name_maps)
     elif isinstance(node, list):
         for i, v in enumerate(node):
-            _reject_inline_secrets(v, source, f"{path}.{i}")
+            _reject_inline_secrets(v, source, f"{path}.{i}", name_maps)
     if path == "db_url" and isinstance(node, str) and _inline_password(node):
         raise ConfigError(
             f"{source}: db_url: inline database password; use ${{VAR}} for it "
@@ -525,7 +528,16 @@ def _inline_password(url: str) -> bool:
     )
 
 
-def load_config(path: str | Path, env: dict[str, str] | None = None) -> GatewayConfig:
+def read_config_tree(
+    path: str | Path,
+    env: dict[str, str] | None = None,
+    *,
+    name_maps: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    """A YAML config file as a mapping, with the rules of this module applied: inline secrets
+    (and literal ``db_url`` passwords) rejected before interpolation, then ``${VAR}``
+    interpolated in string scalars. ``name_maps`` adds dotted paths of operator-named
+    mappings to the gateway's. Shared by the gateway and the control plane."""
     p = Path(path)
     try:
         text = p.read_text()
@@ -535,21 +547,31 @@ def load_config(path: str | Path, env: dict[str, str] | None = None) -> GatewayC
         data = yaml.safe_load(text)
     except yaml.YAMLError:
         raise ConfigError(f"{p}: invalid YAML") from None
-    _reject_inline_secrets(data, str(p))
+    _reject_inline_secrets(data, str(p), name_maps=_NAME_MAPS | name_maps)
     # Interpolate string scalars only, after parsing: env values can never add YAML structure.
     data = _interpolate_tree(data, dict(os.environ) if env is None else env, str(p))
     if not isinstance(data, dict):
         raise ConfigError(f"{p}: config must be a mapping")
+    return data
+
+
+def validation_message(source: str | Path, e: ValidationError) -> str:
+    """``source: loc: msg; ...`` for a pydantic error: field locations and messages only,
+    never the input values."""
+    problems = "; ".join(
+        f"{'.'.join(str(x) for x in err['loc']) or '<root>'}: "
+        f"{err['msg'].removeprefix('Value error, ')}"
+        for err in e.errors(include_input=False, include_url=False)
+    )
+    return f"{source}: {problems}"
+
+
+def load_config(path: str | Path, env: dict[str, str] | None = None) -> GatewayConfig:
+    data = read_config_tree(path, env)
     try:
         return GatewayConfig.model_validate(data)
     except ValidationError as e:
-        # Field locations and messages only; never echo input values.
-        problems = "; ".join(
-            f"{'.'.join(str(x) for x in err['loc']) or '<root>'}: "
-            f"{err['msg'].removeprefix('Value error, ')}"
-            for err in e.errors(include_input=False, include_url=False)
-        )
-        raise ConfigError(f"{p}: {problems}") from None
+        raise ConfigError(validation_message(Path(path), e)) from None
 
 
 def partners_path(cfg: GatewayConfig, config_dir: Path) -> Path:

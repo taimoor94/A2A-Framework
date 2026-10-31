@@ -1069,3 +1069,29 @@ async def _reap(
         if client is not None:
             await client.aclose()
         await engine.dispose()
+
+
+# -- control ---------------------------------------------------------------------------------
+# Mounted at the end: a2agw.control.cli borrows ``guarded`` and the database helpers from this
+# module at call time. Neither path imports FastAPI here.
+def _mount_control() -> None:
+    from a2agw.control import INSTALL_HINT, control_available
+
+    if control_available():
+        from a2agw.control.cli import control_app
+
+        app.add_typer(control_app, name="control")
+        return
+
+    @app.command(
+        "control",
+        context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+        add_help_option=False,
+    )
+    def control_missing() -> None:
+        """The control plane (needs the control extra: pip install 'a2a-gateway[control]')."""
+        typer.echo(f"error: {INSTALL_HINT}", err=True)
+        raise typer.Exit(1)
+
+
+_mount_control()
