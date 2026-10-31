@@ -4,6 +4,7 @@ from typing import Any
 import httpx
 import pytest
 from cascade_support import Env
+from db_leak_guard import pytest_runtest_logstart, pytest_runtest_teardown  # noqa: F401 - hooks
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor

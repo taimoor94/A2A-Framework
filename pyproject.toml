@@ -97,11 +97,18 @@ asyncio_default_fixture_loop_scope = "function"
 # A hung test fails with its stack instead of stalling the run (CI jobs are also capped).
 timeout = 120
 addopts = "--import-mode=importlib"
+# A connection or other resource left to the garbage collector fails the run, not just CI's
+# ``-W error`` (tests/db_leak_guard.py names the test that leaked a database connection).
+filterwarnings = [
+    "error::ResourceWarning",
+    "error::pytest.PytestUnraisableExceptionWarning",
+]
 testpaths = ["tests"]
 pythonpath = ["tests", "."]  # shared helpers (streaming_asgi) and examples/
 markers = [
     "docker: builds the real image; needs A2AGW_DOCKER_TESTS=1 and a Docker daemon",
     "postgres: needs a throwaway PostgreSQL 16 (tests/postgres_support.py); skipped without one",
+    "leaves_db_connections: the test hands live database connections to a later test on purpose (tests/db_leak_guard.py)",
 ]
 
 [tool.ruff]
