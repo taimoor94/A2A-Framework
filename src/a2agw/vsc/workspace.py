@@ -43,7 +43,7 @@ class Workspace:
     base_ref: str
 
 
-async def _git(cwd: Path, *args: str) -> str:
+async def _git(cwd: Path, *args: str, strip: bool = True) -> str:
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     proc = await asyncio.create_subprocess_exec(
         "git",
@@ -62,7 +62,8 @@ async def _git(cwd: Path, *args: str) -> str:
         raise GitError(f"git {' '.join(args)} timed out after {_TIMEOUT_S:.0f}s") from None
     if proc.returncode != 0:
         raise GitError(err.decode(errors="replace").strip())
-    return out.decode(errors="replace").strip()
+    text = out.decode(errors="replace")
+    return text.strip() if strip else text
 
 
 def _safe(name: str) -> str:
@@ -96,23 +97,37 @@ class WorkspaceManager:
         path = self.root / job_id / repo_id
         async with self._locks.setdefault(f"{job_id}/{repo_id}", asyncio.Lock()):
             if path.exists():
-                base = await _git(repo, "config", "--get", f"branch.{branch}.vscbase")
+                try:
+                    base = await _git(repo, "config", "--get", f"branch.{branch}.vscbase")
+                except GitError:
+                    # Interrupted create (worktree added, config not written): the base is where
+                    # the job branch forked from the default branch.
+                    try:
+                        base = await _git(
+                            repo, "merge-base", self._systems[system_id].default_branch, branch
+                        )
+                    except GitError as e:
+                        raise GitError(
+                            f"workspace {path} exists but its base ref is unknown "
+                            f"(branch.{branch}.vscbase missing and no merge-base): {e}"
+                        ) from None
+                    await _git(repo, "config", f"branch.{branch}.vscbase", base)
                 return Workspace(job_id, repo_id, path, branch, base)
             base = await _git(
                 repo, "rev-parse", "--verify", self._systems[system_id].default_branch
             )
             path.parent.mkdir(parents=True, exist_ok=True)
-            await _git(repo, "worktree", "add", "-b", branch, str(path), base)
             await _git(repo, "config", f"branch.{branch}.vscbase", base)
+            await _git(repo, "worktree", "add", "-b", branch, str(path), base)
             return Workspace(job_id, repo_id, path, branch, base)
 
     async def diff(self, ws: Workspace) -> str:
         await _git(ws.path, "add", "-N", ".")
-        return await _git(ws.path, "diff", ws.base_ref)
+        return await _git(ws.path, "diff", "--no-renames", ws.base_ref, strip=False)
 
     async def changed_paths(self, ws: Workspace) -> list[str]:
         await _git(ws.path, "add", "-N", ".")
-        out = await _git(ws.path, "diff", "--name-only", ws.base_ref)
+        out = await _git(ws.path, "diff", "--no-renames", "--name-only", ws.base_ref)
         return [line for line in out.splitlines() if line]
 
     def confine(self, ws: Workspace, system_id: str, paths: list[str]) -> list[str]:

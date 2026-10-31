@@ -94,3 +94,94 @@ async def test_merge_ff_refuses_diverged(tmp_path):
     with pytest.raises(MergeRefused):
         await m.merge_ff(ws2, "main")
     assert git(repo, "rev-parse", "main") == before
+
+
+async def test_repo_id_collision_gets_distinct_workspaces(tmp_path):
+    a = make_repo(tmp_path / "one", "app", {"a.txt": "a\n"})
+    b = make_repo(tmp_path / "two", "app", {"b.txt": "b\n"})
+    m = manager(
+        tmp_path,
+        a,
+        [SystemConfig(id="a", repo=str(a)), SystemConfig(id="b", repo=str(b))],
+    )
+    wa = await m.create("job1", "a")
+    wb = await m.create("job1", "b")
+    assert wa.repo_id != wb.repo_id
+    assert wa.path != wb.path
+    assert (wa.path / "a.txt").exists() and (wb.path / "b.txt").exists()
+    assert git(wa.path, "rev-parse", "--show-toplevel") != git(
+        wb.path, "rev-parse", "--show-toplevel"
+    )
+
+
+async def test_merge_ff_target_not_checked_out(tmp_path):
+    repo = make_repo(tmp_path, "core", {"a.txt": "a\n"})
+    git(repo, "branch", "release")
+    m = manager(tmp_path, repo)
+    ws = await m.create("job1", "core")  # main stays checked out; release is not
+    (ws.path / "w.txt").write_text("w\n")
+    head = await m.commit(ws, "w")
+    assert git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert await m.merge_ff(ws, "release") == head
+    assert git(repo, "rev-parse", "release") == head
+    assert git(repo, "rev-parse", "main") == ws.base_ref
+
+    git(repo, "branch", "other", ws.base_ref)
+    git(repo, "checkout", "other")
+    (repo / "o.txt").write_text("o\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-m", "diverge")
+    git(repo, "checkout", "main")
+    ws2 = await m.create("job2", "core")
+    (ws2.path / "x.txt").write_text("x\n")
+    await m.commit(ws2, "x")
+    before = git(repo, "rev-parse", "other")
+    with pytest.raises(MergeRefused):
+        await m.merge_ff(ws2, "other")
+    assert git(repo, "rev-parse", "other") == before
+
+
+async def test_discard_removes_branch_and_vscbase_config(tmp_path):
+    repo = make_repo(tmp_path, "core", {"a.txt": "a\n"})
+    m = manager(tmp_path, repo)
+    ws = await m.create("job1", "core")
+    key = f"branch.{ws.branch}.vscbase"
+    assert git(repo, "config", "--get", key) == ws.base_ref
+    await m.discard("job1")
+    assert git(repo, "branch", "--list", ws.branch) == ""
+    assert key not in git(repo, "config", "--list")
+
+
+async def test_changed_paths_sees_move_from_outside_system_path(tmp_path):
+    repo = make_repo(tmp_path, "core", {"src/a.txt": "a\n", "secret.txt": "line1\nline2\nline3\n"})
+    m = manager(tmp_path, repo, [SystemConfig(id="core", repo=str(repo), path="src")])
+    ws = await m.create("job1", "core")
+    git(ws.path, "mv", "secret.txt", "src/secret.txt")
+    paths = await m.changed_paths(ws)
+    assert "secret.txt" in paths and "src/secret.txt" in paths
+    assert "secret.txt" in m.confine(ws, "core", paths)
+
+
+async def test_diff_ends_with_newline_and_applies(tmp_path):
+    repo = make_repo(tmp_path, "core", {"a.txt": "a\n"})
+    m = manager(tmp_path, repo)
+    ws = await m.create("job1", "core")
+    (ws.path / "a.txt").write_text("changed\n")
+    (ws.path / "new.txt").write_text("fresh\n")
+    d = await m.diff(ws)
+    assert d.endswith("\n")
+    patch = tmp_path / "p.patch"
+    patch.write_text(d)
+    other = tmp_path / "fresh-wt"
+    git(repo, "worktree", "add", "--detach", str(other), ws.base_ref)
+    git(other, "apply", "--check", str(patch))
+
+
+async def test_create_recovers_from_partial_create(tmp_path):
+    repo = make_repo(tmp_path, "core", {"a.txt": "a\n"})
+    m = manager(tmp_path, repo)
+    ws = await m.create("job1", "core")
+    git(repo, "config", "--unset", f"branch.{ws.branch}.vscbase")  # died before the config write
+    again = await m.create("job1", "core")
+    assert again.base_ref == ws.base_ref
+    assert again.path == ws.path
