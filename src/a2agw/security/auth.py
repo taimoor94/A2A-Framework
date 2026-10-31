@@ -12,6 +12,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Literal
 
+import httpx
 import jwt
 from a2a.auth.user import UnauthenticatedUser, User
 from a2a.server.context import ServerCallContext
@@ -133,9 +134,10 @@ class _JwksCache:
     meanwhile (``_generation`` moved, whatever its outcome) uses its result and never fetches
     again itself."""
 
-    def __init__(self, url: str, tier: Tier) -> None:
+    def __init__(self, url: str, tier: Tier, *, http: httpx.AsyncClient | None = None) -> None:
         self.url = url
         self.tier = tier
+        self.http = http  # None: a fresh guarded client for each fetch
         self._keys: dict[str, jwt.PyJWK] = {}
         self._fetched_at: float | None = None  # last successful fetch
         self._attempted_at: float | None = None  # last fetch, successful or not
@@ -148,8 +150,9 @@ class _JwksCache:
         try:
             if self.url.lower().startswith("http://") and not _dev():
                 raise UnsafeURL("https is required")
+            extra = {"http": self.http} if self.http is not None else {}
             body = await netguard.safe_get(
-                self.url, self.tier, max_bytes=JWKS_MAX_BYTES, deadline_s=JWKS_TIMEOUT_S
+                self.url, self.tier, max_bytes=JWKS_MAX_BYTES, deadline_s=JWKS_TIMEOUT_S, **extra
             )
             jwk_set = jwt.PyJWKSet.from_json(body.decode("utf-8"))
         except asyncio.CancelledError:
@@ -194,6 +197,9 @@ class _JwksCache:
                     return self._keys.get(kid)
             await self._refresh()
             return self._keys.get(kid)
+
+
+JwksCache = _JwksCache  # also used by the control plane for its OIDC provider's keys
 
 
 def _fail() -> AuthenticationError:

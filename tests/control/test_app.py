@@ -75,11 +75,44 @@ async def test_error_shape(sqlite_settings, run_app):
     assert boom_r.json() == {"error": "internal", "detail": "internal error"}
 
 
+async def test_unhandled_error_logs_class_and_request_id_only(sqlite_settings, caplog):
+    """The 500 is answered by the app itself: nothing is re-raised to the server (which
+    would log the traceback and the message), and the one log line names the exception
+    class and the request id."""
+    import logging
+
+    import httpx
+
+    app = create_app(sqlite_settings)
+
+    @app.get("/_boom")
+    async def boom() -> None:
+        raise RuntimeError("secret internals sk-123")
+
+    caplog.set_level(logging.DEBUG)
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=True)
+        async with httpx.AsyncClient(transport=transport, base_url="https://cp.example") as c:
+            r = await c.get("/_boom")  # would raise here if the app re-raised
+    assert r.status_code == 500
+    assert r.json() == {"error": "internal", "detail": "internal error"}
+    request_id = r.headers["x-request-id"]
+    assert len(request_id) >= 16
+    lines = [rec for rec in caplog.records if "RuntimeError" in rec.getMessage()]
+    assert len(lines) == 1 and request_id in lines[0].getMessage()
+    assert lines[0].levelno == logging.ERROR
+    for rec in caplog.records:
+        assert rec.exc_info is None and rec.exc_text is None
+        assert "sk-123" not in rec.getMessage()
+    assert "sk-123" not in caplog.text and "Traceback" not in caplog.text
+
+
 async def test_openapi_mounted_and_docs_disabled(sqlite_settings, run_app):
-    # TODO(Task 5): the document needs the viewer permission (test_openapi_requires_auth).
+    # the document needs the read permission: see test_authn.py::test_openapi_requires_auth
     app = create_app(sqlite_settings)
     async with run_app(app) as c:
-        doc = await c.get("/api/openapi.json")
+        _key_id, key = await app.state.store.create_api_key("v", "viewer", actor="t")
+        doc = await c.get("/api/openapi.json", headers={"authorization": f"Bearer {key}"})
         docs = [await c.get(p) for p in ("/docs", "/redoc", "/openapi.json")]
     assert doc.status_code == 200 and "/healthz" in doc.json()["paths"]
     assert [r.status_code for r in docs] == [404, 404, 404]
@@ -91,17 +124,22 @@ async def test_maintenance_runs_once_with_injected_clock(sqlite_settings, run_ap
     async with run_app(app):
         engine = app.state.engine
         async with engine.begin() as conn:
-            for cid, created, expires in [("old", 1000.0, 2000.0), ("due", now["t"] - 5, now["t"])]:
+            for cid, created, expires in [
+                ("old", 1000.0, 2000.0),
+                ("due", now["t"] - 5, now["t"]),
+                ("done", 1000.0, 2000.0),
+            ]:
                 await conn.execute(
                     COMMANDS.insert().values(
                         id=cid,
                         gateway_id="g",
                         kind="k",
                         args_json="{}",
-                        status="pending",
+                        status="done" if cid == "done" else "pending",
                         actor="a",
                         created_at=created,
                         expires_at=expires,
+                        finished_at=1500.0 if cid == "done" else None,
                     )
                 )
         calls: list[float] = []
@@ -113,9 +151,10 @@ async def test_maintenance_runs_once_with_injected_clock(sqlite_settings, run_ap
         report = await app.state.maintenance.run_once()
         async with engine.connect() as conn:
             rows = dict((await conn.execute(select(COMMANDS.c.id, COMMANDS.c.status))).all())
-    # "old" expired, then purged (created 10 days ago, retention 7); "due" only expired
-    assert rows == {"due": "expired"}
-    assert report == {"expired": 2, "events": 0, "commands": 1}
+    # "old" and "due" expire now, so both stay (purged by when they finished, not when
+    # they were created); "done" finished 10 days ago (retention 7) and is purged
+    assert rows == {"old": "expired", "due": "expired"}
+    assert report == {"expired": 2, "events": 0, "commands": 1, "login_states": 0, "sessions": 0}
     assert calls == [now["t"]]
 
 
@@ -187,7 +226,13 @@ def test_core_does_not_import_fastapi():
     assert ours == [], ours
     # A module importing fastapi after the SDK did is not seen by the spy: scan the source.
     root = Path(a2agw.__file__).parent
-    allowed = {root / "control" / "app.py", root / "control" / "__init__.py"}  # lazy
+    control = root / "control"
+    allowed = {
+        control / "app.py",
+        control / "rbac.py",
+        control / "authn.py",
+        control / "__init__.py",
+    }
     importing = []
     for path in root.rglob("*.py"):
         for node in ast.walk(ast.parse(path.read_text())):

@@ -129,6 +129,7 @@ DETAIL_KEYS = frozenset(
         "hash",  # policy.update / cp.apply: sha256 of the applied document, never its body
         "gateway",  # control plane: the gateway id a row is about
         "role",  # control plane: the role given to an API key or user
+        "user",  # control plane: the user id a row is about (cp.user.update)
     }
 )
 # PartnerRegistry change events -> audit actions (``registry_audit_action``).

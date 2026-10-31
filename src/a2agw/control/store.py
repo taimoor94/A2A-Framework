@@ -11,16 +11,22 @@ later releases will need an ``_ADDED_COLUMNS`` step like ``OutboundHandleStore``
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import hmac
+import json
 import secrets
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     Column,
     Float,
+    Index,
     Integer,
     MetaData,
     PrimaryKeyConstraint,
@@ -28,6 +34,7 @@ from sqlalchemy import (
     Table,
     Text,
     delete,
+    func,
     select,
     update,
 )
@@ -42,6 +49,9 @@ ID = 64  # every id column
 AUDIT_TABLE = "cp_audit"  # the control plane's own audit chain
 NAME = 256
 DAY_S = 86400.0
+BATCH = 1000  # rows per maintenance statement
+LOGIN_STATE_TTL_S = 600.0  # a sign-in must finish within 10 minutes
+TOUCH_EVERY_S = 60.0  # last_used_at of sessions and API keys moves at most this often
 
 _metadata = MetaData()
 
@@ -89,7 +99,7 @@ SESSIONS = Table(
     _id("csrf_digest", nullable=False),
     Column("created_at", Float, nullable=False),
     Column("last_used_at", Float, nullable=False),
-    Column("expires_at", Float, nullable=False),
+    Column("expires_at", Float, nullable=False, index=True),
 )
 # A sign-in in progress (10 minutes); deleted at the callback.
 LOGIN_STATES = Table(
@@ -99,7 +109,7 @@ LOGIN_STATES = Table(
     Column("nonce", String(NAME), nullable=False),
     Column("code_verifier", String(NAME), nullable=False),
     Column("next_path", Text, nullable=False, default="/"),
-    Column("expires_at", Float, nullable=False),
+    Column("expires_at", Float, nullable=False, index=True),
 )
 API_KEYS = Table(
     "cp_api_keys",
@@ -193,11 +203,15 @@ COMMANDS = Table(
     Column("delivered_at", Float, nullable=True),
     Column("finished_at", Float, nullable=True),
     Column("expires_at", Float, nullable=False),
+    Index("ix_cp_commands_status_expires_at", "status", "expires_at"),
 )
 EVENTS = Table(
     "cp_events",
     _metadata,
-    Column("seq", Integer, primary_key=True, autoincrement=True),
+    # 64-bit on Postgres; INTEGER on sqlite, where only "INTEGER PRIMARY KEY" is AUTOINCREMENT
+    Column(
+        "seq", BigInteger().with_variant(Integer, "sqlite"), primary_key=True, autoincrement=True
+    ),
     _id("gateway_id", nullable=False, index=True),
     Column("ts", Float, nullable=False, index=True),
     Column("kind", String(64), nullable=False, index=True),
@@ -236,6 +250,56 @@ def token_digest(token: str) -> str:
 
 def new_token() -> str:
     return secrets.token_urlsafe(32)
+
+
+def csrf_token_for(session_id: str) -> str:
+    """The CSRF token of a session: an HMAC of a fixed label keyed with the session id.
+
+    Only its digest is stored; it is derived again from the session cookie when ``/me``
+    hands it to the page, so no plaintext copy is kept. Without the session id (an
+    HttpOnly cookie) it cannot be computed."""
+    mac = hmac.new(session_id.encode(), b"a2agw-csrf-v1", hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(mac).rstrip(b"=").decode()
+
+
+@dataclass(frozen=True)
+class LoginState:
+    nonce_digest: str
+    code_verifier: str
+    next_path: str
+
+
+@dataclass(frozen=True)
+class User:
+    id: str
+    email: str | None
+    name: str | None
+    roles: tuple[str, ...]
+    disabled: bool
+
+
+@dataclass(frozen=True)
+class Session:
+    user_id: str
+    csrf_digest: str
+    email: str | None
+    name: str | None
+    roles: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ApiKey:
+    id: str
+    name: str
+    role: str
+
+
+def _roles(raw: str | None) -> tuple[str, ...]:
+    try:
+        value = json.loads(raw or "[]")
+    except ValueError:
+        return ()
+    return tuple(sorted({r for r in value if r in ROLES})) if isinstance(value, list) else ()
 
 
 class ControlStore:
@@ -379,32 +443,328 @@ class ControlStore:
         )
         return key_id, key
 
-    # -- maintenance ---------------------------------------------------------------------
-
-    async def expire_commands(self, *, now: float) -> int:
-        """Pending or delivered commands past ``expires_at`` become ``expired`` (never
-        delivered later). Returns how many."""
+    async def revoke_api_key(self, key_id: str, *, actor: str) -> None:
+        """Revoke an API key: it stops working at its next use. ``KeyError`` for an unknown
+        key; revoking a revoked key changes nothing."""
+        now = self._clock()
         async with self.engine.begin() as conn:
             result = await conn.execute(
-                update(COMMANDS)
-                .where(COMMANDS.c.status.in_(("pending", "delivered")))
-                .where(COMMANDS.c.expires_at <= now)
-                .values(status="expired", finished_at=now)
+                update(API_KEYS)
+                .where(API_KEYS.c.id == key_id)
+                .where(API_KEYS.c.revoked_at.is_(None))
+                .values(revoked_at=now)
             )
-        return int(result.rowcount or 0)
+            if not result.rowcount:
+                known = await conn.execute(select(API_KEYS.c.id).where(API_KEYS.c.id == key_id))
+                if known.first() is None:
+                    raise KeyError(f"unknown API key {key_id}")
+                return
+        await self._audit(
+            AuditEvent(
+                actor=actor,
+                action="cp.apikey.revoke",
+                outcome="revoked",
+                detail={"key_id": key_id},
+                ts=now,
+            )
+        )
+
+    async def get_api_key(self, key: str, *, now: float) -> ApiKey | None:
+        """The live (not revoked) API key ``key``, or None. ``last_used_at`` is updated at
+        most once per ``TOUCH_EVERY_S``."""
+        digest = token_digest(key)
+        async with self.engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    select(API_KEYS)
+                    .where(API_KEYS.c.digest == digest)
+                    .where(API_KEYS.c.revoked_at.is_(None))
+                )
+            ).first()
+        if row is None:
+            return None
+        if row.last_used_at is None or now - row.last_used_at >= TOUCH_EVERY_S:
+            async with self.engine.begin() as conn:
+                await conn.execute(
+                    update(API_KEYS).where(API_KEYS.c.digest == digest).values(last_used_at=now)
+                )
+        return ApiKey(id=row.id, name=row.name, role=row.role)
+
+    # -- sign-in: login states, users, sessions -------------------------------------------
+
+    async def create_login_state(
+        self,
+        *,
+        state: str,
+        nonce: str,
+        code_verifier: str,
+        next_path: str,
+        now: float,
+        ttl_s: float = LOGIN_STATE_TTL_S,
+    ) -> None:
+        """A sign-in in progress. The state and nonce are kept as digests; the PKCE verifier
+        is kept as is (it is sent to the token endpoint), for ``ttl_s`` at most."""
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                LOGIN_STATES.insert().values(
+                    state_digest=token_digest(state),
+                    nonce=token_digest(nonce),
+                    code_verifier=code_verifier,
+                    next_path=next_path,
+                    expires_at=now + ttl_s,
+                )
+            )
+
+    async def take_login_state(self, state: str, *, now: float) -> LoginState | None:
+        """The sign-in started with ``state``, deleted as it is read (single use); None when
+        unknown, already taken (also by a concurrent callback) or expired."""
+        digest = token_digest(state)
+        async with self.engine.begin() as conn:
+            row = (
+                await conn.execute(
+                    select(LOGIN_STATES).where(LOGIN_STATES.c.state_digest == digest)
+                )
+            ).first()
+            if row is None:
+                return None
+            gone = await conn.execute(
+                delete(LOGIN_STATES).where(LOGIN_STATES.c.state_digest == digest)
+            )
+            if gone.rowcount != 1:
+                return None
+        if row.expires_at <= now:
+            return None
+        return LoginState(
+            nonce_digest=row.nonce, code_verifier=row.code_verifier, next_path=row.next_path
+        )
+
+    async def upsert_user(
+        self,
+        user_id: str,
+        *,
+        email: str | None,
+        name: str | None,
+        roles: Iterable[str],
+        now: float,
+    ) -> User:
+        """Record a sign-in: the user's name, email and roles (re-derived at every login)
+        replace the stored ones. A disabled user stays disabled."""
+        role_list = sorted({r for r in roles if r in ROLES})
+        email = email[:NAME] if email else None
+        name = name[:NAME] if name else None
+        values: dict[str, Any] = {
+            "email": email,
+            "name": name,
+            "roles_json": json.dumps(role_list),
+            "last_login_at": now,
+        }
+        for attempt in range(2):
+            try:
+                async with self.engine.begin() as conn:
+                    row = (
+                        await conn.execute(select(USERS.c.disabled).where(USERS.c.id == user_id))
+                    ).first()
+                    if row is None:
+                        await conn.execute(
+                            USERS.insert().values(
+                                id=user_id, created_at=now, disabled=False, **values
+                            )
+                        )
+                        disabled = False
+                    else:
+                        await conn.execute(
+                            update(USERS).where(USERS.c.id == user_id).values(**values)
+                        )
+                        disabled = bool(row.disabled)
+                break
+            except IntegrityError:  # a concurrent first sign-in inserted the row
+                if attempt:
+                    raise
+        return User(
+            id=user_id,
+            email=email,
+            name=name,
+            roles=tuple(role_list),
+            disabled=disabled,
+        )
+
+    async def set_user_disabled(self, user_id: str, disabled: bool, *, actor: str) -> None:
+        """Disable (or enable) a user. Disabling ends every session of the user at once.
+        ``KeyError`` for an unknown user."""
+        now = self._clock()
+        async with self.engine.begin() as conn:
+            result = await conn.execute(
+                update(USERS).where(USERS.c.id == user_id).values(disabled=disabled)
+            )
+            if not result.rowcount:
+                raise KeyError(f"unknown user {user_id}")
+            if disabled:
+                await conn.execute(delete(SESSIONS).where(SESSIONS.c.user_id == user_id))
+        await self._audit(
+            AuditEvent(
+                actor=actor,
+                action="cp.user.update",
+                outcome="disabled" if disabled else "enabled",
+                detail={"user": user_id},
+                ts=now,
+            )
+        )
+
+    async def create_session(
+        self,
+        user_id: str,
+        *,
+        now: float,
+        absolute_s: float,
+        idle_s: float,
+        replace: str | None = None,
+    ) -> tuple[str, str]:
+        """A new session for ``user_id``; returns ``(session id, CSRF token)``, both shown
+        only here (digests are stored). ``replace`` is the session id the browser still
+        had, deleted in the same transaction (a fresh id at every login)."""
+        session_id = new_token()
+        csrf = csrf_token_for(session_id)
+        async with self.engine.begin() as conn:
+            if replace:
+                await conn.execute(
+                    delete(SESSIONS).where(SESSIONS.c.digest == token_digest(replace))
+                )
+            await conn.execute(
+                SESSIONS.insert().values(
+                    digest=token_digest(session_id),
+                    user_id=user_id,
+                    csrf_digest=token_digest(csrf),
+                    created_at=now,
+                    last_used_at=now,
+                    expires_at=now + min(absolute_s, idle_s),
+                )
+            )
+        return session_id, csrf
+
+    async def get_session(
+        self, session_id: str, *, now: float, absolute_s: float, idle_s: float
+    ) -> Session | None:
+        """The live session ``session_id`` with its user, or None.
+
+        ``expires_at`` is the earlier of the absolute limit (``created_at + absolute_s``)
+        and the idle limit (``last_used_at + idle_s``). A use moves ``last_used_at`` (and so
+        the idle limit) at most once per ``TOUCH_EVERY_S``, so the idle limit can come up to
+        that much early. An expired session, or one of a disabled or deleted user, is
+        deleted when seen."""
+        digest = token_digest(session_id)
+        query = (
+            select(SESSIONS, USERS.c.email, USERS.c.name, USERS.c.roles_json, USERS.c.disabled)
+            .select_from(SESSIONS.outerjoin(USERS, SESSIONS.c.user_id == USERS.c.id))
+            .where(SESSIONS.c.digest == digest)
+        )
+        async with self.engine.connect() as conn:
+            row = (await conn.execute(query)).first()
+        if row is None:
+            return None
+        if row.expires_at <= now or row.disabled is None or row.disabled:
+            await self.delete_session(session_id)
+            return None
+        if now - row.last_used_at >= TOUCH_EVERY_S:
+            async with self.engine.begin() as conn:
+                await conn.execute(
+                    update(SESSIONS)
+                    .where(SESSIONS.c.digest == digest)
+                    .values(
+                        last_used_at=now,
+                        expires_at=min(row.created_at + absolute_s, now + idle_s),
+                    )
+                )
+        return Session(
+            user_id=row.user_id,
+            csrf_digest=row.csrf_digest,
+            email=row.email,
+            name=row.name,
+            roles=_roles(row.roles_json),
+        )
+
+    async def delete_session(self, session_id: str) -> str | None:
+        """Delete a session; returns its user id, or None if there was no such session."""
+        digest = token_digest(session_id)
+        async with self.engine.begin() as conn:
+            user_id = (
+                await conn.execute(select(SESSIONS.c.user_id).where(SESSIONS.c.digest == digest))
+            ).scalar_one_or_none()
+            if user_id is None:
+                return None
+            gone = await conn.execute(delete(SESSIONS).where(SESSIONS.c.digest == digest))
+        return str(user_id) if gone.rowcount else None
+
+    # -- maintenance ---------------------------------------------------------------------
+
+    async def expire_commands(self, *, now: float, batch: int = BATCH) -> int:
+        """Pending or delivered commands past ``expires_at`` become ``expired`` (never
+        delivered later), ``batch`` rows per transaction. Returns how many."""
+        due = COMMANDS.c.status.in_(("pending", "delivered"))
+        total = 0
+        while True:
+            async with self.engine.begin() as conn:
+                ids = list(
+                    (
+                        await conn.execute(
+                            select(COMMANDS.c.id)
+                            .where(due)
+                            .where(COMMANDS.c.expires_at <= now)
+                            .limit(batch)
+                        )
+                    ).scalars()
+                )
+                if not ids:
+                    return total
+                result = await conn.execute(
+                    update(COMMANDS)
+                    .where(COMMANDS.c.id.in_(ids))
+                    .where(due)
+                    .values(status="expired", finished_at=now)
+                )
+            total += int(result.rowcount or 0)
+            if len(ids) < batch:
+                return total
+
+    async def _delete_batched(self, table: Table, key: Column[Any], where: Any, batch: int) -> int:
+        """Delete the rows of ``table`` matching ``where``, ``batch`` per transaction, so a
+        pass after a long downtime is many small transactions, not one huge one."""
+        total = 0
+        while True:
+            async with self.engine.begin() as conn:
+                keys = list((await conn.execute(select(key).where(where).limit(batch))).scalars())
+                if not keys:
+                    return total
+                result = await conn.execute(delete(table).where(key.in_(keys)))
+            total += int(result.rowcount or 0)
+            if len(keys) < batch:
+                return total
 
     async def purge(
-        self, *, now: float, events_days: float, commands_days: float
+        self, *, now: float, events_days: float, commands_days: float, batch: int = BATCH
     ) -> dict[str, int]:
-        """Delete events older than ``events_days`` and finished commands (done, failed,
-        expired) created more than ``commands_days`` ago."""
-        async with self.engine.begin() as conn:
-            events = await conn.execute(
-                delete(EVENTS).where(EVENTS.c.ts < now - events_days * DAY_S)
-            )
-            commands = await conn.execute(
-                delete(COMMANDS)
-                .where(COMMANDS.c.status.in_(("done", "failed", "expired")))
-                .where(COMMANDS.c.created_at < now - commands_days * DAY_S)
-            )
-        return {"events": int(events.rowcount or 0), "commands": int(commands.rowcount or 0)}
+        """Delete events older than ``events_days``; finished commands (done, failed,
+        expired) that finished more than ``commands_days`` ago (by ``finished_at``, or
+        ``created_at`` when it is not set); and expired login states and sessions."""
+        events = await self._delete_batched(
+            EVENTS, EVENTS.c.seq, EVENTS.c.ts < now - events_days * DAY_S, batch
+        )
+        finished = func.coalesce(COMMANDS.c.finished_at, COMMANDS.c.created_at)
+        commands = await self._delete_batched(
+            COMMANDS,
+            COMMANDS.c.id,
+            COMMANDS.c.status.in_(("done", "failed", "expired"))
+            & (finished < now - commands_days * DAY_S),
+            batch,
+        )
+        login_states = await self._delete_batched(
+            LOGIN_STATES, LOGIN_STATES.c.state_digest, LOGIN_STATES.c.expires_at <= now, batch
+        )
+        sessions = await self._delete_batched(
+            SESSIONS, SESSIONS.c.digest, SESSIONS.c.expires_at <= now, batch
+        )
+        return {
+            "events": events,
+            "commands": commands,
+            "login_states": login_states,
+            "sessions": sessions,
+        }

@@ -7,7 +7,11 @@ disposes the engine.
 
 Errors have one shape, ``{"error": "<code>", "detail": "<message>"}``. Validation errors are
 422 with ``fields``: dotted paths of the offending inputs, never their values. Unexpected
-exceptions are 500 ``internal`` with no message from the exception.
+exceptions are 500 ``internal`` with no message from the exception, answered by the
+``InternalErrors`` middleware, which logs the exception class and the request id only.
+
+Every route is registered through ``a2agw.control.rbac`` (``route``, ``public``,
+``gateway_route``), which records the permission it needs.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import secrets
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
@@ -28,9 +33,13 @@ require_fastapi()  # a one-line install hint instead of a bare ModuleNotFoundErr
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.datastructures import MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from a2agw.consult.guarded_net import fixed_tier, guarded_async_client
+from a2agw.control import authn
+from a2agw.control.rbac import ROUTES, Permission, public, route
 from a2agw.control.settings import ControlSettings
 from a2agw.control.store import AUDIT_TABLE, ControlStore
 from a2agw.ops.audit import AuditLog
@@ -135,10 +144,56 @@ def _install_error_handlers(app: FastAPI) -> None:
             status_code=422,
         )
 
-    @app.exception_handler(Exception)
-    async def internal_error(_request: Request, exc: Exception) -> JSONResponse:
-        log.error("unhandled error in control-plane request: %s", type(exc).__name__)
-        return error(500, "internal error", "internal")
+
+class InternalErrors:
+    """Pure ASGI middleware answering unhandled exceptions with the 500 ``internal`` shape.
+
+    Starlette's own handler for ``Exception`` (in ``ServerErrorMiddleware``) re-raises after
+    responding, so the server would log the traceback and the exception's message, which
+    can carry secrets or request content. This catches the exception first and logs one
+    line: the exception class and a request id (sent as ``X-Request-ID`` on every
+    response), never the message. Nothing is re-raised."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        request_id = secrets.token_hex(8)
+        started = False
+
+        async def send_with_id(message: Message) -> None:
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+                MutableHeaders(scope=message).append("X-Request-ID", request_id)
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_with_id)
+        except Exception as exc:  # noqa: BLE001 - every failure becomes one bare 500
+            log.error(
+                "unhandled error in control-plane request %s: %s", request_id, type(exc).__name__
+            )
+            if started:  # too late for a response; the server ends the connection
+                return
+            response = error(500, "internal error", "internal")
+            response.headers["X-Request-ID"] = request_id
+            await response(scope, receive, send)
+
+
+@public("GET", "/healthz")
+async def healthz() -> dict[str, str]:
+    """Liveness (public)."""
+    return {"status": "ok"}
+
+
+@route("GET", OPENAPI_URL, Permission.READ, include_in_schema=False)
+async def openapi(request: Request) -> JSONResponse:
+    """The OpenAPI document (needs the read permission)."""
+    return JSONResponse(request.app.openapi())
 
 
 def create_app(
@@ -149,13 +204,15 @@ def create_app(
     maintenance_interval_s: float = MAINTENANCE_INTERVAL_S,
 ) -> FastAPI:
     """The control-plane app. ``http`` is the client for outbound calls (the OIDC provider,
-    partner cards); when omitted the app owns a guarded client and closes it at shutdown.
-    ``clock`` (epoch seconds) and ``maintenance_interval_s`` are test seams."""
+    partner cards); when omitted the app owns two guarded clients (``http`` for the
+    ``public`` tier and ``idp_http``, tier ``partner``, for the OIDC provider) and closes
+    them at shutdown. ``clock`` (epoch seconds) and ``maintenance_interval_s`` are test
+    seams."""
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         engine = await create_engine(settings.db_url)
-        owned_http = None
+        owned: list[httpx.AsyncClient] = []
         task: asyncio.Task[None] | None = None
         audit: AuditLog | None = None
         try:
@@ -163,8 +220,12 @@ def create_app(
             store = ControlStore(engine, audit=audit, clock=clock)
             await store.initialize()
             await audit.initialize()
+            client, idp_client = http, http
             if http is None:
-                owned_http = guarded_async_client(fixed_tier("public"))
+                client = guarded_async_client(fixed_tier("public"))
+                owned.append(client)
+                idp_client = guarded_async_client(fixed_tier(authn.IDP_TIER))
+                owned.append(idp_client)
             maintenance = Maintenance(
                 store, settings, clock=clock, interval_s=maintenance_interval_s
             )
@@ -172,7 +233,13 @@ def create_app(
             app.state.engine = engine
             app.state.store = store
             app.state.audit = audit
-            app.state.http = http if http is not None else owned_http
+            app.state.http = client
+            app.state.idp_http = idp_client
+            app.state.oidc = (
+                authn.OidcClient(settings.oidc, http=idp_client, clock=clock)
+                if settings.oidc is not None
+                else None
+            )
             app.state.clock = clock
             app.state.maintenance = maintenance
             task = asyncio.create_task(maintenance.run_forever(), name="a2agw:cp-maint")
@@ -183,26 +250,22 @@ def create_app(
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
             if audit is not None:
+                await audit.flush_coalesced()
                 await audit.drain()
-            if owned_http is not None:
-                await owned_http.aclose()
+            for owned_client in owned:
+                await owned_client.aclose()
             await engine.dispose()
 
     app = FastAPI(
         title="a2agw control plane",
         version="1",
-        # TODO(Task 5): serve the OpenAPI document behind the viewer permission.
-        openapi_url=OPENAPI_URL,
+        openapi_url=None,  # served by the ``openapi`` route, behind the read permission
         docs_url=None,
         redoc_url=None,
         swagger_ui_oauth2_redirect_url=None,
         lifespan=lifespan,
     )
     _install_error_handlers(app)
-
-    @app.get("/healthz", include_in_schema=True)
-    async def healthz() -> dict[str, str]:
-        """Liveness (public)."""
-        return {"status": "ok"}
-
+    app.add_middleware(InternalErrors)
+    ROUTES.mount(app)
     return app

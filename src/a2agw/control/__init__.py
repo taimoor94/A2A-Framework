@@ -1,8 +1,9 @@
 """The control plane: a service gateways connect to, owning partners, policies, users, roles.
 
-Needs the ``control`` extra (FastAPI). Only ``a2agw.control.app`` imports FastAPI; this package,
-its settings, store and CLI do not, so ``import a2agw.control`` works without the extra and
-``require_fastapi`` turns a missing extra into a one-line install hint.
+Needs the ``control`` extra (FastAPI). Only ``a2agw.control.app`` and the modules it serves
+(``rbac``, ``authn``) import FastAPI; this package, its settings, store and CLI do not, so
+``import a2agw.control`` works without the extra and ``require_fastapi`` turns a missing
+extra into a one-line install hint.
 """
 
 from __future__ import annotations
