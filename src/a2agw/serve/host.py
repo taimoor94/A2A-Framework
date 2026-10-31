@@ -89,6 +89,7 @@ from a2agw.gateway.tokens import ConsultTokens, GrantIssuer
 from a2agw.ops.admin import ADMIN_PREFIX, HEALTH_PATH, admin_routes
 from a2agw.ops.audit import AuditEvent, AuditLog, registry_audit_event
 from a2agw.ops.bus import EventBus, GatewayEvent
+from a2agw.ops.metrics import GatewayMetrics
 from a2agw.security.auth import (
     AuthConfig,
     GatewayAuthBackend,
@@ -1061,6 +1062,7 @@ class AgentHost:
         max_open_sidecar_tasks_per_caller: int = DEFAULT_MAX_OPEN_SIDECAR_TASKS,
         mcp_agents: Iterable[str] | None = None,
         consult_url: str | None = None,
+        otel_metrics: bool = True,
     ) -> None:
         self.base_url = base_url
         # Sidecar agents (spec 7.7) consult partners through the outbound REST API
@@ -1158,6 +1160,7 @@ class AgentHost:
         self.admin = admin
         self.admin_without_auth = admin_without_auth  # dev only: open admin when auth is None
         self.bus = EventBus()
+        self.metrics = GatewayMetrics(otel=otel_metrics)
         self.specs: dict[str, AgentSpec] = {}
         self.executors: dict[str, AdapterExecutor] = {}
         self.handlers: dict[str, LimitedRequestHandler] = {}
@@ -1273,6 +1276,8 @@ class AgentHost:
             context_signer=self.context_signer,
             max_consults_per_task=self.max_consults_per_task,
         )
+        self.client.metrics = self.metrics
+        self.metrics.partner_stats = self.client.partner_stats
         self.client.on_denied = self.report_denied  # egress refusals: bus + audit
         stores: dict[str, TaskStore] = {}
         routes: list[BaseRoute] = []
@@ -1298,6 +1303,7 @@ class AgentHost:
             )
             # Cancelling an inbound task cancels the partner tasks it started (and ends the
             # consult tokens of its runs, with their REST calls in flight).
+            executor.metrics = self.metrics
             executor.on_cancel = self._end_inbound
             executor.on_denied = self.report_denied  # policy refusals: bus + audit
             card = build_card(spec, self.base_url, security=self.auth, push=push is not None)

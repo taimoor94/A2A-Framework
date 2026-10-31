@@ -18,7 +18,8 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from opentelemetry import context as otel_context
-from opentelemetry import trace
+from opentelemetry import metrics, trace
+from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SimpleSpanProcessor
@@ -27,6 +28,7 @@ from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapProp
 
 if TYPE_CHECKING:
     from opentelemetry.context import Context
+    from opentelemetry.sdk.metrics.export import MetricReader
     from opentelemetry.sdk.trace.export import SpanExporter
 
     from a2agw.context.call_context import CallContext
@@ -106,6 +108,21 @@ def _install_json_logs() -> None:
         root.addHandler(logging.StreamHandler())
     for handler in root.handlers:
         handler.setFormatter(JsonFormatter())
+
+
+def setup_metrics(service_name: str, *, reader: MetricReader | None = None) -> MeterProvider:
+    """Install a global meter provider unless one is already set (the existing one is then
+    returned). ``reader`` is optional: with none, instruments are recorded but not exported.
+    This package adds no metric-exporter dependency; pass a reader built from yours."""
+    current = metrics.get_meter_provider()
+    if isinstance(current, MeterProvider):
+        return current
+    provider = MeterProvider(
+        metric_readers=[reader] if reader is not None else [],
+        resource=Resource.create({"service.name": service_name}),
+    )
+    metrics.set_meter_provider(provider)
+    return provider
 
 
 def setup_telemetry(

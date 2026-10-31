@@ -102,6 +102,7 @@ from a2agw.context.call_context import (
 from a2agw.context.signing import JWS_METADATA_KEY, CallContextSigner
 from a2agw.ops.audit import AuditEvent, AuditLog
 from a2agw.ops.bus import EventBus, GatewayEvent
+from a2agw.ops.metrics import GatewayMetrics
 from a2agw.ops.telemetry import get_tracer, with_current_traceparent
 from a2agw.security.classify import Classification
 from a2agw.security.policy import Decision, PolicyEngine
@@ -436,6 +437,7 @@ class PartnerClient:
         self.http = http
         self.default_deadline_s = default_deadline_s
         self.agent_id = agent_id
+        self.metrics: GatewayMetrics | None = None  # set by the host
         self._own_http: httpx.AsyncClient | None = None
         self._clients: dict[tuple[str, str, str], Client] = {}
         self._breakers: dict[str, CircuitBreaker] = {}
@@ -749,7 +751,14 @@ class PartnerClient:
             return None
         return (row or {}).get("context_id") or None
 
-    def _publish(self, result: ToolResult, started: float) -> None:
+    def _publish(self, result: ToolResult, started: float, caller_agent: str | None = None) -> None:
+        if self.metrics is not None:
+            self.metrics.record_partner_call(
+                caller_agent or self.agent_id,
+                result.partner,
+                result.state,
+                round((time.monotonic() - started) * 1000, 1),
+            )
         if self.bus is None:
             return
         self.bus.publish(
@@ -812,7 +821,7 @@ class PartnerClient:
                         partner_id, self._record_or_none(partner_id), FORBIDDEN
                     )
                     span.set_attribute("a2agw.result_state", result.state)
-                    self._publish(result, started)
+                    self._publish(result, started, agent_id)
                     if self.audit is not None:
                         await self.audit.emit(
                             self._call_event(
@@ -835,13 +844,13 @@ class PartnerClient:
                     await self._audit_egress_deny(
                         denied, decision, principal, agent_id, inbound_task_id
                     )
-                    self._publish(denied, started)
+                    self._publish(denied, started, agent_id)
                     return denied
                 capped = self._take_fanout(partner_id, inbound_task_id, task_id)
                 if capped is not None:
                     span.set_attribute("a2agw.result_state", capped.state)
                     await self._audit_limit(principal, agent_id, partner_id, inbound_task_id)
-                    self._publish(capped, started)
+                    self._publish(capped, started, agent_id)
                     return capped
                 try:
                     result = await self._consult(
@@ -880,7 +889,7 @@ class PartnerClient:
         finally:
             _owner.reset(owner_token)
             _caller.reset(token)
-        self._publish(result, started)
+        self._publish(result, started, agent_id)
         if self.audit is not None:
             await self.audit.emit(
                 self._call_event(

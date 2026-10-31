@@ -281,6 +281,16 @@ class TaskIndex:
         async with self._engine.connect() as conn:
             return [dict(r._mapping) for r in (await conn.execute(stmt)).all()]
 
+    async def count_by_state(self) -> dict[str, dict[str, int]]:
+        """``{agent_id: {STATE_NAME: count}}`` over every row, in one grouped query."""
+        t = _index_table
+        stmt = select(t.c.agent_id, t.c.state, func.count()).group_by(t.c.agent_id, t.c.state)
+        out: dict[str, dict[str, int]] = {}
+        async with self._engine.connect() as conn:
+            for agent_id, state, n in (await conn.execute(stmt)).all():
+                out.setdefault(agent_id, {})[state.removeprefix("TASK_STATE_")] = int(n)
+        return out
+
     async def count_active_outside(self, agent_ids: set[str]) -> int:
         """Non-terminal rows of agents not in ``agent_ids`` (served by another gateway, or
         orphaned by a removed agent)."""

@@ -48,6 +48,7 @@ from a2agw.core.events import (
 from a2agw.core.spi import InboundContext
 from a2agw.ops.audit import AuditEvent, AuditLog
 from a2agw.ops.bus import EventBus, GatewayEvent
+from a2agw.ops.metrics import GatewayMetrics
 from a2agw.ops.telemetry import extract_parent, get_tracer
 from a2agw.security.auth import BEARER_STATE_KEY
 from a2agw.security.policy import PolicyEngine
@@ -218,6 +219,7 @@ class AdapterExecutor(AgentExecutor):
         self.index = index
         self.bus = bus
         self.local_max_hops = local_max_hops
+        self.metrics: GatewayMetrics | None = None  # set by the host
         self.local_max_deadline_s = local_max_deadline_s
         self._now = now
         self._active: dict[str, _Run] = {}
@@ -257,6 +259,8 @@ class AdapterExecutor(AgentExecutor):
     ) -> None:
         """A ``task.state`` event; ``trace_id`` is the trace of the turn that made the change
         (None before its span starts: the admission, a rejection, a cancel with no run)."""
+        if self.metrics is not None:
+            self.metrics.record_task_state(self.spec.id, state)
         self.bus.publish(
             GatewayEvent(
                 kind="task.state",
@@ -522,6 +526,8 @@ class AdapterExecutor(AgentExecutor):
             cc.check_admit(self.spec.id, allow_reentry=self.spec.allow_reentry, now=self._now())
         except CallContextViolation as exc:
             return None, _REASONS.get(type(exc), _INVALID), detail
+        if self.metrics is not None:
+            self.metrics.record_hop(cc.hop)
         return cc, "", detail
 
     async def _drive(

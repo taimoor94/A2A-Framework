@@ -264,6 +264,8 @@ class TelemetryConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     service_name: str
     otlp_endpoint: str | None = None
+    # Feed the OpenTelemetry meter (a no-op unless a MeterProvider is configured).
+    metrics: bool = True
 
 
 class SigningConfig(BaseModel):
@@ -660,7 +662,7 @@ def _external_agent(entry: ExternalAgentConfig, where: str, config_dir: Path) ->
 
 
 def _setup_telemetry(cfg: TelemetryConfig) -> None:
-    from a2agw.ops.telemetry import setup_telemetry
+    from a2agw.ops.telemetry import setup_metrics, setup_telemetry
 
     exporter = None
     if cfg.otlp_endpoint:
@@ -670,6 +672,8 @@ def _setup_telemetry(cfg: TelemetryConfig) -> None:
             raise ConfigError("install opentelemetry-exporter-otlp to use otlp_endpoint") from None
         exporter = OTLPSpanExporter(endpoint=cfg.otlp_endpoint)
     setup_telemetry(cfg.service_name, exporter=exporter)
+    if cfg.metrics:
+        setup_metrics(cfg.service_name)
 
 
 def config_file(config_dir: Path, value: str, where: str) -> Path:
@@ -910,6 +914,7 @@ def build_host(cfg: GatewayConfig, *, config_dir: Path | str = ".") -> AgentHost
             mcp_agents=cfg.sidecar.mcp.agents if cfg.sidecar.mcp.enabled else None,
             max_open_sidecar_tasks_per_caller=cfg.limits.max_open_sidecar_tasks_per_caller,
             consult_url=cfg.sidecar.consult_url,
+            otel_metrics=cfg.telemetry.metrics if cfg.telemetry is not None else True,
         )
     except ValueError as e:  # e.g. a trusted context kid that clashes with the signing kid
         raise ConfigError(str(e)) from None

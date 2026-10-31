@@ -267,6 +267,11 @@ def admin_routes(host: AgentHost) -> list[Route]:
             raise _BadRequest("cursor") from None
         return JSONResponse({"tasks": rows, "next_cursor": next_cursor})
 
+    async def metrics(_: Request) -> Response:
+        if host.index is None:
+            return JSONResponse({"error": "not started"}, status_code=503)
+        return JSONResponse(await host.metrics.snapshot_with_index(host.index))
+
     async def events(request: Request) -> Response:
         limit = _int_param(request, "limit", lo=1, hi=MAX_EVENTS, default=None)
 
@@ -578,6 +583,7 @@ def admin_routes(host: AgentHost) -> list[Route]:
         route("agents", agents),
         route("partners", partners),
         route("tasks", tasks),
+        route("metrics", metrics),
         route("events", events),
         route("audit", audit_list),
         route("audit/verify", audit_verify),
