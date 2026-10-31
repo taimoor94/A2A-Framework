@@ -12,3 +12,6 @@ dist/
 .DS_Store
 .tck/
 .venv-crewai/
+
+# Claude Code session worktrees
+.claude/worktrees/
