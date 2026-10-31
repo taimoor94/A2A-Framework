@@ -98,7 +98,7 @@ async def test_verify_step_order(tmp_path):
     m, ws, system = await _setup(
         tmp_path,
         gate=py("pass"),
-        tests=py("import os; assert os.path.exists('acc.txt') or True"),
+        tests=py("import os; assert os.path.exists('acc.txt')"),
     )
     (ws.path / "a.txt").write_text("changed\n")
     (ws.path / "t_contract.py").write_text("")
@@ -155,3 +155,85 @@ async def test_verify_whole_passes_env_paths(tmp_path):
     )
     r = await verify_whole(check, {"core": ws1, "node-coder": ws2}, timeout_s=30)
     assert r.kind == "whole_system" and r.passed, r.stderr_tail
+
+
+async def test_env_secret_value_printed_by_child_is_redacted(tmp_path, monkeypatch):
+    monkeypatch.setenv("A2AGW_TEST_API_TOKEN", "plainvalue-xyz-12345")
+    code = "import sys; sys.stderr.write('oops plainvalue-xyz-12345 done')"
+    r = await run_check(
+        "gate",
+        "g",
+        py(code),
+        tmp_path,
+        timeout_s=10,
+        env={"A2AGW_TEST_API_TOKEN": "plainvalue-xyz-12345"},
+    )
+    assert "plainvalue-xyz-12345" not in r.stderr_tail
+    assert "oops" in r.stderr_tail
+
+
+async def test_json_quoted_password_and_auth_scheme_redacted(tmp_path):
+    code = (
+        'import sys; sys.stderr.write(\'{"password": "hunter 2 spaced"} '
+        "Authorization: Token abcdef123456 Authorization: Custom zzz999')"
+    )
+    r = await run_check("gate", "g", py(code), tmp_path, timeout_s=10)
+    assert "hunter" not in r.stderr_tail and "spaced" not in r.stderr_tail
+    assert "abcdef123456" not in r.stderr_tail and "zzz999" not in r.stderr_tail
+
+
+async def test_stderr_tail_drops_partial_first_line(tmp_path):
+    code = "import sys; sys.stderr.write('PARTIALHEAD' + 'x'*3000 + '\\nlast line here\\n')"
+    r = await run_check("gate", "g", py(code), tmp_path, timeout_s=10)
+    assert r.stderr_tail.strip() == "last line here"
+
+
+async def test_non_allowlisted_parent_env_not_visible_to_child(tmp_path, monkeypatch):
+    monkeypatch.setenv("A2AGW_TEST_SECRET", "s3cr3t-value-123")
+    monkeypatch.setenv("UV_FOO_TEST", "kept")
+    code = (
+        "import os,sys; sys.exit(0 if 'A2AGW_TEST_SECRET' not in os.environ "
+        "and os.environ.get('UV_FOO_TEST')=='kept' and os.environ.get('X_EXTRA')=='1' else 1)"
+    )
+    r = await run_check("gate", "g", py(code), tmp_path, timeout_s=10, env={"X_EXTRA": "1"})
+    assert r.passed, r
+
+
+async def test_reproduction_before_spawn_failure_is_inconclusive(tmp_path):
+    m, ws, system = await _setup(tmp_path, tests=["/nonexistent/binary-xyz"])
+    r = await reproduction_before(
+        m, ws, AcceptanceTest(id="t", system="core", files={"n.txt": "y"}), system, timeout_s=10
+    )
+    assert not r.passed and r.reason.startswith("spawn")
+
+
+_FILE_CHECK = "import sys,os; sys.exit(0 if len(sys.argv)<2 or os.path.isfile(sys.argv[1]) else 1)"
+
+
+async def test_contract_path_resolves_from_workspace_root(tmp_path):
+    repo = make_repo(tmp_path, "core", {"svc/a.txt": "a\n", "contracts/test_x.py": "\n"})
+    system = SystemConfig(id="core", repo=str(repo), path="svc", tests=py(_FILE_CHECK))
+    m = WorkspaceManager(tmp_path / "root", [system], tmp_path)
+    ws = await m.create("job1", "core")
+    contract = Contract(name="c", systems=["core"], path="contracts/test_x.py")
+    results = await verify_step(ws, system, spec_for(contracts=[contract]), manager=m, timeout_s=10)
+    assert results[-1].kind == "contract" and results[-1].passed
+    missing = Contract(name="m", systems=["core"], path="contracts/gone.py")
+    results = await verify_step(ws, system, spec_for(contracts=[missing]), manager=m, timeout_s=10)
+    assert results[-1].kind == "contract"
+    assert not results[-1].passed and results[-1].reason == "contract file missing"
+
+
+async def test_contract_text_only_skipped_and_no_tests_fails(tmp_path):
+    m, ws, system = await _setup(tmp_path, tests=py("pass"))
+    text_only = Contract(name="t", systems=["core"], text="prose")
+    results = await verify_step(
+        ws, system, spec_for(contracts=[text_only]), manager=m, timeout_s=10
+    )
+    assert results[-1].kind == "contract" and results[-1].passed
+    assert results[-1].reason == "no contract test"
+    m2, ws2, system2 = await _setup(tmp_path / "n")
+    (ws2.path / "c.py").write_text("")
+    pc = Contract(name="p", systems=["core"], path="c.py")
+    results = await verify_step(ws2, system2, spec_for(contracts=[pc]), manager=m2, timeout_s=10)
+    assert not results[-1].passed and results[-1].reason == "no tests command"

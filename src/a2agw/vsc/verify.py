@@ -4,6 +4,11 @@ Every check is a real subprocess (never a shell) in its own session, so a timeou
 overflow kills the whole process group. Output is read through a shared 4 MiB cap; the result
 keeps only the SHA-256 of what was captured and the last 2 KiB of stderr with secrets masked.
 
+Child processes get an allowlisted environment, never the full gateway environment: the names
+``PATH, HOME, USER, SHELL, LANG, TERM, TMPDIR, TZ, VIRTUAL_ENV, CI`` and the prefixes ``LC_,
+PYTHON, UV_, NODE_, npm_config_, GIT_`` taken from ``os.environ``, merged with the caller's
+``env`` (the caller wins). Redaction of the stderr tail is a best-effort second layer.
+
 Acceptance files (``AcceptanceTest.files``) are paths relative to the *workspace root*; the test
 command itself runs in the system's ``path`` sub-tree of that root.
 """
@@ -42,6 +47,31 @@ STDERR_TAIL_BYTES = 2048
 _CHUNK = 64 * 1024
 _KILL_GRACE_S = 2.0
 
+_ENV_NAMES = frozenset(
+    {"PATH", "HOME", "USER", "SHELL", "LANG", "TERM", "TMPDIR", "TZ", "VIRTUAL_ENV", "CI"}
+)
+_ENV_PREFIXES = ("LC_", "PYTHON", "UV_", "NODE_", "npm_config_", "GIT_")
+_SECRET_NAME = re.compile(
+    r"(?i)(token|secret|password|passwd|api_?key|auth|credential|private_key)"
+)
+_MIN_SECRET_LEN = 8
+
+
+def _child_env(extra: Mapping[str, str] | None) -> dict[str, str]:
+    env = {k: v for k, v in os.environ.items() if k in _ENV_NAMES or k.startswith(_ENV_PREFIXES)}
+    env.update(extra or {})
+    return env
+
+
+def _secret_values(extra: Mapping[str, str] | None) -> list[str]:
+    values = {
+        v
+        for k, v in {**os.environ, **(extra or {})}.items()
+        if _SECRET_NAME.search(k) and len(v) >= _MIN_SECRET_LEN
+    }
+    return sorted(values, key=len, reverse=True)
+
+
 _SECRET_PATTERNS = [
     re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{6,}"),
     re.compile(
@@ -51,10 +81,21 @@ _SECRET_PATTERNS = [
     re.compile(r"\b(?:gh[pousr]_|github_pat_|sk-|xox[abprs]-|AKIA|AIza)[A-Za-z0-9_-]{8,}"),
     re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*"),
     re.compile(r"(?i)(://[^/\s:@]+:)[^@\s/]+@"),
+    re.compile(r"(?i)\b(authorization\s*[=:]\s*)(?:[A-Za-z][\w-]*\s+)?[^\s\"',;]+"),
+    re.compile(
+        r"(?i)([\"'][\w.-]*(?:token|secret|passw(?:or)?d|api[_-]?key|auth|credential|private_key)"
+        r"[\w.-]*[\"']\s*:\s*)([\"'])(?:\\.|(?!\2).)*\2"
+    ),
+    re.compile(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.DOTALL
+    ),
 ]
 
 
 def _redact(text: str) -> str:
+    text = _SECRET_PATTERNS[7].sub("[redacted]", text)
+    text = _SECRET_PATTERNS[6].sub(lambda m: f'{m.group(1)}"[redacted]"', text)
+    text = _SECRET_PATTERNS[5].sub(lambda m: f"{m.group(1)}[redacted]", text)
     text = _SECRET_PATTERNS[0].sub(lambda m: f"{m.group(1)} [redacted]", text)
     text = _SECRET_PATTERNS[1].sub(lambda m: f"{m.group(1)}{m.group(2)}[redacted]", text)
     text = _SECRET_PATTERNS[2].sub("[redacted]", text)
@@ -80,9 +121,15 @@ def _kill_group(pid: int) -> None:
         os.killpg(pid, signal.SIGKILL)
 
 
-def _tail_text(data: bytes) -> str:
+def _tail_text(data: bytes, secrets: Iterable[str] = ()) -> str:
+    # callers may pass one byte more than the tail so that a cut is detectable
+    cut = len(data) > STDERR_TAIL_BYTES
     tail = data[-STDERR_TAIL_BYTES:].decode(errors="replace")
-    return _redact(tail).encode()[-STDERR_TAIL_BYTES:].decode(errors="replace")
+    if cut and "\n" in tail:
+        tail = tail.split("\n", 1)[1]  # the first line may be partial: drop it
+    for value in secrets:
+        tail = tail.replace(value, "[redacted]")
+    return _redact(tail)
 
 
 def _result(
@@ -96,6 +143,7 @@ def _result(
     digest: str = "",
     stderr: bytes = b"",
     reason: str = "",
+    secrets: Iterable[str] = (),
 ) -> CheckResult:
     return CheckResult(
         kind=kind,
@@ -105,7 +153,7 @@ def _result(
         passed=passed,
         duration_s=round(time.monotonic() - started, 3),
         log_sha256=digest or hashlib.sha256(b"").hexdigest(),
-        stderr_tail=_tail_text(stderr),
+        stderr_tail=_tail_text(stderr, secrets),
         reason=reason,
     )
 
@@ -119,12 +167,17 @@ async def run_check(
     timeout_s: float,
     env: Mapping[str, str] | None = None,
 ) -> CheckResult:
+    """Run ``command`` as a subprocess in ``cwd``.
+
+    The child sees only an allowlisted slice of ``os.environ`` (see the module docstring) plus
+    ``env``, which wins. Values of secret-named parent variables are scrubbed from the stderr tail.
+    """
     started = time.monotonic()
     try:
         proc = await asyncio.create_subprocess_exec(
             *command,
             cwd=cwd,
-            env={**os.environ, **(env or {})},
+            env=_child_env(env),
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -134,6 +187,7 @@ async def run_check(
         return _result(
             kind, id, command, exit_code=None, passed=False, started=started, reason=f"spawn: {e}"
         )
+    secrets = _secret_values(env)
 
     digest = hashlib.sha256()
     total = 0
@@ -155,7 +209,7 @@ async def run_check(
                 total += len(chunk)
                 digest.update(chunk)
                 if is_err:
-                    stderr_tail = (stderr_tail + chunk)[-STDERR_TAIL_BYTES:]
+                    stderr_tail = (stderr_tail + chunk)[-(STDERR_TAIL_BYTES + 1) :]
             if truncated:
                 _kill_group(proc.pid)
 
@@ -193,6 +247,7 @@ async def run_check(
         digest=digest.hexdigest(),
         stderr=stderr_tail,
         reason=reason,
+        secrets=secrets,
     )
 
 
@@ -245,8 +300,8 @@ async def reproduction_before(
         res = await run_check(
             "reproduction_before", test.id, command, tmp / system.path, timeout_s=timeout_s
         )
-    if res.reason in ("timeout", "truncated"):
-        return res  # inconclusive, not "failed as required"
+    if res.exit_code is None:
+        return replace(res, passed=False)  # spawn error, timeout, truncated: inconclusive
     if res.exit_code == 0:
         return replace(res, passed=False, reason="passed on base")
     return replace(res, passed=True, reason="failed on base")
@@ -302,20 +357,24 @@ async def verify_step(
         return results
 
     for contract in spec.contracts:
-        if system.id not in contract.systems or contract.path is None:
+        if system.id not in contract.systems:
             continue
-        target = (ws.path / contract.path).resolve()
-        if not target.is_relative_to(ws.path.resolve()) or not target.is_file():
-            push(_skipped("contract", contract.name, "contract file not present"))
+        if contract.path is None:
+            push(_skipped("contract", contract.name, "no contract test"))
             continue
+        root = ws.path.resolve()
+        target = (root / contract.path).resolve()
+        if not target.is_relative_to(root) or not target.is_file():
+            push(_skipped("contract", contract.name, "contract file missing", False))
+            return results
         if system.tests is None:
-            push(_skipped("contract", contract.name, "no tests command"))
-            continue
+            push(_skipped("contract", contract.name, "no tests command", False))
+            return results
         res = await run_check(
             "contract",
             contract.name,
             [*system.tests, contract.path],
-            cwd,
+            ws.path,
             timeout_s=timeout_s,
         )
         if not push(res):
