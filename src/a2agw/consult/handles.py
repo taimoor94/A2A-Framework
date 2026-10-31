@@ -12,6 +12,7 @@ from typing import Any
 
 from sqlalchemy import (
     Column,
+    ColumnElement,
     Float,
     Integer,
     MetaData,
@@ -343,7 +344,7 @@ class OutboundHandleStore:
         if agent_ids is not None:
             t = INDEX_TABLE
             stmt = stmt.select_from(o.outerjoin(t, t.c.task_id == o.c.inbound_task_id))
-            mine = t.c.agent_id.in_(sorted(agent_ids))
+            mine: ColumnElement[bool] = t.c.agent_id.in_(sorted(agent_ids))
             if owners:
                 unlinked = and_(o.c.inbound_task_id.is_(None), o.c.owner.in_(sorted(owners)))
                 mine = or_(mine, unlinked)

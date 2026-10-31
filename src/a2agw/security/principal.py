@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from a2a.auth.user import User
+from starlette.authentication import BaseUser
 
 
 @dataclass(frozen=True)
@@ -28,8 +29,9 @@ class Principal:
         return cls(id=principal_id, kind=kind, scopes=frozenset())
 
 
-class PrincipalUser(User):
-    """Adapts a Principal to the A2A SDK User (used for task ownership scoping)."""
+class PrincipalUser(User, BaseUser):
+    """Adapts a Principal to the A2A SDK User (used for task ownership scoping). It is also
+    the Starlette user the authentication middleware puts on the request."""
 
     def __init__(self, principal: Principal) -> None:
         self._principal = principal
@@ -44,4 +46,12 @@ class PrincipalUser(User):
 
     @property
     def user_name(self) -> str:
+        return self._principal.id
+
+    @property
+    def display_name(self) -> str:
+        return self._principal.id
+
+    @property
+    def identity(self) -> str:
         return self._principal.id

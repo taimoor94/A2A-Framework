@@ -213,7 +213,9 @@ class GatewayAuthBackend(AuthenticationBackend):
         self._config = config
         self._jwks: _JwksCache | None = None
 
-    async def authenticate(self, conn: HTTPConnection) -> tuple[AuthCredentials, User] | None:
+    async def authenticate(
+        self, conn: HTTPConnection
+    ) -> tuple[AuthCredentials, PrincipalUser] | None:
         api_key = conn.headers.get("x-api-key")
         bearer: str | None = None
         authz = conn.headers.get("authorization")

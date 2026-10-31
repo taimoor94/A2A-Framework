@@ -17,7 +17,7 @@ import copy
 import json
 import keyword
 import warnings
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Any, ClassVar, Literal
@@ -148,7 +148,9 @@ class LlamaIndexAdapter:
             async for ev in turn:
                 yield ev
 
-    async def _turn(self, ctx: InboundContext, session: _Session) -> AsyncIterator[AgentEvent]:
+    async def _turn(
+        self, ctx: InboundContext, session: _Session
+    ) -> AsyncGenerator[AgentEvent, None]:
         streamed = False
         tokens = [0, 0]  # in, out: summed over the turn's model calls
 
@@ -257,7 +259,7 @@ def _annotation(schema: Any) -> Any:
     if not isinstance(schema, dict):
         return Any
     if isinstance(schema.get("enum"), list) and schema["enum"]:
-        return Literal[tuple(schema["enum"])]  # type: ignore[valid-type]
+        return Literal[tuple(schema["enum"])]
     t = schema.get("type")
     if t == "array":
         return list[_annotation(schema.get("items"))]  # type: ignore[misc]

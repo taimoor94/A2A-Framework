@@ -280,7 +280,7 @@ def _swap_pool(transport: httpx.AsyncHTTPTransport, pool: httpcore.AsyncConnecti
         raise RuntimeError(
             "unsupported httpx version: AsyncHTTPTransport._pool is not an AsyncConnectionPool"
         )
-    transport._pool = pool  # type: ignore[attr-defined]
+    transport._pool = pool
 
 
 def guarded_async_client(

@@ -58,6 +58,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from a2agw._ddl import retry_ddl
+from a2agw.security.classify import Classification
 
 log = logging.getLogger(__name__)
 
@@ -220,7 +221,7 @@ class AuditEvent:
     agent_id: str | None = None
     partner_id: str | None = None
     task_id: str | None = None
-    classification: str | None = None
+    classification: Classification | str | None = None  # stored as the lowercase name
     outcome: str = ""
     detail: dict[str, Any] = field(default_factory=dict)
     ts: float = field(default_factory=time.time)
@@ -359,7 +360,9 @@ class AuditLog:
                 row["prev_hash"] = last or GENESIS_HASH
                 row["hash"] = _digest(row)
                 result = await conn.execute(t.insert().values(**row))
-                return int(result.inserted_primary_key[0])
+                pk = result.inserted_primary_key
+                assert pk is not None  # a single-row INSERT always reports its key
+                return int(pk[0])
         finally:
             self._lock.release()
 

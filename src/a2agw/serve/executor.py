@@ -282,7 +282,7 @@ class AdapterExecutor(AgentExecutor):
             run.working_due = False
             await self._status(run, TaskState.TASK_STATE_WORKING)
 
-    async def _status(self, run: _Run, state: int, text: str | None = None) -> None:
+    async def _status(self, run: _Run, state: TaskState, text: str | None = None) -> None:
         if run.terminal or run.cancelled:
             return
         await self._materialize(run)
@@ -528,21 +528,23 @@ class AdapterExecutor(AgentExecutor):
         self, run: _Run, inbound: InboundContext, inbound_token: str | None = None
     ) -> None:
         events: Any = None
-        span_attrs = {
+        call = inbound.call
+        assert call is not None  # execute() always builds the inbound context with one
+        span_attrs: dict[str, str | int] = {
             "a2agw.agent_id": self.spec.id,
             "a2a.task_id": run.updater.task_id,
-            "a2agw.hop": inbound.call.hop,
+            "a2agw.hop": call.hop,
         }
         # Outbound calls made by the adapter (partner tools) link to this task and caller.
         with (
             get_tracer().start_as_current_span(
                 "a2agw.inbound",
-                context=extract_parent(inbound.call.traceparent),
+                context=extract_parent(call.traceparent),
                 attributes=span_attrs,
                 record_exception=False,
                 set_status_on_exception=False,
             ) as span,
-            use_call(inbound.call),
+            use_call(call),
             use_inbound(inbound.task_id, inbound.principal),
             use_inbound_token(inbound_token),
             use_agent(self.spec.id),

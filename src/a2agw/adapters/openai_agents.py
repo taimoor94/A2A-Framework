@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import copy
 import json
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Any
@@ -157,8 +157,8 @@ class OpenAIAgentsAdapter:
             async for ev in turn:
                 yield ev
 
-    async def _turn(self, ctx: InboundContext, entry: _Context) -> AsyncIterator[AgentEvent]:
-        session = entry.session
+    async def _turn(self, ctx: InboundContext, entry: _Context) -> AsyncGenerator[AgentEvent, None]:
+        session: Session | None = entry.session
         if session is None:
             assert self.session_factory is not None  # no default session only with a factory
             session = self.session_factory(context_key(ctx))

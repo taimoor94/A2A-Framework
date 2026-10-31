@@ -419,3 +419,33 @@ async def test_cli_reap_uses_configured_credentials_and_tls(tmp_path, monkeypatc
     assert r.exit_code == 0, r.output
     assert isinstance(seen["credentials"], ChainCredentials)
     assert set(seen["tls"]) == {"m1"}
+
+
+async def test_cli_reap_counts_external_agents_as_served(tmp_path, monkeypatch):
+    """H0 (found by mypy): ``tasks reap`` read ``.spec`` of every agent entry, so a config
+    with a webhook or stdio agent crashed; that agent is served and must be refused."""
+    monkeypatch.setenv("CODER_SECRET", "s3cret-for-tests")
+    db = f"sqlite+aiosqlite:///{tmp_path / 'gw.db'}"
+    (tmp_path / "a2agw.yaml").write_text(
+        "base_url: http://localhost\n"
+        f"db_url: {db}\n"
+        "agents:\n"
+        "  - id: coder\n"
+        "    name: Coder\n"
+        "    description: Writes code\n"
+        "    skills:\n"
+        "      - {id: code, name: Code, description: Writes code}\n"
+        "    webhook: {url: 'http://127.0.0.1:9000/a2agw/invoke', secret_env: CODER_SECRET}\n"
+    )
+
+    def reap(agent: str):
+        args = ["tasks", "reap", "--agent", agent, "-c", str(tmp_path / "a2agw.yaml")]
+        return CliRunner().invoke(cli.app, args)
+
+    loop = asyncio.get_running_loop()
+    r = await loop.run_in_executor(None, lambda: reap("coder"))
+    assert r.exit_code != 0
+    assert r.exception is None or isinstance(r.exception, SystemExit), repr(r.exception)
+    assert "refused: agent is served by this gateway" in r.output
+    r = await loop.run_in_executor(None, lambda: reap("gone"))
+    assert r.exit_code == 0, (r.output, r.exception)

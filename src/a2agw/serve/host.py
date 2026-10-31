@@ -22,6 +22,7 @@ from collections.abc import (
     Iterable,
     Iterator,
     Mapping,
+    Sequence,
 )
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
@@ -227,11 +228,11 @@ def _on_exit_signal(callback: Callable[[], None]) -> Iterator[None]:
     try:
         yield
     finally:
-        for sig, prev in previous.items():
+        for prev_sig, prev in previous.items():
             # None (installed outside Python) cannot be reinstalled from Python: ours stays,
             # and it emulates that default (its loop callback is then a no-op).
-            if prev is not None and signal.getsignal(sig) is handler:
-                signal.signal(sig, prev)
+            if prev is not None and signal.getsignal(prev_sig) is handler:
+                signal.signal(prev_sig, prev)
 
 
 _PROXY_VARS = frozenset({"http_proxy", "https_proxy", "all_proxy"})
@@ -577,7 +578,7 @@ class LimitedRequestHandler(DefaultRequestHandler):
             if slot is not None and not slot.adopted:
                 slot.release()
 
-    async def on_message_send(self, params: SendMessageRequest, context: ServerCallContext):  # type: ignore[override]
+    async def on_message_send(self, params: SendMessageRequest, context: ServerCallContext):
         self._check_parts(params)
         key = self._key(params, context)
         if key is None:
@@ -602,7 +603,7 @@ class LimitedRequestHandler(DefaultRequestHandler):
             )
         return result
 
-    async def on_message_send_stream(  # type: ignore[override]
+    async def on_message_send_stream(
         self, params: SendMessageRequest, context: ServerCallContext
     ) -> AsyncGenerator[Any, None]:
         self._check_parts(params)
@@ -663,7 +664,7 @@ class _Compat03Adapter(JSONRPC03Adapter):
     """The SDK's 0.3 JSON-RPC adapter, but an A2A error raised by the handler keeps its
     JSON-RPC code (the SDK turns every one into -32603 internal error on 0.3 requests)."""
 
-    async def _process_non_streaming_request(  # type: ignore[override]
+    async def _process_non_streaming_request(
         self, request_id: Any, request_obj: Any, context: ServerCallContext
     ) -> Any:
         try:
@@ -678,7 +679,7 @@ class _Compat03Adapter(JSONRPC03Adapter):
             )
 
 
-def _with_v03_error_codes(routes: list[BaseRoute], handler: Any) -> list[BaseRoute]:
+def _with_v03_error_codes(routes: Sequence[BaseRoute], handler: Any) -> Sequence[BaseRoute]:
     """Swap the dispatcher's 0.3 adapter for ``_Compat03Adapter``. Fails loudly if the SDK's
     layout changes, rather than silently keeping the -32603 mapping."""
     for route in routes:
@@ -785,7 +786,10 @@ def _remapped_error(body: bytes) -> tuple[int, bytes] | None:
     try:
         payload = json.loads(body)
         error = payload["error"]
-        reasons = [d.get("reason") for d in error.get("details", []) if isinstance(d, dict)]
+        details = error.get("details", [])
+        reasons = [
+            d["reason"] for d in details if isinstance(d, dict) and isinstance(d.get("reason"), str)
+        ]
     except (ValueError, KeyError, TypeError, AttributeError):
         return None
     for reason in reasons:
@@ -942,7 +946,7 @@ class _AuthMiddleware:
                 # refuse everything else with 401 themselves.
                 result = None
             else:
-                await on_auth_error(conn, exc)(scope, receive, send)  # type: ignore[arg-type,misc]
+                await on_auth_error(conn, exc)(scope, receive, send)
                 return
         # The backend returns None only if no credential is accepted; treat that as anonymous.
         scope["auth"], scope["user"] = result or (AuthCredentials(), _anonymous_user())
@@ -1976,6 +1980,7 @@ class AgentHost:
             self.app(),
             host=host,
             port=port,
-            timeout_graceful_shutdown=graceful_timeout_s,
+            # uvicorn annotates this int, but passes it to asyncio.wait_for (a float works).
+            timeout_graceful_shutdown=graceful_timeout_s,  # type: ignore[arg-type]
             **kwargs,
         )

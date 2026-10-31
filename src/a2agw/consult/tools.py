@@ -618,6 +618,8 @@ async def invoke(
     try:
         if tool.kind in ("consult", "consult_any"):
             if tool.kind == "consult":
+                # A per-partner tool (as partner_tools builds it) always names its partner.
+                assert tool.partner_id is not None
                 pid = tool.partner_id
             else:
                 pid = a["partner_id"]

@@ -24,6 +24,9 @@ def test_ci_workflow_jobs():
     gate = _steps(jobs["gate"])
     assert "uv sync --locked" in gate
     assert "uv run pytest -q -W error" in gate and "uv run ruff check" in gate
+    # Type checking over the whole package ([tool.mypy] files), after lint.
+    assert "uv run mypy" in gate
+    assert gate.index("uv run ruff check") < gate.index("uv run mypy")
     assert "scripts/test-crewai.sh" in _steps(jobs["crewai"])
     fresh = _steps(jobs["fresh-resolution"])
     assert "uv venv" in fresh and "'.[all]'" in fresh and "uv sync" not in fresh

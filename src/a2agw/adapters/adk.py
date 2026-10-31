@@ -15,7 +15,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import aclosing
 from typing import Any
 
@@ -130,7 +130,7 @@ class AdkAdapter:
             async for ev in turn:
                 yield ev
 
-    async def _turn(self, ctx: InboundContext, user_id: str) -> AsyncIterator[AgentEvent]:
+    async def _turn(self, ctx: InboundContext, user_id: str) -> AsyncGenerator[AgentEvent, None]:
         message = types.Content(role="user", parts=[types.Part(text=ctx.text)])
         tokens_in = tokens_out = 0
         failed: Event | None = None

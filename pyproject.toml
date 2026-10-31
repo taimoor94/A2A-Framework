@@ -111,5 +111,19 @@ target-version = "py311"
 [tool.mypy]
 python_version = "3.11"
 warn_unused_ignores = true
-ignore_missing_imports = true  # protobuf / yaml stubs
-files = ["src/a2agw/core", "src/a2agw/context"]
+files = ["src/a2agw"]
+
+# Third-party modules without type information in the dev environment, listed explicitly.
+[[tool.mypy.overrides]]
+module = [
+    "yaml",  # PyYAML ships no stubs (types-PyYAML is not a dependency)
+    "google.protobuf.*",  # protobuf ships no stubs (types-protobuf is not a dependency)
+    # Optional OTLP exporter (Observability): imported lazily, not installed in the dev group.
+    "opentelemetry.exporter.otlp.proto.http.*",
+    # crewai conflicts with the dev group (see [tool.uv] conflicts) and lives in its own
+    # environment (scripts/test-crewai.sh): adapters/crewai.py is still checked, with crewai
+    # itself typed as Any.
+    "crewai",
+    "crewai.*",
+]
+ignore_missing_imports = true

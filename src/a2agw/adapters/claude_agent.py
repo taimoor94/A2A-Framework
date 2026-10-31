@@ -20,7 +20,7 @@ import copy
 import dataclasses
 import json
 import logging
-from collections.abc import AsyncIterator, Callable, MutableMapping
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, MutableMapping
 from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Any
@@ -112,7 +112,7 @@ class ClaudeAgentAdapter:
         self,
         options: ClaudeAgentOptions | None = None,
         *,
-        query: Callable[..., AsyncIterator[Any]] | None = None,
+        query: Callable[..., AsyncGenerator[Any, None]] | None = None,
         durable_sessions: bool = False,
         session_store: MutableMapping[str, str] | None = None,
     ):
@@ -123,7 +123,11 @@ class ClaudeAgentAdapter:
             )
         self.options = options if options is not None else ClaudeAgentOptions()
         _check_options(self.options)
-        self.query = query if query is not None else claude_agent_sdk.query
+        # claude_agent_sdk annotates ``query`` as returning AsyncIterator; it is an async
+        # generator function (``aclosing`` below closes it).
+        self.query: Callable[..., AsyncGenerator[Any, None]] = (
+            query if query is not None else claude_agent_sdk.query  # type: ignore[assignment]
+        )
         self.durable_sessions = durable_sessions
         self.session_store = session_store
         # The ``MAX_SESSIONS`` most recently used (caller, context) keys: a key with a turn in
@@ -154,7 +158,7 @@ class ClaudeAgentAdapter:
             async for ev in turn:
                 yield ev
 
-    async def _turn(self, ctx: InboundContext, entry: _Context) -> AsyncIterator[AgentEvent]:
+    async def _turn(self, ctx: InboundContext, entry: _Context) -> AsyncGenerator[AgentEvent, None]:
         # Checked again here: ``self.options`` may have been changed since construction.
         _check_options(self.options)
         key = context_key(ctx)

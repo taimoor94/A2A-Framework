@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from contextlib import aclosing
 from typing import Any
 
@@ -128,7 +128,7 @@ class AG2Adapter:
             async for ev in turn:
                 yield ev
 
-    async def _turn(self, ctx: InboundContext, stream: Stream) -> AsyncIterator[AgentEvent]:
+    async def _turn(self, ctx: InboundContext, stream: Stream) -> AsyncGenerator[AgentEvent, None]:
         queue: asyncio.Queue[Any] = asyncio.Queue()
         tokens_in = tokens_out = 0
         streamed = False

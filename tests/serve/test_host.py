@@ -436,6 +436,20 @@ async def test_rest_conformance_leaves_non_json_errors_alone():
     assert r.status_code == 400 and r.text == "nope"
 
 
+async def test_rest_conformance_leaves_errors_with_non_string_reasons_alone():
+    """A details entry whose ``reason`` is not a string (unhashable here) is not remapped,
+    and the body passes through instead of the middleware raising."""
+    from starlette.responses import Response
+
+    from a2agw.serve.host import _RestConformance
+
+    body = b'{"error": {"code": 400, "details": [{"reason": ["TASK_NOT_CANCELABLE"]}]}}'
+    app = _RestConformance(Response(body, status_code=400, media_type="application/a2a+json"))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t") as hc:
+        r = await hc.get("/")
+    assert r.status_code == 400 and r.content == body
+
+
 async def test_card_cache_control_default_and_override(env):
     e = await env(spec("alpha"))
     hc = e.http()

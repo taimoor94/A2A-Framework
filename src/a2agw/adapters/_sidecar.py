@@ -9,7 +9,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import aclosing
 from typing import Any, Protocol, TypeVar, runtime_checkable
 
@@ -119,7 +119,9 @@ def loads(data: bytes) -> Any:
         raise ProtocolError("invalid JSON") from None
 
 
-async def run_turn(items: AsyncIterator[AgentEvent | str]) -> AsyncIterator[AgentEvent]:
+async def run_turn(
+    items: AsyncGenerator[AgentEvent | str, None],
+) -> AsyncGenerator[AgentEvent, None]:
     """A turn's wire items as events: text deltas become the streamed "output" artifact
     (``stream_events``, its last chunk marked ``last``), nothing is read after a terminal
     event, and a turn that ends without one completes with ``Done()``. Closing the result

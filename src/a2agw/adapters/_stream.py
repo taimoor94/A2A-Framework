@@ -3,14 +3,14 @@ marked ``last`` once the source is exhausted."""
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 from typing import Any
 
 from a2a.types import Part
 
 from a2agw.core.events import AgentEvent, ArtifactChunk
 
-EVENT_TYPES = tuple(AgentEvent.__args__)  # type: ignore[attr-defined]
+EVENT_TYPES = tuple(AgentEvent.__args__)
 
 
 def content_text(content: Any) -> str:
@@ -63,7 +63,7 @@ def text_chunk(text: str, *, first: bool, last: bool) -> ArtifactChunk:
     )
 
 
-async def _items(source: Any) -> AsyncIterator[Any]:
+async def _items(source: Any) -> AsyncGenerator[Any, None]:
     if hasattr(source, "__aiter__"):
         async for item in source:
             yield item
@@ -72,7 +72,7 @@ async def _items(source: Any) -> AsyncIterator[Any]:
             yield item
 
 
-async def stream_events(source: Any) -> AsyncIterator[AgentEvent]:
+async def stream_events(source: Any) -> AsyncGenerator[AgentEvent, None]:
     """Turn an (async) iterable of ``str | AgentEvent`` into events.
 
     Strings stream as one append-style artifact "output"; one string is held back so the

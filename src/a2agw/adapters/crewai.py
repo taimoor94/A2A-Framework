@@ -256,7 +256,7 @@ def _annotation(schema: Any) -> Any:
     if not isinstance(schema, dict):
         return Any
     if isinstance(schema.get("enum"), list) and schema["enum"]:
-        return Literal[tuple(schema["enum"])]  # type: ignore[valid-type]
+        return Literal[tuple(schema["enum"])]
     t = schema.get("type")
     if t == "array":
         return list[_annotation(schema.get("items"))]  # type: ignore[misc]

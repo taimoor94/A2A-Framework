@@ -16,6 +16,7 @@ from a2a.types import (
     HTTPAuthSecurityScheme,
     SecurityRequirement,
     SecurityScheme,
+    StringList,
 )
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -136,7 +137,9 @@ def build_card(
             for s in spec.skills
         ],
         security_schemes=schemes,
-        security_requirements=[SecurityRequirement(schemes={name: {}}) for name in schemes],
+        security_requirements=[
+            SecurityRequirement(schemes={name: StringList()}) for name in schemes
+        ],
     )
     if spec.provider is not None:
         org, url = spec.provider

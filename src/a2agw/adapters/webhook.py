@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import AsyncExitStack, aclosing
 from typing import Any
 
@@ -123,7 +123,7 @@ class WebhookAdapter:
 
     async def _turn(
         self, ctx: InboundContext, log: logging.Logger
-    ) -> AsyncIterator[AgentEvent | str]:
+    ) -> AsyncGenerator[AgentEvent | str, None]:
         """Wire events (a ``str`` is a text delta), then possibly one ``Failed``."""
         # Both clocks are read once, now: the deadline sent is the one enforced.
         deadline = TurnDeadline(self.timeout_s)
@@ -184,7 +184,7 @@ class WebhookAdapter:
 
     async def _events(
         self, response: httpx.Response, within: _Within
-    ) -> AsyncIterator[AgentEvent | str]:
+    ) -> AsyncGenerator[AgentEvent | str, None]:
         ctype = response.headers.get("content-type", "").split(";")[0].strip().lower()
         if ctype not in (NDJSON, JSON):
             raise ProtocolError("unsupported response content type")
@@ -228,7 +228,7 @@ class WebhookAdapter:
                 yield event(loads(check_line(bytes(buf))))
 
 
-async def _chunks(response: httpx.Response, within: _Within) -> AsyncIterator[bytes]:
+async def _chunks(response: httpx.Response, within: _Within) -> AsyncGenerator[bytes, None]:
     """The decoded body, each read under the turn deadline, at most MAX_RESPONSE_BYTES."""
     it = response.aiter_bytes()
     total = 0
@@ -239,4 +239,5 @@ async def _chunks(response: httpx.Response, within: _Within) -> AsyncIterator[by
                 raise ProtocolError("response larger than MAX_RESPONSE_BYTES")
             yield chunk
     finally:
-        await it.aclose()
+        # httpx annotates ``aiter_bytes`` as AsyncIterator; it is an async generator.
+        await it.aclose()  # type: ignore[attr-defined]

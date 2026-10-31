@@ -14,7 +14,8 @@ env:
 
 jobs:
   gate:
-    # The main gate: the locked dev environment, every test with warnings as errors, lint.
+    # The main gate: the locked dev environment, lint, type checking, every test with
+    # warnings as errors.
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -28,6 +29,7 @@ jobs:
       - run: uv python install ${{ env.PYTHON_VERSION }}
       - run: uv sync --locked
       - run: uv run ruff check
+      - run: uv run mypy  # the whole package ([tool.mypy] files)
       - run: uv run pytest -q -W error
 
   crewai:

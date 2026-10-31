@@ -28,7 +28,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, TypedDict
 from urllib.parse import urlsplit
 
 import yaml
@@ -468,9 +468,9 @@ class GatewayConfig(BaseModel):
                         f"oauth {ref!r}: fallback must name a client_credentials oauth entry"
                     )
         for p in self.partners:
-            ref = p.credential_ref
-            if ref is not None and ref not in self.credentials and ref not in self.oauth:
-                raise ValueError(f"partner {p.id!r}: unknown credential_ref {ref!r}")
+            cref = p.credential_ref
+            if cref is not None and cref not in self.credentials and cref not in self.oauth:
+                raise ValueError(f"partner {p.id!r}: unknown credential_ref {cref!r}")
             if p.tls_ref is not None and p.tls_ref not in self.tls:
                 raise ValueError(f"partner {p.id!r}: unknown tls_ref {p.tls_ref!r}")
         if self.classifier is not None and self.policy_file is None:
@@ -631,6 +631,11 @@ def _stdio_adapter(
     )
 
 
+class _Modes(TypedDict, total=False):
+    input_modes: list[str]
+    output_modes: list[str]
+
+
 def _external_agent(entry: ExternalAgentConfig, where: str, config_dir: Path) -> AgentSpec:
     """The ``AgentSpec`` for an external agent, with its transport's adapter."""
     adapter: WebhookAdapter | StdioAdapter
@@ -639,11 +644,11 @@ def _external_agent(entry: ExternalAgentConfig, where: str, config_dir: Path) ->
     else:
         assert entry.stdio is not None  # ExternalAgentConfig._one_transport
         adapter = _stdio_adapter(entry, entry.stdio, where, config_dir)
-    modes = {
-        k: v
-        for k, v in (("input_modes", entry.input_modes), ("output_modes", entry.output_modes))
-        if v is not None
-    }
+    modes: _Modes = {}  # an unset mode keeps AgentSpec's default
+    if entry.input_modes is not None:
+        modes["input_modes"] = entry.input_modes
+    if entry.output_modes is not None:
+        modes["output_modes"] = entry.output_modes
     return AgentSpec(
         id=entry.id,
         name=entry.name,

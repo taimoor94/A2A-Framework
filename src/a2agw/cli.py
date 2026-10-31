@@ -987,7 +987,7 @@ async def _reap(
     """Open the database, index, handles and registry directly: no host, no agent adapters
     are started, and no recovery runs. Partner cancels use the configured credentials
     (static and OAuth) and mTLS settings."""
-    from a2agw.config import _load_agent, _signers, partner_registry
+    from a2agw.config import AgentRef, _load_agent, _signers, partner_registry
     from a2agw.consult.client import PartnerClient
     from a2agw.consult.handles import OutboundHandleStore
     from a2agw.ops.bus import EventBus
@@ -1001,8 +1001,12 @@ async def _reap(
     from a2agw.serve.reap import make_cancel_outbound, reap_agent
     from a2agw.serve.store import TaskIndex, create_engine, task_store_for
 
-    # Only the specs are imported (their ids tell which agents this config serves).
-    served = {_load_agent(ref.spec, config_dir).id for ref in cfg.agents}
+    # Only the specs of module agents are imported (their ids tell which agents this config
+    # serves); an external (webhook or stdio) agent names its id in the config.
+    served = {
+        _load_agent(ref.spec, config_dir).id if isinstance(ref, AgentRef) else ref.id
+        for ref in cfg.agents
+    }
     registry = partner_registry(cfg, config_dir)
     registry.load()
     push = None

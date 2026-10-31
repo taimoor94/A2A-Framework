@@ -45,7 +45,7 @@ import logging
 import os
 import re
 import signal
-from collections.abc import AsyncIterator, Awaitable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Mapping
 from contextlib import aclosing
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -524,7 +524,7 @@ class StdioAdapter:
 
     async def _turn(
         self, ctx: InboundContext, log: logging.Logger
-    ) -> AsyncIterator[AgentEvent | str]:
+    ) -> AsyncGenerator[AgentEvent | str, None]:
         """Wire events (a ``str`` is a text delta), then possibly one ``Failed``."""
         deadline = TurnDeadline(self.timeout_s)
         # Read once: the grant is revoked by the callable that issued it, even if

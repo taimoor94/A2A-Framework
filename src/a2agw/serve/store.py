@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import builtins
 import logging
 import re
 import time
 import warnings
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from a2a.server.context import ServerCallContext
 from a2a.server.models import create_task_model
@@ -274,7 +275,8 @@ class TaskIndex:
             next_cursor = _encode_cursor(last["updated_at"], last["task_id"])
         return rows, next_cursor
 
-    async def by_state(self, states: set[str]) -> list[dict[str, Any]]:
+    # ``builtins.list``: the ``list`` method above shadows the builtin in this class body.
+    async def by_state(self, states: set[str]) -> builtins.list[dict[str, Any]]:
         stmt = select(_index_table).where(_index_table.c.state.in_(sorted(states)))
         async with self._engine.connect() as conn:
             return [dict(r._mapping) for r in (await conn.execute(stmt)).all()]
@@ -353,6 +355,7 @@ class RecoveryReport:
 
 
 def _context_for(owner: str) -> ServerCallContext:
+    kind: Literal["api_key", "jwt", "anonymous"]
     if owner.startswith("key:"):
         kind = "api_key"
     elif owner.startswith("jwt:"):
