@@ -52,3 +52,25 @@ def vsc_config():
             ],
         }
     )
+
+
+def make_repo(tmp_path, name: str, files: dict[str, str]) -> Path:
+    """A throwaway git repository on ``main`` with one initial commit."""
+    import subprocess
+
+    repo = tmp_path / name
+    repo.mkdir(parents=True)
+    for rel, content in files.items():
+        f = repo / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(content)
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+
+    git("init", "-b", "main")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.com")
+    git("add", "-A")
+    git("commit", "-m", "initial")
+    return repo
