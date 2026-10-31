@@ -165,7 +165,37 @@ CASES = {
         lambda h: actions.set_policy(h, {"version": 1}, actor=ACTOR),
         "policy.update",
     ),
+    "task_detail": (
+        lambda h: _seed_task(h, "t-read", "TASK_STATE_WORKING"),
+        lambda h: actions.task_detail(h, "alpha", "t-read", actor=ACTOR),
+        "admin.read",
+    ),
+    "cancel_task": (
+        lambda h: _seed_task(h, "t-cancel", "TASK_STATE_WORKING"),
+        lambda h: actions.cancel_task(h, "alpha", "t-cancel", actor=ACTOR),
+        "task.cancel",
+    ),
+    "answer_task": (
+        lambda h: _seed_task(h, "t-answer", "TASK_STATE_INPUT_REQUIRED"),
+        lambda h: actions.answer_task(h, "alpha", "t-answer", "blue", actor=ACTOR),
+        "task.answer",
+    ),
 }
+
+
+async def _seed_task(host: AgentHost, task_id: str, state: str) -> None:
+    """A task of agent alpha owned by key:user, in the SDK store and the index."""
+    from a2a.server.context import ServerCallContext
+    from a2a.types import Task, TaskState, TaskStatus
+
+    from a2agw.security.principal import Principal, PrincipalUser
+
+    ctx = ServerCallContext(user=PrincipalUser(Principal.from_id("key:user")))
+    status = TaskStatus(state=getattr(TaskState, state))
+    await host.handlers["alpha"].task_store.save(
+        Task(id=task_id, context_id="c1", status=status), ctx
+    )
+    await host.index.upsert(task_id, "alpha", "key:user", "c1", state, None)
 
 
 async def _set_card(host: AgentHost, card: dict) -> None:
@@ -242,7 +272,10 @@ async def test_remove_with_open_handles_needs_force(gw):
     await gw.audit.drain()
     rows, _ = await gw.audit.query({"action": "partner.remove"})
     rows = [r for r in rows if r["task_id"] is None]  # one row per cancelled task besides
-    assert [(r["actor"], r["outcome"]) for r in rows] == [(ACTOR, "active"), (ACTOR, "refused")]
+    # Disabled first (no new consults while its tasks are cancelled), then removed.
+    assert [(r["actor"], r["outcome"]) for r in rows] == [(ACTOR, "disabled"), (ACTOR, "refused")]
+    rows, _ = await gw.audit.query({"action": "partner.disable"})
+    assert [r["actor"] for r in rows] == [ACTOR]
 
 
 async def test_set_policy_action_validates_without_echoing_values(gw):
@@ -302,7 +335,8 @@ async def linked(tmp_path):
     await host.startup()
     try:
         await host.partners.add_from_card("blk", MessageToDict(partner.cards["blk"]), "internal")
-        res = await host.client.consult("blk", "go", wait_seconds=0.2)
+        # Generous: the first partner event must arrive in time under load.
+        res = await host.client.consult("blk", "go", wait_seconds=1.0)
         assert res.state == "working", res
         host.test_partner = partner  # type: ignore[attr-defined]
         host.test_task = res.task_id  # type: ignore[attr-defined]
@@ -367,3 +401,54 @@ async def test_remove_force_cancel_error_still_removes(gw):
     assert (h["state"], h["end_reason"]) == ("TASK_STATE_CANCELED", "partner removed")
     rows, _ = await gw.audit.query({"action": "partner.remove"})
     assert ("cancel_failed", "t9") in [(r["outcome"], r["task_id"]) for r in rows]
+
+
+async def _consult_during_cancel(host: AgentHost) -> list:
+    """Replace the host's cancel step with one that first tries a new consult."""
+    seen: list = []
+    real = host.cancel_partner_tasks
+
+    async def cancel(partner_ids, **kw):
+        seen.append(await host.client.consult("blk", "again", wait_seconds=0.2))
+        return await real(partner_ids, **kw)
+
+    host.cancel_partner_tasks = cancel  # type: ignore[method-assign]
+    return seen
+
+
+async def test_remove_force_refuses_consults_during_the_cancel(linked):
+    seen = await _consult_during_cancel(linked)
+    out = await actions.remove_partner(linked, "blk", force=True, actor=ACTOR)
+    assert out["cancelled"] == 1
+    ((res,),) = [seen]
+    assert res.state == "unavailable" and res.reason == "partner disabled"
+    h = await linked.handles.count_open(["blk"])
+    assert h == {}  # the refused consult started no partner task
+
+
+async def test_remove_force_does_not_contact_a_partner_disabled_before(linked):
+    """A partner an operator had disabled (or that was quarantined) gets no cancel call
+    either: its tasks are ended here only."""
+    await actions.disable_partner(linked, "blk", actor=ACTOR)
+    out = await actions.remove_partner(linked, "blk", force=True, actor=ACTOR)
+    assert (out["cancelled"], out["cancel_errors"]) == (0, 1)
+    h = await linked.handles.get("blk", linked.test_task)
+    assert (h["state"], h["end_reason"]) == ("TASK_STATE_CANCELED", "partner removed")
+    assert await _partner_task_state(linked) == "TASK_STATE_WORKING"  # never contacted
+    # Its operator ends it on its own gateway (so the partner host can shut down).
+    partner = linked.test_partner  # type: ignore[attr-defined]
+    out = await actions.cancel_task(partner, "blk", linked.test_task, actor=ACTOR)
+    assert out == {"state": "TASK_STATE_CANCELED"}
+
+
+async def test_reload_force_refuses_consults_during_the_cancel(linked):
+    linked.partners.path.write_text("partners: []\n")
+    seen = await _consult_during_cancel(linked)
+    out = await actions.reload_partners(linked, force=True, actor=ACTOR)
+    assert out["removed"] == ["blk"] and out["cancelled"] == 1
+    ((res,),) = [seen]
+    assert res.state == "unavailable" and res.reason == "partner disabled"
+    assert linked.partners.all() == []
+    await linked.audit.drain()
+    rows, _ = await linked.audit.query({"action": "partner.disable"})
+    assert [r["actor"] for r in rows] == [ACTOR]

@@ -99,7 +99,12 @@ EVALUATION_ERROR = "policy evaluation error"
 
 
 class PolicyError(ValueError):
-    """The policy file is missing, unreadable or invalid."""
+    """The policy file is missing, unreadable or invalid. ``fields``: the dotted paths of
+    the invalid fields (``<root>`` for the document itself), when known; never values."""
+
+    def __init__(self, message: str, *, fields: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.fields = list(fields or [])
 
 
 def _coerce_classification(value: Any) -> Classification:
@@ -420,11 +425,17 @@ def parse_policy(doc: Any) -> Policy:
     """Validate a policy document (a parsed mapping, e.g. from the control plane or the
     admin API); any problem raises ``PolicyError`` naming field paths, never values."""
     if not isinstance(doc, dict):
-        raise PolicyError("policy must be a mapping")
+        raise PolicyError("policy must be a mapping", fields=["<root>"])
     try:
         return Policy.model_validate(doc)
     except ValidationError as exc:
-        raise PolicyError(f"invalid policy: {_describe_errors(exc)}") from None
+        fields = list(
+            dict.fromkeys(
+                ".".join(str(p) for p in err["loc"]) or "<root>"
+                for err in exc.errors(include_input=False, include_url=False)
+            )
+        )
+        raise PolicyError(f"invalid policy: {_describe_errors(exc)}", fields=fields) from None
 
 
 def policy_hash(policy: Policy) -> str:

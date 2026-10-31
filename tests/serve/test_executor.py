@@ -338,7 +338,11 @@ async def test_index_and_bus_updated(make_server):
             "task_id": task.id,
             "context_id": task.context_id,
             "state": ev.data["state"],
+            "trace_id": ev.data["trace_id"],  # the turn's trace (None before its span)
         }
+    assert events[0].data["trace_id"] is None  # admission: the span has not started
+    traces = {ev.data["trace_id"] for ev in events[1:]}
+    assert len(traces) == 1 and row["trace_id"] in traces
     assert "secret" not in repr(events)
 
 

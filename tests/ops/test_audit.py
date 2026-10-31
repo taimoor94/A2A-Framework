@@ -163,6 +163,17 @@ async def test_submit_runs_in_background_and_drain_waits(log):
     assert rows[0]["task_id"] == "bg"
 
 
+async def test_drain_returns_when_a_finished_event_is_not_yet_discarded(log):
+    """A submitted event that finished but whose done callback (which forgets it) has not
+    run yet: gathering only finished tasks never yields to the loop, so drain must forget
+    them itself instead of spinning (seen as a hung host shutdown)."""
+    done = asyncio.get_running_loop().create_future()
+    done.set_result(None)
+    log._pending.add(done)  # done, and nothing will ever discard it
+    await log.drain()
+    assert not log._pending
+
+
 async def test_initialize_is_idempotent(engine):
     a = AuditLog(engine)
     await a.initialize()

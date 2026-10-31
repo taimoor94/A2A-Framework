@@ -67,9 +67,12 @@ class ReapResult:
     report: RecoveryReport | None = None
 
 
-def make_cancel_outbound(client: PartnerClient) -> Callable[[dict[str, Any]], Awaitable[None]]:
+def make_cancel_outbound(
+    client: PartnerClient, *, disabled_ok: bool = False
+) -> Callable[[dict[str, Any]], Awaitable[None]]:
     """Cancel one recorded partner task as the caller it was started for (a maintenance
-    call); raise unless the partner reports it canceled."""
+    call); raise unless the partner reports it canceled. ``disabled_ok``: a disabled
+    partner is cancelled too (a forced removal)."""
     from a2agw.context.call_context import use_maintenance
     from a2agw.security.principal import Principal
 
@@ -77,7 +80,8 @@ def make_cancel_outbound(client: PartnerClient) -> Callable[[dict[str, Any]], Aw
         caller_id = handle.get("caller_id")
         caller = Principal.from_id(caller_id) if caller_id else None
         with use_maintenance():
-            result = await client.cancel(handle["partner_id"], handle["task_id"], caller=caller)
+            fn = client.cancel_for_removal if disabled_ok else client.cancel
+            result = await fn(handle["partner_id"], handle["task_id"], caller=caller)
         if result.state != "canceled":
             raise RuntimeError("not canceled")
 

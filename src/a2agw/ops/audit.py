@@ -419,7 +419,12 @@ class AuditLog:
     async def drain(self) -> None:
         """Wait for every submitted event to be written (or to fail)."""
         while self._pending:
-            await asyncio.gather(*list(self._pending), return_exceptions=True)
+            batch = list(self._pending)
+            await asyncio.gather(*batch, return_exceptions=True)
+            # Gathering only finished tasks never yields to the loop, so their done
+            # callbacks (which discard them) may not have run: forget them here, or this
+            # loop would spin forever.
+            self._pending.difference_update(batch)
 
     # -- reading ---------------------------------------------------------------------------
 

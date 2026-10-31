@@ -99,6 +99,9 @@ class _Run:
     pending: Message | None = None
     working_due: bool = False
     cascaded: bool = False  # on_cancel already ran for this run (direct reply or end)
+    # This turn's trace (its ``a2agw.inbound`` span, 32 lowercase hex), once that span has
+    # started: recorded on the index row (the first one is kept) and on task.state events.
+    trace_id: str | None = None
     # Serializes this run's index writes with cancel()'s, so an in-flight write never lands
     # after CANCELED.
     lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
@@ -239,16 +242,31 @@ class AdapterExecutor(AgentExecutor):
             name = TaskState.Name(state)
             u = run.updater
             await self.index.upsert(
-                u.task_id, self.spec.id, run.owner, u.context_id, name, run.origin
+                u.task_id,
+                self.spec.id,
+                run.owner,
+                u.context_id,
+                name,
+                run.origin,
+                trace_id=run.trace_id,
             )
-            self._publish(u.task_id, u.context_id, name)
+            self._publish(u.task_id, u.context_id, name, run.trace_id)
 
-    def _publish(self, task_id: str, context_id: str, state: str) -> None:
+    def _publish(
+        self, task_id: str, context_id: str, state: str, trace_id: str | None = None
+    ) -> None:
+        """A ``task.state`` event; ``trace_id`` is the trace of the turn that made the change
+        (None before its span starts: the admission, a rejection, a cancel with no run)."""
         self.bus.publish(
             GatewayEvent(
                 kind="task.state",
                 agent_id=self.spec.id,
-                data={"task_id": task_id, "context_id": context_id, "state": state},
+                data={
+                    "task_id": task_id,
+                    "context_id": context_id,
+                    "state": state,
+                    "trace_id": trace_id,
+                },
             )
         )
 
@@ -359,6 +377,7 @@ class AdapterExecutor(AgentExecutor):
                     "rejected",
                     reason=f"policy: {decision.reason}",
                     rule=decision.rule,
+                    principal_kind=principal.kind if principal is not None else "anonymous",
                     denied=True,
                 )
                 return
@@ -528,6 +547,9 @@ class AdapterExecutor(AgentExecutor):
             use_inbound_token(inbound_token),
             use_agent(self.spec.id),
         ):
+            span_context = span.get_span_context()
+            if span_context.is_valid:
+                run.trace_id = format(span_context.trace_id, "032x")
             try:
                 try:
                     if run.pending is not None:
@@ -635,7 +657,7 @@ class AdapterExecutor(AgentExecutor):
                 parts=[new_text_part(_clean(text))],
             )
         )
-        self._publish(task_id, updater.context_id, DIRECT_REPLY)
+        self._publish(task_id, updater.context_id, DIRECT_REPLY, run.trace_id)
         # The reply ends the turn: partner work it started would otherwise be orphaned.
         run.cascaded = True
         if self.on_cancel is not None:
@@ -678,7 +700,7 @@ class AdapterExecutor(AgentExecutor):
                 await self.index.set_state(task_id, name)
         else:
             await self.index.set_state(task_id, name)
-        self._publish(task_id, context_id, name)
+        self._publish(task_id, context_id, name, run.trace_id if run is not None else None)
         await TaskUpdater(event_queue, task_id, context_id).update_status(
             TaskState.TASK_STATE_CANCELED,
             metadata=run.usage_metadata() if run is not None else None,

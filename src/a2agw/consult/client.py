@@ -586,8 +586,11 @@ class PartnerClient:
         )
 
     async def _prepare(
-        self, partner_id: str
+        self, partner_id: str, *, disabled_ok: bool = False
     ) -> tuple[PartnerRecord | None, Client | None, ToolResult | None]:
+        """The partner's record and SDK client, or the ``unavailable`` result refusing the
+        call. ``disabled_ok``: a disabled partner is still called (only to cancel the tasks
+        of a partner being removed: see ``cancel``)."""
         try:
             rec = self.registry.get(partner_id)
         except KeyError:
@@ -596,7 +599,7 @@ class PartnerClient:
         # load, reload and every mutation): never build a client for a record breaking it,
         # and name that reason rather than the bare status.
         violation = self.registry.signed_violation(rec)
-        if rec.status != "active":
+        if rec.status != "active" and not (disabled_ok and rec.status == "disabled"):
             reason = violation if rec.status == "quarantined" and violation else None
             return rec, None, self._unavailable(partner_id, rec, reason or f"partner {rec.status}")
         if violation is not None:
@@ -1036,6 +1039,9 @@ class PartnerClient:
                 "reason": decision.reason if decision is not None else result.reason,
                 "rule": decision.rule if decision is not None else None,
                 "tier": (result.provenance or {}).get("tier"),
+                # The kind, as the mount and executor sites report it: no inbound caller is
+                # the gateway itself.
+                "principal_kind": principal.kind if principal is not None else "system",
                 **_grant_detail(),
             },
         )
@@ -1682,10 +1688,24 @@ class PartnerClient:
     ) -> ToolResult:
         return await self._task_call(partner_id, task_id, caller, cancel=True)
 
-    async def _task_call(
-        self, partner_id: str, task_id: str, caller: Principal | None, *, cancel: bool
+    async def cancel_for_removal(
+        self, partner_id: str, task_id: str, *, caller: Principal | None = None
     ) -> ToolResult:
-        rec, client, early = await self._prepare(partner_id)
+        """``cancel``, also when the partner is disabled: a forced removal disables an
+        active partner first (so no new consult starts), then cancels its open tasks
+        through its approved card. Not for agents or tools (they use ``cancel``)."""
+        return await self._task_call(partner_id, task_id, caller, cancel=True, disabled_ok=True)
+
+    async def _task_call(
+        self,
+        partner_id: str,
+        task_id: str,
+        caller: Principal | None,
+        *,
+        cancel: bool,
+        disabled_ok: bool = False,
+    ) -> ToolResult:
+        rec, client, early = await self._prepare(partner_id, disabled_ok=disabled_ok)
         if early is not None:
             return early
         assert rec is not None and client is not None

@@ -27,14 +27,17 @@ from sqlalchemy import (
     delete,
     event,
     func,
+    inspect,
     or_,
     select,
+    text,
     update,
 )
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects import sqlite as sqlite_dialect
 from sqlalchemy.engine import URL, make_url
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
 from a2agw._ddl import retry_ddl
 from a2agw.consult.handles import OUTBOUND_TABLE
@@ -51,7 +54,12 @@ _index_table = Table(
     Column("state", String, nullable=False, index=True),
     Column("updated_at", Float, nullable=False),
     Column("origin", String, nullable=True),
+    # The trace (32 lowercase hex digits) of the first traced turn of the task: its inbound
+    # span (``a2agw.inbound``). None until that span starts, and for untraced tasks.
+    Column("trace_id", String, nullable=True),
 )
+# Index columns added after Phase 3, with their DDL type (ALTER TABLE ... ADD COLUMN).
+_ADDED_COLUMNS = {"trace_id": "VARCHAR"}
 
 INDEX_TABLE = _index_table  # joined by the outbound TTL scoping (consult.handles)
 
@@ -186,6 +194,11 @@ class TaskIndex:
                 await conn.run_sync(_metadata.create_all, checkfirst=True)
                 # The re-entry query joins the outbound handles, so make sure the table exists.
                 await conn.run_sync(OUTBOUND_TABLE.create, checkfirst=True)
+                # Tables made before a column existed gain it (sqlite and postgres alike).
+                columns = await conn.run_sync(_index_columns)
+                for name in _ADDED_COLUMNS:
+                    if name not in columns:
+                        await _add_index_column(conn, name)
 
         await retry_ddl(create)
 
@@ -197,8 +210,11 @@ class TaskIndex:
         context_id: str,
         state: str,
         origin: str | None,
+        *,
+        trace_id: str | None = None,
     ) -> None:
-        """Insert or update a row. ``origin=None`` keeps the row's existing origin."""
+        """Insert or update a row. ``origin=None`` keeps the row's existing origin; a row's
+        ``trace_id`` is the first one recorded for it (later turns keep it)."""
         insert = (
             sqlite_dialect.insert if self._engine.dialect.name == "sqlite" else postgresql.insert
         )
@@ -210,14 +226,24 @@ class TaskIndex:
             "state": state,
             "updated_at": time.time(),
             "origin": origin,
+            "trace_id": trace_id,
         }
         stmt = insert(_index_table).values(**values)
         set_: dict[str, Any] = {k: v for k, v in values.items() if k != "task_id"}
         # origin=None never erases a known origin (e.g. a resumed turn has none of its own).
         set_["origin"] = func.coalesce(stmt.excluded.origin, _index_table.c.origin)
+        set_["trace_id"] = func.coalesce(_index_table.c.trace_id, stmt.excluded.trace_id)
         stmt = stmt.on_conflict_do_update(index_elements=["task_id"], set_=set_)
         async with self._engine.begin() as conn:
             await conn.execute(stmt)
+
+    async def get(self, agent_id: str, task_id: str) -> dict[str, Any] | None:
+        """One row, by agent and task id (one query whether or not it exists)."""
+        t = _index_table
+        stmt = select(t).where(t.c.task_id == task_id, t.c.agent_id == agent_id)
+        async with self._engine.connect() as conn:
+            row = (await conn.execute(stmt)).first()
+        return dict(row._mapping) if row is not None else None
 
     async def list(
         self,
@@ -293,6 +319,24 @@ class TaskIndex:
         """Remove a row (a direct-reply turn that ended without creating a task)."""
         async with self._engine.begin() as conn:
             await conn.execute(delete(_index_table).where(_index_table.c.task_id == task_id))
+
+
+def _index_columns(sync: Any) -> set[str]:
+    return {c["name"] for c in inspect(sync).get_columns(_index_table.name)}
+
+
+async def _add_index_column(conn: AsyncConnection, name: str) -> None:
+    # postgres: IF NOT EXISTS tolerates a concurrent startup doing the same. sqlite has no
+    # such clause: a concurrent startup shows up as a "duplicate column" error.
+    guard = "IF NOT EXISTS " if conn.dialect.name == "postgresql" else ""
+    ddl = _ADDED_COLUMNS[name]
+    try:
+        await conn.execute(text(f"ALTER TABLE {_index_table.name} ADD COLUMN {guard}{name} {ddl}"))
+    except OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
+        if name not in await conn.run_sync(_index_columns):
+            raise
 
 
 class OutboundHandleStore(Protocol):

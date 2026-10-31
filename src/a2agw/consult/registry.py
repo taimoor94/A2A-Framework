@@ -486,6 +486,18 @@ class PartnerRegistry:
         self._changed(rec, "disabled")
         return rec
 
+    def suspend(self, ids: Iterable[str]) -> None:
+        """Disable partners a prepared reload is about to remove, so no new consult starts
+        while their open tasks are cancelled. In memory only: the file already lacks them,
+        nothing is saved, and the registry version is kept, so the prepared plan stays
+        applicable. Listeners see "disabled" (audited ``partner.disable``)."""
+        for id in ids:
+            rec = self._records.get(id)
+            if rec is None or rec.status == "disabled":
+                continue
+            rec.status = "disabled"
+            self._notify(rec, "disabled")
+
     def reject(self, id: str) -> PartnerRecord:
         """Refuse a quarantined card change: the pending card (and its key id) is dropped,
         the approved card is kept, and the partner is disabled (event "rejected"), so it is

@@ -18,6 +18,7 @@ from collections.abc import (
     AsyncIterator,
     Awaitable,
     Callable,
+    Collection,
     Iterable,
     Iterator,
     Mapping,
@@ -1130,6 +1131,11 @@ class AgentHost:
         # while no policy is in force, so a later policy reuses it.
         self.policy = policy
         self._policy_engine: PolicyEngine | None = policy
+        # Who put the current policy state in force ("file", "admin", "control_plane"; None:
+        # never set). ``policy_managed``: the control plane owns the policy, so the admin
+        # API's PUT /policy is refused (set by the control-plane connector).
+        self.policy_source: str | None = "file" if policy is not None else None
+        self.policy_managed = False
         self._authorizers: list[_AgentAuthorizer] = []  # mounted at startup
         # audit=False disables the audit log entirely (no table, no events).
         self.audit_enabled = audit
@@ -1609,6 +1615,7 @@ class AgentHost:
             else:
                 engine.policy = policy
         self.policy = engine
+        self.policy_source = source
         for authorizer in self._authorizers:
             authorizer.policy = engine
         for executor in self.executors.values():
@@ -1645,10 +1652,18 @@ class AgentHost:
             logger.warning("policy routing rules name unknown partner ids: %s", ", ".join(unknown))
 
     async def cancel_partner_tasks(
-        self, partner_ids: list[str], *, actor: str = "system"
+        self,
+        partner_ids: list[str],
+        *,
+        actor: str = "system",
+        disabled_for_removal: Collection[str] = (),
     ) -> tuple[int, int]:
         """Before a forced removal: end and cancel every open outbound task of these
-        partners, best effort, the way the TTL pass does. Each handle is first claimed
+        partners, best effort, the way the TTL pass does. ``disabled_for_removal``: the
+        partners the removal itself just disabled (they were active): their cancels are
+        still sent, through the approved card. A partner that was already disabled or
+        quarantined is not contacted (its tasks are ended here, ``cancel_failed``). Each
+        handle is first claimed
         (``claim_end``: ``TASK_STATE_CANCELED``, ``end_reason`` "partner removed", so later
         partner updates no longer move it), then the partner task is cancelled as the caller
         it was started for, within ``default_deadline_s``. One ``partner.remove`` audit row
@@ -1658,6 +1673,8 @@ class AgentHost:
         if self.handles is None or self.client is None or not partner_ids:
             return 0, 0
         handles = self.handles
+        reach = make_cancel_outbound(self.client, disabled_ok=True)
+        contact = set(disabled_for_removal)
         rows = await handles.open_for_partners(partner_ids)
         gate = asyncio.Semaphore(CANCEL_CONCURRENCY)
         counts = {"cancelled": 0, "errors": 0}
@@ -1676,7 +1693,10 @@ class AgentHost:
                 outcome = "canceled"
                 try:
                     async with asyncio.timeout(self.default_deadline_s):
-                        await self._cancel_outbound(h)
+                        if h["partner_id"] in contact:
+                            await reach(h)  # disabled by this removal: cancel anyway
+                        else:
+                            await self._cancel_outbound(h)
                     counts["cancelled"] += 1
                 except Exception as exc:  # noqa: BLE001 - best effort: the removal goes on
                     outcome = "cancel_failed"
@@ -1708,11 +1728,16 @@ class AgentHost:
         CLI are usable without a restart (``PartnerRegistry.prepare_reload``/``apply_reload``).
 
         Removing a partner that still has non-terminal outbound tasks (handles) would orphan
-        them: that is refused with ``PartnersInUse`` unless ``force``; forced, those tasks
-        are cancelled first (``cancel_partner_tasks``, best effort). The result has the ids
-        per change, ``open_handles`` (the open handles of removed partners, logged when not
-        zero), ``cancelled`` and ``cancel_errors``. ValueError if there is no partners file or it is invalid; ReloadConflict
-        if the registry changed meanwhile. In every failure case the registry is unchanged.
+        them: that is refused with ``PartnersInUse`` unless ``force``; forced, those
+        partners are first disabled (in memory, ``PartnerRegistry.suspend``: no new consult
+        starts), then their tasks are cancelled (``cancel_partner_tasks``, best effort),
+        then the plan is applied. The result has the ids per change, ``open_handles`` (the
+        open handles of removed partners, logged when not zero), ``cancelled`` and
+        ``cancel_errors``. ValueError if there is no partners file or it is invalid;
+        ReloadConflict if the registry changed meanwhile. A refused or invalid reload changes
+        nothing. A forced reload that then hits ReloadConflict has already disabled the
+        removed partners and cancelled their tasks (the registry keeps them, disabled, until
+        a reload succeeds); the plan itself is not applied.
 
         Known window: the open handles are counted while awaiting ``count_open``; a partner
         task started for a removed partner during that await is not counted, so the removal
@@ -1725,8 +1750,14 @@ class AgentHost:
             raise PartnersInUse(open_handles)
         cancelled = cancel_errors = 0
         if open_handles:
-            # Cancelled while the partners are still registered (the client needs them).
-            cancelled, cancel_errors = await self.cancel_partner_tasks(plan.removed, actor=actor)
+            # Disabled first, so no consult starts during the cancels; cancelled while the
+            # partners are still registered (the client needs their records).
+            active = [i for i in plan.removed if self.partners.get(i).status == "active"]
+            with self.partners.acting_as(actor):
+                self.partners.suspend(plan.removed)
+            cancelled, cancel_errors = await self.cancel_partner_tasks(
+                plan.removed, actor=actor, disabled_for_removal=active
+            )
         changes: dict[str, Any] = self.partners.apply_reload(plan)
         if open_handles:
             logger.warning(

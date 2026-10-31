@@ -499,3 +499,106 @@ async def test_handles_have_a_partner_context_index(db_url):
             assert ("partner_id", "context_id") in await conn.run_sync(indexes)
     finally:
         await eng.dispose()
+
+
+# -- trace ids on index rows ------------------------------------------------------------------
+
+
+async def test_trace_id_column_added_to_existing_table(db_url):
+    """A Phase 1-3 index table (no trace_id) gains the column at startup; rows keep the
+    trace id they were first recorded with."""
+    from sqlalchemy import inspect, text
+
+    eng = await create_engine(db_url)
+    try:
+        async with eng.begin() as conn:
+            await conn.execute(
+                text(
+                    "CREATE TABLE a2agw_task_index (task_id VARCHAR PRIMARY KEY, "
+                    "agent_id VARCHAR NOT NULL, owner VARCHAR NOT NULL, "
+                    "context_id VARCHAR NOT NULL, state VARCHAR NOT NULL, "
+                    "updated_at FLOAT NOT NULL, origin VARCHAR)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO a2agw_task_index VALUES "
+                    "('old', 'a1', 'key:x', 'c', 'TASK_STATE_WORKING', 1.0, NULL)"
+                )
+            )
+        idx = TaskIndex(eng)
+        await idx.initialize()
+        await idx.initialize()  # idempotent
+        async with eng.connect() as conn:
+            cols = await conn.run_sync(
+                lambda s: {c["name"] for c in inspect(s).get_columns("a2agw_task_index")}
+            )
+        assert "trace_id" in cols
+        assert (await idx.get("a1", "old"))["trace_id"] is None
+
+        first, second = "a" * 32, "b" * 32
+        await idx.upsert("new", "a1", "key:x", "c", S, None)  # admission: no span yet
+        await idx.upsert("new", "a1", "key:x", "c", W, None, trace_id=first)
+        await idx.upsert("new", "a1", "key:x", "c", IR, None, trace_id=second)  # a later turn
+        await idx.upsert("new", "a1", "key:x", "c", W, None)
+        row = await idx.get("a1", "new")
+        assert (row["state"], row["trace_id"]) == (W, first)
+        assert await idx.get("a2", "new") is None  # scoped to the agent
+        rows, _ = await idx.list("a1")
+        assert {r["task_id"]: r["trace_id"] for r in rows} == {"old": None, "new": first}
+    finally:
+        await eng.dispose()
+
+
+async def test_task_state_event_carries_trace_id(tmp_path, spans):
+    import httpx
+    from a2a.client import ClientConfig, ClientFactory
+    from a2a.types import Message, Part, SendMessageRequest
+    from a2a.types import Role as R
+
+    from a2agw.core.events import Done
+    from a2agw.serve.agent import AgentSpec, SkillSpec
+    from a2agw.serve.host import AgentHost
+
+    class Echo:
+        durable_sessions = False
+
+        async def run(self, ctx):
+            yield Done(text="ok")
+
+    host = AgentHost("http://t", db_url=f"sqlite+aiosqlite:///{tmp_path / 'h.db'}")
+    host.add(
+        AgentSpec(
+            id="alpha",
+            name="Alpha",
+            description="d",
+            skills=[SkillSpec(id="s", name="S", description="d")],
+            adapter=Echo(),
+        )
+    )
+    await host.startup()
+    try:
+        _, sub = host.bus.subscribe_with_replay(0)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=host.app()), base_url="http://t"
+        ) as hc:
+            c = ClientFactory(ClientConfig(httpx_client=hc, streaming=False)).create(
+                host.cards["alpha"]
+            )
+            req = SendMessageRequest(
+                message=Message(message_id="m1", role=R.ROLE_USER, parts=[Part(text="hi")])
+            )
+            events = [ev async for ev in c.send_message(req)]
+        task_id = events[-1].task.id
+        got = []
+        async with sub:
+            while len(got) < 3:
+                got.append(await asyncio.wait_for(sub.__anext__(), 5))
+        (span,) = [s for s in spans.get_finished_spans() if s.name == "a2agw.inbound"]
+        trace_id = format(span.context.trace_id, "032x")
+        states = [(ev.data["state"], ev.data["trace_id"]) for ev in got if ev.kind == "task.state"]
+        # Admission is recorded before the inbound span starts; every change after it has it.
+        assert states == [(S, None), (W, trace_id), ("TASK_STATE_COMPLETED", trace_id)]
+        assert (await host.index.get("alpha", task_id))["trace_id"] == trace_id
+    finally:
+        await host.shutdown()

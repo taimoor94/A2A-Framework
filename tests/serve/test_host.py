@@ -1116,6 +1116,51 @@ async def test_partner_state_and_security_denied_are_published(env):
     assert "key:b" not in text and "secret-b" not in text and "hello" not in text
 
 
+async def test_security_denied_principal_kind_from_the_principal_at_every_site(env):
+    """The executor and egress deny sites name the principal's kind, as the mount does: a
+    principal whose id has no key:/jwt: prefix is not reported as "system"."""
+    from google.protobuf.json_format import MessageToDict
+
+    from a2agw.security.policy import PolicyEngine
+    from a2agw.security.principal import Principal
+
+    e = await env(spec("alpha"), auth=key_auth(b="secret-b"))
+    await e.host.partners.add_from_card("p1", MessageToDict(e.host.cards["alpha"]), "internal")
+    _, sub = e.host.bus.subscribe_with_replay(0)
+    # Executor site: only the executor has the lockdown (the mount lets the call through).
+    e.host.executors["alpha"].policy = PolicyEngine(_policy(LOCKDOWN))
+    client = e.client("alpha", **{"X-API-Key": "secret-b"})
+    events = await send_one(client, msg())
+    assert events[-1].task.status.state == TaskState.TASK_STATE_REJECTED
+    # Egress site: a caller whose id says nothing about its kind.
+    e.host.client.policy = PolicyEngine(
+        _policy(
+            {
+                "version": 1,
+                "egress": {"partner_ceilings": {"p1": "public"}},
+                "defaults": {"unknown_classification": "restricted"},
+            }
+        )
+    )
+    res = await e.host.client.consult(
+        "p1", "hi", caller=Principal(id="svc-7", kind="jwt", scopes=frozenset())
+    )
+    assert res.state == "rejected"
+    got = []
+    async with sub:
+        while len(got) < 2:
+            ev = await asyncio.wait_for(sub.__anext__(), 5)
+            if ev.kind == "security.denied":
+                got.append(ev)
+    assert [(ev.agent_id, ev.data["principal_kind"]) for ev in got] == [
+        ("alpha", "api_key"),
+        ("host", "jwt"),
+    ]
+    for action in ("inbound.reject", "egress.deny"):
+        (row,) = [r for r in await _audit_rows(e.host, action) if r["outcome"] == "rejected"]
+        assert row["detail"]["principal_kind"] in {"api_key", "jwt"}
+
+
 async def test_security_denied_published_with_audit_disabled(env):
     e = await env(spec("alpha"), auth=key_auth(b="secret-b"), audit=False)
     assert e.host.audit is None

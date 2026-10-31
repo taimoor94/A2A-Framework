@@ -91,7 +91,7 @@ ID    TIER      STATUS  HASH          PENDING
 echo  internal  active  da7686314f77
 ```
 
-The host and the CLI share `partners.yaml` safely: each writes only the partner entries it changed, under a lock on `partners.yaml.lock`, replacing the file atomically and durably (fsynced, keeping the file's permissions), and never overwrites an entry another process changed since it read the file (it logs a warning asking for a reload instead). The CLI waits up to 10 s for the lock and then fails with `partners.yaml is locked by another process`; the running gateway waits at most 0.25 s, so it never stalls, and keeps a change it could not write in memory until its next maintenance pass writes it. A running `a2agw serve` picks up the new partner after `curl -X POST -H "X-API-Key: $ADMIN_KEY" -H "X-A2AGW-Admin: 1" localhost:8000/a2agw/admin/partners/reload` (admin scope, the `X-A2AGW-Admin: 1` header is required on every admin POST, audited as `partner.reload`; it re-reads `partners.yaml`; an invalid file is a 400 and changes nothing; removing a partner that still has open outbound tasks is a 409 unless `?force=true`, which first cancels those partner tasks, best effort, and reports `cancelled` and `cancel_errors`), or on its next start. Partners are registered gateway-wide, but an agent only gets them as tools if its code builds them with `host.partner_tools` / `as_langchain_tools` (see below); the echo agent does not. Open `agent.py` and edit the function: it is a normal Python function.
+The host and the CLI share `partners.yaml` safely: each writes only the partner entries it changed, under a lock on `partners.yaml.lock`, replacing the file atomically and durably (fsynced, keeping the file's permissions), and never overwrites an entry another process changed since it read the file (it logs a warning asking for a reload instead). The CLI waits up to 10 s for the lock and then fails with `partners.yaml is locked by another process`; the running gateway waits at most 0.25 s, so it never stalls, and keeps a change it could not write in memory until its next maintenance pass writes it. A running `a2agw serve` picks up the new partner after `curl -X POST -H "X-API-Key: $ADMIN_KEY" -H "X-A2AGW-Admin: 1" localhost:8000/a2agw/admin/partners/reload` (admin scope, the `X-A2AGW-Admin: 1` header is required on every admin POST, audited as `partner.reload`; it re-reads `partners.yaml`; an invalid file is a 400 and changes nothing; removing a partner that still has open outbound tasks is a 409 unless `?force=true`, which first disables those partners (no new consults) and cancels their partner tasks, best effort, and reports `cancelled` and `cancel_errors`; if the registry changed meanwhile the forced reload answers 409 `registry changed during reload` with those tasks already cancelled, so retry it), or on its next start. Partners are registered gateway-wide, but an agent only gets them as tools if its code builds them with `host.partner_tools` / `as_langchain_tools` (see below); the echo agent does not. Open `agent.py` and edit the function: it is a normal Python function.
 
 ```python
 from a2agw.adapters.callable import agent
@@ -682,17 +682,32 @@ setup_telemetry("my-gateway")  # JSON logs plus an OpenTelemetry tracer provider
 
 Or set `telemetry:` in `a2agw.yaml`. Two span names are emitted: `a2agw.inbound` for each inbound task and `a2agw.partner_call` for each outbound call. The trace context travels between agents in the call-context extension (`https://a2agw.dev/ext/call-context/v1`), so one request is one trace across the whole network. Spans carry identifiers and states, never message text or credentials. To export over OTLP, pass your own exporter to `setup_telemetry(exporter=...)`, or set `telemetry.otlp_endpoint` (needs `opentelemetry-exporter-otlp`).
 
-The read-only admin API is mounted on the host:
+The admin API is mounted on the host. Every route but `healthz` needs the `a2agw:admin` scope; every write (POST, PUT, DELETE) also needs the header `X-A2AGW-Admin: 1` and is audited with the admin principal as the actor:
 
 | Endpoint | Returns |
 |---|---|
 | `GET /a2agw/admin/healthz` | Liveness (no auth) |
 | `GET /a2agw/admin/agents` | Hosted agents and their skills |
 | `GET /a2agw/admin/partners` | Partners with tier, status, card hash, breaker state, in-flight calls |
+| `GET /a2agw/admin/partners/{id}` | The full record: approved card, pending card, its hash (`pending_hash`) and the card `diff` (ref names only, never secrets) |
+| `POST /a2agw/admin/partners` | Registers a partner from `{id, card_url \| card, tier, credential_ref?, tls_ref?, tags?}`; 409 for a duplicate id, 422 for a card that is not accepted (fetch, signature, unsafe endpoint) |
+| `POST /a2agw/admin/partners/{id}/approve` | Approves a quarantined card change; body `{"expected_hash"}` (the reviewed `pending_hash`), 409 if the pending card changed since |
+| `POST /a2agw/admin/partners/{id}/reject` \| `disable` \| `enable` \| `refresh` | Rejects the pending card (keeps the approved one, disables the partner), disables, re-enables, or re-fetches the card now (`result`: `unchanged` or `quarantined`) |
+| `DELETE /a2agw/admin/partners/{id}` | Removes a partner; 409 while it has open outbound tasks unless `force=true`, which disables it, cancels those tasks (best effort), then removes it |
+| `GET /a2agw/admin/policy` | `{managed, source, policy}`: the policy in force (null: none) and who set it (`file`, `admin`, `control_plane`) |
+| `PUT /a2agw/admin/policy` | Puts a policy document in force at once; 422 `{"error": "invalid policy", "fields": [...]}` (field paths, never values); 409 while the control plane manages the policy |
 | `GET /a2agw/admin/tasks` | Task index; filters `agent`, `state`, `limit`, `cursor` |
-| `GET /a2agw/admin/events` | Server-sent event stream (`task.state`, `partner.call`) |
-| `POST /a2agw/admin/partners/reload` | Re-reads the partners file; returns the ids added, updated and removed (`force=true` removes partners with open outbound tasks after cancelling those tasks, best effort; the result adds `open_handles`, `cancelled` and `cancel_errors`). Needs `X-A2AGW-Admin: 1` |
-| `POST /a2agw/admin/tasks/reap` | Fails the open tasks of an agent no gateway serves (dry run unless `confirm=true`). Needs `X-A2AGW-Admin: 1` |
+| `GET /a2agw/admin/tasks/{agent}/{task}` | One task: state, owner, `trace_id`, status message, the last 50 messages and 50 artifacts (files by name, MIME type and size only), its partner tasks and the `pending_prompt` of an input-required task |
+| `POST /a2agw/admin/tasks/{agent}/{task}/cancel` | Cancels the task as its owner would (its partner tasks are cancelled too); 409 for a task already ended |
+| `POST /a2agw/admin/tasks/{agent}/{task}/answer` | Answers an input-required task: body `{"text"}` (at most 32 KiB) goes in as the owner's next message, with metadata `a2agw.answered_by` naming the operator; 409 in any other state (auth-required included: an operator never supplies someone else's credentials) |
+| `GET /a2agw/admin/events` | Server-sent event stream (`task.state` with `trace_id`, `partner.call`, `partner.state`, `security.denied`) |
+| `GET /a2agw/admin/audit` | Audit events, newest first; filters `action`, `agent`, `partner`, `since`, `limit`, `cursor` |
+| `GET /a2agw/admin/audit/verify` | Checks the audit hash chain: `{"ok": true}` or the first bad sequence number |
+| `GET /a2agw/admin/push` | Push delivery counters per agent |
+| `POST /a2agw/admin/partners/reload` | Re-reads the partners file; returns the ids added, updated and removed (`force=true` removes partners with open outbound tasks after disabling them and cancelling those tasks, best effort; the result adds `open_handles`, `cancelled` and `cancel_errors`) |
+| `POST /a2agw/admin/tasks/reap` | Fails the open tasks of an agent no gateway serves (dry run unless `confirm=true`) |
+
+The three task routes answer an unknown agent and an unknown task with the same 404 `{"error": "not found"}`, so they never reveal whether a task exists. Task index rows (and `task.state` events) carry the `trace_id` (32 hex digits) of the task's first traced turn, its `a2agw.inbound` span.
 
 ## Configuration
 
