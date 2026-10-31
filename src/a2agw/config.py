@@ -662,7 +662,7 @@ def _external_agent(entry: ExternalAgentConfig, where: str, config_dir: Path) ->
 
 
 def _setup_telemetry(cfg: TelemetryConfig) -> None:
-    from a2agw.ops.telemetry import setup_metrics, setup_telemetry
+    from a2agw.ops.telemetry import setup_telemetry
 
     exporter = None
     if cfg.otlp_endpoint:
@@ -672,8 +672,6 @@ def _setup_telemetry(cfg: TelemetryConfig) -> None:
             raise ConfigError("install opentelemetry-exporter-otlp to use otlp_endpoint") from None
         exporter = OTLPSpanExporter(endpoint=cfg.otlp_endpoint)
     setup_telemetry(cfg.service_name, exporter=exporter)
-    if cfg.metrics:
-        setup_metrics(cfg.service_name)
 
 
 def config_file(config_dir: Path, value: str, where: str) -> Path:

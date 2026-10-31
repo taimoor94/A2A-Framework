@@ -120,6 +120,7 @@ def test_otel_instruments_receive_records():
                 found[metric.name] = metric.data.data_points[0]
     assert found["a2agw.partner.calls"].value == 1
     assert dict(found["a2agw.partner.calls"].attributes) == {"partner_id": "p", "state": "failed"}
+    assert dict(found["a2agw.task.transitions"].attributes)["state"] == "WORKING"
     assert found["a2agw.partner.duration"].sum == 12.5
     assert found["a2agw.task.transitions"].value == 1
 
@@ -269,3 +270,37 @@ def test_telemetry_metrics_config_defaults_true_and_can_be_disabled():
 
     assert TelemetryConfig(service_name="x").metrics is True
     assert TelemetryConfig(service_name="x", metrics=False).metrics is False
+
+
+@pytest.fixture
+def fresh_global_meter():
+    from opentelemetry import metrics
+    from opentelemetry.metrics import _internal
+
+    def reset() -> None:
+        _internal._METER_PROVIDER_SET_ONCE._done = False
+        _internal._METER_PROVIDER = None
+        _internal._PROXY_METER_PROVIDER = _internal._ProxyMeterProvider()
+
+    reset()
+    yield metrics
+    reset()
+
+
+@pytest.mark.parametrize("before", [True, False])
+def test_embedder_meter_provider_receives_records(fresh_global_meter, tmp_path, before):
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    if before:
+        fresh_global_meter.set_meter_provider(provider)
+    host = AgentHost("http://t", db_url=f"sqlite+aiosqlite:///{tmp_path / 'h.db'}")
+    if not before:
+        fresh_global_meter.set_meter_provider(provider)
+    host.metrics.record_partner_call("a", "p", "completed", 3.0)
+    names = {
+        m.name
+        for rm in reader.get_metrics_data().resource_metrics
+        for sm in rm.scope_metrics
+        for m in sm.metrics
+    }
+    assert "a2agw.partner.calls" in names

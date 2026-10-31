@@ -105,7 +105,9 @@ class GatewayMetrics:
 
     def record_task_state(self, agent_id: str, state: str) -> None:
         if self._transitions is not None:
-            self._transitions.add(1, {"agent_id": agent_id, "state": state})
+            self._transitions.add(
+                1, {"agent_id": agent_id, "state": state.removeprefix("TASK_STATE_")}
+            )
 
     def record_hop(self, depth: int) -> None:
         self._hops.append((self._clock(), depth))
