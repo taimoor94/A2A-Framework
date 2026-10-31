@@ -811,6 +811,7 @@ The core never imports a framework; adapters live in `a2agw.adapters.<name>` beh
 
 ## Known limitations
 
+- `a2a-sdk` is pinned to the tested minor (`>=1.2.3,<1.3`) because the gateway overrides two private SDK hooks (`DefaultRequestHandler._setup_active_task` for inbound idempotency, `JSONRPC03Adapter._process_non_streaming_request` for 0.3 error codes); to verify a new minor, run `tests/serve/test_sdk_contract.py` and the TCK (`scripts/run_tck.sh`) against it before raising the pin.
 - Card trust is global: any trusted key (or allowlisted JWKS) may sign any partner's first card. Per-partner expected key ids are planned.
 - A signed call context can be replayed within its lifetime; a `jti` replay cache is planned (Phase 4+).
 - Some negative tests still wait a fixed time ("nothing happened within N ms").
