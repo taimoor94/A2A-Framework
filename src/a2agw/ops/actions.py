@@ -601,11 +601,52 @@ async def answer_task(
     owner's call context, so the task resumes and stays the owner's. The call returns once
     the turn has started (``state`` then). Auth-required and every other state raise
     ``TaskConflict(NOT_WAITING)``: an operator never supplies someone else's credentials.
-    ValueError for bad ``text`` (``check_answer``). Audited ``task.answer``."""
+    ValueError for bad ``text`` (``check_answer``). Audited ``task.answer``.
+
+    One answer per task at a time (per process): the task is held in
+    ``host.answers_in_flight`` from the state check until the send returns, so a second
+    answer meanwhile (a double click) is refused ``NOT_WAITING`` instead of resuming the
+    task twice (neither the SDK nor the executor serializes a second message to an open
+    task)."""
     check_answer(text)
     try:
         row, handler = await _locate(host, agent_id, task_id)
-        ctx = _owner_context(row["owner"])
+    except TaskNotFound:
+        await _task_audit(host, "task.answer", actor, agent_id, task_id, "not_found")
+        raise
+    key = (agent_id, task_id)
+    in_flight: set[tuple[str, str]] = host.answers_in_flight
+    if key in in_flight:
+        await _task_audit(
+            host,
+            "task.answer",
+            actor,
+            agent_id,
+            task_id,
+            "refused",
+            reason=NOT_WAITING,
+            context="answer in progress",
+        )
+        raise TaskConflict(NOT_WAITING)
+    in_flight.add(key)  # no await between the check and this
+    try:
+        return await _answer(host, handler, row, task_id, agent_id, text, actor=actor)
+    finally:
+        in_flight.discard(key)
+
+
+async def _answer(
+    host: AgentHost,
+    handler: Any,
+    row: dict[str, Any],
+    task_id: str,
+    agent_id: str,
+    text: str,
+    *,
+    actor: str,
+) -> dict[str, Any]:
+    ctx = _owner_context(row["owner"])
+    try:
         task = await _get_task(handler, task_id, ctx)
     except TaskNotFound:
         await _task_audit(host, "task.answer", actor, agent_id, task_id, "not_found")

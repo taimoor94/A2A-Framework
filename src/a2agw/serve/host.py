@@ -1136,6 +1136,9 @@ class AgentHost:
         # API's PUT /policy is refused (set by the control-plane connector).
         self.policy_source: str | None = "file" if policy is not None else None
         self.policy_managed = False
+        # (agent id, task id) of operator answers being sent (``actions.answer_task``): a
+        # second answer to the same task meanwhile is refused, never a second resume.
+        self.answers_in_flight: set[tuple[str, str]] = set()
         self._authorizers: list[_AgentAuthorizer] = []  # mounted at startup
         # audit=False disables the audit log entirely (no table, no events).
         self.audit_enabled = audit

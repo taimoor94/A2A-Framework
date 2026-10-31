@@ -127,3 +127,33 @@ async def test_answer_body_checked(env):
         assert r.status_code == 400, body
         assert r.json() == {"error": "bad request", "field": field}
     assert await _state(e.host, task.id) == "TASK_STATE_INPUT_REQUIRED"
+
+
+async def test_concurrent_answers_resume_the_task_once(env):
+    """A double click: two answers at once. One resumes the task, the other is refused."""
+    asker = Asker()
+    e = await env(spec("a", asker), admin_without_auth=True)
+    task = (await e.send("a", "paint the fence"))[-1].task
+    url = f"{A}/tasks/a/{task.id}/answer"
+    r1, r2 = await asyncio.gather(
+        e.hc.post(url, headers=CSRF, json={"text": "blue"}),
+        e.hc.post(url, headers=CSRF, json={"text": "red"}),
+    )
+    assert sorted([r1.status_code, r2.status_code]) == [200, 409]
+    refused = r1 if r1.status_code == 409 else r2
+    assert refused.json() == {"error": "task is not waiting for input"}
+
+    async def done() -> bool:
+        got = await e.client("a").get_task(GetTaskRequest(id=task.id))
+        return got.status.state == TaskState.TASK_STATE_COMPLETED
+
+    await until(done)
+    await asyncio.sleep(0.2)  # a second resume, if any, would have run by now
+    assert [s["metadata"] for s in asker.seen].count({"a2agw.answered_by": "anonymous"}) == 1
+    final = await e.client("a").get_task(GetTaskRequest(id=task.id))
+    answered = [m for m in final.history if MessageToDict(m.metadata).get("a2agw.answered_by")]
+    assert len(answered) == 1
+    await e.host.audit.drain()
+    rows, _ = await e.host.audit.query({"action": "task.answer"})
+    assert sorted(r["outcome"] for r in rows) == ["ok", "refused"]
+    assert e.host.answers_in_flight == set()
