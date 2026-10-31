@@ -221,6 +221,9 @@ openai = [
 postgres = [
     { name = "asyncpg" },
 ]
+vsc = [
+    { name = "claude-agent-sdk" },
+]
 
 [package.dev-dependencies]
 crewai-test = [
@@ -257,6 +260,7 @@ requires-dist = [
     { name = "asyncpg", marker = "extra == 'postgres'", specifier = ">=0.30" },
     { name = "claude-agent-sdk", marker = "extra == 'all'", specifier = ">=0.2.174" },
     { name = "claude-agent-sdk", marker = "extra == 'claude'", specifier = ">=0.2.174" },
+    { name = "claude-agent-sdk", marker = "extra == 'vsc'", specifier = ">=0.2.174" },
     { name = "crewai", marker = "extra == 'crewai'", specifier = ">=1.15" },
     { name = "google-adk", marker = "extra == 'adk'", specifier = ">=2.13" },
     { name = "httpcore", specifier = ">=1.0,<2" },
@@ -280,7 +284,7 @@ requires-dist = [
     { name = "typer" },
     { name = "uvicorn" },
 ]
-provides-extras = ["langchain", "langgraph", "postgres", "mcp", "openai", "claude", "adk", "ag2", "llamaindex", "crewai", "all"]
+provides-extras = ["langchain", "langgraph", "postgres", "mcp", "openai", "claude", "vsc", "adk", "ag2", "llamaindex", "crewai", "all"]
 
 [package.metadata.requires-dev]
 crewai-test = [

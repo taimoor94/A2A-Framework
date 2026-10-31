@@ -59,6 +59,7 @@ from a2agw.security.policy import PolicyEngine, PolicyError, load_policy
 from a2agw.serve.agent import AGENT_ID_PATTERN, AgentSpec, SkillSpec
 from a2agw.serve.host import AgentHost
 from a2agw.serve.push import PushSettings
+from a2agw.vsc.config import VscConfig
 
 logger = logging.getLogger(__name__)
 
@@ -454,6 +455,7 @@ class GatewayConfig(BaseModel):
     audit: bool = True
     server_tls: ServerTlsConfig | None = None
     sidecar: SidecarConfig = Field(default_factory=SidecarConfig)
+    vsc: VscConfig | None = None
 
     @model_validator(mode="after")
     def _refs_exist(self) -> GatewayConfig:
