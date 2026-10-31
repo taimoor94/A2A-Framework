@@ -36,3 +36,19 @@ vsc:
   systems:
     - {id: core, repo: "git@github.com:acme/x.git"}
 """
+
+
+def vsc_config():
+    from a2agw.vsc.config import VscConfig
+
+    return VscConfig.model_validate(
+        {
+            "systems": [
+                {"id": "core", "repo": "./core"},
+                {"id": "node-coder", "repo": "./node-coder"},
+            ],
+            "checks": [
+                {"id": "sidecar", "systems": ["core", "node-coder"], "run": ["make", "sidecar"]}
+            ],
+        }
+    )
