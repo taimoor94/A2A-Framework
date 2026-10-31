@@ -18,6 +18,9 @@ import hashlib
 import os
 import posixpath
 import re
+import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -142,6 +145,20 @@ class WorkspaceManager:
 
         outside = [p for p in paths if not inside(p)]
         return outside
+
+    @asynccontextmanager
+    async def throwaway(self, ws: Workspace) -> AsyncIterator[Path]:
+        """A detached checkout of ``ws.base_ref`` under ``<root>/<job_id>/.tmp/``, removed on exit."""
+        repo = self._repo_of(ws)
+        tmp = self.root / ws.job_id / ".tmp" / uuid.uuid4().hex
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        await _git(repo, "worktree", "add", "--detach", str(tmp), ws.base_ref)
+        try:
+            yield tmp
+        finally:
+            await _git(repo, "worktree", "remove", "--force", str(tmp))
+            if tmp.parent.is_dir() and not any(tmp.parent.iterdir()):
+                tmp.parent.rmdir()
 
     async def commit(self, ws: Workspace, message: str) -> str:
         await _git(ws.path, "add", "-A")

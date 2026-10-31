@@ -185,3 +185,16 @@ async def test_create_recovers_from_partial_create(tmp_path):
     again = await m.create("job1", "core")
     assert again.base_ref == ws.base_ref
     assert again.path == ws.path
+
+
+async def test_throwaway_checks_out_base_and_cleans_up(tmp_path):
+    repo = make_repo(tmp_path, "core", {"a.txt": "a\n"})
+    m = manager(tmp_path, repo)
+    ws = await m.create("job1", "core")
+    (ws.path / "a.txt").write_text("changed\n")
+    async with m.throwaway(ws) as tmp:
+        assert (tmp / "a.txt").read_text() == "a\n"
+        assert tmp.parent == tmp_path / "root" / "job1" / ".tmp"
+        seen = tmp
+    assert not seen.exists()
+    assert str(seen) not in git(repo, "worktree", "list")
