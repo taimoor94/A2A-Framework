@@ -89,6 +89,11 @@ Action = Literal[
     "cp.apply",
     "cp.reject",
     "cp.command",
+    "vsc.job",
+    "vsc.step",
+    "vsc.check",
+    "vsc.approve",
+    "vsc.receipt",
 ]
 ACTIONS: frozenset[str] = frozenset(get_args(Action))
 DETAIL_KEYS = frozenset(
