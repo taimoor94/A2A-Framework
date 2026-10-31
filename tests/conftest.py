@@ -103,12 +103,16 @@ async def env(tmp_path, fast):
             host.add(s)
         # Unless told otherwise, partners are the host's own agents.
         transport.apps.setdefault("t", host.app())
-        e = Env(host, partner_hc)
+        e = Env(host, partner_hc, transport)
         made.append(e)
         await host.startup()
         return e
 
     yield _make
+    # As a server shuts down: stop serving first (requests still running end while their host
+    # is up), then shut the hosts down.
+    for e in made:
+        await e.stop_serving()
     for e in made:
         await e.host.shutdown()
         await e.hc.aclose()

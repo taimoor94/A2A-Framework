@@ -3,6 +3,12 @@
 An app that raises ``ConnectionError`` after it started its response breaks the body stream
 the way a dropped connection does (``httpx.RemoteProtocolError``).
 
+The transport owns the app task of every request, as a server does: a request whose client
+gives up keeps running (its work is not cut short), and ``stop_serving()`` (also run by
+``aclose()``) shuts down like a server does: new requests are refused, the requests still
+running are cancelled and waited for. Shut down this way before the app's own shutdown, or an
+abandoned request outlives the app and keeps using its database after the engine is disposed.
+
 ``streaming_transport(httpx2)`` builds the same transport for ``httpx2`` (the MCP client's
 HTTP library)."""
 
@@ -13,6 +19,16 @@ from types import ModuleType
 from typing import Any
 
 import httpx
+
+
+async def _cancel_and_wait(tasks: set[asyncio.Task]) -> None:
+    """Cancel the tasks and wait until they have finished, cleanups included (SQLAlchemy
+    returns a connection from a shielded task of its own)."""
+    pending = [t for t in tasks if not t.done()]
+    for t in pending:
+        t.cancel()
+    if pending:
+        await asyncio.wait(pending)
 
 
 def streaming_transport(httpx: ModuleType) -> type:
@@ -42,7 +58,7 @@ def streaming_transport(httpx: ModuleType) -> type:
                 try:
                     await asyncio.wait_for(asyncio.shield(self._task), 1.0)
                 except (TimeoutError, Exception):  # noqa: BLE001
-                    self._task.cancel()
+                    await _cancel_and_wait({self._task})
 
     class StreamingASGITransport(httpx.AsyncBaseTransport):
         """Routes by host to ASGI apps; response bodies are streamed chunk by chunk."""
@@ -50,8 +66,20 @@ def streaming_transport(httpx: ModuleType) -> type:
         def __init__(self, apps: dict[str, Any]):
             self.apps = apps
             self.requests: list[tuple[str, str, bytes]] = []  # (host, path, body)
+            self._running: set[asyncio.Task] = set()  # app tasks of requests not yet finished
+            self._serving = True
+
+        async def stop_serving(self) -> None:
+            """Refuse new requests, then cancel the ones still running and wait for them."""
+            self._serving = False
+            await _cancel_and_wait(self._running)
+
+        async def aclose(self) -> None:
+            await self.stop_serving()
 
         async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if not self._serving:
+                raise httpx.ConnectError("connection refused: server stopped", request=request)
             body = b"".join([c async for c in request.stream])  # type: ignore[union-attr]
             self.requests.append((request.url.host, request.url.path, body))
             app = self.apps[request.url.host]
@@ -84,7 +112,8 @@ def streaming_transport(httpx: ModuleType) -> type:
 
             async def send(message):
                 if message["type"] == "http.response.start":
-                    started.set_result(message)
+                    if not started.done():  # not when the client already gave up
+                        started.set_result(message)
                 elif message["type"] == "http.response.body":
                     if disconnected.is_set():
                         return  # the client is gone: dropped, as uvicorn does
@@ -103,8 +132,19 @@ def streaming_transport(httpx: ModuleType) -> type:
                 finally:
                     queue.put_nowait(None)
 
-            task = asyncio.create_task(run())
-            start = await started
+            task = asyncio.create_task(
+                run(), name=f"asgi {request.method} {request.url.host}{request.url.path}"
+            )
+            self._running.add(task)
+            task.add_done_callback(self._running.discard)
+            try:
+                start = await started
+            except BaseException:
+                # The client gave up before the response started (e.g. its timeout): the
+                # request carries on, as on a real server, until it ends or stop_serving().
+                disconnected.set()
+                started.cancel()
+                raise
             return httpx.Response(
                 start["status"],
                 headers=start.get("headers", []),

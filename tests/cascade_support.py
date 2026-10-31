@@ -43,12 +43,24 @@ def msg(text: str) -> Message:
 
 
 class Env:
-    def __init__(self, host: AgentHost, partner_hc: httpx.AsyncClient):
+    def __init__(
+        self,
+        host: AgentHost,
+        partner_hc: httpx.AsyncClient,
+        partner_transport: StreamingASGITransport | None = None,
+    ):
         self.host = host
         self.partner_hc = partner_hc  # the host's outbound client
-        self.hc = httpx.AsyncClient(  # inbound callers of this host
-            transport=StreamingASGITransport({"t": host.app()}), base_url="http://t"
-        )
+        self._inbound = StreamingASGITransport({"t": host.app()})
+        self._transports = [self._inbound] + ([partner_transport] if partner_transport else [])
+        self.hc = httpx.AsyncClient(transport=self._inbound, base_url="http://t")  # callers
+
+    async def stop_serving(self) -> None:
+        """Like a server shutting down: refuse new requests and end the ones still running
+        (a request whose client gave up may still be running). Run before the host's own
+        shutdown, so no request outlives its engine."""
+        for t in self._transports:
+            await t.stop_serving()
 
     def client(self, agent_id: str, *, streaming: bool = False):
         card = self.host.cards[agent_id]
