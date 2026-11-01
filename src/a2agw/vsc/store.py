@@ -186,6 +186,10 @@ class VscStore:
             cost=_jobs.c.cost + cost,
         )
 
+    async def add_attempt(self, job_id: str) -> None:
+        """Count one more worker attempt against the job."""
+        await self._update_job(job_id, attempts=_jobs.c.attempts + 1)
+
     async def list_jobs(
         self, *, state: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]:
@@ -302,6 +306,14 @@ class VscStore:
             .where(t.job_id == job_id)
             .order_by(t.seq, t.step_id)
         )
+        async with self._engine.connect() as conn:
+            return [dict(r._mapping) for r in (await conn.execute(stmt)).all()]
+
+    async def attempts(self, job_id: str) -> list[dict[str, Any]]:
+        """Every attempt row of every step (attempt 0 is the planned placeholder), in plan
+        order, then attempt order."""
+        t = _steps.c
+        stmt = select(_steps).where(t.job_id == job_id).order_by(t.seq, t.step_id, t.attempt)
         async with self._engine.connect() as conn:
             return [dict(r._mapping) for r in (await conn.execute(stmt)).all()]
 

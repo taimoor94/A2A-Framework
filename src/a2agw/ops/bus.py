@@ -27,7 +27,8 @@ from typing import Any, Literal, Self
 # - partner.state: {partner_id, status, event} (AgentHost, on every registry change)
 # - security.denied: {reason, rule?, principal_kind} (AgentHost, on every audited
 #   authz.deny / egress.deny / sidecar.denied); never a principal id.
-EventKind = Literal["task.state", "partner.call", "partner.state", "security.denied"]
+# - vsc.job: {job_id, state, reason} (a2agw.vsc JobRunner, on every job state change)
+EventKind = Literal["task.state", "partner.call", "partner.state", "security.denied", "vsc.job"]
 
 # Pushed into a subscriber's queue on close so a pending __anext__ wakes up.
 _CLOSED = object()

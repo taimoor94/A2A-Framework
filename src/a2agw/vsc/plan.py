@@ -5,6 +5,7 @@ log, so both are deliberately excluded from it."""
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from typing import Literal
 
@@ -121,6 +122,19 @@ def plan_hash(plan: Plan) -> str:
     but never change the steps."""
     payload = {"steps": [{k: getattr(s, k) for k in _STRUCTURAL} for s in plan.steps]}
     return hashlib.sha256(canonical_json(payload).encode()).hexdigest()
+
+
+def load_plan(plan_json: str) -> Plan:
+    """A plan as the job runner stores it. A logged replan decision carries no plan (its plan
+    replaced the stored one), so it is rebuilt without the replan-needs-a-plan validation."""
+    data = json.loads(plan_json)
+    decisions = data.pop("decisions", [])
+    plan = Plan.model_validate(data)
+    plan.decisions = [
+        Decision.model_construct(**d) if d.get("kind") == "replan" else Decision.model_validate(d)
+        for d in decisions
+    ]
+    return plan
 
 
 def validate_plan(plan: Plan, spec: ExecutableSpec) -> None:

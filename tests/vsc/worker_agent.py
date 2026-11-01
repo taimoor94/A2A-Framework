@@ -6,7 +6,8 @@ ends with a line ``---FILES---`` and one JSON object ``{"files": {relative_path:
 Modes: ``apply`` writes the files and answers ``done``; ``fail`` answers ``failed``;
 ``inject`` is ``apply`` plus a text event carrying an injected instruction; ``usage`` is
 ``apply`` plus a usage event; ``noop`` answers ``done`` without writing; ``hang`` sends one
-``status`` event and never answers; ``crash`` exits with code 3 mid-turn.
+``status`` event and never answers; ``crash`` exits with code 3 mid-turn; ``hang_marked`` is
+``hang`` when the invoke text contains ``HANG`` and ``apply`` otherwise.
 """
 
 import json
@@ -32,7 +33,7 @@ def apply_files(text):
 
 
 def answer(rid, req):
-    if MODE == "hang":
+    if MODE == "hang" or (MODE == "hang_marked" and "HANG" in req["text"]):
         emit(rid, {"type": "status", "text": "working"})
         while True:
             time.sleep(60)

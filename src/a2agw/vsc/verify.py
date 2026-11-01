@@ -40,6 +40,7 @@ CheckKind = Literal[
     "path_confinement",
     "whole_system",
     "review",
+    "worker",  # the worker itself failed (crash, timeout, gave up); no check ran
 ]
 
 MAX_OUTPUT_BYTES = 4 * 1024 * 1024

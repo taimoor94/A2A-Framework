@@ -94,6 +94,9 @@ class WorkspaceManager:
         repo = self._repos[system_id]
         return repo, self._ids[repo]
 
+    def repo_id(self, system_id: str) -> str:
+        return self._repo_for(system_id)[1]
+
     async def create(self, job_id: str, system_id: str) -> Workspace:
         repo, repo_id = self._repo_for(system_id)
         branch = f"vsc/{job_id}/{repo_id}"
@@ -170,6 +173,15 @@ class WorkspaceManager:
         )  # fmt: skip
         return await _git(ws.path, "rev-parse", "HEAD")
 
+    async def head(self, ws: Workspace) -> str:
+        return await _git(ws.path, "rev-parse", "HEAD")
+
+    async def reset(self, ws: Workspace, ref: str) -> None:
+        """Drop every uncommitted change in the workspace and move its branch to ``ref``
+        (ignored files are kept)."""
+        await _git(ws.path, "reset", "--hard", ref)
+        await _git(ws.path, "clean", "-fd")
+
     async def merge_ff(self, ws: Workspace, target_branch: str) -> str:
         """Fast-forward ``target_branch`` in the main repository to the workspace branch."""
         repo = self._repo_of(ws)
@@ -190,10 +202,13 @@ class WorkspaceManager:
                 return repo
         raise KeyError(ws.repo_id)
 
-    async def discard(self, job_id: str) -> None:
-        for repo, repo_id in self._ids.items():
-            path = self.root / job_id / repo_id
-            branch = f"vsc/{job_id}/{repo_id}"
+    async def discard(self, job_id: str, repo_id: str | None = None) -> None:
+        """Remove the job's worktrees and branches (only ``repo_id``'s when given)."""
+        for repo, rid in self._ids.items():
+            if repo_id is not None and rid != repo_id:
+                continue
+            path = self.root / job_id / rid
+            branch = f"vsc/{job_id}/{rid}"
             if path.exists():
                 await _git(repo, "worktree", "remove", "--force", str(path))
             if await _git(repo, "branch", "--list", branch):
