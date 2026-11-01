@@ -72,6 +72,16 @@ _jobs = Table(
     # The A2A context the job was submitted in (the ``deliver`` agent's), if any: one job per
     # (context, owner) (``_CONTEXT_INDEX``).
     Column("context_id", String, nullable=True),
+    # JSON {repo id: commit}: each repository's base (its default branch when the job's
+    # workspace was created) and the heads the whole-system checks passed on (a merge is bound
+    # to these).
+    Column("base_refs_json", Text, nullable=True),
+    Column("verified_heads_json", Text, nullable=True),
+    # JSON list of every A2A ``deliver`` task id that drove the job (``set_task``), in order.
+    Column("task_ids_json", Text, nullable=True),
+    # JSON list of the job-level check results (fail-on-base reproductions, whole-system
+    # checks): kind, id, command, exit code, log hash, ... and the ``audit_seq`` of its row.
+    Column("checks_json", Text, nullable=True),
 )
 _CONTEXT_INDEX = Index("ux_vsc_jobs_context_owner", _jobs.c.context_id, _jobs.c.owner, unique=True)
 _steps = Table(
@@ -107,6 +117,10 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "active_s": "FLOAT NOT NULL DEFAULT 0",
         "whole_passed": "INTEGER NOT NULL DEFAULT 0",
         "context_id": "VARCHAR",
+        "base_refs_json": "TEXT",
+        "verified_heads_json": "TEXT",
+        "task_ids_json": "TEXT",
+        "checks_json": "TEXT",
     },
 }
 
@@ -194,6 +208,13 @@ class VscStore:
             row = (await conn.execute(stmt)).first()
         return dict(row._mapping) if row is not None else None
 
+    async def job_for_task(self, task_id: str) -> dict[str, Any] | None:
+        """The job the A2A task ``task_id`` currently follows (``current_task_id``), if any."""
+        stmt = select(_jobs).where(_jobs.c.current_task_id == task_id)
+        async with self._engine.connect() as conn:
+            row = (await conn.execute(stmt)).first()
+        return dict(row._mapping) if row is not None else None
+
     async def set_state(
         self, job_id: str, state: JobState, *, reason: str | None = None, active_s: float = 0.0
     ) -> None:
@@ -217,7 +238,34 @@ class VscStore:
         )
 
     async def set_task(self, job_id: str, task_id: str | None) -> None:
-        await self._update_job(job_id, current_task_id=task_id)
+        """The A2A task now following the job; every task id is also kept (``task_ids_json``)."""
+        job = await self.get_job(job_id)
+        ids = json.loads(job["task_ids_json"]) if job and job["task_ids_json"] else []
+        if task_id is not None and task_id not in ids:
+            ids.append(task_id)
+        await self._update_job(job_id, current_task_id=task_id, task_ids_json=json.dumps(ids))
+
+    async def set_base_ref(self, job_id: str, repo_id: str, commit: str) -> None:
+        """Record a repository's base (kept once set)."""
+        job = await self.get_job(job_id)
+        refs = json.loads(job["base_refs_json"]) if job and job["base_refs_json"] else {}
+        if repo_id not in refs:
+            refs[repo_id] = commit
+            await self._update_job(job_id, base_refs_json=json.dumps(refs, sort_keys=True))
+
+    async def add_check(self, job_id: str, entry: dict[str, Any]) -> None:
+        """Append one job-level check result (``checks_json``)."""
+        job = await self.get_job(job_id)
+        items = json.loads(job["checks_json"]) if job and job["checks_json"] else []
+        items.append(entry)
+        await self._update_job(job_id, checks_json=json.dumps(items, sort_keys=True))
+
+    async def set_verified_heads(self, job_id: str, heads: dict[str, str] | None) -> None:
+        """The heads (repo id -> commit) every whole-system check passed on; None clears."""
+        await self._update_job(
+            job_id,
+            verified_heads_json=json.dumps(heads, sort_keys=True) if heads is not None else None,
+        )
 
     async def add_usage(self, job_id: str, tokens_in: int, tokens_out: int, cost: float) -> None:
         await self._update_job(

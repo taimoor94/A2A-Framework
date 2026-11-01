@@ -124,10 +124,10 @@ async def _build(store: VscStore, audit: AuditLog, job_id: str) -> dict[str, Any
     approvals: list[dict[str, Any]] = [
         {
             "step": r["detail"].get("step"),
-            "outcome": r["outcome"],
+            "outcome": "approved" if r["outcome"] == "auto" else r["outcome"],
             "actor": r["actor"],
             "note": r["detail"].get("note", ""),
-            "auto": False,
+            "auto": r["outcome"] == "auto",
             "audit_seq": r["seq"],
         }
         for r in rows
@@ -137,9 +137,6 @@ async def _build(store: VscStore, audit: AuditLog, job_id: str) -> dict[str, Any
         if a["attempt"] <= 0:
             continue
         result, usage = _loads(a["result_json"]), _loads(a["usage_json"])
-        approval = result.get("approval")
-        if isinstance(approval, dict) and approval.get("auto"):
-            approvals.append({"step": a["step_id"], **approval, "outcome": "approved"})
         checks = [
             {**c, "audit_seq": _find_seq(rows, "vsc.check", a["step_id"], a["attempt"], None)}
             if isinstance(c, dict)
@@ -160,8 +157,17 @@ async def _build(store: VscStore, audit: AuditLog, job_id: str) -> dict[str, Any
                 "checks": checks,
                 "diff_sha256": result.get("diff_sha256"),
                 "commit": result.get("commit"),
+                "base": result.get("base"),
+                "touched_tests": result.get("touched_tests", []),
+                "interrupted": result == {"reason": "interrupted"},
+                **{
+                    k: result[k]
+                    for k in ("target_branch", "verified_head", "head", "executed", "reason")
+                    if k in result
+                },
             }
         )
+    job_checks = [c for c in json.loads(job["checks_json"] or "[]") if isinstance(c, dict)]
     receipt: dict[str, Any] = {
         "version": VERSION,
         "job_id": job_id,
@@ -170,13 +176,21 @@ async def _build(store: VscStore, audit: AuditLog, job_id: str) -> dict[str, Any
         "spec_hash": job["spec_hash"],
         "plan": _loads(job["plan_json"]),
         "plan_hash": job["plan_hash"],
-        "tasks": sorted({r["task_id"] for r in rows if r["action"] == "vsc.job"}),
-        "steps": steps,
-        "whole_checks": [
-            {"outcome": r["outcome"], "audit_seq": r["seq"]}
+        "tasks": json.loads(job["task_ids_json"] or "[]"),
+        "planner": [
+            {
+                **{k: (r["detail"] or {}).get(k) for k in ("task_id", "tokens_in", "tokens_out")},
+                "cost": (r["detail"] or {}).get("cost"),
+                "audit_seq": r["seq"],
+            }
             for r in rows
-            if r["action"] == "vsc.check" and "step" not in (r["detail"] or {})
+            if r["action"] == "vsc.planner"
         ],
+        "base_refs": json.loads(job["base_refs_json"] or "{}"),
+        "verified_heads": json.loads(job["verified_heads_json"] or "null"),
+        "steps": steps,
+        "reproductions": [c for c in job_checks if c.get("check") == "reproduction_before"],
+        "whole_checks": [c for c in job_checks if c.get("check") == "whole_system"],
         "approvals": approvals,
         "usage": {
             "tokens_in": job["tokens_in"],
@@ -261,7 +275,7 @@ def _audit_problems(receipt: dict[str, Any]) -> list[str]:
 
 def _cited(receipt: dict[str, Any]) -> list[Any]:
     cited: list[Any] = []
-    for key in ("steps", "approvals", "whole_checks"):
+    for key in ("steps", "approvals", "whole_checks", "reproductions", "planner"):
         items = receipt.get(key)
         for item in items if isinstance(items, list) else []:
             if not isinstance(item, dict):
@@ -274,6 +288,32 @@ def _cited(receipt: dict[str, Any]) -> list[Any]:
     return [c for c in cited if c is not None]
 
 
+def _is_seq(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _uncited(receipt: dict[str, Any]) -> list[str]:
+    """Every worker attempt (an edit step attempt that was not interrupted) and every
+    non-auto approval must cite its audit row."""
+    problems: list[str] = []
+    steps = receipt.get("steps")
+    for item in steps if isinstance(steps, list) else []:
+        if (
+            isinstance(item, dict)
+            and item.get("kind") == "edit"
+            and not item.get("interrupted")
+            and not _is_seq(item.get("audit_seq"))
+        ):
+            problems.append(
+                f"audit: worker attempt {item.get('step_id')}/{item.get('attempt')} cites no row"
+            )
+    approvals = receipt.get("approvals")
+    for item in approvals if isinstance(approvals, list) else []:
+        if isinstance(item, dict) and not item.get("auto") and not _is_seq(item.get("audit_seq")):
+            problems.append(f"audit: approval of {item.get('step')} cites no row")
+    return problems
+
+
 def _completeness_problems(receipt: dict[str, Any], rows: list[Any]) -> list[str]:
     audit = receipt["audit"]
     job_id = receipt.get("job_id")
@@ -284,8 +324,14 @@ def _completeness_problems(receipt: dict[str, Any], rows: list[Any]) -> list[str
     if not isinstance(seqs, list):
         return ["audit: job_seqs missing"]
     problems: list[str] = []
+    cited = _cited(receipt)
+    bad = [x for x in [*seqs, *cited] if not _is_seq(x)]
+    if bad:
+        problems.append(f"audit: {len(bad)} job_seqs/audit_seq entries are not integers")
+    problems += _uncited(receipt)
+    seqs = [x for x in seqs if _is_seq(x)]
     listed = set(seqs)
-    for seq in sorted({*seqs, *_cited(receipt)}, key=repr):
+    for seq in sorted({*seqs, *(c for c in cited if _is_seq(c))}):
         row = full.get(seq)
         if row is None:
             problems.append(f"audit: job row {seq} is missing or a stub")

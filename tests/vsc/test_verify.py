@@ -6,7 +6,9 @@ from a2agw.vsc.config import BudgetConfig, CheckConfig, SystemConfig
 from a2agw.vsc.spec import AcceptanceTest, Contract, ExecutableSpec
 from a2agw.vsc.verify import (
     all_passed,
+    executable_checks,
     reproduction_before,
+    reproduction_before_whole,
     run_check,
     verify_step,
     verify_whole,
@@ -122,7 +124,75 @@ async def test_verify_step_order(tmp_path):
         "contract",
     ]
     assert all_passed(results)
-    assert (ws.path / "acc.txt").read_text() == "1"
+    assert not (ws.path / "acc.txt").exists()  # written in the throwaway checkout only
+
+
+async def test_verify_step_runs_in_a_throwaway_checkout_of_the_candidate(tmp_path):
+    """Ignored files the worker left in its tree never reach the checks; untracked ones do
+    (they are part of the candidate)."""
+    repo = make_repo(tmp_path, "core", {".gitignore": "cache/\n", "a.txt": "a\n"})
+    probe = py(
+        "import os, sys; sys.exit(0 if os.path.exists('new.txt') "
+        "and not os.path.exists('cache/poison') and os.getcwd() != sys.argv[1] else 1)"
+    )
+    system = SystemConfig(id="core", repo=str(repo), tests=probe)
+    m = WorkspaceManager(tmp_path / "root", [system], tmp_path)
+    ws = await m.create("job1", "core")
+    system = system.model_copy(update={"tests": [*probe, str(ws.path.resolve())]})
+    (ws.path / "new.txt").write_text("n\n")
+    (ws.path / "cache").mkdir()
+    (ws.path / "cache" / "poison").write_text("x")
+    results = await verify_step(ws, system, spec_for(), manager=m, timeout_s=30)
+    assert all_passed(results), results
+
+
+async def test_verify_step_without_any_executed_check_fails(tmp_path):
+    m, ws, system = await _setup(tmp_path)  # no gate, no tests, no acceptance test
+    results = await verify_step(ws, system, spec_for(), manager=m, timeout_s=10)
+    assert not all_passed(results)
+    assert (results[-1].kind, results[-1].reason) == ("regression", "no checks")
+    covered = await verify_step(ws, system, spec_for(), manager=m, timeout_s=10, whole_covered=True)
+    assert all_passed(covered)
+
+
+def test_executable_checks():
+    bare = SystemConfig(id="core", repo="./core")
+    assert not executable_checks(bare, spec_for())
+    assert executable_checks(bare.model_copy(update={"gate": py("pass")}), spec_for())
+    assert executable_checks(bare.model_copy(update={"tests": py("pass")}), spec_for())
+    with_run = spec_for(acceptance=[AcceptanceTest(id="a", system="core", run=py("pass"))])
+    assert executable_checks(bare, with_run)
+    no_run = spec_for(acceptance=[AcceptanceTest(id="a", system="core")])
+    assert not executable_checks(bare, no_run)
+    whole = spec_for(acceptance=[AcceptanceTest(id="w", check="c")])
+    check = CheckConfig(id="c", systems=["core", "other"], run=py("pass"))
+    assert not executable_checks(bare, whole)
+    assert executable_checks(bare, whole, [check])  # covered in the whole-system phase
+
+
+async def test_reproduction_before_whole_requires_failure_on_base(tmp_path):
+    _m, _ws, system = await _setup(tmp_path)
+    repo2 = make_repo(tmp_path, "node-coder", {"b.txt": "b\n"})
+    s2 = SystemConfig(id="node-coder", repo=str(repo2))
+    m = WorkspaceManager(tmp_path / "root", [system, s2], tmp_path)
+    wss = {"core": await m.create("job1", "core"), "node-coder": await m.create("job1", "node-coder")}
+    present = py(
+        "import os, sys; sys.exit(0 if os.path.exists(os.path.join(os.environ['VSC_WS_CORE'], "
+        "'w.txt')) and os.path.exists(os.path.join(os.environ['VSC_WS_CORE'], 'a.txt')) else 1)"
+    )
+    needs_change = py(
+        "import os, sys; sys.exit(0 if os.path.exists(os.path.join(os.environ['VSC_WS_CORE'], "
+        "'changed.txt')) else 1)"
+    )
+    test = AcceptanceTest(id="w", check="c", files={"core/w.txt": "x"})
+    passes = CheckConfig(id="c", systems=["core", "node-coder"], run=present)
+    r = await reproduction_before_whole(m, passes, wss, [test], timeout_s=30)
+    assert r is not None and not r.passed and r.reason == "passed on base"
+    fails = CheckConfig(id="c", systems=["core", "node-coder"], run=needs_change)
+    r = await reproduction_before_whole(m, fails, wss, [test], timeout_s=30)
+    assert r is not None and r.passed and r.kind == "reproduction_before"
+    assert not (wss["core"].path / "w.txt").exists()  # never in the job's workspace
+    assert await reproduction_before_whole(m, fails, wss, [], timeout_s=30) is None
 
 
 async def test_verify_step_no_gate_and_stops_on_first_failure(tmp_path):

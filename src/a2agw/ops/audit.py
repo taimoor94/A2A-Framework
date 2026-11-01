@@ -94,6 +94,7 @@ Action = Literal[
     "vsc.check",
     "vsc.approve",
     "vsc.receipt",
+    "vsc.planner",
 ]
 ACTIONS: frozenset[str] = frozenset(get_args(Action))
 DETAIL_KEYS = frozenset(
@@ -125,6 +126,14 @@ DETAIL_KEYS = frozenset(
         "usage_reported",  # vsc.step: whether the worker reported usage at all
         "receipt_hash",  # vsc.receipt: sha256 of the receipt bundle
         "spec_hash",  # vsc.job spec_edited: sha256 of the specification set by hand
+        "check",  # vsc.check: which check ("whole_system", "reproduction_before")
+        "check_id",  # vsc.check: the check's or acceptance test's id
+        "exit_code",  # vsc.check: the check command's exit code
+        "log_sha256",  # vsc.check: sha256 of the check's captured output, never the output
+        "task_id",  # vsc.planner: the planner turn's A2A task id
+        "kind",  # vsc.approve: the privileged step's kind
+        "target_branch",  # vsc.approve / vsc.step: a merge step's target branch
+        "head",  # vsc.step merge: the commit the target was moved to
     }
 )
 # PartnerRegistry change events -> audit actions (``registry_audit_action``).

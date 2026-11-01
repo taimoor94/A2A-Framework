@@ -56,3 +56,40 @@ def test_whole_system_acceptance_needs_check_id():
         AcceptanceTest(id="a", system=None)
     with pytest.raises(ValidationError):
         AcceptanceTest(id="a", system="core", check="sidecar")
+
+
+
+def test_validate_against_fails_closed():
+    from a2agw.vsc.config import CheckConfig, SystemConfig, VscConfig
+
+    cfg = VscConfig(
+        systems=[
+            SystemConfig(id="a", repo="./a"),
+            SystemConfig(id="b", repo="./b"),
+            SystemConfig(id="c", repo="./c"),
+        ],
+        checks=[CheckConfig(id="ab", systems=["a", "b"], run=["true"])],
+    )
+
+    def spec(systems, acceptance=()):
+        return ExecutableSpec(
+            request="r",
+            done="d",
+            systems=systems,
+            acceptance=list(acceptance),
+            budgets=BudgetConfig(),
+        )
+
+    validate_against(spec(["a"]), cfg)
+    validate_against(spec(["a", "b"]), cfg)
+    with pytest.raises(ValueError, match="no whole-system check covers system"):
+        validate_against(spec(["a", "c"]), cfg)
+    with pytest.raises(ValueError, match="not in the spec"):
+        validate_against(spec(["a"], [AcceptanceTest(id="t", system="b")]), cfg)
+    with pytest.raises(ValueError, match="duplicate acceptance test id"):
+        validate_against(
+            spec(["a"], [AcceptanceTest(id="t", system="a"), AcceptanceTest(id="t", system="a")]),
+            cfg,
+        )
+    with pytest.raises(ValueError, match="none of the spec's systems"):
+        validate_against(spec(["c"], [AcceptanceTest(id="w", check="ab")]), cfg)

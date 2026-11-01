@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import stat
+import sys
 
 import pytest
 
@@ -50,11 +51,13 @@ async def test_receipt_hash_covers_everything(built):
     attempts = [s for s in receipt["steps"]]
     assert [(s["step_id"], s["attempt"]) for s in attempts] == [("edit-alpha", 1), ("edit-beta", 1)]
     assert all(len(s["diff_sha256"]) == 64 and s["checks"] for s in attempts)
-    assert receipt["audit"]["rows"] and receipt["tasks"] == [job_id]
-    # whole-system results come from the audit rows
-    assert any(
-        r["action"] == "vsc.check" and "step" not in r["detail"] for r in receipt["audit"]["rows"]
-    )
+    assert receipt["audit"]["rows"] and receipt["tasks"] == []  # no A2A task drove it
+    # whole-system results: the command, exit code and log hash, citing their audit row
+    (whole,) = receipt["whole_checks"]
+    assert whole["exit_code"] == 0 and whole["command"] and len(whole["log_sha256"]) == 64
+    assert isinstance(whole["audit_seq"], int)
+    assert set(receipt["base_refs"]) == set(receipt["verified_heads"]) == {"repo-a", "repo-b"}
+    assert receipt["verified_heads"]["repo-a"] == receipt["steps"][0]["commit"]
     for key in ("spec", "plan", "usage", "approvals", "created_at", "audit"):
         tampered = copy.deepcopy(receipt)
         tampered[key] = "x" if key != "audit" else {**tampered[key], "last_seq": 10**6}
@@ -124,7 +127,7 @@ async def test_export_mode_0600(built, tmp_path):
 
 
 async def _two_jobs(env):
-    cfg = two_repo_cfg(env.tmp)
+    cfg = two_repo_cfg(env.tmp, run=[sys.executable, "-c", "pass"])
     r1 = env.runner(cfg, FixedPlanner([edit("alpha")]), [worker("apply")])
     r2 = env.runner(cfg, FixedPlanner([edit("beta")]), [worker("apply")])
     j1 = await r1.submit("greet alpha systems: alpha", owner="key:a")
@@ -222,3 +225,62 @@ async def test_hidden_extra_job_row_is_rejected(built):
     forged["audit"]["job_seqs"].pop()
     forged["audit"]["job_rows"] -= 1
     assert any("job_seqs" in p for p in verify_receipt(_reseal(forged)))
+
+
+async def test_receipt_lists_tasks_planner_turns_and_auto_approvals(env):
+    from a2agw.vsc.config import AutoApprove
+    from a2agw.vsc.plan import PlanStep
+
+    cfg = two_repo_cfg(env.tmp).model_copy(
+        update={
+            "auto_approve": [AutoApprove(system="alpha", action="merge", target_branch="main")]
+        }
+    )
+
+    class TurnPlanner(FixedPlanner):
+        def turns(self):
+            turn = {"task_id": "planner-task-1", "tokens_in": 3, "tokens_out": 4, "cost": 0.5}
+            return [turn] * self.intakes
+
+    merge = PlanStep(
+        id="merge-alpha",
+        system="alpha",
+        kind="merge",
+        target_branch="main",
+        depends_on=["edit-alpha"],
+        instructions="m",
+    )
+    runner = env.runner(cfg, TurnPlanner([edit("alpha"), edit("beta"), merge]), [worker("apply")])
+    job_id = await runner.submit("greet  systems: alpha, beta", owner="key:a")
+    await env.store.set_task(job_id, "task-1")
+    await env.store.set_task(job_id, "task-2")
+    job = await runner.run(job_id)
+    assert job["state"] == "accepted", job
+    receipt = await build_receipt(env.store, env.audit, job_id)
+    assert verify_receipt(receipt) == []
+    assert receipt["tasks"] == ["task-1", "task-2"]
+    (turn,) = receipt["planner"]
+    assert turn["task_id"] == "planner-task-1" and turn["tokens_out"] == 4
+    assert isinstance(turn["audit_seq"], int)
+    assert receipt["spec"]["request"] == "greet  systems: alpha, beta"
+    (auto,) = receipt["approvals"]
+    assert (auto["actor"], auto["auto"], auto["outcome"]) == ("policy", True, "approved")
+    assert isinstance(auto["audit_seq"], int)
+    merged = next(s for s in receipt["steps"] if s["step_id"] == "merge-alpha")
+    assert merged["verified_head"] == merged["head"] == receipt["verified_heads"]["repo-a"]
+    assert merged["target_branch"] == "main"
+
+
+async def test_verify_receipt_survives_unhashable_and_missing_seqs(built):
+    _, _, receipt = built
+    weird = copy.deepcopy(receipt)
+    weird["audit"]["job_seqs"].append({"x": 1})
+    weird["steps"][0]["audit_seq"] = [1]
+    problems = verify_receipt(_reseal(weird))  # no TypeError
+    assert any("not integers" in p for p in problems)
+    missing = copy.deepcopy(receipt)
+    missing["steps"][0]["audit_seq"] = None
+    assert any("cites no row" in p for p in verify_receipt(_reseal(missing)))
+    approval = copy.deepcopy(receipt)
+    approval["approvals"] = [{"step": "s", "auto": False, "audit_seq": None}]
+    assert any("cites no row" in p for p in verify_receipt(_reseal(approval)))

@@ -335,8 +335,21 @@ async def test_vsc_delivers_change_across_core_and_node_coder(tmp_path):
         receipt = await build_receipt(store, audit, job_id)
         assert [c["outcome"] for c in receipt["whole_checks"]] == ["passed"]
         rows, _ = await audit.query({"action": "vsc.check"}, 100, ascending=True)
-        whole = [r for r in rows if r["task_id"] == job_id and "step" not in r["detail"]]
+        mine = [r for r in rows if r["task_id"] == job_id]
+        whole = [r for r in mine if r["detail"].get("check") == "whole_system"]
         assert [r["detail"]["reason"] for r in whole] == ["whole_system:sidecar"]
+        # The runner itself checked every acceptance test against the base first.
+        repro = [r for r in mine if r["detail"].get("check") == "reproduction_before"]
+        assert [(r["detail"]["check_id"], r["outcome"]) for r in repro] == [
+            ("core-accepts-progress", "passed"),
+            ("node-coder-reports-progress", "passed"),
+            ("sidecar", "passed"),
+        ]
+        # No acceptance file reached the job branch.
+        for test in tests:
+            for rel in test.files:
+                path = rel.split("/", 1)[1] if test.system is None else rel
+                assert path not in changed, path
         per_step = {
             (s["step_id"], c["kind"], c["id"]): c["passed"]
             for s in receipt["steps"]

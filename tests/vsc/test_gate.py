@@ -188,3 +188,49 @@ async def test_first_waiter_cancelled_in_on_wait_does_not_strand_second(audit):
     assert not t2.done()
     await g.approve("j", "s1", actor="alice")
     assert (await asyncio.wait_for(t2, 2)).actor == "alice"
+
+
+async def test_auto_merge_names_its_target_and_is_audited(audit):
+    with pytest.raises(ValueError, match="target_branch"):
+        AutoApprove(system="prod", action="merge")
+    with pytest.raises(ValueError, match="only for merge"):
+        AutoApprove(system="prod", action="deploy", target_branch="main")
+    g = Gate(cfg(AutoApprove(system="prod", action="merge", target_branch="main")), audit)
+    assert (await g.wait("j", step("merge"))).auto
+    other = step("merge").model_copy(update={"target_branch": "release"})
+    t = asyncio.create_task(g.wait("j", other))
+    await asyncio.sleep(0.05)
+    assert not t.done()  # another target is not covered
+    t.cancel()
+    await asyncio.gather(t, return_exceptions=True)
+    rows, _ = await audit.query({"action": "vsc.approve"}, 10)
+    (row,) = rows
+    assert (row["actor"], row["outcome"], row["task_id"]) == ("policy", "auto", "j")
+    assert row["detail"]["step"] == "s1" and row["detail"]["target_branch"] == "main"
+    assert not await g.already_approved("j", "s1")  # an auto row is no human decision
+
+
+def test_approval_refusal_rules():
+    from a2agw.vsc.gate import approval_refusal
+
+    open_cfg = VscConfig.model_construct(approvers=[], allow_self_approval=False)
+    assert approval_refusal(open_cfg, "key:b", "key:a") is None
+    assert "owner" in approval_refusal(open_cfg, "key:a", "key:a")
+    assert approval_refusal(open_cfg, "key:a", "key:a", admin=True) is None
+    selfish = VscConfig.model_construct(approvers=[], allow_self_approval=True)
+    assert approval_refusal(selfish, "key:a", "key:a") is None
+    listed = VscConfig.model_construct(approvers=["key:ops"], allow_self_approval=True)
+    assert approval_refusal(listed, "key:ops", "key:ops") is None
+    assert approval_refusal(listed, "key:b", "key:a") == "not an approver"
+    assert approval_refusal(listed, "key:b", "key:a", admin=True) is None
+
+
+async def test_approve_with_owner_enforces_the_rules(audit):
+    from a2agw.vsc.gate import NotApprover
+
+    g = Gate(VscConfig.model_construct(auto_approve=[], approvers=[]), audit)
+    with pytest.raises(NotApprover):
+        await g.approve("j", "s1", actor="key:a", owner="key:a")
+    assert not await g.already_approved("j", "s1")
+    await g.approve("j", "s1", actor="key:b", owner="key:a")
+    assert await g.already_approved("j", "s1")

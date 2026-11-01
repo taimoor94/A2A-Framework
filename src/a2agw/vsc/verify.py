@@ -4,13 +4,15 @@ Every check is a real subprocess (never a shell) in its own session, so a timeou
 overflow kills the whole process group. Output is read through a shared 4 MiB cap; the result
 keeps only the SHA-256 of what was captured and the last 2 KiB of stderr with secrets masked.
 
-Child processes get an allowlisted environment, never the full gateway environment: the names
-``PATH, HOME, USER, SHELL, LANG, TERM, TMPDIR, TZ, VIRTUAL_ENV, CI`` and the prefixes ``LC_,
-PYTHON, UV_, NODE_, npm_config_, GIT_`` taken from ``os.environ``, merged with the caller's
-``env`` (the caller wins). Redaction of the stderr tail is a best-effort second layer.
+Child processes get an allowlisted environment, never the full gateway environment
+(``a2agw.vsc._env``): the names ``PATH, HOME, USER, SHELL, LANG, TERM, TMPDIR, TZ, VIRTUAL_ENV,
+CI`` and the prefixes ``LC_, PYTHON, UV_, NODE_, npm_config_, GIT_`` taken from ``os.environ``,
+merged with the caller's ``env`` (the caller wins). Redaction of the stderr tail is a best-effort second layer.
 
 Acceptance files (``AcceptanceTest.files``) are paths relative to the *workspace root*; the test
-command itself runs in the system's ``path`` sub-tree of that root. A whole-system test's
+command itself runs in the system's ``path`` sub-tree of that root. They are only ever written
+into throwaway checkouts (``verify_step``, ``reproduction_before``), never into a job's
+workspace, so they cannot reach the job branch. A whole-system test's
 (``system`` unset) files instead start with a repository id (``contract/tests/test_x.py``): each
 is written into that repository's workspace, without the id (``write_whole_files``).
 """
@@ -24,11 +26,12 @@ import os
 import re
 import signal
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
+from a2agw.vsc._env import child_env
 from a2agw.vsc.config import CheckConfig, SystemConfig
 from a2agw.vsc.spec import AcceptanceTest, ExecutableSpec
 from a2agw.vsc.workspace import Workspace, WorkspaceManager
@@ -50,20 +53,10 @@ STDERR_TAIL_BYTES = 2048
 _CHUNK = 64 * 1024
 _KILL_GRACE_S = 2.0
 
-_ENV_NAMES = frozenset(
-    {"PATH", "HOME", "USER", "SHELL", "LANG", "TERM", "TMPDIR", "TZ", "VIRTUAL_ENV", "CI"}
-)
-_ENV_PREFIXES = ("LC_", "PYTHON", "UV_", "NODE_", "npm_config_", "GIT_")
 _SECRET_NAME = re.compile(
     r"(?i)(token|secret|password|passwd|api_?key|auth|credential|private_key)"
 )
 _MIN_SECRET_LEN = 8
-
-
-def _child_env(extra: Mapping[str, str] | None) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if k in _ENV_NAMES or k.startswith(_ENV_PREFIXES)}
-    env.update(extra or {})
-    return env
 
 
 def _secret_values(extra: Mapping[str, str] | None) -> list[str]:
@@ -180,7 +173,7 @@ async def run_check(
         proc = await asyncio.create_subprocess_exec(
             *command,
             cwd=cwd,
-            env=_child_env(env),
+            env=child_env(env),
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -332,6 +325,27 @@ async def reproduction_before(
     return replace(res, passed=True, reason="failed on base")
 
 
+# The kinds of check that execute something (a check of one of these kinds with a command ran).
+_EXECUTED_KINDS = frozenset({"gate", "reproduction_after", "regression", "contract"})
+
+
+def executable_checks(
+    system: SystemConfig, spec: ExecutableSpec, checks: Iterable[CheckConfig] = ()
+) -> bool:
+    """Whether verifying ``system`` under ``spec`` executes at least one check that is about
+    it: a gate, a tests command, a per-system acceptance test of the system with its own
+    command, or (given the configured ``checks``) a whole-system acceptance test of a check
+    that names the system. The last kind runs in the whole-system phase, not per step."""
+    if (
+        system.gate is not None
+        or system.tests is not None
+        or any(t.system == system.id and t.run for t in spec.acceptance)
+    ):
+        return True
+    covering = {c.id for c in checks if system.id in c.systems}
+    return any(t.system is None and t.check in covering for t in spec.acceptance)
+
+
 async def verify_step(
     ws: Workspace,
     system: SystemConfig,
@@ -339,27 +353,55 @@ async def verify_step(
     *,
     manager: WorkspaceManager,
     timeout_s: float,
+    candidate: str | None = None,
+    whole_covered: bool = False,
 ) -> list[CheckResult]:
-    """Run the ranked checks for one system's workspace; stop at the first failure."""
+    """Run the ranked checks for one system's change; stop at the first failure.
+
+    The change is the commit ``candidate`` (default: a ``snapshot`` of the worker's tree on
+    ``ws.base_ref``), compared with ``ws.base_ref``. Every check runs in a detached throwaway
+    checkout of that commit (``WorkspaceManager.throwaway``, cleaned with ``clean -fdx``); the
+    acceptance files are written there, never into the worker's tree. A verification that
+    executed no check at all fails (``no checks``), unless ``whole_covered``: a whole-system
+    acceptance test of a check over the system runs later (``executable_checks``)."""
     results: list[CheckResult] = []
-    cwd = ws.path / system.path
 
     def push(res: CheckResult) -> bool:
         results.append(res)
         return res.passed
 
-    changed = await manager.changed_paths(ws)
+    if candidate is None:
+        candidate = await manager.snapshot(ws, f"vsc candidate {ws.job_id}")
+    changed = await manager.changed_between(ws, ws.base_ref, candidate)
     outside = manager.confine(ws, system.id, changed)
     if outside:
         shown = ", ".join(outside[:10])
         push(_skipped("path_confinement", system.id, f"outside {system.path}: {shown}", False))
         return results
     push(_skipped("path_confinement", system.id, ""))
+    async with manager.throwaway(ws, candidate) as root:
+        await _checks_in(root, system, spec, timeout_s, push)
+    if (
+        all_passed(results)
+        and not whole_covered
+        and not any(r.kind in _EXECUTED_KINDS and r.command for r in results)
+    ):
+        push(_skipped("regression", system.id, "no checks", False))
+    return results
 
+
+async def _checks_in(
+    root: Path,
+    system: SystemConfig,
+    spec: ExecutableSpec,
+    timeout_s: float,
+    push: Callable[[CheckResult], bool],
+) -> None:
+    cwd = root / system.path
     if system.gate is None:
         push(_skipped("gate", system.id, "no gate"))
     elif not push(await run_check("gate", system.id, system.gate, cwd, timeout_s=timeout_s)):
-        return results
+        return
 
     for test in spec.acceptance:
         if test.system != system.id:
@@ -367,19 +409,19 @@ async def verify_step(
         command = _test_command(test, system)
         if command is None:
             push(_skipped("reproduction_after", test.id, "no test command", False))
-            return results
-        err = _write_files(ws.path, test.files)
+            return
+        err = _write_files(root, test.files)
         if err:
             push(_skipped("reproduction_after", test.id, err, False))
-            return results
+            return
         res = await run_check("reproduction_after", test.id, command, cwd, timeout_s=timeout_s)
         if not push(res):
-            return results
+            return
 
     if system.tests is None:
         push(_skipped("regression", system.id, "no tests"))
     elif not push(await run_check("regression", system.id, system.tests, cwd, timeout_s=timeout_s)):
-        return results
+        return
 
     for contract in spec.contracts:
         if system.id not in contract.systems:
@@ -387,24 +429,23 @@ async def verify_step(
         if contract.path is None:
             push(_skipped("contract", contract.name, "no contract test"))
             continue
-        root = ws.path.resolve()
-        target = (root / contract.path).resolve()
-        if not target.is_relative_to(root) or not target.is_file():
+        base = root.resolve()
+        target = (base / contract.path).resolve()
+        if not target.is_relative_to(base) or not target.is_file():
             push(_skipped("contract", contract.name, "contract file missing", False))
-            return results
+            return
         if system.tests is None:
             push(_skipped("contract", contract.name, "no tests command", False))
-            return results
+            return
         res = await run_check(
             "contract",
             contract.name,
             [*system.tests, contract.path],
-            ws.path,
+            root,
             timeout_s=timeout_s,
         )
         if not push(res):
-            return results
-    return results
+            return
 
 
 async def verify_whole(
@@ -419,6 +460,56 @@ async def verify_whole(
     return await run_check(
         "whole_system", check.id, check.run, first.path, timeout_s=timeout_s, env=env
     )
+
+
+async def run_whole(
+    manager: WorkspaceManager,
+    check: CheckConfig,
+    workspaces: Mapping[str, Workspace],
+    refs: Mapping[str, str],
+    acceptance: Iterable[AcceptanceTest],
+    *,
+    timeout_s: float,
+) -> CheckResult:
+    """Run the whole-system ``check`` over detached throwaway checkouts: of ``refs[repo_id]``
+    for each repository of ``workspaces`` (system id -> workspace). The files of the check's
+    whole-system acceptance tests are written into those checkouts first, never into the
+    job's workspaces."""
+    by_repo = {ws.repo_id: ws for ws in workspaces.values()}
+    async with contextlib.AsyncExitStack() as stack:
+        tmp: dict[str, Workspace] = {}
+        for rid, ws in by_repo.items():
+            path = await stack.enter_async_context(manager.throwaway(ws, refs[rid]))
+            tmp[rid] = replace(ws, path=path)
+        err = write_whole_files(acceptance, check.id, tmp)
+        if err:
+            return _skipped("whole_system", check.id, err, False)
+        views = {sid: tmp[ws.repo_id] for sid, ws in workspaces.items()}
+        return await verify_whole(check, views, timeout_s=timeout_s)
+
+
+async def reproduction_before_whole(
+    manager: WorkspaceManager,
+    check: CheckConfig,
+    workspaces: Mapping[str, Workspace],
+    acceptance: Iterable[AcceptanceTest],
+    *,
+    timeout_s: float,
+) -> CheckResult | None:
+    """The whole-system acceptance tests of ``check`` must make it FAIL on the base (every
+    repository at its workspace's ``base_ref``): ``passed`` means "failed as required". None
+    when the check has no whole-system acceptance test."""
+    tests = [t for t in acceptance if t.system is None and t.check == check.id]
+    if not tests:
+        return None
+    refs = {ws.repo_id: ws.base_ref for ws in workspaces.values()}
+    res = await run_whole(manager, check, workspaces, refs, tests, timeout_s=timeout_s)
+    res = replace(res, kind="reproduction_before")
+    if res.exit_code is None:
+        return replace(res, passed=False, reason=res.reason or "inconclusive")
+    if res.exit_code == 0:
+        return replace(res, passed=False, reason="passed on base")
+    return replace(res, passed=True, reason="failed on base")
 
 
 def all_passed(results: Iterable[CheckResult]) -> bool:

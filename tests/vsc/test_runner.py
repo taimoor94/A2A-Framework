@@ -130,7 +130,12 @@ class Env:
         return (await self.store.get_job(job_id))["state"]
 
     async def whole_checks(self, job_id: str) -> list[dict]:
-        return [r for r in await self.rows("vsc.check", job_id) if "step" not in r["detail"]]
+        rows = await self.rows("vsc.check", job_id)
+        return [r for r in rows if r["detail"].get("check") == "whole_system"]
+
+    async def reproductions(self, job_id: str) -> list[dict]:
+        rows = await self.rows("vsc.check", job_id)
+        return [r for r in rows if r["detail"].get("check") == "reproduction_before"]
 
     async def edit_attempts(self, job_id: str) -> list[tuple]:
         rows = await self.store.attempts(job_id)
@@ -274,11 +279,7 @@ async def test_step_retries_then_escalates(env):
 
 async def test_budget_attempts_exhausted_fails_job(env):
     """The attempts budget is per step: the second step still gets its own two attempts."""
-    a = make_repo(env.tmp, "repo-a", REPO_FILES)
-    b = make_repo(env.tmp, "repo-b", REPO_FILES)
-    cfg = VscConfig(
-        systems=[sys_cfg("alpha", a), sys_cfg("beta", b)], budgets=BudgetConfig(attempts=2)
-    )
+    cfg = two_repo_cfg(env.tmp, budgets=BudgetConfig(attempts=2))
     steps = [edit("alpha"), edit("beta", {"nothing.txt": "x"}, deps=["edit-alpha"])]
     r = env.runner(cfg, FixedPlanner(steps), [worker("apply")])
     job_id = await r.submit("greet", owner="key:a")
@@ -326,7 +327,10 @@ async def test_two_systems_one_repo_serialised(env):
             "b/tests/test_x.py": TEST_FILE,
         },
     )
-    cfg = VscConfig(systems=[sys_cfg("sa", repo, "a"), sys_cfg("sb", repo, "b")])
+    cfg = VscConfig(
+        systems=[sys_cfg("sa", repo, "a"), sys_cfg("sb", repo, "b")],
+        checks=[CheckConfig(id="both", systems=["sa", "sb"], run=[PY, "-c", "pass"])],
+    )
     planner = FixedPlanner([edit("sa", {"a/greet.py": GREET}), edit("sb", {"b/greet.py": GREET})])
     r = env.runner(cfg, planner, [worker("apply")])
     job_id = await r.submit("greet both", owner="key:a")
@@ -465,7 +469,8 @@ async def test_cancel_running_job(env):
 
 
 async def test_attempts_bound_survives_restart(env):
-    """An interrupted attempt counts: after a restart the step only gets what is left."""
+    """An interrupted attempt does not count against the attempts budget: after a restart the
+    step still gets its full budget of real attempts."""
     repo = make_repo(env.tmp, "repo-a", REPO_FILES)
     cfg = VscConfig(systems=[sys_cfg("alpha", repo)], budgets=BudgetConfig(attempts=2))
     crashing = CrashingStore(env.engine)
@@ -482,9 +487,12 @@ async def test_attempts_bound_survives_restart(env):
     job = await asyncio.wait_for(r2.tasks[job_id], 60)
     assert (job["state"], job["reason"]) == ("failed", "budget")
     assert await env.edit_attempts(job_id) == [
-        ("edit-alpha", 1, "failed"),  # interrupted
-        ("edit-alpha", 2, "failed"),  # the only attempt left
+        ("edit-alpha", 1, "failed"),  # interrupted: not counted
+        ("edit-alpha", 2, "failed"),
+        ("edit-alpha", 3, "failed"),
     ]
+    limit = [r["detail"].get("limit") for r in await env.rows("vsc.job", job_id)][-1]
+    assert limit == "attempts"
 
 
 def merge_step() -> PlanStep:
@@ -607,8 +615,9 @@ PRESENT = [
     "-c",
     (
         "import os, sys; p = lambda k: os.path.join(os.environ[k], *'tests/whole_e2e.txt'.split('/'));"
+        " g = lambda k: os.path.exists(os.path.join(os.environ[k], 'greet.py'));"
         " sys.exit(0 if open(p('VSC_WS_ALPHA')).read() == 'a' and open(p('VSC_WS_BETA')).read() == 'b'"
-        " else 1)"
+        " and g('VSC_WS_ALPHA') and g('VSC_WS_BETA') else 1)"
     ),
 ]
 
@@ -650,10 +659,12 @@ async def test_whole_system_acceptance_file_outside_workspace_fails_check(env):
     r = env.runner(cfg, planner, [worker("apply")])
     job_id = await r.submit("greet systems: alpha, beta", owner="key:a")
     job = await r.run(job_id)
-    assert (job["state"], job["reason"]) == ("failed", "whole_system"), job
-    reasons = [x["detail"]["reason"] for x in await env.whole_checks(job_id)]
+    # caught by the fail-on-base reproduction, before any worker runs
+    assert (job["state"], job["reason"]) == ("failed", "verification"), job
+    reasons = [x["detail"]["reason"] for x in await env.reproductions(job_id)]
     assert reasons and all("outside the workspace" in x for x in reasons), reasons
     assert not (env.tmp / "escape.txt").exists()
+    assert job["attempts"] == 0 and await env.whole_checks(job_id) == []
 
 
 class SeeingPlanner(AcceptancePlanner):
@@ -738,3 +749,231 @@ async def test_planner_usage_counts_against_the_budget(env):
     )  # 15 after intake, 30 after plan
     limits = [x["detail"].get("limit") for x in await env.rows("vsc.job", job_id)]
     assert "tokens" in limits
+
+
+# -- final-review fixes --------------------------------------------------------------------
+
+HIDDEN_OK = (
+    "import unittest\n\nfrom greet import hello\n\n\n"
+    "class H(unittest.TestCase):\n    def test_h(self):\n        self.assertEqual(hello(), 'hi')\n"
+)
+
+
+async def test_acceptance_test_passing_on_base_fails_job_before_any_worker(env):
+    repo = make_repo(env.tmp, "repo-a", REPO_FILES)
+    cfg = VscConfig(systems=[sys_cfg("alpha", repo)])
+    trivial = "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
+    acceptance = [
+        AcceptanceTest(
+            id="trivial",
+            system="alpha",
+            files={"tests/test_t.py": trivial},
+            run=[PY, "-B", "-m", "unittest", "tests.test_t"],
+        )
+    ]
+    r = env.runner(cfg, AcceptancePlanner([edit("alpha")], acceptance), [worker("apply")])
+    job_id = await r.submit("greet", owner="key:a")
+    job = await r.run(job_id)
+    assert (job["state"], job["reason"]) == ("failed", "verification"), job
+    assert job["attempts"] == 0 and await env.edit_attempts(job_id) == []
+    (row,) = await env.reproductions(job_id)
+    assert row["outcome"] == "failed" and "passed on base" in row["detail"]["reason"]
+    (stored,) = json.loads(job["checks_json"])
+    assert stored["check"] == "reproduction_before" and stored["exit_code"] == 0
+    assert stored["audit_seq"] == row["seq"]
+
+
+async def test_acceptance_files_never_reach_the_job_branch(env):
+    repo = make_repo(env.tmp, "repo-a", REPO_FILES)
+    cfg = VscConfig(systems=[sys_cfg("alpha", repo)])
+    acceptance = [AcceptanceTest(id="h", system="alpha", files={"tests/test_h.py": HIDDEN_OK})]
+    r = env.runner(cfg, AcceptancePlanner([edit("alpha")], acceptance), [worker("apply")])
+    job_id = await r.submit("greet", owner="key:a")
+    job = await r.run(job_id)
+    assert job["state"] == "accepted", job
+    (row,) = await env.reproductions(job_id)
+    assert row["outcome"] == "passed"  # it failed on base, as required
+    branch = f"vsc/{job_id}/repo-a"
+    with pytest.raises(subprocess.CalledProcessError):
+        git(repo, "cat-file", "-e", f"{branch}:tests/test_h.py")
+    assert not (env.tmp / "root" / job_id / "repo-a" / "tests" / "test_h.py").exists()
+    (step,) = await env.store.steps(job_id)
+    result = json.loads(step["result_json"])
+    names = git(repo, "diff", "--name-only", result["base"], result["commit"]).split()
+    assert names == ["greet.py"]
+    assert result["candidate"] == result["commit"] == git(repo, "rev-parse", branch)
+
+
+async def test_touched_tests_are_flagged(env):
+    repo = make_repo(env.tmp, "repo-a", REPO_FILES)
+    cfg = VscConfig(systems=[sys_cfg("alpha", repo)])
+    files = {"greet.py": GREET, "tests/test_x.py": TEST_FILE + "\n"}
+    r = env.runner(cfg, FixedPlanner([edit("alpha", files)]), [worker("apply")])
+    job_id = await r.submit("greet", owner="key:a")
+    job = await r.run(job_id)
+    assert job["state"] == "accepted", job
+    (step,) = await env.store.steps(job_id)
+    assert json.loads(step["result_json"])["touched_tests"] == ["tests/test_x.py"]
+
+
+async def test_system_without_any_check_fails_before_a_worker(env):
+    repo = make_repo(env.tmp, "repo-a", REPO_FILES)
+    cfg = VscConfig(systems=[SystemConfig(id="alpha", repo=str(repo))])  # no gate, no tests
+    r = env.runner(cfg, FixedPlanner([edit("alpha")]), [worker("apply")])
+    job_id = await r.submit("greet", owner="key:a")
+    job = await r.run(job_id)
+    assert (job["state"], job["reason"]) == ("failed", "no checks"), job
+    assert job["attempts"] == 0
+
+
+async def test_two_systems_without_a_covering_check_fail_intake(env):
+    a = make_repo(env.tmp, "repo-a", REPO_FILES)
+    b = make_repo(env.tmp, "repo-b", REPO_FILES)
+    cfg = VscConfig(systems=[sys_cfg("alpha", a), sys_cfg("beta", b)])
+    r = env.runner(cfg, FixedPlanner([edit("alpha"), edit("beta")]), [worker("apply")])
+    job_id = await r.submit("greet systems: alpha, beta", owner="key:a")
+    job = await r.run(job_id)
+    assert (job["state"], job["reason"]) == ("failed", "planner"), job
+
+
+async def test_whole_checks_run_for_untouched_systems_too(env):
+    """A check over an edited and an untouched system runs (the untouched one at its base)."""
+    marker = env.tmp / "whole-ran"
+    run = [PY, "-c", f"open({str(marker)!r}, 'w').write('x')"]
+    cfg = two_repo_cfg(env.tmp, run=run)
+    r = env.runner(cfg, FixedPlanner([edit("alpha")]), [worker("apply")])
+    job_id = await r.submit("greet systems: alpha", owner="key:a")
+    job = await r.run(job_id)
+    assert job["state"] == "accepted", job
+    assert marker.exists()
+    assert [x["outcome"] for x in await env.whole_checks(job_id)] == ["passed"]
+    heads = json.loads(job["verified_heads_json"])
+    assert heads["repo-b"] == git(env.tmp / "repo-b", "rev-parse", "main")
+    assert set(json.loads(job["base_refs_json"])) == {"repo-a", "repo-b"}
+
+
+async def test_merge_refused_when_branch_moved_after_verification(env):
+    repo = make_repo(env.tmp, "repo-a", REPO_FILES)
+    cfg = VscConfig(systems=[sys_cfg("alpha", repo)])
+    gate = Gate(cfg, env.audit)
+    r = env.runner(cfg, FixedPlanner([edit("alpha"), merge_step()]), [worker("apply")], gate=gate)
+    job_id = await r.submit("greet", owner="key:a")
+    task = asyncio.create_task(r.run(job_id))
+    await until(lambda: _is(env, job_id, "awaiting_approval"))
+    ws = env.tmp / "root" / job_id / "repo-a"
+    (ws / "sneaky.txt").write_text("unverified\n")
+    git(ws, "add", "-A")
+    git(ws, "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-m", "after verification")
+    await gate.approve(job_id, "merge-alpha", actor="alice")
+    job = await asyncio.wait_for(task, 30)
+    assert (job["state"], job["reason"]) == ("failed", "merge_refused"), job
+    assert "sneaky.txt" not in git(repo, "ls-tree", "--name-only", "main")
+    step = (await env.store.steps(job_id))[1]
+    res = json.loads(step["result_json"])
+    assert res["target_branch"] == "main" and "verified head" in res["reason"]
+
+
+async def test_merge_target_must_be_default_branch_or_listed(env):
+    repo = make_repo(env.tmp, "repo-a", REPO_FILES)
+    git(repo, "branch", "release")
+    step = merge_step().model_copy(update={"target_branch": "release"})
+    cfg = VscConfig(systems=[sys_cfg("alpha", repo)])
+    r = env.runner(cfg, FixedPlanner([edit("alpha"), step]), [worker("apply")])
+    job_id = await r.submit("greet", owner="key:a")
+    job = await r.run(job_id)
+    assert (job["state"], job["reason"]) == ("failed", "planner"), job  # plan rejected
+    cfg2 = cfg.model_copy(update={"merge_targets": ["release"]})
+    gate = Gate(cfg2, env.audit)
+    r2 = env.runner(cfg2, FixedPlanner([edit("alpha"), step]), [worker("apply")], gate=gate)
+    job2 = await r2.submit("greet", owner="key:a")
+    task = asyncio.create_task(r2.run(job2))
+    await until(lambda: _is(env, job2, "awaiting_approval"))
+    await gate.approve(job2, "merge-alpha", actor="alice")
+    assert (await asyncio.wait_for(task, 30))["state"] == "accepted"
+    assert git(repo, "rev-parse", "release") == git(repo, "rev-parse", f"vsc/{job2}/repo-a")
+
+
+async def test_interrupted_attempts_are_capped_apart(env):
+    repo = make_repo(env.tmp, "repo-a", REPO_FILES)
+    cfg = VscConfig(systems=[sys_cfg("alpha", repo)], budgets=BudgetConfig(attempts=1))
+    r = env.runner(cfg, FixedPlanner([edit("alpha")]), [worker("apply")])
+    job_id = await r.submit("greet", owner="key:a")
+    await r.run(job_id)  # accepted; now fake a history of interrupted attempts on a new job
+    job2 = await r.submit("greet again", owner="key:a")
+    spec = await FixedPlanner([edit("alpha")]).intake("greet again", cfg.systems, cfg.checks)
+    await env.store.set_spec(job2, spec)
+    plan = Plan(steps=[edit("alpha")])
+    await env.store.set_plan(job2, plan.model_dump(mode="json"), plan_hash(plan))
+    await env.store.add_step(job2, plan.steps[0].model_dump(mode="json"), 0)
+    for n in (1, 2):
+        await env.store.add_attempt(job2)
+        await env.store.start_attempt(job2, "edit-alpha", n, "fake", "")
+        await env.store.end_attempt(
+            job2, "edit-alpha", n, "failed", {"reason": "interrupted"}, {}
+        )
+    await env.store.set_state(job2, "running")
+    job = await r.run(job2)
+    assert (job["state"], job["reason"]) == ("failed", "budget"), job
+    limit = [x["detail"].get("limit") for x in await env.rows("vsc.job", job2)][-1]
+    assert limit == "interrupted"
+
+
+async def test_resume_isolates_a_job_that_cannot_resume(env):
+    cfg = two_repo_cfg(env.tmp)
+    steps = [edit("alpha"), edit("beta")]
+    crashing = CrashingStore(env.engine)
+    r1 = env.runner(cfg, FixedPlanner(steps), [worker("hang")], store=crashing)
+    broken = await r1.submit("greet", owner="key:a")
+    t1 = asyncio.create_task(r1.run(broken))
+    await until(lambda: _step_is(env, broken, "edit-alpha", "running"))
+    crashing.crashed = True
+    t1.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t1
+    fine = await r1.submit("greet too", owner="key:b")  # never started
+    ws = env.tmp / "root" / broken / "repo-a"
+    ws.rename(env.tmp / "moved-away")  # the workspace was moved
+    r2 = env.runner(cfg, FixedPlanner(steps), [worker("apply")])
+    assert await r2.resume_all() == [fine]
+    assert ((await env.store.get_job(broken))["state"], (await env.store.get_job(broken))["reason"]) == (
+        "failed",
+        "resume",
+    )
+    job = await asyncio.wait_for(r2.tasks[fine], 60)
+    assert job["state"] == "accepted", job
+
+
+async def test_spec_review_pauses_until_confirmed(env):
+    repo = make_repo(env.tmp, "repo-a", REPO_FILES)
+    cfg = VscConfig(systems=[sys_cfg("alpha", repo)], require_spec_review=True)
+    bus = EventBus()
+    sub = bus.subscribe()
+    planner = FixedPlanner([edit("alpha")])
+    r = env.runner(cfg, planner, [worker("apply")], bus=bus)
+    job_id = await r.submit("greet", owner="key:a")
+    job = await r.run(job_id)
+    assert job["state"] == "awaiting_spec" and job["spec_json"] and planner.plans == 0
+    events = []
+    while not sub._queue.empty():
+        events.append(sub._queue.get_nowait())
+    (ev,) = [e for e in events if e.data["state"] == "awaiting_spec"]
+    assert ev.data["spec_hash"] == job["spec_hash"]
+    assert await r.resume_all() == []  # waits for a human, not for a restart
+    job = await r.start(job_id)  # the spec was confirmed (PUT .../spec)
+    assert job["state"] == "accepted", job
+    assert planner.intakes == 1 and planner.plans == 1
+
+
+async def test_spec_request_is_the_callers_verbatim(env):
+    repo = make_repo(env.tmp, "repo-a", REPO_FILES)
+    cfg = VscConfig(systems=[sys_cfg("alpha", repo)])
+
+    class Rewording(FixedPlanner):
+        async def intake(self, request, systems, checks):
+            spec = await super().intake(request, systems, checks)
+            return spec.model_copy(update={"request": "something else"})
+
+    r = env.runner(cfg, Rewording([edit("alpha")]), [worker("apply")])
+    job_id = await r.submit("greet  exactly", owner="key:a")
+    job = await r.run(job_id)
+    assert json.loads(job["spec_json"])["request"] == "greet  exactly"

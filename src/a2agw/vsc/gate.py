@@ -1,6 +1,11 @@
 """The approval gate: privileged steps (merge, deploy, migrate, send) pause for a human unless
 policy auto-approves them. Decisions are audited (``vsc.approve``), so a resumed job finds an
-earlier approval in the log instead of asking again."""
+earlier approval in the log instead of asking again; a policy approval is audited too (outcome
+``auto``, actor ``policy``).
+
+Who may approve (``approval_refusal``): an admin always; otherwise, when ``vsc.approvers`` is
+set, only a listed principal; when it is empty, anyone but the job's owner unless
+``vsc.allow_self_approval``. Rejecting is open to the owner too (it only stops the job)."""
 
 from __future__ import annotations
 
@@ -15,6 +20,22 @@ from a2agw.vsc.plan import PRIVILEGED_KINDS, PlanStep
 NOTE_MAX_CHARS = 256
 _AGENT = "deliver"
 _PAGE = 200
+
+
+class NotApprover(PermissionError):
+    """The principal may not approve this job's privileged steps."""
+
+
+def approval_refusal(cfg: VscConfig, actor: str, owner: str, *, admin: bool = False) -> str | None:
+    """Why ``actor`` may not approve a privileged step of a job owned by ``owner``; None if
+    they may."""
+    if admin:
+        return None
+    if cfg.approvers:
+        return None if actor in cfg.approvers else "not an approver"
+    if actor == owner and not cfg.allow_self_approval:
+        return "the job's owner may not approve its own privileged steps"
+    return None
 
 
 class Rejected(Exception):
@@ -58,7 +79,8 @@ class Gate:
     async def wait(self, job_id: str, step: PlanStep) -> Approval:
         if step.kind not in PRIVILEGED_KINDS:
             return Approval(actor="none", auto=True)
-        if any(a.system == step.system and a.action == step.kind for a in self._cfg.auto_approve):
+        if self._cfg.auto_approved(step.system, step.kind, step.target_branch):
+            await self._audit_auto(job_id, step)
             return Approval(actor="policy", auto=True)
         key = (job_id, step.id)
         done = self._decided.get(key)
@@ -107,7 +129,39 @@ class Gate:
             elif fut.done() and self._waiters.get(key) is fut:
                 del self._waiters[key]
 
-    async def approve(self, job_id: str, step_id: str, *, actor: str, note: str = "") -> None:
+    async def _audit_auto(self, job_id: str, step: PlanStep) -> None:
+        if self._audit is None:
+            return
+        detail: dict[str, str] = {"step": step.id, "note": "", "kind": step.kind}
+        if step.target_branch is not None:
+            detail["target_branch"] = step.target_branch
+        await self._audit.emit(
+            AuditEvent(
+                actor="policy",
+                action="vsc.approve",
+                agent_id=_AGENT,
+                task_id=job_id,
+                outcome="auto",
+                detail=detail,
+            )
+        )
+
+    async def approve(
+        self,
+        job_id: str,
+        step_id: str,
+        *,
+        actor: str,
+        note: str = "",
+        owner: str | None = None,
+        admin: bool = False,
+    ) -> None:
+        """Approve the step as ``actor``. Given the job's ``owner``, the approver rules apply
+        (``approval_refusal``; NotApprover). Every gateway entry point passes it."""
+        if owner is not None:
+            why = approval_refusal(self._cfg, actor, owner, admin=admin)
+            if why is not None:
+                raise NotApprover(why)
         await self._decide(job_id, step_id, actor, note, "approved")
 
     async def reject(self, job_id: str, step_id: str, *, actor: str, note: str) -> None:

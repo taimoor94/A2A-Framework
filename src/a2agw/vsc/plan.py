@@ -11,10 +11,13 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from a2agw.ops.audit import canonical_json
-from a2agw.vsc.spec import ExecutableSpec
+from a2agw.vsc.config import VscConfig
+from a2agw.vsc.spec import ExecutableSpec, uncovered_systems
 
 _FORBID = ConfigDict(extra="forbid")
 _FENCE = re.compile(r"```[^\n`]*\n(.*?)```", re.DOTALL)
+# A plain branch name (git check-ref-format is applied again at merge time).
+_BRANCH = re.compile(r"[A-Za-z0-9._/-]{1,200}")
 
 StepKind = Literal["edit", "merge", "deploy", "migrate", "send"]
 PRIVILEGED_KINDS: frozenset[str] = frozenset({"merge", "deploy", "migrate", "send"})
@@ -124,10 +127,47 @@ def plan_hash(plan: Plan) -> str:
     return hashlib.sha256(canonical_json(payload).encode()).hexdigest()
 
 
-def validate_plan(plan: Plan, spec: ExecutableSpec) -> None:
+def validate_plan(plan: Plan, spec: ExecutableSpec, cfg: VscConfig | None = None) -> None:
+    """ValueError unless the plan fits the spec (and, given ``cfg``, the configuration),
+    failing closed: every step targets a system of the spec; no edit step depends on a
+    privileged step; a merge targets a plain branch name. With ``cfg``: a merge targets the
+    system's ``default_branch`` or one of ``merge_targets``; the edited systems (two or more)
+    are covered by whole-system checks; every acceptance test will run (a per-system one's
+    system is edited, a whole-system one's check is over an edited system)."""
+    kinds = {s.id: s.kind for s in plan.steps}
     for s in plan.steps:
         if s.system not in spec.systems:
             raise ValueError(f"step '{s.id}' targets system '{s.system}' not in the spec")
+        if s.kind == "edit":
+            for dep in s.depends_on:
+                if kinds.get(dep) in PRIVILEGED_KINDS:
+                    raise ValueError(f"edit step '{s.id}' depends on privileged step '{dep}'")
+        if s.target_branch is not None and (
+            s.target_branch.startswith("-") or not _BRANCH.fullmatch(s.target_branch)
+        ):
+            raise ValueError(f"merge step '{s.id}': invalid target_branch")
+    if cfg is None:
+        return
+    for s in plan.steps:
+        if s.kind == "merge" and not cfg.merge_target_allowed(s.system, s.target_branch or ""):
+            raise ValueError(
+                f"merge step '{s.id}' targets '{s.target_branch}', which is neither the "
+                "system's default_branch nor in merge_targets"
+            )
+    edited = [s.system for s in plan.steps if s.kind == "edit"]
+    missing = uncovered_systems(edited, cfg)
+    if missing:
+        raise ValueError(
+            "no whole-system check covers edited system(s) "
+            + ", ".join(repr(s) for s in missing)
+        )
+    checks = {c.id: c for c in cfg.checks}
+    for test in spec.acceptance:
+        if test.system is not None and test.system not in edited:
+            raise ValueError(f"acceptance test '{test.id}': system '{test.system}' is not edited")
+        check = checks.get(test.check) if test.check is not None else None
+        if test.check is not None and (check is None or not set(check.systems) & set(edited)):
+            raise ValueError(f"acceptance test '{test.id}': check '{test.check}' would not run")
 
 
 def _balanced_at(text: str, start: int) -> str | None:

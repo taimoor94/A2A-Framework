@@ -138,3 +138,41 @@ def test_validate_plan_unknown_system():
     validate_plan(Plan(steps=[step("s1", "a")]), spec)
     with pytest.raises(ValueError, match="s2"):
         validate_plan(Plan(steps=[step("s1", "a"), step("s2", "zz")]), spec)
+
+
+
+def test_validate_plan_fails_closed():
+    from a2agw.vsc.config import CheckConfig, SystemConfig, VscConfig
+    from a2agw.vsc.spec import AcceptanceTest
+
+    cfg = VscConfig(
+        systems=[SystemConfig(id="a", repo="./a"), SystemConfig(id="b", repo="./b")],
+        checks=[CheckConfig(id="ab", systems=["a", "b"], run=["true"])],
+        merge_targets=["release"],
+    )
+    spec = ExecutableSpec(
+        request="r", done="d", systems=["a", "b"], acceptance=[], budgets=BudgetConfig()
+    )
+    ok = Plan(steps=[step("ea", "a"), step("eb", "b")])
+    validate_plan(ok, spec, cfg)
+    # an edit step depending on a privileged step
+    merge = PlanStep(id="m", system="a", kind="merge", target_branch="main", instructions="m")
+    with pytest.raises(ValueError, match="privileged"):
+        validate_plan(Plan(steps=[merge, step("ea", "a", deps=["m"])]), spec)
+    # merge targets: default branch or merge_targets only; never an option-like name
+    validate_plan(Plan(steps=[step("ea", "a"), step("eb", "b"), merge]), spec, cfg)
+    rel = merge.model_copy(update={"target_branch": "release"})
+    validate_plan(Plan(steps=[step("ea", "a"), step("eb", "b"), rel]), spec, cfg)
+    for bad in ("other", "-x", "a b"):
+        m2 = merge.model_copy(update={"target_branch": bad})
+        with pytest.raises(ValueError):
+            validate_plan(Plan(steps=[step("ea", "a"), step("eb", "b"), m2]), spec, cfg)
+    # two edited systems need a covering check
+    bare = cfg.model_copy(update={"checks": []})
+    with pytest.raises(ValueError, match="no whole-system check"):
+        validate_plan(ok, spec, bare)
+    # an acceptance test of a system the plan does not edit would never run
+    only_a = Plan(steps=[step("ea", "a")])
+    lonely = spec.model_copy(update={"acceptance": [AcceptanceTest(id="t", system="b")]})
+    with pytest.raises(ValueError, match="not edited"):
+        validate_plan(only_a, lonely, cfg)

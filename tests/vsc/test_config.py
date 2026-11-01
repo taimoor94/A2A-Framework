@@ -42,7 +42,7 @@ def test_duplicate_system_ids_rejected(tmp_path):
 def test_auto_approve_unknown_system_rejected(tmp_path):
     text = (
         "base_url: http://x\nvsc:\n  systems:\n    - {id: a, repo: .}\n"
-        "  auto_approve:\n    - {system: b, action: merge}\n"
+        "  auto_approve:\n    - {system: b, action: merge, target_branch: main}\n"
     )
     with pytest.raises(ConfigError, match=r"auto_approve\[0\].system: unknown system 'b'"):
         load_config(write_yaml(tmp_path, text))
