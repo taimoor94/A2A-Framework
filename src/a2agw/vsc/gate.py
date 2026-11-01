@@ -51,18 +51,28 @@ class Gate:
         if any(a.system == step.system and a.action == step.kind for a in self._cfg.auto_approve):
             return Approval(actor="policy", auto=True)
         key = (job_id, step.id)
-        done = self._decided.get(key) or await self._from_audit(job_id, step.id)
+        done = self._decided.get(key)
+        if done is None:  # memory is authoritative once set; the log serves a resume
+            done = await self._latest_from_audit(job_id, step.id)
         if done is None:
-            if self._on_wait is not None:
-                await self._on_wait(job_id, step)
+            fut = self._waiters.get(key)
+            if fut is None:  # the first waiter announces; later ones just wait
+                fut = asyncio.get_running_loop().create_future()
+                self._waiters[key] = fut
+                if self._on_wait is not None:
+                    try:
+                        await self._on_wait(job_id, step)
+                    except BaseException:
+                        if self._waiters.get(key) is fut:
+                            del self._waiters[key]
+                        raise
             done = self._decided.get(key)  # decided while on_wait ran
             if done is None:
-                fut = self._waiters.setdefault(key, asyncio.get_running_loop().create_future())
                 try:
                     done = await asyncio.shield(fut)
                 finally:
-                    if fut.done():
-                        self._waiters.pop(key, None)
+                    if fut.done() and self._waiters.get(key) is fut:
+                        del self._waiters[key]
         if isinstance(done, Rejected):
             raise done
         return done
@@ -75,11 +85,13 @@ class Gate:
 
     async def already_approved(self, job_id: str, step_id: str) -> bool:
         d = self._decided.get((job_id, step_id))
-        if isinstance(d, Approval):
-            return True
-        return await self._from_audit(job_id, step_id) is not None
+        if d is None:
+            d = await self._latest_from_audit(job_id, step_id)
+        return isinstance(d, Approval)
 
     async def _decide(self, job_id: str, step_id: str, actor: str, note: str, outcome: str) -> None:
+        if not step_id:
+            raise ValueError("step_id must not be empty")
         note = note[:NOTE_MAX_CHARS]
         if self._audit is not None:
             await self._audit.emit(
@@ -101,20 +113,23 @@ class Gate:
         if fut is not None and not fut.done():
             fut.set_result(result)
 
-    async def _from_audit(self, job_id: str, step_id: str) -> Approval | None:
+    async def _latest_from_audit(self, job_id: str, step_id: str) -> Approval | Rejected | None:
+        """The most recent decision (highest seq) for this job and step, or None."""
         if self._audit is None:
             return None
+        latest: Approval | Rejected | None = None
         cursor: str | None = None
         while True:
             rows, cursor = await self._audit.query(
                 {"action": "vsc.approve", "agent": _AGENT}, _PAGE, cursor, ascending=True
             )
             for r in rows:
-                if (
-                    r["task_id"] == job_id
-                    and r["outcome"] == "approved"
-                    and r["detail"].get("step") == step_id
-                ):
-                    return Approval(actor=r["actor"], auto=False, note=r["detail"].get("note", ""))
+                if r["task_id"] != job_id or r["detail"].get("step") != step_id:
+                    continue
+                note = r["detail"].get("note", "")
+                if r["outcome"] == "approved":
+                    latest = Approval(actor=r["actor"], auto=False, note=note)
+                elif r["outcome"] == "rejected":
+                    latest = Rejected(note)
             if cursor is None:
-                return None
+                return latest

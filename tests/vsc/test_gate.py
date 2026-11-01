@@ -43,6 +43,7 @@ async def test_auto_approve_matches_system_and_action():
     assert not t.done() and not t2.done()
     t.cancel()
     t2.cancel()
+    await asyncio.gather(t, t2, return_exceptions=True)
 
 
 async def test_wait_until_approve(audit):
@@ -88,3 +89,67 @@ async def test_edit_steps_never_gate(audit):
     assert a == Approval(actor="none", auto=True, note="")
     rows, _ = await audit.query({"action": "vsc.approve"})
     assert rows == []
+
+
+async def test_latest_decision_wins_and_rejection_is_durable(audit):
+    g = Gate(cfg(), audit)
+    await g.approve("j", "s1", actor="alice")
+    await g.reject("j", "s1", actor="bob", note="changed my mind")
+    assert not await g.already_approved("j", "s1")
+    g2 = Gate(cfg(), audit)  # resumed process
+    assert not await g2.already_approved("j", "s1")
+    with pytest.raises(Rejected, match="changed my mind"):
+        await asyncio.wait_for(g2.wait("j", step()), 2)
+
+
+async def test_reject_then_approve_is_approved(audit):
+    g = Gate(cfg(), audit)
+    await g.reject("j", "s1", actor="bob", note="no")
+    await g.approve("j", "s1", actor="alice")
+    assert await Gate(cfg(), audit).already_approved("j", "s1")
+    assert await g.already_approved("j", "s1")
+
+
+async def test_reject_before_wait_is_honoured(audit):
+    g = Gate(cfg(), audit)
+    await g.reject("j", "s1", actor="bob", note="nope")
+    with pytest.raises(Rejected, match="nope"):
+        await asyncio.wait_for(g.wait("j", step()), 2)
+    assert not await g.already_approved("j", "s1")
+
+
+async def test_concurrent_waits_resolve_once_and_on_wait_fires_once(audit):
+    waited: list[str] = []
+
+    async def on_wait(job_id, st):
+        waited.append(st.id)
+
+    g = Gate(cfg(), audit, on_wait=on_wait)
+    t1 = asyncio.create_task(g.wait("j", step()))
+    t2 = asyncio.create_task(g.wait("j", step()))
+    await asyncio.sleep(0.05)
+    assert not t1.done() and not t2.done()
+    await g.approve("j", "s1", actor="alice")
+    r = await asyncio.wait_for(asyncio.gather(t1, t2), 2)
+    assert r[0] == r[1] == Approval("alice", False, "")
+    assert waited == ["s1"]
+
+
+async def test_memory_isolated_between_jobs(audit):
+    g = Gate(cfg(), audit)
+    tb = asyncio.create_task(g.wait("B", step()))
+    await g.approve("A", "s1", actor="alice")
+    await asyncio.sleep(0.05)
+    assert not tb.done()
+    assert await g.already_approved("A", "s1")
+    assert not await g.already_approved("B", "s1")
+    await g.approve("B", "s1", actor="carol")
+    assert (await asyncio.wait_for(tb, 2)).actor == "carol"
+
+
+async def test_empty_step_id_rejected(audit):
+    g = Gate(cfg(), audit)
+    with pytest.raises(ValueError):
+        await g.approve("j", "", actor="a")
+    with pytest.raises(ValueError):
+        await g.reject("j", "", actor="a", note="x")
