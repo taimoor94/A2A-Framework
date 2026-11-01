@@ -687,6 +687,7 @@ async def take_commands(
                 update(COMMANDS)
                 .where(COMMANDS.c.id == row.id)
                 .where(COMMANDS.c.status == "pending")
+                .where(COMMANDS.c.expires_at > now)  # expiry is final, even mid-poll
                 .where(live.exists())
                 .values(status="delivered", delivered_at=now)
             )

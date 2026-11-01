@@ -41,7 +41,14 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from a2agw.config import trust_card_verifier
 from a2agw.consult.guarded_net import fixed_tier, guarded_async_client
 from a2agw.control import admin as _admin  # noqa: F401 - registers the gateway routes
-from a2agw.control import authn, catalogue, channel, policies, views  # noqa: F401 - routes
+from a2agw.control import (  # noqa: F401 - routes
+    authn,
+    catalogue,
+    channel,
+    operations,
+    policies,
+    views,
+)
 from a2agw.control.rbac import ROUTES, Permission, public, route
 from a2agw.control.settings import ControlSettings
 from a2agw.control.store import AUDIT_TABLE, ControlStore
@@ -266,6 +273,7 @@ def create_app(
             app.state.maintenance = maintenance
             app.state.cards = cards  # the partner catalogue's card fetch and checks
             app.state.task_details = views.DetailGate()  # task.get sharing and waiters
+            app.state.operations = operations.OperateGate()  # operator actions' waiters
             task = asyncio.create_task(maintenance.run_forever(), name="a2agw:cp-maint")
             yield
         finally:

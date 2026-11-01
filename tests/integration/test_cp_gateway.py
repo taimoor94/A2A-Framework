@@ -45,6 +45,10 @@ from a2agw.serve.host import AgentHost
 CP_HOST = "cp.example"
 CP = f"https://{CP_HOST}"
 TOKEN_ENV = "A2AGW_CP_TOKEN"
+ANON_POLICY = {
+    "version": 1,
+    "authz": [{"id": "anon", "principal": "anonymous", "agents": "*", "effect": "allow"}],
+}
 POLICY = {
     "version": 1,
     "authz": [{"id": "ops", "principal": "*", "agents": "*", "effect": "allow"}],
@@ -248,7 +252,9 @@ def enroll(control_plane, monkeypatch):
 
 
 @asynccontextmanager
-async def gateway(app: Any, db: str) -> AsyncIterator[tuple[AgentHost, ControlPlaneConnector]]:
+async def gateway(
+    app: Any, db: str, adapter: Any = None
+) -> AsyncIterator[tuple[AgentHost, ControlPlaneConnector]]:
     host = AgentHost("http://gw.test", db_url=db)
     host.add(
         AgentSpec(
@@ -256,7 +262,7 @@ async def gateway(app: Any, db: str) -> AsyncIterator[tuple[AgentHost, ControlPl
             name="Alpha",
             description="d",
             skills=[SkillSpec(id="s", name="S", description="d")],
-            adapter=Echo(),
+            adapter=adapter or Echo(),
         )
     )
     clock = Clock(500.0)
@@ -530,3 +536,141 @@ async def test_catalogue_approval_of_a_gateway_quarantine_end_to_end(
                 await until(lambda: host.partners.get("acme").card_hash == v2["card_hash"])
                 rec = host.partners.get("acme")
                 assert rec.status == "active" and rec.pending_card is None
+
+
+# -- operator actions (Task 11): the control plane queues, the connector runs -----------------
+
+
+class Asker:
+    """Asks a question, then finishes with the answer it got."""
+
+    durable_sessions = False
+
+    async def run(self, ctx):
+        from a2agw.core.events import Done, NeedInput
+
+        if not ctx.resumed:
+            yield NeedInput(question="which colour?")
+            return
+        yield Done(text=f"painting it {ctx.text}")
+
+
+class Sender:
+    """Callers of the gateway's agents (its inbound A2A API, served in process)."""
+
+    def __init__(self, host: AgentHost) -> None:
+        self.host = host
+        self.transport = StreamingASGITransport({"gw.test": host.app()})
+        self.hc = httpx.AsyncClient(transport=self.transport, base_url="http://gw.test")
+
+    def client(self, agent_id: str) -> Any:
+        from a2a.client import ClientConfig, ClientFactory
+
+        card = self.host.cards[agent_id]
+        return ClientFactory(ClientConfig(httpx_client=self.hc, streaming=False)).create(card)
+
+    async def send(self, agent_id: str, text: str) -> list[Any]:
+        import uuid
+
+        from a2a.types import Message, Part, Role, SendMessageRequest
+
+        message = Message(message_id=uuid.uuid4().hex, role=Role.ROLE_USER, parts=[Part(text=text)])
+        return [
+            ev
+            async for ev in self.client(agent_id).send_message(SendMessageRequest(message=message))
+        ]
+
+    async def close(self) -> None:
+        await self.transport.stop_serving()
+        await self.hc.aclose()
+
+
+@asynccontextmanager
+async def operated(app: Any, tmp_path: Any, adapter: Any) -> AsyncIterator[Any]:
+    """A gateway running ``adapter`` as agent ``alpha``, an Env to send tasks to it and the
+    control plane's client with an operator key."""
+    _kid, key = await app.state.store.create_api_key("ops", "operator", actor="t")
+    async with gateway(app, f"sqlite+aiosqlite:///{tmp_path / 'gw.db'}", adapter) as (host, _c):
+        env = Sender(host)
+        async with httpx.AsyncClient(
+            transport=app.state.link, base_url=CP, headers={"authorization": f"Bearer {key}"}
+        ) as cp:
+            try:
+                yield host, env, cp
+            finally:
+                await env.close()
+
+
+async def finished_command(cp: httpx.AsyncClient, response: httpx.Response) -> dict[str, Any]:
+    """The command of an action's response once it is finished (the action itself may have
+    answered 202 when the gateway took longer than its wait)."""
+    cid = response.json()["command_id"]
+    box: dict[str, Any] = {}
+
+    async def done() -> bool:
+        box.update((await cp.get(f"/api/v1/commands/{cid}")).json())
+        return box["status"] in ("done", "failed", "expired")
+
+    await until(done)
+    return box
+
+
+async def test_cancel_round_trip_through_connector(control_plane, enroll, tmp_path):
+    app = control_plane
+    gw = await enroll()
+    await seed_policy(app, gw, ANON_POLICY)
+    async with operated(app, tmp_path, Asker()) as (host, env, cp):
+        await until(lambda: host.control_plane.status()["applied_version"] == 1)
+        task = (await env.send("alpha", "paint"))[-1].task
+        r = await cp.post(f"/api/v1/tasks/{gw}/alpha/{task.id}/cancel")
+        assert r.status_code in (200, 202), r.text
+        done = await finished_command(cp, r)
+        assert done["status"] == "done", done
+        assert done["result"] == {"state": "TASK_STATE_CANCELED"}
+        assert done["kind"] == "task.cancel" and done["actor"] == "key"
+        # the gateway ran it as the operator: its audit trail names cp:<key id>
+        await host.audit.drain()
+        rows, _ = await host.audit.query({"action": "task.cancel"})
+        assert [(r_["outcome"], r_["task_id"]) for r_ in rows] == [("ok", task.id)]
+        assert rows[0]["actor"].startswith("cp:ak-")
+        # a second cancel is refused by the task's state: 409 with the reason
+        again = await cp.post(f"/api/v1/tasks/{gw}/alpha/{task.id}/cancel")
+        failed = await finished_command(cp, again)
+        assert failed["status"] == "failed" and failed["result"]["error"] == "conflict"
+        if again.status_code != 202:
+            assert again.status_code == 409
+
+
+async def test_answer_round_trip_resumes_task(control_plane, enroll, tmp_path):
+    from a2a.types import GetTaskRequest, TaskState
+
+    app = control_plane
+    gw = await enroll()
+    await seed_policy(app, gw, ANON_POLICY)
+    async with operated(app, tmp_path, Asker()) as (host, env, cp):
+        await until(lambda: host.control_plane.status()["applied_version"] == 1)
+        task = (await env.send("alpha", "paint"))[-1].task
+        assert task.status.state == TaskState.TASK_STATE_INPUT_REQUIRED
+        r = await cp.post(f"/api/v1/tasks/{gw}/alpha/{task.id}/answer", json={"text": "blue"})
+        assert r.status_code in (200, 202), r.text
+        done = await finished_command(cp, r)
+        assert done["status"] == "done", done
+        assert done["result"]["state"] in {"TASK_STATE_WORKING", "TASK_STATE_COMPLETED"}
+
+        async def completed() -> bool:
+            got = await env.client("alpha").get_task(GetTaskRequest(id=task.id))
+            return got.status.state == TaskState.TASK_STATE_COMPLETED
+
+        await until(completed)
+        final = await env.client("alpha").get_task(GetTaskRequest(id=task.id))
+        assert [p.text for a in final.artifacts for p in a.parts] == ["painting it blue"]
+        # the answer text is in the task's history, never in the control plane's audit
+        from sqlalchemy import text
+
+        async with app.state.engine.connect() as c:
+            cp_audit = (await c.execute(text("SELECT detail_json FROM cp_audit"))).all()
+        assert cp_audit and "blue" not in json.dumps([tuple(r) for r in cp_audit])
+        # no longer waiting: a second answer fails at the gateway
+        again = await cp.post(f"/api/v1/tasks/{gw}/alpha/{task.id}/answer", json={"text": "red"})
+        failed = await finished_command(cp, again)
+        assert failed["status"] == "failed" and failed["result"]["error"] == "conflict"

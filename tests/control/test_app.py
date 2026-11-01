@@ -236,6 +236,7 @@ def test_core_does_not_import_fastapi():
         control / "catalogue.py",
         control / "policies.py",
         control / "views.py",
+        control / "operations.py",
         control / "__init__.py",
     }
     importing = []
