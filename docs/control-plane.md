@@ -158,7 +158,8 @@ Every `report_interval_s` the gateway posts what it has to say, in one report:
 - the audit rows after `audit_acked_seq`, ascending, up to 500. `audit_acked_seq` (kept in
   `a2agw_cp_state`) moves only to the response's `acked_audit_seq`, so rows not acknowledged
   are sent again; the control plane stores them once;
-- command results, and the outcome of each state applied or rejected;
+- command results (at most 8 `task.get` results per report, the rest in the next ones), and
+  the outcome of each state applied or rejected;
 - every `health_interval_s`: health, the metrics snapshot (`/a2agw/admin/metrics`) and the
   gateway info `{version, agents, base_url}`. Each agent is `{id, name, version, skills,
   card_url}` from the hosted agent's spec (the source of its card): at most 200 agents and
@@ -324,7 +325,7 @@ filters, or on another list, is a `400 bad_request`, so it never widens what a c
 | `GET /api/v1/overview` | `read` | gateways, tasks per minute, error rate, top partners, alerts |
 | `GET /api/v1/agents?kind=hosted\|partner` | `read` | hosted agents (from gateway info) and catalogue partners |
 | `GET /api/v1/tasks` | `read` | the latest state of each task; filters `gateway_id, agent_id, state, since, trace_id, q` (task id prefix) |
-| `GET /api/v1/tasks/{gateway}/{agent}/{task}` | `read` | the gateway's compact detail (a `task.get` command, waited for 5 s) plus `timeline`; 202 `{command_id, timeline}` when it does not answer in time |
+| `GET /api/v1/tasks/{gateway}/{agent}/{task}` | `read` | the gateway's compact detail (a `task.get` command, waited for 5 s) plus `timeline`; 202 `{command_id, timeline}` when it does not answer in time. Concurrent requests for one task share one command, an answer is reused for 5 s, and at most 16 requests per process wait at once (the others answer 202 at once); every reader is audited (`cp.command` `queued` or `shared`) |
 | `GET /api/v1/topology?window_m=5..1440` | `read` | who called whom, with latency, errors and the policy overlay |
 | `GET /api/v1/audit`, `/audit/export?format=jsonl\|csv`, `/audit/verify` | `audit.read` | both audit sources; streamed export; the control plane's own chain |
 | `GET /api/v1/credentials` | `read` | credential and TLS reference names |
@@ -359,6 +360,7 @@ filters, or on another list, is a `400 bad_request`, so it never widens what a c
 ### Who sees what
 
 - No read view shows a principal id: a task's owner is shown as its kind (`owner_kind`),
+  so is whoever answered a prompt (`answered_by_kind`: `console` for an operator here),
   and partner tasks drop their caller. The audit views (`audit.read`) show actors.
 - An export is audited (`cp.audit.export`, with its format, source and the names of the
   filters used), streams up to 100 000 rows, and prefixes every CSV cell that starts with

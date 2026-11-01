@@ -265,6 +265,7 @@ def create_app(
             background = app.state.background = channel.Background()
             app.state.maintenance = maintenance
             app.state.cards = cards  # the partner catalogue's card fetch and checks
+            app.state.task_details = views.DetailGate()  # task.get sharing and waiters
             task = asyncio.create_task(maintenance.run_forever(), name="a2agw:cp-maint")
             yield
         finally:

@@ -870,3 +870,24 @@ def test_info_agents_are_bounded(monkeypatch):
     assert len(agents) == cp_client.INFO_AGENTS_MAX
     assert all(len(a["name"]) == cp_client.INFO_STRING_MAX for a in agents)
     assert all(len(a["skills"]) == cp_client.INFO_SKILLS_MAX for a in agents)
+
+
+async def test_a_report_carries_at_most_8_task_get_results(gateway, cp):
+    """Large task.get results are spread over reports (REPORT_TASK_GET_MAX each), so a
+    burst of them cannot push one report past the control plane's body cap."""
+    from a2agw.ops import cp_client
+
+    _host, conn = await gateway(start=False)
+    for i in range(12):
+        conn._record_result(f"g{i}", "task.get", "done", {"n": i})
+        conn._record_result(f"c{i}", "task.cancel", "done", {"n": i})
+    first = conn._take_results()
+    gets = [r for r in first if r["id"].startswith("g")]
+    assert len(gets) == cp_client.REPORT_TASK_GET_MAX == 8
+    assert [r["id"] for r in first if r["id"].startswith("c")] == [f"c{i}" for i in range(12)]
+    conn._sent_results(first)
+    second = conn._take_results()
+    assert [r["id"] for r in second] == [f"g{i}" for i in range(8, 12)]
+    assert set(second[0]) == {"id", "status", "result"}  # the kind is not reported
+    conn._sent_results(second)
+    assert conn._take_results() == []

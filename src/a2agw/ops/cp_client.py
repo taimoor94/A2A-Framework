@@ -99,6 +99,7 @@ EVENT_QUEUE_MAX = 10_000
 REPORT_EVENTS_MAX = 500
 REPORT_AUDIT_MAX = 500
 REPORT_RESULTS_MAX = 100
+REPORT_TASK_GET_MAX = 8  # task.get results (up to 64 KiB each) per report; the rest wait
 RESULT_MAX_BYTES = 8192  # a larger command result is reported as {"truncated": true}
 # ``task.get`` answers the compact task detail (``actions.task_detail(compact=True)``),
 # sized to fit this; the control plane keeps the same cap for that kind.
@@ -413,6 +414,7 @@ class ControlPlaneConnector:
         self._unsent: list[dict[str, Any]] = []  # events of the report being (re)sent
         self._batch = REPORT_EVENTS_MAX  # halved after a 413, grown back after successes
         self._results: list[dict[str, Any]] = []
+        self._task_gets: set[str] = set()  # ids of the task.get results in _results
         # applied / rejected outcomes not yet reported, oldest first (one per report)
         self._pending_applied: list[dict[str, Any]] = []
         self._last_health: float | None = None
@@ -913,7 +915,35 @@ class ControlPlaneConnector:
                     status, result = "failed", _failure(exc)
                     if result["error"] == "internal":
                         log.warning("control plane: command %s failed: %s", kind, result["detail"])
+        self._record_result(cid, kind, status, result)
+
+    def _record_result(self, cid: str, kind: Any, status: str, result: Any) -> None:
         self._results.append({"id": cid, "status": status, "result": _clip(result, kind)})
+        if kind == "task.get":
+            self._task_gets.add(cid)
+
+    def _take_results(self) -> list[dict[str, Any]]:
+        """The results for the next report, oldest first: up to ``REPORT_RESULTS_MAX`` (and
+        the current batch size), of which at most ``REPORT_TASK_GET_MAX`` large ``task.get``
+        results; the others wait for the next report."""
+        limit = min(REPORT_RESULTS_MAX, self._batch)
+        out: list[dict[str, Any]] = []
+        large = 0
+        for r in self._results:
+            if len(out) >= limit:
+                break
+            if r["id"] in self._task_gets:
+                if large >= REPORT_TASK_GET_MAX:
+                    continue
+                large += 1
+            out.append(r)
+        return out
+
+    def _sent_results(self, sent: list[dict[str, Any]]) -> None:
+        """Forget the results a report delivered."""
+        gone = {id(r) for r in sent}
+        self._results = [r for r in self._results if id(r) not in gone]
+        self._task_gets -= {r["id"] for r in sent}
 
     # -- reports ---------------------------------------------------------------------------
 
@@ -967,7 +997,7 @@ class ControlPlaneConnector:
             )
             if rows:
                 body["audit"] = rows
-        results = self._results[: min(REPORT_RESULTS_MAX, self._batch)]
+        results = self._take_results()
         if results:
             body["results"] = results
         applied = self._pending_applied[0] if self._pending_applied else None
@@ -1006,7 +1036,7 @@ class ControlPlaneConnector:
             self._last_error = f"http_{r.status_code}"
             return False
         del self._unsent[: len(events)]
-        del self._results[: len(results)]
+        self._sent_results(results)
         if applied is not None and self._pending_applied and self._pending_applied[0] is applied:
             del self._pending_applied[0]
         if health_due:

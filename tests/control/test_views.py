@@ -912,7 +912,16 @@ async def test_pagination_cursor_stable(db_url, make_app, run_app, clock):
 def test_public_detail_hides_principals_and_reports_truncation():
     shown = views_mod.public_detail(
         {
-            "task": {"id": "t1", "owner": "jwt:carol", "state": WORKING},
+            "task": {
+                "id": "t1",
+                "owner": "jwt:carol",
+                "state": WORKING,
+                "history": [
+                    {"message_id": "m1", "role": "user", "parts": []},
+                    {"message_id": "m2", "role": "user", "parts": [], "answered_by": "cp:oidc:bob"},
+                    {"message_id": "m3", "role": "user", "parts": [], "answered_by": "key:ops"},
+                ],
+            },
             "partner_tasks": [{"partner_id": "p1", "task_id": "pt", "caller_id": "key:x"}, "junk"],
             "pending_prompt": "which account?",
             "history_total": 40,
@@ -923,7 +932,12 @@ def test_public_detail_hides_principals_and_reports_truncation():
     )
     assert (shown["history_total"], shown["artifacts_total"]) == (40, 2)
     assert shown["partner_tasks_total"] == 1 and shown["clipped"] is True
-    assert shown["task"] == {"id": "t1", "state": WORKING, "owner_kind": "jwt"}
+    assert shown["task"]["owner_kind"] == "jwt" and "owner" not in shown["task"]
+    m1, m2, m3 = shown["task"]["history"]
+    assert m1 == {"message_id": "m1", "role": "user", "parts": []}
+    assert m2 == {"message_id": "m2", "role": "user", "parts": [], "answered_by_kind": "console"}
+    assert m3["answered_by_kind"] == "api_key" and "answered_by" not in m3
+    assert "oidc:bob" not in json.dumps(shown) and "key:ops" not in json.dumps(shown)
     assert shown["partner_tasks"] == [
         {
             "partner_id": "p1",
@@ -961,3 +975,123 @@ def test_public_detail_hides_principals_and_reports_truncation():
 )
 def test_csv_cell_formula_guard(value, cell):
     assert views_mod.csv_cell(value) == cell
+
+
+async def test_task_detail_coalesces_and_bounds_waiters(
+    db_url, cp_http, run_app, clock, monkeypatch
+):
+    """Concurrent details of one task share one task.get; at most DETAIL_WAITERS_MAX
+    requests wait for it (the others answer 202 at once); a result just answered is reused,
+    an older one is not."""
+    from sqlalchemy import func, select
+
+    from a2agw.control.store import COMMANDS
+
+    monkeypatch.setattr(views_mod, "DETAIL_WAITERS_MAX", 2)
+    release = asyncio.Event()
+    sleeping: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        sleeping.append(seconds)
+        await release.wait()
+
+    app = detail_app(db_url, clock, cp_http, sleep)
+
+    async def commands() -> int:
+        async with app.state.engine.connect() as conn:
+            query = select(func.count()).select_from(COMMANDS).where(COMMANDS.c.kind == "task.get")
+            return int((await conn.execute(query)).scalar_one())
+
+    async with run_app(app) as c:
+        admin = await admin_key(app)
+        gw1, _t1 = await gateway(app, "east")
+        path = f"/api/v1/tasks/{gw1}/billing/t1"
+        calls = [asyncio.create_task(c.get(path, headers=admin)) for _ in range(5)]
+        for _ in range(500):
+            if sum(t.done() for t in calls) == 3 and len(sleeping) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        early = [t.result() for t in calls if t.done()]
+        assert len(early) == 3 and all(r.status_code == 202 for r in early)
+        release.set()  # the two waiters run out their 5 s
+        responses = await asyncio.gather(*calls)
+        assert all(r.status_code == 202 for r in responses)
+        assert len({r.json()["command_id"] for r in responses}) == 1
+        assert await commands() == 1
+        # the gateway answers; a detail asked right after reuses that answer
+        store = app.state.store
+        [cmd] = await channel.take_commands(store, gw1, clock())
+        result = {"task": {"id": "t1", "owner": "key:a"}, "partner_tasks": []}
+        await channel.finish_command(store, gw1, cmd.id, "done", result, now=clock())
+        reused = await c.get(path, headers=admin)
+        assert reused.status_code == 200 and reused.json()["task"]["id"] == "t1"
+        assert await commands() == 1
+        clock.advance(views_mod.DETAIL_REUSE_S + 1)  # too old: a new command
+        again = await c.get(path, headers=admin)
+        assert again.status_code == 202 and again.json()["command_id"] != cmd.id
+        assert await commands() == 2
+        # another task is another command
+        other = await c.get(f"/api/v1/tasks/{gw1}/billing/t2", headers=admin)
+        assert other.json()["command_id"] != again.json()["command_id"]
+        assert await commands() == 3
+        outcomes = [r["outcome"] for r in await audit_rows(app, "cp.command")]
+    # every reader is audited: one queued command, the other readers sharing it
+    assert outcomes.count("queued") == 3 and outcomes.count("shared") == 5
+
+
+def test_forced_and_forbidden_partner_is_forbidden():
+    from a2agw.consult.registry import PartnerRecord
+    from a2agw.security.policy import PolicyEngine, parse_policy
+
+    policy = parse_policy(
+        {
+            "version": 1,
+            "routing": [
+                {"agent": "billing", "partners": ["p5"], "mode": "force"},
+                {"agent": "billing", "partners": ["p5"], "mode": "forbid"},
+            ],
+        }
+    )
+    rec = PartnerRecord(id="p5", card={}, card_hash="", tier="public")
+    plan = PolicyEngine(policy).route("billing", [rec])
+    assert views_mod._decision(plan, "p5") == "forbidden"
+
+
+async def test_audit_gateway_filter_matches_non_ascii_control_rows(db_url, make_app, run_app):
+    from a2agw.ops.audit import AuditEvent
+
+    app = make_app(settings_for(db_url))
+    async with run_app(app) as c:
+        security = await signed_in(app, ["security"])
+        for gid in ("gw-é", "gw-e"):
+            await app.state.audit.emit(
+                AuditEvent(actor="t", action="cp.gateway.create", detail={"gateway": gid})
+            )
+        rows = await pages(c, "/api/v1/audit", security, {"gateway_id": "gw-é"})
+    assert [r["detail"] for r in rows] == [{"gateway": "gw-é"}]
+
+
+async def test_percentiles_match_the_nearest_rank_definition(db_url, make_app, run_app, clock):
+    from a2agw.ops.metrics import _percentile
+
+    app = make_app(settings_for(db_url))
+    async with run_app(app) as c:
+        admin = await admin_key(app)
+        _gw, token = await gateway(app, "east")
+        now = clock()
+        durations = {f"p{n}": [float((i * 37) % 101) for i in range(n)] for n in range(1, 26)}
+        events = [
+            call_ev("billing", pid, "completed", d, now - 60)
+            for pid, ds in durations.items()
+            for d in ds
+        ]
+        for i in range(0, len(events), 200):
+            await report(c, token, events=events[i : i + 200])
+        edges = (await c.get("/api/v1/topology", headers=admin)).json()["edges"]
+        top = (await c.get("/api/v1/overview", headers=admin)).json()["top_partners"]
+    by_partner = {e["to"]: e for e in edges}
+    for pid, ds in durations.items():
+        assert by_partner[pid]["p50_ms"] == _percentile(ds, 50), pid
+        assert by_partner[pid]["p95_ms"] == _percentile(ds, 95), pid
+    for t in top:
+        assert t["p95_ms"] == _percentile(durations[t["partner_id"]], 95)

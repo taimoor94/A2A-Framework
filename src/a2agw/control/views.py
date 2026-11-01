@@ -24,7 +24,9 @@ or other filters is a 400 ``bad_request``, so a cursor cannot widen what a calle
   ``gateway_id``, ``agent_id``, ``state``, ``since``, ``trace_id`` (any event of the task),
   ``q`` (a task id prefix).
 - ``GET /api/v1/tasks/{gateway_id}/{agent_id}/{task_id}`` (``read``): a ``task.get``
-  command for the gateway, waited for ``DETAIL_WAIT_S``: its compact task detail (the last
+  command for the gateway (shared by concurrent requests and reused for
+  ``DETAIL_REUSE_S`` once answered; at most ``DETAIL_WAITERS_MAX`` requests wait, the others
+  answer 202 at once), waited for ``DETAIL_WAIT_S``: its compact task detail (the last
   messages, clipped, with totals and ``clipped``) plus ``timeline``, or 202
   ``{command_id, timeline}`` when it does not answer in time.
 - ``GET /api/v1/topology`` (``read``) ``window_m`` 5..1440: who called whom, from
@@ -41,6 +43,7 @@ policy dry-run's ``actor_kind``); the audit views, behind ``audit.read``, show a
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import csv
@@ -109,11 +112,13 @@ TASK_ERRORS = frozenset({"TASK_STATE_FAILED", "TASK_STATE_REJECTED"})
 BREAKER_ORDER = {"closed": 0, "half_open": 1, "open": 2}
 
 DETAIL_WAIT_S = 5.0  # how long a task detail waits for the gateway's answer
+DETAIL_REUSE_S = 5.0  # a task.get answered this recently is shared, not asked again
+DETAIL_WAITERS_MAX = 16  # requests waiting for task.get answers at once (per process)
 TIMELINE_MAX = 500
 TRACES_MAX = 50
 HANDLES_MAX = 100
 HANDLE_FIELDS = ("partner_id", "task_id", "context_id", "state", "created_at", "end_reason")
-EDGES_MAX = 500  # topology: the busiest edges (each costs two percentile lookups)
+EDGES_MAX = 500  # topology: the busiest edges
 
 EXPORT_MAX = 100_000
 EXPORT_BATCH = 1000
@@ -329,22 +334,46 @@ def _breakers(metrics: dict[str, Any]) -> dict[str, str]:
     return out
 
 
-async def _nearest_rank(conn: AsyncConnection, where: list[Any], n: int, pct: float) -> float:
-    """The nearest-rank percentile of ``duration_ms`` over the events matching ``where``
-    (``n`` of them have a duration): one indexed range, sorted, one row read. 0.0 for no
-    samples (as the gateway's own metrics)."""
-    if n <= 0:
-        return 0.0
-    rank = min(n, max(1, math.ceil(pct / 100 * n)))
-    query = (
-        select(EVENTS.c.duration_ms)
-        .where(*where, EVENTS.c.duration_ms.is_not(None))
-        .order_by(EVENTS.c.duration_ms)
-        .offset(rank - 1)
-        .limit(1)
+async def percentiles(
+    conn: AsyncConnection, where: list[Any], group: list[Any], pcts: tuple[int, ...]
+) -> dict[tuple[Any, ...], dict[int, float]]:
+    """Nearest-rank percentiles of ``duration_ms`` per ``group`` over the events matching
+    ``where``, in one statement: each group's durations are numbered in order
+    (``row_number``, ``count`` over the group) and only the rank rows are kept, the rank of
+    ``p`` being ``ceil(p * n / 100)`` in integer arithmetic. A group without durations is
+    absent (0.0 for it, as the gateway's own metrics)."""
+    e = EVENTS.c
+    ordered = func.row_number().over(partition_by=group, order_by=(e.duration_ms, e.seq))
+    total = func.count().over(partition_by=group)
+    ranked = (
+        select(*group, e.duration_ms, ordered.label("rn"), total.label("n"))
+        .where(*where, e.duration_ms.is_not(None))
+        .subquery()
     )
-    value = (await conn.execute(query)).scalar_one_or_none()
-    return float(value) if value is not None else 0.0
+    keys = [ranked.c[c.name] for c in group]
+
+    def rank(p: int) -> Any:
+        return (ranked.c.n * p + 99) // 100
+
+    query = (
+        select(
+            *keys,
+            *(
+                func.max(case((ranked.c.rn == rank(p), ranked.c.duration_ms))).label(f"p{p}")
+                for p in pcts
+            ),
+        )
+        .where(or_(*(ranked.c.rn == rank(p) for p in pcts)))
+        .group_by(*keys)
+    )
+    out: dict[tuple[Any, ...], dict[int, float]] = {}
+    for r in (await conn.execute(query)).all():
+        values = tuple(r)
+        out[values[: len(keys)]] = {
+            p: float(v) if v is not None else 0.0
+            for p, v in zip(pcts, values[len(keys) :], strict=True)
+        }
+    return out
 
 
 def _errors() -> Any:
@@ -399,17 +428,28 @@ async def _top_partners(conn: AsyncConnection, now: float) -> list[dict[str, Any
     ]
     calls = func.count().label("calls")
     query = (
-        select(EVENTS.c.partner_id, calls, _errors(), func.count(EVENTS.c.duration_ms))
+        select(EVENTS.c.partner_id, calls, _errors())
         .where(*window)
         .group_by(EVENTS.c.partner_id)
         .order_by(calls.desc(), EVENTS.c.partner_id)
         .limit(TOP_PARTNERS)
     )
-    out = []
-    for pid, n, errors, timed in (await conn.execute(query)).all():
-        p95 = await _nearest_rank(conn, [*window, EVENTS.c.partner_id == pid], int(timed), 95)
-        out.append({"partner_id": pid, "calls": int(n), "errors": int(errors or 0), "p95_ms": p95})
-    return out
+    top = (await conn.execute(query)).all()
+    if not top:
+        return []
+    ids = [r[0] for r in top]
+    ranks = await percentiles(
+        conn, [*window, EVENTS.c.partner_id.in_(ids)], [EVENTS.c.partner_id], (95,)
+    )
+    return [
+        {
+            "partner_id": pid,
+            "calls": int(n),
+            "errors": int(errors or 0),
+            "p95_ms": ranks.get((pid,), {}).get(95, 0.0),
+        }
+        for pid, n, errors in top
+    ]
 
 
 def _rejection_alert(gw: GatewayRow) -> dict[str, Any] | None:
@@ -693,9 +733,27 @@ def _owner_kind(owner: Any) -> str | None:
     return Principal.from_id(owner).kind if isinstance(owner, str) else None
 
 
+def _answerer_kind(actor: Any) -> str | None:
+    """The kind of whoever answered a prompt for the owner: ``console`` for an operator of
+    the control plane (actor ``cp:<id>``), else the gateway principal's kind."""
+    if not isinstance(actor, str):
+        return None
+    return "console" if actor.startswith("cp:") else Principal.from_id(actor).kind
+
+
+def _public_message(message: Any) -> Any:
+    """A history message without the answering operator's id (``answered_by_kind``)."""
+    if not isinstance(message, dict) or "answered_by" not in message:
+        return message
+    shown = {k: v for k, v in message.items() if k != "answered_by"}
+    shown["answered_by_kind"] = _answerer_kind(message["answered_by"])
+    return shown
+
+
 def public_detail(result: dict[str, Any]) -> dict[str, Any]:
-    """A gateway's task detail without principal ids: the owner becomes ``owner_kind``,
-    and a partner task keeps only ``HANDLE_FIELDS`` (no caller id). A detail the gateway
+    """A gateway's task detail without principal ids: the owner becomes ``owner_kind``, a
+    message's ``answered_by`` becomes ``answered_by_kind``, and a partner task keeps only
+    ``HANDLE_FIELDS`` (no caller id). A detail the gateway
     cut for size (``{"truncated": true}``) is ``task: null`` with ``truncated: true``."""
     task = result.get("task")
     if not isinstance(task, dict):
@@ -707,6 +765,9 @@ def public_detail(result: dict[str, Any]) -> dict[str, Any]:
         }
     shown = {k: v for k, v in task.items() if k != "owner"}
     shown["owner_kind"] = _owner_kind(task.get("owner"))
+    history = task.get("history")
+    if isinstance(history, list):
+        shown["history"] = [_public_message(m) for m in history]
     handles = result.get("partner_tasks")
     out = {
         "task": shown,
@@ -776,21 +837,65 @@ async def timeline(
     return [_timeline_entry(r) for r in rows]
 
 
+class DetailGate:
+    """Bounds what task details cost (``app.state.task_details``): concurrent requests for
+    one task share one ``task.get`` (found or queued under ``lock``, so two requests of
+    this process never both queue it), and at most ``DETAIL_WAITERS_MAX`` requests wait for
+    answers at once; the others answer 202 at once."""
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.waiting = 0
+
+
+async def _detail_command(
+    store: ControlStore, gate: DetailGate, gateway_id: str, args: dict[str, Any], actor: str
+) -> str:
+    async with gate.lock:
+        found = await channel.find_command(
+            store, gateway_id, "task.get", args, now=store.now(), done_within_s=DETAIL_REUSE_S
+        )
+        if found is not None:
+            if store.audit is not None:  # who read it, though the gateway ran it once
+                await store.audit.emit(
+                    AuditEvent(
+                        actor=actor,
+                        action="cp.command",
+                        outcome="shared",
+                        detail={"gateway": gateway_id, "command": "task.get"},
+                        ts=store.now(),
+                    )
+                )
+            return found
+        try:
+            return await channel.enqueue_command(store, gateway_id, "task.get", args, actor)
+        except KeyError:
+            raise _not_found("gateway") from None
+        except ValueError:
+            raise HTTPException(
+                409, {"error": "conflict", "detail": "gateway is revoked"}
+            ) from None
+
+
 @route("GET", "/api/v1/tasks/{gateway_id}/{agent_id}/{task_id}", READ)
 async def task_detail(
     gateway_id: str, agent_id: str, task_id: str, request: Request, actor: Reader
 ) -> Any:
     state = request.app.state
     store: ControlStore = state.store
+    gate: DetailGate = state.task_details
     args = {"agent_id": agent_id, "task_id": task_id}
-    try:
-        command_id = await channel.enqueue_command(store, gateway_id, "task.get", args, actor.id)
-    except KeyError:
-        raise _not_found("gateway") from None
-    except ValueError:
-        raise HTTPException(409, {"error": "conflict", "detail": "gateway is revoked"}) from None
-    # polls the command row (one short query per poll, no connection held between polls)
-    command = await channel.wait_command(store, command_id, DETAIL_WAIT_S, sleep=state.sleep)
+    command_id = await _detail_command(store, gate, gateway_id, args, actor.id)
+    if gate.waiting >= DETAIL_WAITERS_MAX:
+        command = await channel.get_command(store, command_id)
+    else:
+        gate.waiting += 1
+        try:  # polls the command row: one short query per poll, no connection held between
+            command = await channel.wait_command(
+                store, command_id, DETAIL_WAIT_S, sleep=state.sleep
+            )
+        finally:
+            gate.waiting -= 1
     result = _dict(command.result)
     if command.status == "failed":
         if result.get("error") == "not_found":
@@ -936,25 +1041,23 @@ async def topology(request: Request, window_m: int = Query(60, ge=5, le=1440)) -
     ]
     calls = func.count().label("calls")
     query = (
-        select(e.gateway_id, e.agent_id, e.partner_id, calls, _errors(), func.count(e.duration_ms))
+        select(e.gateway_id, e.agent_id, e.partner_id, calls, _errors())
         .where(*window)
         .group_by(e.gateway_id, e.agent_id, e.partner_id)
         .order_by(calls.desc(), e.gateway_id, e.agent_id, e.partner_id)
         .limit(EDGES_MAX)
     )
-    found = []
     async with store.engine.connect() as conn:
-        for gid, agent, pid, n, errors, timed in (await conn.execute(query)).all():
-            edge = [*window, e.gateway_id == gid, e.agent_id == agent, e.partner_id == pid]
-            found.append(
-                (
-                    (gid, agent, pid),
-                    int(n),
-                    int(errors or 0),
-                    await _nearest_rank(conn, edge, int(timed), 50),
-                    await _nearest_rank(conn, edge, int(timed), 95),
-                )
-            )
+        rows = (await conn.execute(query)).all()
+        ranks = (
+            await percentiles(conn, window, [e.gateway_id, e.agent_id, e.partner_id], (50, 95))
+            if rows
+            else {}
+        )
+    found = []
+    for gid, agent, pid, n, errors in rows:
+        p = ranks.get((gid, agent, pid), {})
+        found.append(((gid, agent, pid), int(n), int(errors or 0), p.get(50, 0.0), p.get(95, 0.0)))
     decisions = await _policy_overlay(store, [key for key, *_ in found])
     nodes: dict[str, dict[str, Any]] = {}
     edges = []

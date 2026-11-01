@@ -590,6 +590,34 @@ async def enqueue_command(
     return command_id
 
 
+async def find_command(
+    store: ControlStore,
+    gateway_id: str,
+    kind: str,
+    args: dict[str, Any],
+    *,
+    now: float,
+    done_within_s: float,
+) -> str | None:
+    """The newest command of ``kind`` with exactly ``args`` for the gateway that is still
+    open (pending or delivered, unexpired) or finished ``done`` within ``done_within_s``,
+    so a caller can share it instead of queueing the same command again; else None."""
+    open_ = COMMANDS.c.status.in_(("pending", "delivered")) & (COMMANDS.c.expires_at > now)
+    fresh = (COMMANDS.c.status == "done") & (COMMANDS.c.finished_at >= now - done_within_s)
+    query = (
+        select(COMMANDS.c.id)
+        .where(COMMANDS.c.gateway_id == gateway_id)
+        .where(COMMANDS.c.kind == kind)
+        .where(COMMANDS.c.args_json == _json(args))
+        .where(open_ | fresh)
+        .order_by(COMMANDS.c.created_at.desc(), COMMANDS.c.id.desc())
+        .limit(1)
+    )
+    async with store.engine.connect() as conn:
+        found = (await conn.execute(query)).scalar_one_or_none()
+    return str(found) if found is not None else None
+
+
 async def get_command(store: ControlStore, command_id: str) -> CommandRow:
     """``KeyError`` for an unknown (or purged) command."""
     async with store.engine.connect() as conn:
