@@ -213,3 +213,61 @@ approved card version. Every write is audited in `cp_audit`.
 - **References only.** `credential_ref` and `tls_ref` are names each gateway resolves from
   its own configuration. The control plane holds no partner secret, and it fetches cards
   without a client certificate: register an mTLS-only partner with its card inline.
+
+## Policies
+
+A policy is a named series of versions. Each version is a policy document (the same
+schema as a gateway's `policy_file`, see the policy reference), validated when it is
+saved and stored normalized, with every default filled in, and with its hash: the
+`policy_hash` the gateway audits as `policy.update` when it applies the version. Versions
+are never edited. To change a policy, save a new version. Every write is audited in
+`cp_audit` (`cp.policy.save`, `cp.assign`, `cp.policy.dryrun`) with ids, version numbers
+and hashes only, never a document.
+
+| Route | Permission | What it does |
+|---|---|---|
+| `POST /api/v1/policies` `{name, doc, comment?}` | `policy.edit` | create the policy at version 1 |
+| `POST /api/v1/policies/{id}/versions` `{doc, comment?}` | `policy.edit` | save the next version |
+| `GET /api/v1/policies` | `read` | each policy with version summaries and the gateways it is assigned to |
+| `GET /api/v1/policies/{id}` | `read` | every version with its document and a unified `diff` from the version before (over canonical YAML) |
+| `PUT /api/v1/gateways/{gid}/policy` `{policy_id, version}` | `assign` | the gateway's one policy: a version number pins it, `null` follows the latest version |
+| `POST /api/v1/policies/dry-run` `{doc, gateway_ids?, days = 7}` | `policy.edit` | replay recent gateway audit rows against a candidate document |
+
+- **Validation.** A document that fails validation is a 422 whose `fields` are dotted
+  paths under `body.doc` (`body.doc.authz.0.principal`). Values are never echoed.
+- **Warnings.** Create and version responses carry `warnings`. A deny rule with no allow
+  rule is reported as `lone deny rule locks down every agent`, because a lone deny is a
+  lockdown and not a blocklist. A deny rule for an agent that no allow rule names, and a
+  routing rule that names a partner the catalogue does not know, are reported too. These
+  are warnings only: the version is saved.
+- **Assignment and desired state.** The assigned version (the pinned one, or the latest)
+  is the `policy` of the gateway's desired state. A new version marks every gateway that
+  follows the latest version, so they get it at their next poll. Pinned gateways keep
+  their version. **A gateway with no policy assigned is locked down.** Its desired state
+  has `policy: null`, and a gateway with `manage: [policy]` treats that as the lone deny
+  `cp:unconfigured`, so every call to every agent is denied until a policy is assigned.
+- **Dry-run.** Replays the gateways' audit rows (all gateways, or `gateway_ids`) of the
+  last `days` (1 to 30), newest first, against the candidate. At most 50 000 rows are
+  read. When more rows match, `truncated` is true. The rows are read in batches and
+  evaluated off the request loop.
+  - `inbound.admit` rows, and `authz.deny` / `inbound.reject` rows that were the policy's
+    own refusal, go through `authorize(principal, agent, None)`. AgentAccess refusals are
+    not the policy's decision and are skipped.
+  - `partner.call` and `egress.deny` rows go through the routing `forbid` rules (with the
+    partner's tags and approved card from the catalogue) and then the tier and partner
+    ceilings. The level used is the row's `classification`, raised to the candidate's
+    agent default.
+  - The response is `{evaluated, newly_blocked, newly_allowed, truncated,
+    not_replayable, counts}`. Each entry is `{gateway_id, seq, ts, actor_kind, agent_id,
+    partner_id, action, rule}`. The caller appears only as its kind (`api_key`, `jwt`,
+    `anonymous`, `system`) and never by id. Each list holds at most 1 000 entries.
+    `counts` has the full totals and the number of `skipped` rows.
+  - A row is skipped, never guessed, when it lacks what replay needs. Skipped rows are:
+    a partner call without a `classification` (unless a forbid rule now blocks it); an
+    `unavailable` partner call without a classification, since the gateway does not
+    report whether a routing forbid caused it; a call whose tier is unknown; and a
+    partner unknown to the catalogue under a forbid rule that matches on tags or skills.
+  - `not_replayable` lists the checks a replay cannot repeat. `egress content checks`
+    is one of them, because the classifier saw message content that audit rows never
+    hold. A row's `classification` is the level the gateway computed at the time, so a
+    candidate that lowers an agent's default cannot lower the level replayed.

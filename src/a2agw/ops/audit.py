@@ -132,6 +132,7 @@ DETAIL_KEYS = frozenset(
         "gateway",  # control plane: the gateway id a row is about
         "role",  # control plane: the role given to an API key or user
         "user",  # control plane: the user id a row is about (cp.user.update)
+        "policy",  # control plane: the policy id a row is about (cp.policy.*, cp.assign)
     }
 )
 # PartnerRegistry change events -> audit actions (``registry_audit_action``).
