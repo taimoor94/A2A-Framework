@@ -1,0 +1,143 @@
+import json
+import sys
+
+import pytest
+
+from a2agw.adapters.callable import CallableAdapter
+from a2agw.serve.host import AgentHost
+from a2agw.vsc.config import BudgetConfig, SystemConfig, VscConfig
+from a2agw.vsc.plan import Plan, PlanStep, plan_hash
+from a2agw.vsc.planner import (
+    AgentPlanner,
+    PlannerError,
+    ScriptedPlanner,
+    claude_planner_adapter,
+    deliver_agent,
+)
+from a2agw.vsc.spec import ExecutableSpec
+from a2agw.vsc.verify import CheckResult
+
+SYSTEMS = [SystemConfig(id="core", repo="./core"), SystemConfig(id="app", repo="./app")]
+
+
+def make_spec(systems=("core", "app")) -> ExecutableSpec:
+    return ExecutableSpec(
+        request="r", done="ship it", systems=list(systems), acceptance=[], budgets=BudgetConfig()
+    )
+
+
+def failure() -> CheckResult:
+    return CheckResult(
+        kind="gate",
+        id="g",
+        command=["x"],
+        exit_code=1,
+        passed=False,
+        duration_s=0.1,
+        log_sha256="0",
+        stderr_tail="boom",
+    )
+
+
+def two_step_plan(text="a") -> Plan:
+    return Plan(
+        steps=[
+            PlanStep(id="s1", system="core", instructions=text),
+            PlanStep(id="s2", system="app", instructions=text),
+        ]
+    )
+
+
+async def test_scripted_plan_one_step_per_system():
+    p = ScriptedPlanner()
+    spec = await p.intake("do it. systems: app", SYSTEMS, [])
+    assert spec.systems == ["app"]
+    spec = await p.intake("do it", SYSTEMS, [])
+    assert spec.systems == ["core", "app"]
+    plan = await p.plan(spec)
+    assert [(s.system, s.kind, s.instructions) for s in plan.steps] == [
+        ("core", "edit", spec.done),
+        ("app", "edit", spec.done),
+    ]
+    kinds = [(await p.replan(spec, plan, failure(), [])).kind for _ in range(3)]
+    assert kinds == ["retry", "escalate", "stop"]
+
+
+async def test_replan_with_new_steps_is_refused(tmp_path):
+    spec = make_spec()
+    old = two_step_plan()
+    changed = Plan(steps=[PlanStep(id="s1", system="core", instructions="a")])
+
+    async def run(plan, name):
+        text = json.dumps({"kind": "replan", "text": plan.model_dump_json()})
+        host, planner = await _host(tmp_path / name, lambda ctx: text)
+        try:
+            return await planner.replan(spec, old, failure(), [])
+        finally:
+            await planner.aclose()
+            await host.shutdown()
+
+    d = await run(changed, "a")
+    assert d.kind == "stop" and d.text == "plan_immutable"
+    d = await run(old, "b")
+    assert d.kind == "replan" and plan_hash(Plan.model_validate_json(d.text)) == plan_hash(old)
+
+
+async def _host(tmp_path, fn, job_id="job-1"):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    host = AgentHost("http://t", db_url=f"sqlite+aiosqlite:///{tmp_path / 'h.db'}", admin=False)
+    host.add(deliver_agent(CallableAdapter(fn)))
+    await host.startup()
+    return host, AgentPlanner(host, job_id=job_id)
+
+
+async def test_agent_planner_turn_is_a_task_in_job_context(tmp_path):
+    spec = make_spec()
+    plan = two_step_plan()
+    host, planner = await _host(tmp_path / "h", lambda ctx: plan.model_dump_json(), "job-42")
+    try:
+        got = await planner.plan(spec)
+        assert plan_hash(got) == plan_hash(plan)
+        rows, _ = await host.index.list(agent_id="deliver")
+        assert [r["context_id"] for r in rows] == ["job-42"]
+        await host.audit.drain()
+        audit, _ = await host.audit.query({"action": "inbound.admit"})
+        assert audit
+    finally:
+        await planner.aclose()
+        await host.shutdown()
+
+
+async def test_agent_planner_retries_parse_error_once(tmp_path):
+    spec = make_spec()
+    prompts: list[str] = []
+    replies = ["not json at all", two_step_plan().model_dump_json()]
+
+    def fn(ctx):
+        prompts.append(ctx.text)
+        return replies[len(prompts) - 1]
+
+    host, planner = await _host(tmp_path / "h", fn)
+    try:
+        assert len((await planner.plan(spec)).steps) == 2
+        assert len(prompts) == 2 and "no JSON object" in prompts[1]
+    finally:
+        await planner.aclose()
+        await host.shutdown()
+
+    prompts.clear()
+    replies[:] = ["bad", "still bad"]
+    host, planner = await _host(tmp_path / "h2", fn, "job-2")
+    try:
+        with pytest.raises(PlannerError):
+            await planner.plan(spec)
+        assert len(prompts) == 2
+    finally:
+        await planner.aclose()
+        await host.shutdown()
+
+
+def test_claude_planner_requires_extra(monkeypatch):
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", None)
+    with pytest.raises(ImportError, match=r"a2a-gateway\[vsc\]"):
+        claude_planner_adapter(VscConfig(systems=SYSTEMS))
