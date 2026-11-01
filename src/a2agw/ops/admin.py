@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, Any
 from a2a.types import TaskState
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
-from starlette.routing import Route
+from starlette.routing import BaseRoute, Route
 
 from a2agw.ops import actions
 from a2agw.ops.audit import ACTIONS, AuditEvent, parse_since
@@ -107,43 +107,64 @@ def _str_param(request: Request, name: str) -> str | None:
     return raw
 
 
-def admin_routes(host: AgentHost) -> list[Route]:
-    async def audit(request: Request, action: Any, outcome: str, reason: str) -> None:
-        log = getattr(host, "audit", None)
-        if log is None:
-            return
-        user = request.scope.get("user")
-        principal = user.principal if isinstance(user, PrincipalUser) else None
-        ev = AuditEvent(
-            actor=principal.id if principal is not None else "anonymous",
-            action=action,
-            outcome=outcome,
-            detail={"reason": reason},
-        )
-        if action == "authz.deny" and (principal is None or principal.kind == "anonymous"):
-            await log.emit_coalesced(ev, reason)  # one row per admin category per window
-        else:
-            await log.emit(ev)
+async def _audit_request(
+    host: AgentHost, request: Request, action: Any, outcome: str, reason: str
+) -> None:
+    log = getattr(host, "audit", None)
+    if log is None:
+        return
+    user = request.scope.get("user")
+    principal = user.principal if isinstance(user, PrincipalUser) else None
+    ev = AuditEvent(
+        actor=principal.id if principal is not None else "anonymous",
+        action=action,
+        outcome=outcome,
+        detail={"reason": reason},
+    )
+    if action == "authz.deny" and (principal is None or principal.kind == "anonymous"):
+        await log.emit_coalesced(ev, reason)  # one row per admin category per window
+    else:
+        await log.emit(ev)
 
+
+def guard(
+    host: AgentHost,
+    category: str,
+    fn: Handler,
+    *,
+    read: bool = True,
+    allowed: Callable[[AgentHost, Request], bool] = _allowed,
+) -> Handler:
+    """An admin handler behind the admin rules: ``allowed`` (default: the admin scope) or 403
+    (audited ``authz.deny``), the ``X-A2AGW-Admin: 1`` header on every write, an
+    ``admin.read`` row for every admitted read, and ``_BadRequest`` mapped to 400. Routes
+    mounted from outside this module (``AgentHost.admin_extra_routes``) use it too."""
+
+    async def wrapper(request: Request) -> Response:
+        if not allowed(host, request):
+            await _audit_request(host, request, "authz.deny", "forbidden", f"admin {category}")
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+        if not read and request.headers.get(ADMIN_HEADER) != "1":
+            # CSRF: a browser cannot add this header to a cross-site form POST.
+            await _audit_request(
+                host, request, "authz.deny", "forbidden", f"admin {category}: no header"
+            )
+            return JSONResponse(
+                {"error": f"forbidden: send the {ADMIN_HEADER}: 1 header"}, status_code=403
+            )
+        if read:
+            await _audit_request(host, request, "admin.read", "ok", category)
+        try:
+            return await fn(request)
+        except _BadRequest as exc:
+            return _bad(exc.field)
+
+    return wrapper
+
+
+def admin_routes(host: AgentHost) -> list[BaseRoute]:
     def guarded(category: str, fn: Handler, *, read: bool = True) -> Handler:
-        async def wrapper(request: Request) -> Response:
-            if not _allowed(host, request):
-                await audit(request, "authz.deny", "forbidden", f"admin {category}")
-                return JSONResponse({"error": "forbidden"}, status_code=403)
-            if not read and request.headers.get(ADMIN_HEADER) != "1":
-                # CSRF: a browser cannot add this header to a cross-site form POST.
-                await audit(request, "authz.deny", "forbidden", f"admin {category}: no header")
-                return JSONResponse(
-                    {"error": f"forbidden: send the {ADMIN_HEADER}: 1 header"}, status_code=403
-                )
-            if read:
-                await audit(request, "admin.read", "ok", category)
-            try:
-                return await fn(request)
-            except _BadRequest as exc:
-                return _bad(exc.field)
-
-        return wrapper
+        return guard(host, category, fn, read=read)
 
     async def healthz(_: Request) -> Response:
         body: dict[str, Any] = {"status": "ok"}
@@ -348,6 +369,8 @@ def admin_routes(host: AgentHost) -> list[Route]:
         route("push", push),
         route("tasks/reap", tasks_reap, method="POST"),
         route("partners/reload", partners_reload, method="POST"),
+        # Mounted by optional features (e.g. ``a2agw.vsc`` under ``/a2agw/admin/vsc``).
+        *getattr(host, "admin_extra_routes", ()),
     ]
 
 

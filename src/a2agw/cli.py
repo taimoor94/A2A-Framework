@@ -49,6 +49,15 @@ app.add_typer(card_app, name="card")
 tasks_app = typer.Typer(help="Maintenance of stored tasks.", no_args_is_help=True)
 app.add_typer(audit_app, name="audit")
 app.add_typer(tasks_app, name="tasks")
+vsc_app = typer.Typer(
+    help="Verified System Change jobs on the configured gateway (its admin API).",
+    no_args_is_help=True,
+)
+vsc_receipt_app = typer.Typer(help="Export and verify job receipts.", no_args_is_help=True)
+vsc_spec_app = typer.Typer(help="Edit a job's executable specification.", no_args_is_help=True)
+app.add_typer(vsc_app, name="vsc")
+vsc_app.add_typer(vsc_receipt_app, name="receipt")
+vsc_app.add_typer(vsc_spec_app, name="spec")
 
 
 class DatabaseError(Exception):
@@ -1065,3 +1074,145 @@ async def _reap(
         if client is not None:
             await client.aclose()
         await engine.dispose()
+
+
+# -- vsc -------------------------------------------------------------------------------------
+# These call the configured gateway's admin API (``base_url`` + ``/a2agw/admin/vsc``) with the
+# API key from A2AGW_API_KEY; ``receipt verify`` is offline.
+VSC_ADMIN_PATH = "/a2agw/admin/vsc"
+VSC_TIMEOUT_S = 30.0
+# Tests replace this with a transport to an in-process gateway.
+_admin_transport: httpx.BaseTransport | None = None
+
+ApiKeyOpt = Annotated[
+    str | None,
+    typer.Option(
+        "--api-key",
+        envvar="A2AGW_API_KEY",
+        show_envvar=True,
+        help="API key for the gateway's admin API; prefer the A2AGW_API_KEY env var.",
+    ),
+]
+
+
+def _vsc_api(
+    config: Path, api_key: str | None, method: str, path: str, body: Any = None
+) -> dict[str, Any]:
+    """One admin API call; ValueError (no secrets, no body echo) for anything but 2xx."""
+    cfg = load_config(config)
+    headers = {"X-A2AGW-Admin": "1"} if method != "GET" else {}
+    if api_key:
+        headers["X-API-Key"] = api_key
+    url = cfg.base_url.rstrip("/") + VSC_ADMIN_PATH + path
+    try:
+        with httpx.Client(transport=_admin_transport, timeout=VSC_TIMEOUT_S, trust_env=False) as hc:
+            r = hc.request(method, url, headers=headers, json=body)
+    except httpx.HTTPError as e:
+        raise ValueError(f"gateway unreachable: {type(e).__name__}") from None
+    try:
+        data = r.json()
+    except ValueError:
+        data = None
+    if not r.is_success:
+        detail = data.get("error") if isinstance(data, dict) else None
+        if isinstance(data, dict) and data.get("field"):
+            detail = f"{detail} ({data['field']})"
+        raise ValueError(f"gateway answered {r.status_code}" + (f": {detail}" if detail else ""))
+    if not isinstance(data, dict):
+        raise ValueError("gateway answered with no JSON object")  # noqa: TRY004
+    return data
+
+
+def _job_path(job: str) -> str:
+    from urllib.parse import quote
+
+    return "/jobs/" + quote(job, safe="")
+
+
+@vsc_app.command("submit")
+@guarded
+def vsc_submit(
+    request: str, config: ConfigOpt = Path("a2agw.yaml"), api_key: ApiKeyOpt = None
+) -> None:
+    """Submit a change request; prints the new job id."""
+    typer.echo(_vsc_api(config, api_key, "POST", "/jobs", {"request": request})["job_id"])
+
+
+@vsc_app.command("status")
+@guarded
+def vsc_status(job: str, config: ConfigOpt = Path("a2agw.yaml"), api_key: ApiKeyOpt = None) -> None:
+    """Show a job's state and its steps."""
+    data = _vsc_api(config, api_key, "GET", _job_path(job))
+    line = f"job {data['job_id']}: {data['state']}"
+    typer.echo(f"{line} ({data['reason']})" if data.get("reason") else line)
+    for s in data.get("steps") or []:
+        typer.echo(f"  {s['step_id']} [{s['kind']} on {s['system']}] {s['state']} "
+                   f"(attempt {s['attempt']})")  # fmt: skip
+    if data.get("waiting_step"):
+        typer.echo(f"waiting for approval: {data['waiting_step']}")
+
+
+@vsc_app.command("approve")
+@guarded
+def vsc_approve(
+    job: str,
+    step: str,
+    note: Annotated[str, typer.Option("--note", help="Recorded with the decision.")] = "",
+    reject: Annotated[bool, typer.Option("--reject", help="Reject the step instead.")] = False,
+    config: ConfigOpt = Path("a2agw.yaml"),
+    api_key: ApiKeyOpt = None,
+) -> None:
+    """Approve (or, with --reject, reject) a job's privileged step."""
+    verb = "reject" if reject else "approve"
+    _vsc_api(config, api_key, "POST", f"{_job_path(job)}/{verb}", {"step_id": step, "note": note})
+    typer.echo(f"{step}: {verb}d")
+
+
+@vsc_receipt_app.command("export")
+@guarded
+def vsc_receipt_export(
+    job: str, file: Path, config: ConfigOpt = Path("a2agw.yaml"), api_key: ApiKeyOpt = None
+) -> None:
+    """Write a finished job's receipt to FILE (mode 0600)."""
+    from a2agw.vsc.receipt import export_receipt
+
+    receipt = _vsc_api(config, api_key, "GET", f"{_job_path(job)}/receipt")
+    export_receipt(receipt, file)
+    typer.echo(f"receipt {receipt.get('receipt_hash')} written to {file}")
+
+
+@vsc_receipt_app.command("verify")
+@guarded
+def vsc_receipt_verify(file: Path) -> None:
+    """Check an exported receipt offline (no gateway needed); exit 1 listing the problems."""
+    from a2agw.vsc.receipt import verify_receipt
+
+    try:
+        bundle = json.loads(file.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError(f"{file} is not a JSON receipt") from None
+    if not isinstance(bundle, dict):
+        raise ValueError(f"{file} is not a JSON receipt")  # noqa: TRY004
+    problems = verify_receipt(bundle)
+    if problems:
+        for p in problems:
+            typer.echo(p, err=True)
+        raise typer.Exit(1)
+    typer.echo(f"receipt ok: {bundle['receipt_hash']}")
+
+
+@vsc_spec_app.command("edit")
+@guarded
+def vsc_spec_edit(
+    job: str, file: Path, config: ConfigOpt = Path("a2agw.yaml"), api_key: ApiKeyOpt = None
+) -> None:
+    """Set a job's executable specification from FILE (JSON or YAML); only while the job is
+    awaiting_spec."""
+    try:
+        spec = yaml.safe_load(file.read_text(encoding="utf-8"))  # JSON is a YAML subset
+    except (UnicodeDecodeError, yaml.YAMLError):
+        raise ValueError(f"{file} is not a JSON or YAML specification") from None
+    if not isinstance(spec, dict):
+        raise ValueError(f"{file} must contain an object")  # noqa: TRY004
+    data = _vsc_api(config, api_key, "PUT", f"{_job_path(job)}/spec", spec)
+    typer.echo(f"spec {data.get('spec_hash')} set; job {job} continues")

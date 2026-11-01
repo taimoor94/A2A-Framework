@@ -1132,6 +1132,11 @@ class AgentHost:
         self.handlers: dict[str, LimitedRequestHandler] = {}
         self.cards: dict[str, AgentCard] = {}
         self.extra_routes: list[BaseRoute] = []  # mounted before the agent routes (admin, ...)
+        # Admin routes of optional features (``a2agw.vsc``), served with the admin API (only
+        # when ``admin`` is on) and behind its rules (``a2agw.ops.admin.guard``).
+        self.admin_extra_routes: list[BaseRoute] = []
+        # The Verified System Change runtime (``a2agw.vsc.host.VscRuntime``) when attached.
+        self.vsc: Any = None
         self.engine: AsyncEngine | None = None
         self.index: TaskIndex | None = None  # created at startup
         self.last_recovery: RecoveryReport | None = None

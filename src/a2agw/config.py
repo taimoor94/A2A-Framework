@@ -915,6 +915,15 @@ def build_host(cfg: GatewayConfig, *, config_dir: Path | str = ".") -> AgentHost
             host.add(_load_agent(entry.spec, config_dir))
         else:
             host.add(_external_agent(entry, f"agents.{i}", config_dir))
+    if cfg.vsc:
+        from a2agw.vsc.host import attach_vsc
+
+        try:
+            attach_vsc(host, cfg.vsc, config_dir)
+        except ImportError as e:
+            raise ConfigError(f"vsc.planner: {e}") from None
+        except ValueError as e:  # no worker, or an agent id taken by a configured agent
+            raise ConfigError(str(e)) from None
     return host
 
 

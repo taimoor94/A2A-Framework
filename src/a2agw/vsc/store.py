@@ -68,6 +68,8 @@ _jobs = Table(
     Column("active_s", Float, nullable=False, server_default="0"),
     # Every whole-system check passed on the job's current commits.
     Column("whole_passed", Integer, nullable=False, server_default="0"),
+    # The A2A context the job was submitted in (the ``deliver`` agent's), if any.
+    Column("context_id", String, nullable=True, index=True),
 )
 _steps = Table(
     "vsc_steps",
@@ -101,6 +103,7 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
     "vsc_jobs": {
         "active_s": "FLOAT NOT NULL DEFAULT 0",
         "whole_passed": "INTEGER NOT NULL DEFAULT 0",
+        "context_id": "VARCHAR",
     },
 }
 
@@ -144,7 +147,9 @@ class VscStore:
 
     # -- jobs ----------------------------------------------------------------------------
 
-    async def create_job(self, job_id: str, request: str, owner: str) -> None:
+    async def create_job(
+        self, job_id: str, request: str, owner: str, *, context_id: str | None = None
+    ) -> None:
         now = time.time()
         stmt = _upsert(self._engine)(_jobs).values(
             job_id=job_id,
@@ -157,6 +162,7 @@ class VscStore:
             tokens_out=0,
             cost=0.0,
             attempts=0,
+            context_id=context_id,
         )
         async with self._engine.begin() as conn:
             await conn.execute(stmt.on_conflict_do_nothing(index_elements=["job_id"]))
@@ -171,6 +177,18 @@ class VscStore:
     async def get_job(self, job_id: str) -> dict[str, Any] | None:
         async with self._engine.connect() as conn:
             row = (await conn.execute(select(_jobs).where(_jobs.c.job_id == job_id))).first()
+        return dict(row._mapping) if row is not None else None
+
+    async def job_for_context(self, context_id: str) -> dict[str, Any] | None:
+        """The job submitted in this A2A context (the earliest, should there be several)."""
+        stmt = (
+            select(_jobs)
+            .where(_jobs.c.context_id == context_id)
+            .order_by(_jobs.c.created_at, _jobs.c.job_id)
+            .limit(1)
+        )
+        async with self._engine.connect() as conn:
+            row = (await conn.execute(stmt)).first()
         return dict(row._mapping) if row is not None else None
 
     async def set_state(

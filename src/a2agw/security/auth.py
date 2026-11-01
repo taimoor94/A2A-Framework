@@ -44,6 +44,22 @@ JWKS_FAIL_BACKOFF_S = 30.0  # after a failed fetch, none is tried for this long
 JWKS_MAX_BYTES = 1024 * 1024
 
 
+# Lets a principal submit, follow and approve Verified System Change jobs (the ``deliver``
+# agent and ``/a2agw/admin/vsc``); only meaningful on a gateway with a ``vsc:`` section.
+VSC_SCOPE = "a2agw:vsc"
+# Scopes that grant others as well: the admin scope implies the VSC scope.
+IMPLIED_SCOPES: dict[str, frozenset[str]] = {"a2agw:admin": frozenset({VSC_SCOPE})}
+
+
+def has_scope(principal: Principal | None, scope: str) -> bool:
+    """Whether the principal holds ``scope`` directly or through a scope that implies it."""
+    if principal is None:
+        return False
+    return scope in principal.scopes or any(
+        scope in IMPLIED_SCOPES.get(held, frozenset()) for held in principal.scopes
+    )
+
+
 class PermissionDenied(Exception):
     """The authenticated principal may not access the agent."""
 

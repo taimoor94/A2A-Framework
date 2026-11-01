@@ -12,8 +12,8 @@ from a2agw.vsc.planner import (
     PlannerError,
     ScriptedPlanner,
     claude_planner_adapter,
-    deliver_agent,
     guard_replan,
+    planner_agent,
 )
 from a2agw.vsc.spec import ExecutableSpec
 from a2agw.vsc.verify import CheckResult
@@ -191,7 +191,7 @@ async def test_intake_prompt_fences_request_as_json(tmp_path):
 async def _host(tmp_path, fn, job_id="job-1"):
     tmp_path.mkdir(parents=True, exist_ok=True)
     host = AgentHost("http://t", db_url=f"sqlite+aiosqlite:///{tmp_path / 'h.db'}", admin=False)
-    host.add(deliver_agent(CallableAdapter(fn)))
+    host.add(planner_agent(CallableAdapter(fn)))
     await host.startup()
     return host, AgentPlanner(host, job_id=job_id)
 
@@ -203,7 +203,7 @@ async def test_agent_planner_turn_is_a_task_in_job_context(tmp_path):
     try:
         got = await planner.plan(spec)
         assert plan_hash(got) == plan_hash(plan)
-        rows, _ = await host.index.list(agent_id="deliver")
+        rows, _ = await host.index.list(agent_id="vsc-planner")
         assert [r["context_id"] for r in rows] == ["job-42"]
         await host.audit.drain()
         audit, _ = await host.audit.query({"action": "inbound.admit"})

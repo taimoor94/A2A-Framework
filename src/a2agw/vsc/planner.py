@@ -1,5 +1,5 @@
 """The planner: the one coordinator that turns a request into an executable specification and a
-fixed plan. ``AgentPlanner`` talks to the ``deliver`` agent on the host, so every planning call is
+fixed plan. ``AgentPlanner`` talks to the ``vsc-planner`` agent on the host, so every planning call is
 an audited A2A task in the job's context."""
 
 from __future__ import annotations
@@ -159,7 +159,7 @@ def _text_of(msg: Any) -> str:
 
 
 class AgentPlanner:
-    def __init__(self, host: AgentHost, agent_id: str = "deliver", *, job_id: str) -> None:
+    def __init__(self, host: AgentHost, agent_id: str = "vsc-planner", *, job_id: str) -> None:
         self._host = host
         self._agent_id = agent_id
         self._job_id = job_id
@@ -282,16 +282,17 @@ class AgentPlanner:
         return guard_replan(plan, await self._turn(prompt, parse))
 
 
-def deliver_agent(adapter: InboundAdapter) -> AgentSpec:
+def planner_agent(adapter: InboundAdapter, agent_id: str = "vsc-planner") -> AgentSpec:
+    """The planner's hosted agent (``AgentPlanner`` sends it every planning turn)."""
     return AgentSpec(
-        id="deliver",
-        name="Deliver",
-        description="Plans and coordinates verified changes across systems.",
+        id=agent_id,
+        name="VSC planner",
+        description="Plans verified changes across systems.",
         skills=[
             SkillSpec(
-                id="deliver",
-                name="Deliver",
-                description="Plans and coordinates verified changes across systems.",
+                id="plan",
+                name="Plan",
+                description="Turns a change request into a specification and a fixed plan.",
             )
         ],
         adapter=adapter,

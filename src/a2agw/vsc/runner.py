@@ -171,11 +171,11 @@ class JobRunner:
         """Background runs still in progress, by job id."""
         return dict(self._tasks)
 
-    async def submit(self, request: str, *, owner: str) -> str:
+    async def submit(self, request: str, *, owner: str, context_id: str | None = None) -> str:
         if len(request) > REQUEST_MAX_CHARS:
             raise ValueError(f"request longer than {REQUEST_MAX_CHARS} characters")
         job_id = uuid.uuid4().hex
-        await self._store.create_job(job_id, request, owner)
+        await self._store.create_job(job_id, request, owner, context_id=context_id)
         await self._transition(job_id, "submitted", actor=owner)
         return job_id
 
