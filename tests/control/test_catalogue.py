@@ -772,3 +772,146 @@ async def test_every_write_audited(respx_mock, db_url, catalogue_app, run_app):
                 )
             ).scalars()
             assert set(partner_ids) == {"acme"}
+
+
+# -- fix round 1: a version is approved only if it passes the checks of the current tier ----
+
+
+def private_iface(name: str, **over: Any) -> dict[str, Any]:
+    return card(
+        name,
+        supportedInterfaces=[
+            {
+                "url": "https://private.example.com/rpc",
+                "protocolBinding": "JSONRPC",
+                "protocolVersion": "1.0",
+            }
+        ],
+        **over,
+    )
+
+
+@respx.mock(assert_all_called=False)
+async def test_approve_rechecks_a_version_for_the_current_tier(
+    respx_mock, db_url, catalogue_app, run_app
+):
+    """v1 approved, v2 (private interface) and v3 pending under ``internal``; the tier moves
+    to ``public``. Settings re-check only the approved and the latest card, so v2 is caught
+    by approve: 422, and nothing changes."""
+    route = respx_mock.get(card_url_of("acme")).respond(200, json=card("Acme"))
+    app = catalogue_app(settings_for(db_url))
+    async with run_app(app) as c:
+        admin = await admin_key(app)
+        gid, _ = await gateway(app, "edge-1")
+        await register(c, admin, "acme", tier="internal")
+        await assign(c, admin, gid, "acme")
+        assert (await approve(c, admin, "acme")).status_code == 200
+        route.respond(200, json=private_iface("Acme"))
+        r = await c.post("/api/v1/partners/acme/refresh", headers=admin)
+        assert r.json()["outcome"] == "pending"
+        v2 = r.json()["pending_version"]
+        route.respond(200, json=card("Acme", description="third"))
+        r = await c.post("/api/v1/partners/acme/refresh", headers=admin)
+        v3 = r.json()["pending_version"]
+        assert [v2["version"], v3["version"]] == [2, 3]
+        r = await c.put("/api/v1/partners/acme/settings", json={"tier": "public"}, headers=admin)
+        assert r.status_code == 200, r.text
+        before = await desired(app, gid)
+
+        r = await c.post(
+            "/api/v1/partners/acme/approve",
+            json={"version": 2, "expected_hash": v2["card_hash"]},
+            headers=admin,
+        )
+        assert r.status_code == 422 and r.json() == {
+            "error": "card",
+            "detail": "UnsafeInterfaceURL",
+        }
+        detail = (await c.get("/api/v1/partners/acme", headers=admin)).json()
+        assert detail["current_version"] == 1 and detail["status"] == "approved"
+        assert detail["versions"][1]["approved_at"] is None
+        assert await channel.dirty_gateways(app.state.store) == []
+        assert (await desired(app, gid)).hash == before.hash
+        assert [r["outcome"] for r in await audit_rows(app, "cp.partner.approve")] == ["approved"]
+        r = await c.post(
+            "/api/v1/partners/acme/approve",
+            json={"version": 3, "expected_hash": v3["card_hash"]},
+            headers=admin,
+        )
+        assert r.status_code == 200 and r.json()["current_version"] == 3
+
+
+@respx.mock(assert_all_called=False)
+async def test_refresh_refused_when_the_tier_changes_meanwhile(
+    respx_mock, db_url, catalogue_app, run_app
+):
+    """A card checked for the old tier is never stored when the tier changed while it was
+    fetched: the refresh is a 409 and adds no version."""
+    from a2agw.control.catalogue import CardChecker
+    from a2agw.control.store import PARTNERS
+
+    route = respx_mock.get(card_url_of("acme")).respond(200, json=card("Acme"))
+    app = catalogue_app(settings_for(db_url))
+    async with run_app(app) as c:
+        admin = await admin_key(app)
+        await register(c, admin, "acme", tier="internal")
+        await approve(c, admin, "acme")
+        real: CardChecker = app.state.cards
+
+        class TierChangesDuringFetch(CardChecker):
+            async def fetch(self, card_url: str, tier: Any) -> dict[str, Any]:
+                raw = await real.fetch(card_url, tier)
+                async with app.state.engine.begin() as conn:  # a concurrent settings write
+                    await conn.execute(
+                        PARTNERS.update().where(PARTNERS.c.id == "acme").values(tier="public")
+                    )
+                return raw
+
+        app.state.cards = TierChangesDuringFetch(real.http, real.verifier, real.require_signed)
+        for new in (card("Acme", version="2"), private_iface("Acme")):  # cosmetic, significant
+            async with app.state.engine.begin() as conn:
+                await conn.execute(
+                    PARTNERS.update().where(PARTNERS.c.id == "acme").values(tier="internal")
+                )
+            route.respond(200, json=new)
+            r = await c.post("/api/v1/partners/acme/refresh", headers=admin)
+            assert r.status_code == 409 and r.json()["error"] == "conflict", r.text
+            detail = (await c.get("/api/v1/partners/acme", headers=admin)).json()
+            assert [v["version"] for v in detail["versions"]] == [1]
+            assert detail["current_version"] == 1
+
+
+@respx.mock(assert_all_called=False)
+async def test_desired_is_the_approved_version_at_current_version(
+    respx_mock, db_url, catalogue_app, run_app
+):
+    """Task 6's render, fed by the catalogue: only approved partners, as the version at
+    ``current_version`` (a newer approved version is not sent after a roll-back)."""
+    route = respx_mock.get(card_url_of("acme")).respond(200, json=card("Acme"))
+    app = catalogue_app(settings_for(db_url))
+    async with run_app(app) as c:
+        admin = await admin_key(app)
+        gid, _ = await gateway(app, "edge-1")
+        await register(c, admin, "acme")
+        await register(c, admin, "beta", card=card("Beta"))  # pending: never sent
+        await assign(c, admin, gid, "acme", "beta")
+        v1 = await latest(c, admin, "acme")
+        await approve(c, admin, "acme")
+        changed = card("Acme", description="v2")
+        route.respond(200, json=changed)
+        await c.post("/api/v1/partners/acme/refresh", headers=admin)
+        [rec] = (await desired(app, gid)).partners  # v2 pending: v1 is sent
+        assert rec["id"] == "acme" and rec["card_hash"] == v1["card_hash"]
+        await approve(c, admin, "acme")
+        [rec] = (await desired(app, gid)).partners
+        assert rec["card_hash"] == card_hash(normalized(changed))
+        r = await c.post(
+            "/api/v1/partners/acme/approve",
+            json={"version": 1, "expected_hash": v1["card_hash"]},
+            headers=admin,
+        )
+        assert r.status_code == 200 and r.json()["current_version"] == 1
+        [rec] = (await desired(app, gid)).partners
+        assert rec["card_hash"] == v1["card_hash"]
+        await c.post("/api/v1/partners/acme/quarantine", headers=admin)
+        assert (await desired(app, gid)).partners == []

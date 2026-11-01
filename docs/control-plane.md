@@ -183,7 +183,7 @@ approved card version. Every write is audited in `cp_audit`.
 | `POST /api/v1/partners` `{id, card_url \| card, tier, credential_ref?, tls_ref?, tags?}` | `partners.register` | fetch the card (SSRF-guarded for the tier), validate and verify it; version 1, `pending` |
 | `GET /api/v1/partners?tier=&status=&gateway_id=&q=` | `read` | the list; `q` is the skill search. Without `status` only `approved` partners are listed and searched |
 | `GET /api/v1/partners/{id}` | `read` | approved card, pending card, their `diff`, the versions, what each gateway reported |
-| `POST /api/v1/partners/{id}/approve` `{version, expected_hash}` | `partners.trust` | approve that version (409 if the hash differs) |
+| `POST /api/v1/partners/{id}/approve` `{version, expected_hash}` | `partners.trust` | approve that version (409 if the hash differs; the card is checked again for the current tier, 422 `card` if it fails) |
 | `POST /api/v1/partners/{id}/reject`, `.../quarantine` | `partners.trust` | the partner leaves every gateway |
 | `POST /api/v1/partners/{id}/refresh` | `partners.register` | fetch the card again |
 | `PUT /api/v1/partners/{id}/settings` `{tier?, credential_ref?, tls_ref?, tags?}` | `partners.trust` | change the operator's fields (`null` clears a ref) |

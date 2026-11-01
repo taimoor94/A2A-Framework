@@ -424,3 +424,106 @@ async def test_removed_partner_with_open_tasks_disabled_then_removed(
         await host.handles.update_state("p1", "pt-1", "TASK_STATE_COMPLETED")
         await host.maintain()
         assert partner_ids(host) == []
+
+
+async def test_catalogue_approval_of_a_gateway_quarantine_end_to_end(
+    control_plane, enroll, tmp_path
+):
+    """A gateway quarantines a changed card; the catalogue fetches the card itself, and the
+    hash it computes is the one the gateway's partner.approve compares: the queued command
+    succeeds and the partner is active with the new card."""
+    import respx
+
+    from a2agw.control.store import COMMANDS
+
+    app = control_plane
+    gw = await enroll()
+    _kid, key = await app.state.store.create_api_key("ops", "admin", actor="t")
+    admin = {"authorization": f"Bearer {key}"}
+    raw = {
+        "name": "Acme",
+        "description": "acme does things",
+        "version": "1.0",
+        "supportedInterfaces": [
+            {
+                "url": "https://acme.example.com/rpc",
+                "protocolBinding": "JSONRPC",
+                "protocolVersion": "1.0",
+            }
+        ],
+        "capabilities": {},
+        "defaultInputModes": ["text/plain"],
+        "defaultOutputModes": ["text/plain"],
+        "skills": [{"id": "s1", "name": "S1", "description": "d", "tags": ["a"]}],
+    }
+    changed = {**raw, "description": "acme does other things now"}
+    with respx.mock(assert_all_called=False) as rx:
+        route = rx.get("https://acme.example.com/.well-known/agent-card.json").respond(
+            200, json=raw
+        )
+        async with httpx.AsyncClient(transport=app.state.link, base_url=CP) as cp:
+            r = await cp.post(
+                "/api/v1/partners",
+                json={"id": "acme", "tier": "partner", "card_url": "https://acme.example.com"},
+                headers=admin,
+            )
+            assert r.status_code == 201, r.text
+            v1 = r.json()["versions"][0]
+            r = await cp.post(
+                "/api/v1/partners/acme/approve",
+                json={"version": 1, "expected_hash": v1["card_hash"]},
+                headers=admin,
+            )
+            assert r.status_code == 200, r.text
+            r = await cp.put(
+                f"/api/v1/gateways/{gw}/partners", json={"partner_ids": ["acme"]}, headers=admin
+            )
+            assert r.status_code == 200, r.text
+            async with gateway(app, f"sqlite+aiosqlite:///{tmp_path / 'gw.db'}") as (host, _c):
+                await until(lambda: partner_ids(host) == ["acme"])
+                assert host.partners.get("acme").card_hash == v1["card_hash"]
+
+                # the gateway sees the card change first and quarantines it locally
+                route.respond(200, json=changed)
+                assert await host.partners.refresh("acme") == "quarantined"
+                local_pending = card_hash(host.partners.get("acme").pending_card or {})
+
+                async def reported() -> bool:
+                    d = (await cp.get("/api/v1/partners/acme", headers=admin)).json()
+                    return any(g["status"] == "quarantined" for g in d["gateways"])
+
+                await until(reported)
+                r = await cp.post("/api/v1/partners/acme/refresh", headers=admin)
+                assert r.status_code == 200 and r.json()["outcome"] == "pending", r.text
+                v2 = r.json()["pending_version"]
+                [gw_state] = r.json()["gateways"]
+                assert v2["card_hash"] == local_pending == gw_state["pending_hash"]
+
+                r = await cp.post(
+                    "/api/v1/partners/acme/approve",
+                    json={"version": 2, "expected_hash": v2["card_hash"]},
+                    headers=admin,
+                )
+                assert r.status_code == 200, r.text
+                [queued] = r.json()["commands"]
+
+                async def finished() -> bool:
+                    async with app.state.engine.connect() as c:
+                        row = (
+                            await c.execute(
+                                select(COMMANDS).where(COMMANDS.c.id == queued["command_id"])
+                            )
+                        ).first()
+                    return row is not None and row.status in ("done", "failed")
+
+                await until(finished)
+                async with app.state.engine.connect() as c:
+                    row = (
+                        await c.execute(
+                            select(COMMANDS).where(COMMANDS.c.id == queued["command_id"])
+                        )
+                    ).first()
+                assert row.status == "done", row.result_json
+                await until(lambda: host.partners.get("acme").card_hash == v2["card_hash"])
+                rec = host.partners.get("acme")
+                assert rec.status == "active" and rec.pending_card is None

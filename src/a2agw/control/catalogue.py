@@ -14,7 +14,9 @@ approved partner is in a gateway's desired state, as its approved version
   skill search.
 - ``GET /api/v1/partners/{id}`` (``read``): record, approved card, pending card, their
   diff, the versions, and what each gateway reported.
-- ``POST .../approve`` (``partners.trust``) ``{version, expected_hash}``: hash-pinned; a
+- ``POST .../approve`` (``partners.trust``) ``{version, expected_hash}``: hash-pinned, and
+  the card is checked again for the partner's current tier (a version stored under another
+  tier may not pass: 422 ``card``); a
   gateway that reported the partner quarantined with that pending hash also gets a
   ``partner.approve`` command.
 - ``POST .../reject``, ``POST .../quarantine`` (``partners.trust``): the partner leaves
@@ -557,8 +559,7 @@ async def approve_partner(
     state = request.app.state
     store: ControlStore = state.store
     cards: CardChecker = state.cards
-    now = store.now()
-    async with store.engine.begin() as conn:
+    async with store.engine.connect() as conn:
         p = await _partner(conn, partner_id)
         v = (
             await conn.execute(
@@ -567,23 +568,36 @@ async def approve_partner(
                 .where(PARTNER_VERSIONS.c.version == body.version)
             )
         ).first()
-        if v is None:
-            raise _not_found("version")
-        if v.card_hash != body.expected_hash:
-            raise _conflict("card changed since it was reviewed")
-        if p.tier in cards.require_signed and v.signed_key_id is None:
-            raise _conflict("the tier requires a signed card; refresh to verify one")
-        if v.approved_at is None:
-            await conn.execute(
-                update(PARTNER_VERSIONS)
-                .where(PARTNER_VERSIONS.c.partner_id == partner_id)
-                .where(PARTNER_VERSIONS.c.version == body.version)
-                .values(approved_by=actor.id, approved_at=now)
-            )
-        await conn.execute(
+    if v is None:
+        raise _not_found("version")
+    if v.card_hash != body.expected_hash:
+        raise _conflict("card changed since it was reviewed")
+    # The version was checked for the tier it was stored under; the partner's tier may
+    # have changed since. What gateways get must pass their checks for the current tier.
+    try:
+        checked = await cards.check(_loads(v.card_json, {}), p.tier)
+    except CardFetchError as e:
+        raise _card_error(e) from None
+    if checked.hash != v.card_hash:  # normalization is stable: never expected
+        raise _conflict("stored card does not match its hash")
+    now = store.now()
+    async with store.engine.begin() as conn:
+        moved = await conn.execute(
             update(PARTNERS)
             .where(PARTNERS.c.id == partner_id)
+            .where(PARTNERS.c.tier == p.tier)  # checked for this tier only
             .values(status="approved", current_version=body.version, updated_at=now)
+        )
+        if moved.rowcount != 1:
+            raise _conflict("partner changed while it was approved")
+        version_values: dict[str, Any] = {"signed_key_id": checked.key_id}
+        if v.approved_at is None:
+            version_values.update(approved_by=actor.id, approved_at=now)
+        await conn.execute(
+            update(PARTNER_VERSIONS)
+            .where(PARTNER_VERSIONS.c.partner_id == partner_id)
+            .where(PARTNER_VERSIONS.c.version == body.version)
+            .values(**version_values)
         )
         assigned = await _assigned(conn, partner_id)
         holding = (
@@ -711,6 +725,7 @@ async def refresh_partner(partner_id: str, request: Request, actor: Registrar) -
                     .where(PARTNERS.c.id == partner_id)
                     .where(PARTNERS.c.current_version == p.current_version)
                     .where(PARTNERS.c.status == p.status)
+                    .where(PARTNERS.c.tier == p.tier)  # the card was checked for this tier
                     .values(**changes)
                 )
                 if moved.rowcount != 1:
@@ -765,11 +780,16 @@ async def partner_settings(
     if "tags" in changed:
         values["tags_json"] = json.dumps(wanted["tags"])
     async with store.engine.begin() as conn:
-        await conn.execute(
+        moved = await conn.execute(
             update(PARTNERS)
             .where(PARTNERS.c.id == partner_id)
+            # what was re-checked is still what gateways get
+            .where(PARTNERS.c.tier == p.tier)
+            .where(PARTNERS.c.current_version == p.current_version)
             .values(**values, updated_at=store.now())
         )
+        if moved.rowcount != 1:
+            raise _conflict("partner changed while its settings were saved")
         for version, key_id in rechecked:
             await conn.execute(
                 update(PARTNER_VERSIONS)
