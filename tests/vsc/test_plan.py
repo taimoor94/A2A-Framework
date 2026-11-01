@@ -46,11 +46,60 @@ def test_parse_plan_bare_json_with_prose():
     assert parse_plan(text).steps[0].instructions == "a } b"
 
 
+PLAN = '{"steps": [{"id": "s1", "system": "a", "instructions": "go"}]}'
+
+
 def test_parse_plan_failure():
     with pytest.raises(PlanParseError):
         parse_plan("no json here " * 50)
-    with pytest.raises(PlanParseError):
+    with pytest.raises(PlanParseError, match="steps"):
         parse_plan('{"steps": []}')
+    with pytest.raises(PlanParseError, match="system"):
+        parse_plan('{"steps": [{"id": "s1", "instructions": "x"}]}')
+    with pytest.raises(PlanParseError, match="target_branch"):
+        parse_plan('{"steps": [{"id": "s1", "system": "a", "kind": "merge", "instructions": "x"}]}')
+
+
+def test_parse_plan_error_does_not_leak_input():
+    with pytest.raises(PlanParseError) as ei:
+        parse_plan('{"steps": [{"id": "s1", "system": "a", "instructions": "x", "bogus": "SECRETVALUE"}]}')
+    assert "SECRETVALUE" not in str(ei.value)
+    assert len(str(ei.value)) <= 230
+
+
+def test_parse_plan_prose_balanced_braces_before_plan():
+    assert parse_plan("use {x} here, then " + PLAN).steps[0].id == "s1"
+
+
+def test_parse_plan_unclosed_brace_in_prose():
+    assert parse_plan("a stray { in prose\n" + PLAN).steps[0].id == "s1"
+
+
+def test_parse_plan_second_fence():
+    text = "```json\n{\"note\": 1}\n```\nand\n```json\n" + PLAN + "\n```"
+    assert parse_plan(text).steps[0].id == "s1"
+
+
+def test_parse_plan_bare_and_uppercase_fences():
+    assert parse_plan("```\n" + PLAN + "\n```").steps[0].id == "s1"
+    assert parse_plan("```JSON\n" + PLAN + "\n```").steps[0].id == "s1"
+
+
+def test_target_branch_only_for_merge():
+    with pytest.raises(ValueError, match="needs a target_branch"):
+        step("m1", kind="merge")
+    with pytest.raises(ValueError, match="target_branch is only for merge steps"):
+        step("e1", target_branch="main")
+
+
+def test_self_dependency_rejected():
+    with pytest.raises(ValueError, match="cycle"):
+        Plan(steps=[step("a1", deps=["a1"])])
+
+
+def test_unknown_dependency_rejected():
+    with pytest.raises(ValueError, match="unknown step 'zz'"):
+        Plan(steps=[step("a1", deps=["zz"])])
 
 
 def test_order_layers():

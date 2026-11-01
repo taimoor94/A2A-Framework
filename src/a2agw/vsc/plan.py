@@ -4,7 +4,7 @@ enforceable; decisions are an append-only log and are deliberately excluded from
 from __future__ import annotations
 
 import hashlib
-import json
+import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -13,6 +13,7 @@ from a2agw.ops.audit import canonical_json
 from a2agw.vsc.spec import ExecutableSpec
 
 _FORBID = ConfigDict(extra="forbid")
+_FENCE = re.compile(r"```[^\n`]*\n(.*?)```", re.DOTALL)
 
 StepKind = Literal["edit", "merge", "deploy", "migrate", "send"]
 PRIVILEGED_KINDS: frozenset[str] = frozenset({"merge", "deploy", "migrate", "send"})
@@ -39,6 +40,8 @@ class PlanStep(BaseModel):
     def _merge_needs_target(self) -> PlanStep:
         if self.kind == "merge" and not self.target_branch:
             raise ValueError(f"merge step '{self.id}' needs a target_branch")
+        if self.kind != "merge" and self.target_branch is not None:
+            raise ValueError("target_branch is only for merge steps")
         return self
 
 
@@ -107,45 +110,64 @@ def validate_plan(plan: Plan, spec: ExecutableSpec) -> None:
             raise ValueError(f"step '{s.id}' targets system '{s.system}' not in the spec")
 
 
-def _first_object(text: str) -> str | None:
-    start = text.find("{")
-    while start != -1:
-        depth, in_str, esc = 0, False, False
-        for i in range(start, len(text)):
-            c = text[i]
-            if in_str:
-                if esc:
-                    esc = False
-                elif c == "\\":
-                    esc = True
-                elif c == '"':
-                    in_str = False
+def _balanced_at(text: str, start: int) -> str | None:
+    """The balanced `{...}` object starting at text[start], or None if it never closes."""
+    depth, in_str, esc = 0, False, False
+    for i in range(start, len(text)):
+        c = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
             elif c == '"':
-                in_str = True
-            elif c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    return text[start : i + 1]
-        return None
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
     return None
 
 
+def _candidates(text: str):
+    """Fenced blocks (any info string) in order, then the whole text; yield each `{` object."""
+    segments = [m.group(1) for m in _FENCE.finditer(text)] + [text]
+    for seg in segments:
+        start = seg.find("{")
+        while start != -1:
+            obj = _balanced_at(seg, start)
+            if obj is not None:
+                yield obj
+            start = seg.find("{", start + 1)
+
+
+def _error_detail(exc: Exception) -> str:
+    if isinstance(exc, ValidationError):
+        parts = []
+        for e in exc.errors():
+            loc = ".".join(str(x) for x in e["loc"])
+            parts.append(f"{loc}: {e['msg']}" if loc else str(e["msg"]))
+        return "; ".join(parts)[:200]
+    return (str(exc) or type(exc).__name__).splitlines()[0][:200]
+
+
 def parse_plan(text: str) -> Plan:
-    candidate: str | None = None
-    fence = text.find("```json")
-    if fence != -1:
-        end = text.find("```", fence + 7)
-        if end != -1:
-            candidate = _first_object(text[fence + 7 : end])
-    if candidate is None:
-        candidate = _first_object(text)
-    if candidate is None:
+    semantic: str | None = None  # valid JSON, invalid plan: the most informative error
+    syntactic: str | None = None
+    for candidate in _candidates(text):
+        try:
+            return Plan.model_validate_json(candidate)
+        except ValidationError as exc:
+            msg = f"invalid plan: {_error_detail(exc)}"
+            if exc.errors()[0]["type"] == "json_invalid":
+                syntactic = syntactic or msg
+            else:
+                semantic = semantic or msg
+    found = semantic or syntactic
+    if found is None:
         raise PlanParseError(f"no JSON object found in: {text[:200]!r}")
-    try:
-        json.loads(candidate)
-        return Plan.model_validate_json(candidate)
-    except (ValidationError, ValueError) as exc:
-        first = str(exc).splitlines()[0][:200] if str(exc) else type(exc).__name__
-        raise PlanParseError(f"invalid plan: {first}") from None
+    raise PlanParseError(found)
