@@ -22,10 +22,19 @@ pytest on the Python side, Node 24 on the other.
 
 ## Try it
 
+From the root of this (gateway) repository, whose environment has every dependency:
+
 ```sh
 uv run python examples/vsc_estate/init_estate.py examples/vsc_estate/estate
-cd examples/vsc_estate/estate/contract && uv run python -m pytest -q tests
+uv run python -m pytest -q examples/vsc_estate/estate/contract/tests
+uv run python -m pytest -q examples/vsc_estate/estate/orders-api/tests
+(cd examples/vsc_estate/estate/inventory-service && node --test "test/*.test.mjs")
 ```
+
+Do not run `uv run` from inside an estate repository: uv would build a separate `.venv` from
+that repository's own `pyproject.toml`, which lists dependency groups uv does not install by
+default, and orders-api would not start. pytest still picks up each repository's own
+`pyproject.toml` (rootdir and options) when given its `tests` directory.
 
 `init_estate.py <target>` copies the three directories into `<target>/` and makes each a git
 repository on `main` with one commit (local `user.name`/`user.email`). It refuses a target
@@ -64,9 +73,13 @@ Conventions:
   repository run `git apply -p2` on its part, which is the same as stripping the id and
   applying with `-p1`. `tests/vsc/estate_support.py` (`split_patch`, `apply_patch`,
   `split_files`) is the reference implementation.
-- Acceptance tests fail by a failing assertion (exit status 1), never by a collection or
-  import error, and they bring their own fakes when a scenario needs a fake to behave
+- On the base commits, acceptance tests fail by a failing test (exit status 1: pytest, and
+  `node --test`), not by a pytest collection or import error (exit 2); `tests/vsc/test_estate.py`
+  asserts the exit status. They bring their own fakes when a scenario needs a fake to behave
   differently, so they do not depend on how a solution changes the existing test helpers.
+- Passing by skipping is not passing: inside a gateway check (any `VSC_WS_*` set) the
+  contract suite fails when a service repository is missing, and the estate tests read a
+  JUnit report of the `estate` check and require zero skipped tests.
 
 | Scenario                                    | Systems                 | The change                                                                                              |
 | ------------------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------- |
@@ -85,7 +98,9 @@ Conventions:
 commits every per-system acceptance test fails through `reproduction_before` and every
 whole-system one fails through `verify_whole`; with the reference patch applied and the
 acceptance files added, every touched system's gate and tests and the `estate` check pass.
-It also checks that the contract suite passes on the base commits.
+It also checks that the contract suite passes on the base commits, with nothing skipped.
+The estate tests carry the `estate` marker: the gate runs them, and `uv run pytest -m "not
+estate"` leaves them out of a quick local run.
 
 ## Adding a scenario
 

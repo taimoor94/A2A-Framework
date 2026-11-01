@@ -25,6 +25,11 @@ import yaml
 
 CONTRACT = Path(__file__).resolve().parents[1]
 STARTUP_S = 20.0
+PORT_ATTEMPTS = 3
+
+
+class ServiceExited(RuntimeError):
+    """The service process exited before it was ready (for example: its port was taken)."""
 
 
 def repo(env_name: str, sibling: str) -> Path:
@@ -62,7 +67,7 @@ class Service:
         deadline = time.monotonic() + STARTUP_S
         while time.monotonic() < deadline:
             if self.proc.poll() is not None:
-                raise RuntimeError(f"{self.name} exited:\n{self.log.read_text()[-2000:]}")
+                raise ServiceExited(f"{self.name} exited:\n{self.log.read_text()[-2000:]}")
             try:
                 if httpx.get(self.url + "/healthz", timeout=1.0).status_code == 200:
                     return
@@ -93,21 +98,41 @@ def _spawn(name: str, cmd: list[str], cwd: Path, port: int, env: dict[str, str],
     return service
 
 
+def _on_free_port(start, port: int | None) -> Service:
+    """``start(port)`` on ``port``, or on a fresh free port when none is given. A free port can
+    be taken between picking and binding it, so a service that dies during startup is retried
+    on a new port a few times (a caller-chosen port is never changed)."""
+    if port is not None:
+        return start(port)
+    for attempt in range(PORT_ATTEMPTS):
+        try:
+            return start(free_port())
+        except ServiceExited:
+            if attempt == PORT_ATTEMPTS - 1:
+                raise
+    raise AssertionError("unreachable")
+
+
 def start_inventory(tmp: Path, *, port: int | None = None, env: dict[str, str] | None = None):
     node = shutil.which("node")
     if node is None:
         raise RuntimeError("node is not on PATH")
     cmd = [node, str(INVENTORY_REPO / "server.mjs")]
-    return _spawn("inventory", cmd, INVENTORY_REPO, port or free_port(), env or {}, tmp)
+    return _on_free_port(
+        lambda p: _spawn("inventory", cmd, INVENTORY_REPO, p, env or {}, tmp), port
+    )
 
 
 def start_orders(
     tmp: Path, inventory_url: str, *, port: int | None = None, env: dict[str, str] | None = None
 ):
-    port = port or free_port()
-    base = {"INVENTORY_URL": inventory_url, "ORDERS_DB": str(tmp / f"orders-{port}.db")}
     cmd = [sys.executable, str(ORDERS_REPO / "app.py")]
-    return _spawn("orders", cmd, ORDERS_REPO, port, {**base, **(env or {})}, tmp)
+
+    def start(p: int) -> Service:
+        base = {"INVENTORY_URL": inventory_url, "ORDERS_DB": str(tmp / f"orders-{p}.db")}
+        return _spawn("orders", cmd, ORDERS_REPO, p, {**base, **(env or {})}, tmp)
+
+    return _on_free_port(start, port)
 
 
 _counter = itertools.count(1)
@@ -158,7 +183,9 @@ _TYPES = {
 
 
 def problems(api: dict[str, Any], schema: dict[str, Any], value: Any, at: str = "$") -> list[str]:
-    """Where ``value`` breaks ``schema`` (a small subset of JSON Schema: enough for the docs)."""
+    """Where ``value`` breaks ``schema``: a small subset of JSON Schema (``$ref``, ``type``,
+    ``enum``, ``minimum``/``maximum``, ``minLength``/``maxLength``, ``required``,
+    ``properties``, ``additionalProperties: false``, ``items``, ``minItems``/``maxItems``)."""
     schema = resolve(api, schema)
     out: list[str] = []
     types = schema.get("type")
@@ -173,8 +200,16 @@ def problems(api: dict[str, Any], schema: dict[str, Any], value: Any, at: str = 
             return [f"{at}: expected {types}, got {type(value).__name__}"]
     if "enum" in schema and value not in schema["enum"]:
         out.append(f"{at}: {value!r} not in {schema['enum']}")
-    if "minimum" in schema and isinstance(value, int | float) and value < schema["minimum"]:
-        out.append(f"{at}: {value} < {schema['minimum']}")
+    if isinstance(value, int | float) and not isinstance(value, bool):
+        if "minimum" in schema and value < schema["minimum"]:
+            out.append(f"{at}: {value} < minimum {schema['minimum']}")
+        if "maximum" in schema and value > schema["maximum"]:
+            out.append(f"{at}: {value} > maximum {schema['maximum']}")
+    if isinstance(value, str):
+        if len(value) < schema.get("minLength", 0):
+            out.append(f"{at}: shorter than {schema['minLength']}")
+        if "maxLength" in schema and len(value) > schema["maxLength"]:
+            out.append(f"{at}: longer than {schema['maxLength']}")
     if isinstance(value, dict):
         props = schema.get("properties", {})
         out += [f"{at}: missing {k!r}" for k in schema.get("required", []) if k not in value]
@@ -186,6 +221,8 @@ def problems(api: dict[str, Any], schema: dict[str, Any], value: Any, at: str = 
     if isinstance(value, list):
         if len(value) < schema.get("minItems", 0):
             out.append(f"{at}: fewer than {schema['minItems']} items")
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            out.append(f"{at}: more than {schema['maxItems']} items")
         if "items" in schema:
             for n, item in enumerate(value):
                 out += problems(api, schema["items"], item, f"{at}[{n}]")

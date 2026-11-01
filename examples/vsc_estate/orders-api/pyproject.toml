@@ -10,4 +10,5 @@ dev = ["pytest"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]  # app.py, wherever pytest is started from
 addopts = "--disable-plugin-autoload"

@@ -53,8 +53,8 @@ acceptance:
         });
 
         after(async () => {
-          child.kill();
-          await new Promise((resolve) => receiver.close(resolve));
+          child?.kill(); // guarded: a failed before() must report its own error, not this one
+          if (receiver?.listening) await new Promise((resolve) => receiver.close(resolve));
         });
 
         async function add(sku, stock) {
@@ -157,26 +157,43 @@ acceptance:
 
         import httpx
         import pytest
-        from estate import conforms, free_port, new_product, start_inventory, start_orders
+        from estate import (
+            ServiceExited,
+            conforms,
+            free_port,
+            new_product,
+            start_inventory,
+            start_orders,
+        )
 
 
         @pytest.fixture(scope="module")
         def wired(tmp_path_factory):
             tmp = tmp_path_factory.mktemp("webhook")
-            inventory_port = free_port()
-            orders = start_orders(tmp, f"http://127.0.0.1:{inventory_port}")
-            try:
-                inventory = start_inventory(
-                    tmp,
-                    port=inventory_port,
-                    env={
-                        "LOW_STOCK_WEBHOOK_URL": orders.url + "/webhooks/low-stock",
-                        "LOW_STOCK_THRESHOLD": "2",
-                    },
-                )
-            except BaseException:
-                orders.stop()
-                raise
+            # orders-api must know inventory's URL before inventory exists (and inventory needs the
+            # orders URL), so inventory's port is picked first. Another process can take that port
+            # before inventory binds it: then start the pair again on a new port.
+            for attempt in range(3):
+                inventory_port = free_port()
+                orders = start_orders(tmp, f"http://127.0.0.1:{inventory_port}")
+                try:
+                    inventory = start_inventory(
+                        tmp,
+                        port=inventory_port,
+                        env={
+                            "LOW_STOCK_WEBHOOK_URL": orders.url + "/webhooks/low-stock",
+                            "LOW_STOCK_THRESHOLD": "2",
+                        },
+                    )
+                except ServiceExited:
+                    orders.stop()
+                    if attempt == 2:
+                        raise
+                    continue
+                except BaseException:
+                    orders.stop()
+                    raise
+                break
             try:
                 with (
                     httpx.Client(base_url=orders.url, timeout=10) as o,

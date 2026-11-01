@@ -17,8 +17,10 @@ def services(tmp_path_factory):
         ("VSC_WS_INVENTORY_SERVICE", estate.INVENTORY_REPO, "server.mjs"),
     ):
         if not (path / marker).is_file():
-            if os.environ.get(env_name):
-                pytest.fail(f"{env_name}={path} has no {marker}")
+            # Inside a gateway check (any VSC_WS_* set) a missing system is a failure: a job
+            # must never pass because its cross-service tests were skipped.
+            if any(name.startswith("VSC_WS_") for name in os.environ):
+                pytest.fail(f"{marker} not found at {path} (from {env_name} or the sibling)")
             pytest.skip(f"service repository not found at {path} (set {env_name})")
     tmp = tmp_path_factory.mktemp("estate")
     inventory = estate.start_inventory(tmp)

@@ -10,7 +10,8 @@ export function useServer(seed) {
     server = await start({ port: 0, seed });
     ctx.url = `http://127.0.0.1:${server.address().port}`;
   });
-  after(() => new Promise((resolve) => server.close(resolve)));
+  // guarded: when before() failed there is no server, and its error is the one to report
+  after(() => server && new Promise((resolve) => server.close(resolve)));
   return ctx;
 }
 

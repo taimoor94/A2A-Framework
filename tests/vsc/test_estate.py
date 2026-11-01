@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import xml.etree.ElementTree as ET
 
 import pytest
 
@@ -25,7 +26,10 @@ from .estate_support import (
     write_files,
 )
 
-pytestmark = pytest.mark.skipif(shutil.which("node") is None, reason="node is not on PATH")
+pytestmark = [
+    pytest.mark.estate,
+    pytest.mark.skipif(shutil.which("node") is None, reason="node is not on PATH"),
+]
 
 TIMEOUT_S = 90.0
 SCENARIOS = scenario_paths()
@@ -90,13 +94,41 @@ async def test_every_system_passes_gate_and_tests_on_base(estate):
             assert res.passed, (system.id, kind, res.reason, res.stderr_tail)
 
 
-async def test_contract_suite_passes_on_base(estate):
+def with_junit(check, path):
+    """The check with a JUnit report, so a test can see what ran and what was skipped."""
+    return check.model_copy(update={"run": [*check.run, f"--junitxml={path}"]})
+
+
+def junit_counts(path) -> tuple[int, int]:
+    """(tests, skipped) of a pytest JUnit report."""
+    suite = ET.parse(path).getroot()
+    suite = suite if suite.tag == "testsuite" else suite.find("testsuite")
+    assert suite is not None
+    return int(suite.get("tests", "0")), int(suite.get("skipped", "0"))
+
+
+async def test_contract_suite_passes_on_base(estate, tmp_path):
     cfg, manager = estate
     (check,) = cfg.checks
     assert check.systems[0] == "contract"  # the check runs in the first system's workspace
     wss = {sid: await manager.create("base-whole", sid) for sid in check.systems}
-    res = await verify_whole(check, wss, timeout_s=TIMEOUT_S)
+    report = tmp_path / "junit.xml"
+    res = await verify_whole(with_junit(check, report), wss, timeout_s=TIMEOUT_S)
     assert res.passed, (res.reason, res.stderr_tail)
+    tests, skipped = junit_counts(report)
+    assert tests > 0 and skipped == 0, (tests, skipped)  # passing by skipping is not passing
+
+
+async def test_contract_suite_fails_when_a_service_workspace_is_missing(estate):
+    cfg, manager = estate
+    (check,) = cfg.checks
+    # orders-api has no workspace in this job: neither VSC_WS_ORDERS_API nor a sibling exists
+    wss = {
+        sid: await manager.create("missing-orders", sid)
+        for sid in ("contract", "inventory-service")
+    }
+    res = await verify_whole(check, wss, timeout_s=TIMEOUT_S)
+    assert not res.passed and res.exit_code not in (None, 0), (res.reason, res.stderr_tail)
 
 
 def test_the_required_scenarios_exist():
@@ -128,7 +160,7 @@ def test_scenario_file_is_well_formed(path, estate):
 
 
 @pytest.mark.parametrize("path", SCENARIOS, ids=lambda p: p.stem)
-async def test_each_scenario_fails_before_and_passes_with_reference_patch(path, estate):
+async def test_each_scenario_fails_before_and_passes_with_reference_patch(path, estate, tmp_path):
     cfg, manager = estate
     data = load_scenario(path)
     job = data["id"]
@@ -179,8 +211,11 @@ async def test_each_scenario_fails_before_and_passes_with_reference_patch(path, 
             res = await run_check("reproduction_after", t.id, t.run, cwd, timeout_s=TIMEOUT_S)
             assert res.passed, (t.id, res.reason, res.stderr_tail)
     for check in cfg.checks:
+        report = tmp_path / f"{check.id}-junit.xml"
         res = await verify_whole(
-            check, {sid: wss[sid] for sid in check.systems}, timeout_s=TIMEOUT_S
+            with_junit(check, report), {sid: wss[sid] for sid in check.systems}, timeout_s=TIMEOUT_S
         )
         assert res.passed, (check.id, res.reason, res.stderr_tail)
+        tests, skipped = junit_counts(report)
+        assert tests > 0 and skipped == 0, (check.id, tests, skipped)
     await manager.discard(job)
