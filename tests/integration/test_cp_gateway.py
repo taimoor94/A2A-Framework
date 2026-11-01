@@ -411,7 +411,11 @@ async def test_removed_partner_with_open_tasks_disabled_then_removed(
         await host.handles.record("pt-1", "p1", "c1", None, None, "TASK_STATE_WORKING")
         await unassign(app, gw, "p1")
         await unassign(app, gw, "p2")
-        await until(lambda: (conn.status()["applied_version"] or 0) > version)
+        # the desired state without both partners: wait for that one, not for whichever
+        # version follows the first unassign
+        final = await channel.compute_desired(app.state.store, gw)
+        assert final.version > version and final.partners == []
+        await until(lambda: conn.status()["applied_version"] == final.version)
         # p1 has an open partner task: disabled at once, kept until it ends; p2 is gone
         assert partner_ids(host) == ["p1"]
         assert host.partners.get("p1").status == "disabled"
