@@ -6,13 +6,14 @@ import pytest
 from a2agw.adapters.callable import CallableAdapter
 from a2agw.serve.host import AgentHost
 from a2agw.vsc.config import BudgetConfig, SystemConfig, VscConfig
-from a2agw.vsc.plan import Plan, PlanStep, plan_hash
+from a2agw.vsc.plan import Decision, Plan, PlanStep, plan_hash
 from a2agw.vsc.planner import (
     AgentPlanner,
     PlannerError,
     ScriptedPlanner,
     claude_planner_adapter,
     deliver_agent,
+    guard_replan,
 )
 from a2agw.vsc.spec import ExecutableSpec
 from a2agw.vsc.verify import CheckResult
@@ -119,6 +120,24 @@ async def test_large_replan_plan_is_carried_and_accepted(tmp_path):
     d = await _replan_decision(tmp_path, old, new)
     assert d.kind == "replan" and d.plan is not None
     assert d.plan.steps[2].instructions == "x" * 5120
+
+
+def test_guard_replan_without_plan_is_a_stop():
+    plan = two_step_plan()
+    d = guard_replan(plan, Decision(ts=1.0, step_id="s1", text="r", kind="replan"))
+    assert (d.kind, d.text, d.step_id, d.plan) == ("stop", "plan_immutable", "s1", None)
+    ok = guard_replan(plan, Decision(ts=1.0, text="r", kind="replan", plan=two_step_plan()))
+    assert ok.kind == "replan"
+
+
+async def test_replan_without_plan_is_a_stop(tmp_path):
+    host, planner = await _host(tmp_path, lambda ctx: json.dumps({"kind": "replan", "text": "r"}))
+    try:
+        d = await planner.replan(make_spec(), two_step_plan(), failure(), [])
+    finally:
+        await planner.aclose()
+        await host.shutdown()
+    assert d.kind == "stop" and d.plan is None
 
 
 async def test_replan_with_unparseable_plan_is_a_stop(tmp_path):

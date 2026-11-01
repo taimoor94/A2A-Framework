@@ -4,16 +4,20 @@ intake -> plan -> edit steps (by dependency layer; steps in one repository seria
 order, different repositories in parallel), each an attempt loop of worker -> ranked checks ->
 planner decision -> whole-system checks -> privileged steps through the gate -> ``accepted``.
 
-Every attempt is a new ``vsc_steps`` row; an attempt number is never reused. A passed edit step
-is committed on the job branch of its repository, so later steps (and a resumed job) start from
-it and verify only their own change. After a restart, ``resume_all`` closes interrupted attempts
-(``failed``, ``{"reason": "interrupted"}``), discards or cleans their half-done worktrees and
-continues each job from its first step that has not passed.
+Every attempt is a new ``vsc_steps`` row; an attempt number is never reused, and an attempt
+that is cancelled (job cancel, deadline, a failing sibling) is closed ``failed`` with
+``{"reason": "interrupted"}``. A passed edit step is committed on the job branch of its
+repository, so later steps (and a resumed job) start from it and verify only their own change.
+After a restart, ``resume_all`` closes attempts a dead process left ``running`` the same way,
+discards or cleans their half-done worktrees and continues each job from its first step that has
+not passed; a job whose whole-system checks already passed (``whole_passed``) goes straight back
+to its privileged steps.
 
 Budgets (the tighter of ``cfg.budgets`` and the spec's) are enforced here: tokens and cost after
-every worker and planner turn, attempts before every worker attempt, the deadline (measured from
-the job's creation) around everything but human approval waits. Exceeding one fails the job with
-reason ``budget``.
+every worker and planner turn; attempts per step (counted from the step's stored rows, so the
+bound holds across whole-system rounds and restarts); the deadline bounds active time
+(``vsc_jobs.active_s``: planning, running, verifying), never time awaiting approval. Exceeding
+one fails the job with reason ``budget``.
 """
 
 from __future__ import annotations
@@ -40,14 +44,13 @@ from a2agw.vsc.plan import (
     Decision,
     Plan,
     PlanStep,
-    load_plan,
     order,
     plan_hash,
     validate_plan,
 )
 from a2agw.vsc.planner import Planner, PlannerError, guard_replan
 from a2agw.vsc.spec import REQUEST_MAX_CHARS, ExecutableSpec, validate_against
-from a2agw.vsc.store import JobState, VscStore
+from a2agw.vsc.store import JobState, StepState, VscStore
 from a2agw.vsc.verify import CheckResult, all_passed, verify_step, verify_whole
 from a2agw.vsc.workers import WorkerSpec, WorkerTask, run_worker
 from a2agw.vsc.workspace import MergeRefused, Workspace, WorkspaceManager
@@ -60,6 +63,8 @@ _AGENT = "deliver"
 CHECK_TIMEOUT_S = 1800.0
 TERMINAL_STATES = ("accepted", "failed", "cancelled")
 _INTERRUPTED = ("running", "verifying")
+_ACTIVE_STATES = ("planning", "running", "verifying")
+_INTERRUPTED_RESULT = {"reason": "interrupted"}
 _EMPTY_SHA = hashlib.sha256(b"").hexdigest()
 
 
@@ -119,6 +124,7 @@ class _Run:
     spec: ExecutableSpec
     plan: Plan
     budget: Budget
+    retry: RetryPolicy
 
 
 class JobRunner:
@@ -156,6 +162,7 @@ class JobRunner:
         self._running: dict[str, asyncio.Task[Any]] = {}  # any run, for cancel
         self._locks: dict[str, asyncio.Lock] = {}
         self._cancelled: set[str] = set()
+        self._active_since: dict[str, float] = {}  # job id -> loop time it became active
 
     # -- public API ----------------------------------------------------------------------
 
@@ -253,6 +260,8 @@ class JobRunner:
             log.exception("vsc job %s failed", job_id)
             await self._fail(job_id, "error")
         finally:
+            with suppress(Exception):
+                await self._tick(job_id, keep=False)
             aclose = getattr(planner, "aclose", None)
             if aclose is not None:
                 with suppress(Exception):
@@ -261,20 +270,23 @@ class JobRunner:
         assert row is not None
         return row
 
-    def _budget(self, job: dict[str, Any], cfg: BudgetConfig) -> Budget:
-        elapsed = max(0.0, time.time() - job["created_at"])
+    @staticmethod
+    def _budget(job: dict[str, Any], cfg: BudgetConfig, start: float) -> Budget:
+        """``start`` is the loop time this run began; the job's earlier active time counts."""
         return Budget.from_config(
             cfg,
-            deadline=asyncio.get_running_loop().time() + cfg.deadline_s - elapsed,
+            deadline=start + cfg.deadline_s - job["active_s"],
             used_tokens=job["tokens_in"] + job["tokens_out"],
             used_cost=job["cost"],
-            used_attempts=job["attempts"],
         )
 
     async def _drive(self, job: dict[str, Any], planner: Planner) -> None:
         job_id, cfg = job["job_id"], self._cfg
         state = job["state"]
-        budget = self._budget(job, cfg.budgets)
+        start = asyncio.get_running_loop().time()
+        if state in _ACTIVE_STATES:
+            self._active_since[job_id] = start
+        budget = self._budget(job, cfg.budgets, start)
         async with deadline(budget.deadline):
             if job["spec_json"]:
                 spec = ExecutableSpec.model_validate_json(job["spec_json"])
@@ -288,9 +300,10 @@ class JobRunner:
                     raise JobFailed("planner") from e
                 budget.charge(0, 0, 0.0)  # planner usage is not reported to the runner
                 await self._store.set_spec(job_id, spec)
-            budget = self._budget(job, tighter(cfg.budgets, spec.budgets))
+            limits = tighter(cfg.budgets, spec.budgets)
+            budget = self._budget(job, limits, start)
             if job["plan_json"]:
-                plan = load_plan(job["plan_json"])
+                plan = Plan.model_validate_json(job["plan_json"])
             else:
                 state = await self._move(job_id, state, "planning")
                 try:
@@ -304,12 +317,14 @@ class JobRunner:
                 await self._save_plan(job_id, plan)
             for seq, step in enumerate(plan.steps):  # idempotent
                 await self._store.add_step(job_id, step.model_dump(mode="json"), seq)
-        ctx = _Run(job_id, job["owner"], state, planner, spec, plan, budget)
-        async with deadline(budget.deadline):
-            await self._move_ctx(ctx, "running")
-            await self._run_edits(ctx)
-            await self._move_ctx(ctx, "verifying")
-            await self._whole_system(ctx)
+        retry = dataclasses.replace(self._retry, max_attempts=limits.attempts)
+        ctx = _Run(job_id, job["owner"], state, planner, spec, plan, budget, retry)
+        if not job["whole_passed"]:  # else: everything up to the gate is done already
+            async with deadline(budget.deadline):
+                await self._move_ctx(ctx, "running")
+                await self._run_edits(ctx)
+                await self._move_ctx(ctx, "verifying")
+                await self._whole_system(ctx)
         await self._privileged(ctx)
         await self._move_ctx(ctx, "accepted")
         if self._on_accepted is not None:
@@ -335,7 +350,7 @@ class JobRunner:
 
             async def serial(steps: list[PlanStep]) -> None:
                 for s in steps:
-                    await self._run_step(ctx, s.id, rows[s.id])
+                    await self._run_step(ctx, s.id)
 
             await _all_or_cancel([serial(steps) for steps in groups.values()])
 
@@ -343,87 +358,99 @@ class JobRunner:
         self,
         ctx: _Run,
         step_id: str,
-        row: dict[str, Any],
         *,
         failure: CheckResult | None = None,
         escalate: bool = False,
     ) -> None:
-        """The attempt loop of one edit step: returns when an attempt passed."""
+        """The attempt loop of one edit step: returns when an attempt passed. The step's
+        attempts so far are read from the store, so its bound holds across calls and restarts."""
         loop = asyncio.get_running_loop()
+        row = (await self._rows(ctx.job_id))[step_id]
         first = next(s for s in ctx.plan.steps if s.id == step_id)
         system = self._systems[first.system]
         ws = await self._ws.create(ctx.job_id, system.id)
         current = self._by_id.get(row["worker"] or "", self._workers[0])
         if escalate:
             current = stronger(self._workers, current)
-        attempt, local = row["attempt"], 0
+        attempt, limit = row["attempt"], ctx.retry.max_attempts
         while True:
+            if attempt >= limit:
+                raise BudgetExceeded("attempts")
             step = next(s for s in ctx.plan.steps if s.id == step_id)  # a replan may reword it
             ctx.budget.check_deadline(loop.time())
-            ctx.budget.attempt()
             await self._store.add_attempt(ctx.job_id)
-            attempt, local = attempt + 1, local + 1
+            attempt += 1
             base = await self._ws.head(ws)
             await self._ws.reset(ws, base)  # start from the last passed step, nothing else
             await self._store.start_attempt(ctx.job_id, step_id, attempt, current.id, str(ws.path))
-            task = WorkerTask(
-                job_id=ctx.job_id,
-                step_id=step_id,
-                attempt=attempt,
-                system=system,
-                spec=ctx.spec,
-                step=step,
-                failure=failure,
-            )
-            res = await run_worker(
-                current, task, ws, consult=self._consult, audit=self._audit, actor=ctx.owner
-            )
-            own = dataclasses.replace(ws, base_ref=base)  # this attempt's change only
-            if res.failed is not None:
-                checks = [_worker_failure(current, res.failed)]
-            else:
-                checks = await verify_step(
-                    own,
-                    system,
-                    ctx.spec,
-                    manager=self._ws,
-                    timeout_s=min(CHECK_TIMEOUT_S, max(1.0, ctx.budget.deadline - loop.time())),
+            closed = False
+            try:
+                task = WorkerTask(
+                    job_id=ctx.job_id,
+                    step_id=step_id,
+                    attempt=attempt,
+                    system=system,
+                    spec=ctx.spec,
+                    step=step,
+                    failure=failure,
                 )
-            passed = all_passed(checks)
-            result: dict[str, Any] = {
-                "checks": [dataclasses.asdict(c) for c in checks],
-                "diff_sha256": _sha256(await self._ws.diff(own)),
-            }
-            if passed:
-                result["commit"] = await self._ws.commit(
-                    ws, f"vsc {ctx.job_id}: {step_id} (attempt {attempt})"
+                res = await run_worker(
+                    current, task, ws, consult=self._consult, audit=self._audit, actor=ctx.owner
                 )
-            usage = {
-                "tokens_in": res.tokens_in,
-                "tokens_out": res.tokens_out,
-                "cost": res.cost,
-                "usage_reported": res.usage_reported,
-            }
-            await self._store.end_attempt(
-                ctx.job_id, step_id, attempt, "passed" if passed else "failed", result, usage
-            )
+                own = dataclasses.replace(ws, base_ref=base)  # this attempt's change only
+                if res.failed is not None:
+                    checks = [_worker_failure(current, res.failed)]
+                else:
+                    timeout = min(CHECK_TIMEOUT_S, max(1.0, ctx.budget.deadline - loop.time()))
+                    checks = await verify_step(
+                        own, system, ctx.spec, manager=self._ws, timeout_s=timeout
+                    )
+                passed = all_passed(checks)
+                result: dict[str, Any] = {
+                    "checks": [dataclasses.asdict(c) for c in checks],
+                    "diff_sha256": _sha256(await self._ws.diff(own)),
+                }
+                if passed:
+                    result["commit"] = await self._ws.commit(
+                        ws, f"vsc {ctx.job_id}: {step_id} (attempt {attempt})"
+                    )
+                usage = {
+                    "tokens_in": res.tokens_in,
+                    "tokens_out": res.tokens_out,
+                    "cost": res.cost,
+                    "usage_reported": res.usage_reported,
+                }
+                await self._store.end_attempt(
+                    ctx.job_id, step_id, attempt, "passed" if passed else "failed", result, usage
+                )
+                closed = True
+            finally:
+                if not closed:
+                    await self._close_interrupted(ctx.job_id, step_id, attempt)
+            await self._tick(ctx.job_id)
             await self._audit_check(ctx.job_id, checks, passed, step=step_id, attempt=attempt)
             await self._store.add_usage(ctx.job_id, res.tokens_in, res.tokens_out, res.cost)
             ctx.budget.charge(res.tokens_in, res.tokens_out, res.cost)
             if passed:
                 return
+            if attempt >= limit:  # no planner turn for an attempt that cannot happen
+                raise BudgetExceeded("attempts")
             failure = next(c for c in checks if not c.passed)
-            if local >= self._retry.max_attempts:
-                d = _decision("stop", f"{local} attempts failed", step_id)
-            else:
-                d = await self._replan(ctx, failure, step_id)
+            d = await self._replan(ctx, failure, step_id)
             await self._record(ctx, d)
             if d.kind == "stop":
                 raise JobFailed("verification")
             if d.kind == "escalate":
                 current = stronger(self._workers, current)
             else:
-                current = self._retry.next_worker(self._workers, local, current)
+                current = ctx.retry.next_worker(self._workers, attempt, current)
+
+    async def _close_interrupted(self, job_id: str, step_id: str, attempt: int) -> None:
+        """Close an attempt that was cancelled before it could finish."""
+        with suppress(Exception):
+            await self._store.end_attempt(
+                job_id, step_id, attempt, "failed", _INTERRUPTED_RESULT, {}
+            )
 
     # -- planner decisions ---------------------------------------------------------------
 
@@ -475,10 +502,11 @@ class JobRunner:
                     failed = (check, res)
                     break
             if failed is None:
+                await self._store.set_whole_passed(ctx.job_id, True)
                 return
             check, res = failed
             rounds += 1
-            if rounds >= self._retry.max_attempts:
+            if rounds >= ctx.retry.max_attempts:
                 d = _decision("stop", f"whole-system check {check.id} failed {rounds} times")
             else:
                 d = await self._replan(ctx, res, None)
@@ -486,12 +514,11 @@ class JobRunner:
             if d.kind == "stop":
                 raise JobFailed("whole_system")
             await self._move_ctx(ctx, "running")
-            rows = await self._rows(ctx.job_id)
             for layer in order(ctx.plan):
                 for step in layer:
                     if step.kind == "edit" and step.system in check.systems:
                         await self._run_step(
-                            ctx, step.id, rows[step.id], failure=res, escalate=d.kind == "escalate"
+                            ctx, step.id, failure=res, escalate=d.kind == "escalate"
                         )
             await self._move_ctx(ctx, "verifying")
 
@@ -509,30 +536,37 @@ class JobRunner:
         job_id = ctx.job_id
         ws = await self._ws.create(job_id, step.system)
         await self._store.start_attempt(job_id, step.id, attempt, "gate", str(ws.path))
-        auto = any(
-            a.system == step.system and a.action == step.kind for a in self._cfg.auto_approve
-        )
-        if not auto and not await self._gate.already_approved(job_id, step.id):
-            await self._move_ctx(ctx, "awaiting_approval")
+        closed = False
+
+        async def close(state: StepState, result: dict[str, Any]) -> None:
+            nonlocal closed
+            await self._store.end_attempt(job_id, step.id, attempt, state, result, {})
+            closed = True
+
         try:
-            approval = await self._gate.wait(job_id, step)
-        except Rejected as e:
-            await self._store.end_attempt(
-                job_id, step.id, attempt, "failed", {"rejected": True, "note": e.note}, {}
+            auto = any(
+                a.system == step.system and a.action == step.kind for a in self._cfg.auto_approve
             )
-            raise
-        result: dict[str, Any] = {"approval": dataclasses.asdict(approval), "executed": False}
-        if step.kind == "merge":
-            assert step.target_branch is not None
+            if not auto and not await self._gate.already_approved(job_id, step.id):
+                await self._move_ctx(ctx, "awaiting_approval")
             try:
-                result["head"] = await self._ws.merge_ff(ws, step.target_branch)
-            except MergeRefused as e:
-                await self._store.end_attempt(
-                    job_id, step.id, attempt, "failed", {**result, "reason": str(e)}, {}
-                )
-                raise JobFailed("merge_refused") from e
-            result["executed"] = True
-        await self._store.end_attempt(job_id, step.id, attempt, "passed", result, {})
+                approval = await self._gate.wait(job_id, step)
+            except Rejected as e:
+                await close("failed", {"rejected": True, "note": e.note})
+                raise
+            result: dict[str, Any] = {"approval": dataclasses.asdict(approval), "executed": False}
+            if step.kind == "merge":
+                assert step.target_branch is not None
+                try:
+                    result["head"] = await self._ws.merge_ff(ws, step.target_branch)
+                except MergeRefused as e:
+                    await close("failed", {**result, "reason": str(e)})
+                    raise JobFailed("merge_refused") from e
+                result["executed"] = True
+            await close("passed", result)
+        finally:
+            if not closed:
+                await self._close_interrupted(job_id, step.id, attempt)
 
     # -- resume --------------------------------------------------------------------------
 
@@ -548,7 +582,7 @@ class JobRunner:
                 else:  # keep the passed steps' commits, drop the half-done edit
                     await self._ws.reset(ws, "HEAD")
             await self._store.end_attempt(
-                job_id, row["step_id"], row["attempt"], "failed", {"reason": "interrupted"}, {}
+                job_id, row["step_id"], row["attempt"], "failed", _INTERRUPTED_RESULT, {}
             )
             if self._audit is not None:
                 await self._audit.emit(
@@ -572,6 +606,16 @@ class JobRunner:
     async def _move_ctx(self, ctx: _Run, state: JobState) -> None:
         ctx.state = await self._move(ctx.job_id, ctx.state, state)
 
+    async def _tick(self, job_id: str, *, keep: bool = True) -> None:
+        """Bank the active time since the job last became active (or was last ticked)."""
+        since = self._active_since.pop(job_id, None)
+        if since is None:
+            return
+        now = asyncio.get_running_loop().time()
+        if keep:
+            self._active_since[job_id] = now
+        await self._store.add_active(job_id, now - since)
+
     async def _fail(self, job_id: str, reason: str, *, limit: str | None = None) -> None:
         await self._transition(job_id, "failed", reason=reason, limit=limit)
 
@@ -586,7 +630,12 @@ class JobRunner:
     ) -> None:
         if job_id in self._cancelled and state != "cancelled":
             return  # a cancelled job never changes state again
-        await self._store.set_state(job_id, state, reason=reason)
+        now = asyncio.get_running_loop().time()
+        since = self._active_since.pop(job_id, None)
+        if state in _ACTIVE_STATES:
+            self._active_since[job_id] = now
+        active = now - since if since is not None else 0.0
+        await self._store.set_state(job_id, state, reason=reason, active_s=active)
         detail: dict[str, Any] = {}
         if reason:
             detail["reason"] = reason

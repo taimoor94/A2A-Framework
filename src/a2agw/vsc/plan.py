@@ -5,7 +5,6 @@ log, so both are deliberately excluded from it."""
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from typing import Literal
 
@@ -53,12 +52,13 @@ class Decision(BaseModel):
     step_id: str | None = None
     text: str = Field(max_length=DECISION_MAX_CHARS)
     kind: Literal["plan", "retry", "escalate", "replan", "gate", "stop"]
-    plan: Plan | None = None  # carried by a replan decision only; text is then a short reason
+    # Only a replan decision carries a plan (text is then a short reason). A replan in the job's
+    # decision log has none: its plan replaced the stored plan. ``guard_replan`` turns a
+    # plan-less replan from the planner into a stop.
+    plan: Plan | None = None
 
     @model_validator(mode="after")
     def _plan_only_for_replan(self) -> Decision:
-        if self.kind == "replan" and self.plan is None:
-            raise ValueError("a replan decision must carry a plan")
         if self.kind != "replan" and self.plan is not None:
             raise ValueError("plan is only for replan decisions")
         return self
@@ -122,19 +122,6 @@ def plan_hash(plan: Plan) -> str:
     but never change the steps."""
     payload = {"steps": [{k: getattr(s, k) for k in _STRUCTURAL} for s in plan.steps]}
     return hashlib.sha256(canonical_json(payload).encode()).hexdigest()
-
-
-def load_plan(plan_json: str) -> Plan:
-    """A plan as the job runner stores it. A logged replan decision carries no plan (its plan
-    replaced the stored one), so it is rebuilt without the replan-needs-a-plan validation."""
-    data = json.loads(plan_json)
-    decisions = data.pop("decisions", [])
-    plan = Plan.model_validate(data)
-    plan.decisions = [
-        Decision.model_construct(**d) if d.get("kind") == "replan" else Decision.model_validate(d)
-        for d in decisions
-    ]
-    return plan
 
 
 def validate_plan(plan: Plan, spec: ExecutableSpec) -> None:

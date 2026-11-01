@@ -29,8 +29,8 @@ def test_plan_hash_ignores_decisions():
 def test_decision_plan_only_for_replan():
     plan = Plan(steps=[step("s1")])
     assert Decision(ts=1.0, text="why", kind="replan", plan=plan).plan == plan
-    with pytest.raises(ValueError, match="plan"):
-        Decision(ts=1.0, text="why", kind="replan")
+    # a logged replan carries no plan (its plan replaced the stored one)
+    assert Decision(ts=1.0, text="why", kind="replan").plan is None
     with pytest.raises(ValueError, match="plan"):
         Decision(ts=1.0, text="why", kind="retry", plan=plan)
     assert Decision(ts=1.0, text="why", kind="stop").plan is None

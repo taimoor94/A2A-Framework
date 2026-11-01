@@ -42,7 +42,7 @@ JobState = Literal[
 StepState = Literal["pending", "running", "verifying", "passed", "failed", "skipped"]
 
 # Jobs a restarted gateway picks up again.
-RESUMABLE_STATES = ("running", "verifying", "awaiting_approval")
+RESUMABLE_STATES = ("submitted", "planning", "running", "verifying", "awaiting_approval")
 
 _metadata = MetaData()
 _jobs = Table(
@@ -64,6 +64,10 @@ _jobs = Table(
     Column("cost", Float, nullable=False, server_default="0"),
     Column("attempts", Integer, nullable=False, server_default="0"),
     Column("current_task_id", String, nullable=True),
+    # Seconds spent in active states (planning, running, verifying): what the deadline bounds.
+    Column("active_s", Float, nullable=False, server_default="0"),
+    # Every whole-system check passed on the job's current commits.
+    Column("whole_passed", Integer, nullable=False, server_default="0"),
 )
 _steps = Table(
     "vsc_steps",
@@ -93,7 +97,12 @@ _receipts = Table(
 )
 # Columns added after the first release, per table, with their DDL type
 # (ALTER TABLE ... ADD COLUMN).
-_ADDED_COLUMNS: dict[str, dict[str, str]] = {}
+_ADDED_COLUMNS: dict[str, dict[str, str]] = {
+    "vsc_jobs": {
+        "active_s": "FLOAT NOT NULL DEFAULT 0",
+        "whole_passed": "INTEGER NOT NULL DEFAULT 0",
+    },
+}
 
 
 def _upsert(engine: AsyncEngine):
@@ -164,8 +173,19 @@ class VscStore:
             row = (await conn.execute(select(_jobs).where(_jobs.c.job_id == job_id))).first()
         return dict(row._mapping) if row is not None else None
 
-    async def set_state(self, job_id: str, state: JobState, *, reason: str | None = None) -> None:
-        await self._update_job(job_id, state=state, reason=reason)
+    async def set_state(
+        self, job_id: str, state: JobState, *, reason: str | None = None, active_s: float = 0.0
+    ) -> None:
+        """Set the state; ``active_s`` is added to the job's active time in the same write."""
+        await self._update_job(
+            job_id, state=state, reason=reason, active_s=_jobs.c.active_s + active_s
+        )
+
+    async def add_active(self, job_id: str, seconds: float) -> None:
+        await self._update_job(job_id, active_s=_jobs.c.active_s + seconds)
+
+    async def set_whole_passed(self, job_id: str, passed: bool) -> None:
+        await self._update_job(job_id, whole_passed=int(passed))
 
     async def set_spec(self, job_id: str, spec: ExecutableSpec) -> None:
         await self._update_job(job_id, spec_json=spec.model_dump_json(), spec_hash=spec_hash(spec))

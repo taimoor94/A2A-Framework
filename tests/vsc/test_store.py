@@ -92,7 +92,7 @@ async def test_resumable_lists_running_only(db_url):
         ]:
             await store.create_job(jid, "r", "o")
             await store.set_state(jid, st)
-        assert sorted(await store.resumable()) == ["r", "v", "w"]
+        assert sorted(await store.resumable()) == ["p", "r", "s", "v", "w"]
     finally:
         await eng.dispose()
 
@@ -117,5 +117,30 @@ async def test_receipt_roundtrip(db_url):
         got = await store.get_receipt("j")
         assert got["receipt"] == {"a": 1}
         assert (got["receipt_hash"], got["audit_seq"]) == ("h1", 4)
+    finally:
+        await eng.dispose()
+
+
+async def test_initialize_adds_active_time_columns_to_old_jobs_table(db_url):
+    from sqlalchemy import MetaData, Table
+
+    from a2agw.vsc import store as vsc_store
+
+    eng = await create_engine(db_url)
+    try:
+        old = MetaData()
+        added = vsc_store._ADDED_COLUMNS["vsc_jobs"]
+        Table("vsc_jobs", old, *[c._copy() for c in vsc_store._jobs.columns if c.name not in added])
+        async with eng.begin() as conn:
+            await conn.run_sync(old.create_all)
+        store = VscStore(eng)
+        await store.initialize()
+        await store.initialize()  # idempotent
+        await store.create_job("j", "r", "o")
+        await store.set_state("j", "running", active_s=1.5)
+        await store.add_active("j", 2.0)
+        await store.set_whole_passed("j", True)
+        job = await store.get_job("j")
+        assert (job["active_s"], job["whole_passed"]) == (3.5, 1)
     finally:
         await eng.dispose()

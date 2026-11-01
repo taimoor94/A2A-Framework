@@ -1,9 +1,11 @@
 """Job budgets and the retry policy of the job runner.
 
 A budget is the tighter of the configured one and the spec's (a request can never raise its own
-budget). Tokens and cost are charged after every worker and planner turn, an attempt is counted
-before every worker attempt (job-wide), and the deadline is event-loop time measured from the
-job's creation. Exceeding any raises ``BudgetExceeded(what)``.
+budget). Tokens and cost are charged after every worker and planner turn; the deadline is
+event-loop time, set from the job's remaining *active* time (time awaiting approval never
+counts). The ``attempts`` budget is per step and is the retry policy's ``max_attempts``; the
+runner counts a step's attempts from its stored rows. Exceeding any raises
+``BudgetExceeded(what)``.
 """
 
 from __future__ import annotations
@@ -29,11 +31,9 @@ class BudgetExceeded(Exception):
 class Budget:
     tokens: int
     cost_usd: float
-    attempts: int
     deadline: float  # event-loop (monotonic) time
     used_tokens: int = 0
     used_cost: float = 0.0
-    used_attempts: int = 0
 
     @classmethod
     def from_config(
@@ -43,11 +43,8 @@ class Budget:
         deadline: float,
         used_tokens: int = 0,
         used_cost: float = 0.0,
-        used_attempts: int = 0,
     ) -> Budget:
-        return cls(
-            cfg.tokens, cfg.cost_usd, cfg.attempts, deadline, used_tokens, used_cost, used_attempts
-        )
+        return cls(cfg.tokens, cfg.cost_usd, deadline, used_tokens, used_cost)
 
     def charge(self, tokens_in: int, tokens_out: int, cost: float) -> None:
         self.used_tokens += tokens_in + tokens_out
@@ -56,11 +53,6 @@ class Budget:
             raise BudgetExceeded("tokens")
         if self.used_cost > self.cost_usd:
             raise BudgetExceeded("cost")
-
-    def attempt(self) -> None:
-        if self.used_attempts >= self.attempts:
-            raise BudgetExceeded("attempts")
-        self.used_attempts += 1
 
     def check_deadline(self, now: float) -> None:
         if now >= self.deadline:
