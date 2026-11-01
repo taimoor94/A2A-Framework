@@ -180,3 +180,45 @@ async def test_non_dict_audit_row_is_a_problem(built):
     empty = copy.deepcopy(receipt)
     empty["audit"]["rows"] = []
     verify_receipt(empty)  # no crash
+
+
+def _reseal(r: dict) -> dict:
+    body = {k: v for k, v in r.items() if k != "receipt_hash"}
+    r["receipt_hash"] = hashlib.sha256(canonical_json(body).encode()).hexdigest()
+    return r
+
+
+async def test_stubbed_job_row_is_rejected(built):
+    _, _, receipt = built
+    forged = copy.deepcopy(receipt)
+    rows = forged["audit"]["rows"]
+    i = next(i for i, r in enumerate(rows) if r.get("action") == "vsc.check")
+    seq = rows[i]["seq"]
+    rows[i] = {k: rows[i][k] for k in ("seq", "prev_hash", "hash")}  # chain still links
+    problems = verify_receipt(_reseal(forged))
+    assert any(str(seq) in p for p in problems), problems
+    # dropping the seq from job_seqs and the count does not help: the claims still cite it
+    forged["audit"]["job_seqs"].remove(seq)
+    forged["audit"]["job_rows"] -= 1
+    assert any(str(seq) in p for p in verify_receipt(_reseal(forged)))
+
+
+async def test_cited_seqs_are_full_rows(built):
+    _, _, receipt = built
+    audit = receipt["audit"]
+    full = {r["seq"] for r in audit["rows"] if "task_id" in r}
+    cited = [s["audit_seq"] for s in receipt["steps"]]
+    cited += [c["audit_seq"] for s in receipt["steps"] for c in s["checks"]]
+    cited += [a["audit_seq"] for a in receipt["approvals"] if "audit_seq" in a]
+    cited += [c["audit_seq"] for c in receipt["whole_checks"]]
+    assert cited and all(isinstance(c, int) for c in cited)
+    assert set(cited) <= set(audit["job_seqs"]) <= full
+    assert audit["job_rows"] == len(audit["job_seqs"]) == len(full)
+
+
+async def test_hidden_extra_job_row_is_rejected(built):
+    _, _, receipt = built
+    forged = copy.deepcopy(receipt)
+    forged["audit"]["job_seqs"].pop()
+    forged["audit"]["job_rows"] -= 1
+    assert any("job_seqs" in p for p in verify_receipt(_reseal(forged)))

@@ -11,8 +11,16 @@ The bundle's audit rows are the contiguous slice of the chain from the job's fir
 last. Only the job's own rows are embedded in full; every other row in the span (a concurrent
 job's) is an opaque stub ``{seq, prev_hash, hash}`` that keeps the chain linkable without
 disclosing anything. The first row's ``prev_hash`` is trusted as given; every later row must link
-to the one before it. Offline this proves the slice is internally consistent; that it is the gateway's own is shown by comparing
-``receipt_hash`` with the ``vsc.receipt`` row in the gateway's log."""
+to the one before it.
+
+The receipt cites the job's audit rows: every step attempt, check and approval carries the
+``audit_seq`` of its row, and ``audit.job_seqs`` / ``audit.job_rows`` list and count all of the
+job's rows in the span. What offline verification proves: the bundle is internally consistent
+(hashes, chain links) and the job's own rows are complete relative to what the receipt claims
+(every cited and listed seq is present as a full row of this job, none is a stub, no further
+row of this job hides in the span). It does not prove the bundle is the gateway's: a forger who
+rewrites the claims and recomputes every hash is caught only by comparing ``receipt_hash`` with
+the gateway's ``vsc.receipt`` row."""
 
 from __future__ import annotations
 
@@ -75,8 +83,31 @@ async def build_receipt(store: VscStore, audit: AuditLog, job_id: str) -> dict[s
     """The job's receipt, built once: a repeat returns the stored one. Diff hashes come from the
     attempts' recorded results. A job that has not finished has no receipt."""
     lock = _locks.setdefault(job_id, asyncio.Lock())
-    async with lock:
-        return await _build(store, audit, job_id)
+    try:
+        async with lock:
+            return await _build(store, audit, job_id)
+    finally:
+        if not lock.locked() and not getattr(lock, "_waiters", None):
+            _locks.pop(job_id, None)
+
+
+def _find_seq(
+    rows: list[dict[str, Any]],
+    action: str,
+    step: str | None,
+    attempt: int | None,
+    outcome: str | None,
+) -> int | None:
+    for r in rows:
+        d = r["detail"] or {}
+        if (
+            r["action"] == action
+            and d.get("step") == step
+            and (attempt is None or d.get("attempt") == attempt)
+            and (outcome is None or r["outcome"] == outcome)
+        ):
+            return int(r["seq"])
+    return None
 
 
 async def _build(store: VscStore, audit: AuditLog, job_id: str) -> dict[str, Any]:
@@ -97,7 +128,7 @@ async def _build(store: VscStore, audit: AuditLog, job_id: str) -> dict[str, Any
             "actor": r["actor"],
             "note": r["detail"].get("note", ""),
             "auto": False,
-            "seq": r["seq"],
+            "audit_seq": r["seq"],
         }
         for r in rows
         if r["action"] == "vsc.approve"
@@ -109,6 +140,12 @@ async def _build(store: VscStore, audit: AuditLog, job_id: str) -> dict[str, Any
         approval = result.get("approval")
         if isinstance(approval, dict) and approval.get("auto"):
             approvals.append({"step": a["step_id"], **approval, "outcome": "approved"})
+        checks = [
+            {**c, "audit_seq": _find_seq(rows, "vsc.check", a["step_id"], a["attempt"], None)}
+            if isinstance(c, dict)
+            else c
+            for c in result.get("checks", [])
+        ]
         steps.append(
             {
                 "step_id": a["step_id"],
@@ -119,7 +156,8 @@ async def _build(store: VscStore, audit: AuditLog, job_id: str) -> dict[str, Any
                 "worker": a["worker"],
                 "usage": {k: usage.get(k, 0) for k in ("tokens_in", "tokens_out", "cost")},
                 "usage_reported": bool(usage.get("usage_reported", False)),
-                "checks": result.get("checks", []),
+                "audit_seq": _find_seq(rows, "vsc.step", a["step_id"], a["attempt"], "worker"),
+                "checks": checks,
                 "diff_sha256": result.get("diff_sha256"),
                 "commit": result.get("commit"),
             }
@@ -134,6 +172,11 @@ async def _build(store: VscStore, audit: AuditLog, job_id: str) -> dict[str, Any
         "plan_hash": job["plan_hash"],
         "tasks": sorted({r["task_id"] for r in rows if r["action"] == "vsc.job"}),
         "steps": steps,
+        "whole_checks": [
+            {"outcome": r["outcome"], "audit_seq": r["seq"]}
+            for r in rows
+            if r["action"] == "vsc.check" and "step" not in (r["detail"] or {})
+        ],
         "approvals": approvals,
         "usage": {
             "tokens_in": job["tokens_in"],
@@ -146,6 +189,8 @@ async def _build(store: VscStore, audit: AuditLog, job_id: str) -> dict[str, Any
         "audit": {
             "first_seq": chain[0]["seq"] if chain else None,
             "last_seq": chain[-1]["seq"] if chain else None,
+            "job_rows": len(rows),
+            "job_seqs": [r["seq"] for r in rows],
             "rows": chain,
         },
         "created_at": time.time(),
@@ -210,6 +255,48 @@ def _audit_problems(receipt: dict[str, Any]) -> list[str]:
             and (row.get("detail") or {}).get("receipt_hash") != receipt.get("receipt_hash")
         ):
             problems.append("audit: vsc.receipt row does not match receipt_hash")
+    problems += _completeness_problems(receipt, rows)
+    return problems
+
+
+def _cited(receipt: dict[str, Any]) -> list[Any]:
+    cited: list[Any] = []
+    for key in ("steps", "approvals", "whole_checks"):
+        items = receipt.get(key)
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            cited.append(item.get("audit_seq"))
+            checks = item.get("checks")
+            for c in checks if isinstance(checks, list) else []:
+                if isinstance(c, dict):
+                    cited.append(c.get("audit_seq"))
+    return [c for c in cited if c is not None]
+
+
+def _completeness_problems(receipt: dict[str, Any], rows: list[Any]) -> list[str]:
+    audit = receipt["audit"]
+    job_id = receipt.get("job_id")
+    full = {
+        r.get("seq"): r for r in rows if isinstance(r, dict) and set(r) != _STUB_KEYS and "seq" in r
+    }
+    seqs = audit.get("job_seqs")
+    if not isinstance(seqs, list):
+        return ["audit: job_seqs missing"]
+    problems: list[str] = []
+    listed = set(seqs)
+    for seq in sorted({*seqs, *_cited(receipt)}, key=repr):
+        row = full.get(seq)
+        if row is None:
+            problems.append(f"audit: job row {seq} is missing or a stub")
+        elif row.get("task_id") != job_id:
+            problems.append(f"audit: row {seq} does not belong to the job")
+        elif seq not in listed:
+            problems.append(f"audit: cited row {seq} is not in job_seqs")
+    mine = [s for s, r in full.items() if r.get("task_id") == job_id]
+    problems += [f"audit: job row {s} is not in job_seqs" for s in mine if s not in listed]
+    if audit.get("job_rows") != len(mine):
+        problems.append("audit: job_rows does not match the full job rows")
     return problems
 
 
