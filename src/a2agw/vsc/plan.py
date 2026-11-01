@@ -1,5 +1,6 @@
-"""The plan: the coordinator's fixed set of steps. Its hash is what makes plan-then-execute
-enforceable; decisions are an append-only log and are deliberately excluded from it."""
+"""The plan: the coordinator's fixed set of steps. Its hash (structure only) is what makes
+plan-then-execute enforceable; instructions may be reworded and decisions are an append-only
+log, so both are deliberately excluded from it."""
 
 from __future__ import annotations
 
@@ -99,8 +100,14 @@ def order(plan: Plan) -> list[list[PlanStep]]:
     return _layers(plan.steps)
 
 
+_STRUCTURAL = ("id", "system", "kind", "depends_on", "contracts", "target_branch")
+
+
 def plan_hash(plan: Plan) -> str:
-    payload = {"steps": [s.model_dump(mode="json") for s in plan.steps]}
+    """Hash of the plan's structure only: per step id, system, kind, depends_on, contracts and
+    target_branch. Instructions and decisions are excluded, so a replan may reword instructions
+    but never change the steps."""
+    payload = {"steps": [{k: getattr(s, k) for k in _STRUCTURAL} for s in plan.steps]}
     return hashlib.sha256(canonical_json(payload).encode()).hexdigest()
 
 
@@ -133,7 +140,7 @@ def _balanced_at(text: str, start: int) -> str | None:
     return None
 
 
-def _candidates(text: str):
+def json_candidates(text: str):
     """Fenced blocks (any info string) in order, then the whole text; yield each `{` object."""
     segments = [m.group(1) for m in _FENCE.finditer(text)] + [text]
     for seg in segments:
@@ -158,7 +165,7 @@ def _error_detail(exc: Exception) -> str:
 def parse_plan(text: str) -> Plan:
     semantic: str | None = None  # valid JSON, invalid plan: the most informative error
     syntactic: str | None = None
-    for candidate in _candidates(text):
+    for candidate in json_candidates(text):
         try:
             return Plan.model_validate_json(candidate)
         except ValidationError as exc:

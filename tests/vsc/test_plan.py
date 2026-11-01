@@ -26,6 +26,15 @@ def test_plan_hash_ignores_decisions():
     assert plan_hash(Plan(steps=[step("s2")])) != h
 
 
+def test_plan_hash_ignores_instructions():
+    a = Plan(steps=[step("s1")])
+    b = Plan(steps=[PlanStep(id="s1", system="a", instructions="something else entirely")])
+    assert plan_hash(a) == plan_hash(b)
+    assert plan_hash(Plan(steps=[step("s1", system="b")])) != plan_hash(a)
+    assert plan_hash(Plan(steps=[step("s1", kind="deploy")])) != plan_hash(a)
+    assert plan_hash(Plan(steps=[step("s1", contracts=["c"])])) != plan_hash(a)
+
+
 def test_cycle_rejected():
     with pytest.raises(ValueError, match="cycle"):
         Plan(steps=[step("a1", "a", deps=["b1"]), step("b1", "b", deps=["a1"])])

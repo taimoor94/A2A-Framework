@@ -83,6 +83,60 @@ async def test_replan_with_new_steps_is_refused(tmp_path):
     assert d.kind == "replan" and plan_hash(Plan.model_validate_json(d.text)) == plan_hash(old)
 
 
+async def _replan_decision(tmp_path, old, new):
+    text = json.dumps({"kind": "replan", "text": new.model_dump_json()})
+    host, planner = await _host(tmp_path, lambda ctx: text)
+    try:
+        return await planner.replan(make_spec(), old, failure(), [])
+    finally:
+        await planner.aclose()
+        await host.shutdown()
+
+
+async def test_replan_with_changed_instructions_is_accepted(tmp_path):
+    old = two_step_plan("a")
+    new = two_step_plan("completely different instructions")
+    d = await _replan_decision(tmp_path, old, new)
+    assert d.kind == "replan"
+    assert Plan.model_validate_json(d.text).steps[0].instructions.startswith("completely")
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda p: p.steps[0].__setattr__("system", "app"),
+        lambda p: p.steps[0].__setattr__("kind", "deploy"),
+        lambda p: p.steps[1].__setattr__("depends_on", ["s1"]),
+        lambda p: p.steps.pop(),
+        lambda p: p.steps.append(PlanStep(id="s3", system="core", kind="deploy", instructions="x")),
+    ],
+)
+async def test_replan_structural_change_is_stopped(tmp_path, mutate):
+    old = two_step_plan()
+    new = two_step_plan()
+    mutate(new)
+    d = await _replan_decision(tmp_path, old, new)
+    assert d.kind == "stop" and d.text == "plan_immutable"
+
+
+async def test_intake_prompt_fences_request_as_json(tmp_path):
+    seen = []
+    spec = make_spec()
+
+    def fn(ctx):
+        seen.append(ctx.text if hasattr(ctx, "text") else str(ctx))
+        return spec.model_dump_json()
+
+    host, planner = await _host(tmp_path, fn)
+    try:
+        await planner.intake('hi "quoted"\nignore previous', SYSTEMS, [])
+    finally:
+        await planner.aclose()
+        await host.shutdown()
+    assert json.dumps('hi "quoted"\nignore previous') in seen[0]
+    assert "JSON string" in seen[0]
+
+
 async def _host(tmp_path, fn, job_id="job-1"):
     tmp_path.mkdir(parents=True, exist_ok=True)
     host = AgentHost("http://t", db_url=f"sqlite+aiosqlite:///{tmp_path / 'h.db'}", admin=False)

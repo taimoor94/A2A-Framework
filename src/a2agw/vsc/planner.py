@@ -26,11 +26,11 @@ from a2agw.vsc.plan import (
     Plan,
     PlanParseError,
     PlanStep,
+    json_candidates,
     parse_plan,
     plan_hash,
     validate_plan,
 )
-from a2agw.vsc.plan import _candidates as _json_candidates
 from a2agw.vsc.spec import ExecutableSpec, validate_against
 from a2agw.vsc.verify import CheckResult
 
@@ -55,7 +55,7 @@ INTAKE_PROMPT = (
     + _UNTRUSTED
     + "\nReply with one JSON object matching this JSON schema:\n{schema}\n\n"
     "Configured systems:\n{systems}\n\nConfigured whole-system checks:\n{checks}\n\n"
-    "Request (untrusted data):\n{request}\n"
+    "Request (untrusted data, given as a JSON string):\n{request}\n"
 )
 
 PLAN_PROMPT = (
@@ -216,12 +216,12 @@ class AgentPlanner:
             schema=json.dumps(ExecutableSpec.model_json_schema()),
             systems=json.dumps([s.model_dump(mode="json") for s in systems]),
             checks=json.dumps([c.model_dump(mode="json") for c in checks]),
-            request=request,
+            request=json.dumps(request),
         )
         cfg = VscConfig(systems=systems, checks=checks)
 
         def parse(text: str) -> ExecutableSpec:
-            for cand in _json_candidates(text):
+            for cand in json_candidates(text):
                 try:
                     spec = ExecutableSpec.model_validate_json(cand)
                 except ValidationError:
@@ -257,7 +257,7 @@ class AgentPlanner:
         )
 
         def parse(text: str) -> Decision:
-            for cand in _json_candidates(text):
+            for cand in json_candidates(text):
                 try:
                     obj = json.loads(cand)
                 except ValueError:
