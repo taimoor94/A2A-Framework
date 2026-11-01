@@ -123,6 +123,7 @@ DETAIL_KEYS = frozenset(
         "cost",
         "note",  # vsc.approve: the approver's note (truncated by the caller)
         "usage_reported",  # vsc.step: whether the worker reported usage at all
+        "receipt_hash",  # vsc.receipt: sha256 of the receipt bundle
     }
 )
 # PartnerRegistry change events -> audit actions (``registry_audit_action``).
@@ -282,7 +283,11 @@ def _classification(value: Any) -> str | None:
     return _cut(str(value), 32)
 
 
-def _digest(row: dict[str, Any]) -> str:
+def row_digest(row: dict[str, Any]) -> str:
+    """The hash a row must carry. ``row`` is a stored row (``detail_json``) or a public one
+    (``detail``, as ``query`` returns and receipts embed)."""
+    if "detail_json" not in row:
+        row = {**row, "detail_json": canonical_json(row.get("detail", {}))}
     body = {k: row[k] for k in _HASHED}
     return hashlib.sha256((row["prev_hash"] + canonical_json(body)).encode()).hexdigest()
 
@@ -378,7 +383,7 @@ class AuditLog:
                     await conn.execute(select(t.c.hash).order_by(t.c.seq.desc()).limit(1))
                 ).scalar_one_or_none()
                 row["prev_hash"] = last or GENESIS_HASH
-                row["hash"] = _digest(row)
+                row["hash"] = row_digest(row)
                 result = await conn.execute(t.insert().values(**row))
                 return int(result.inserted_primary_key[0])
         finally:
@@ -499,6 +504,6 @@ class AuditLog:
                 if not batch:
                     return None
                 for row in batch:
-                    if row["prev_hash"] != prev or _digest(row) != row["hash"]:
+                    if row["prev_hash"] != prev or row_digest(row) != row["hash"]:
                         return int(row["seq"])
                     prev, after = row["hash"], row["seq"]
