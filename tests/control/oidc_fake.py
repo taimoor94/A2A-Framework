@@ -4,7 +4,8 @@ It answers the discovery document, a JWKS with one generated EC P-256 key, and a
 endpoint that checks the code, the PKCE verifier, the redirect URI and the client's basic
 credentials, then returns an ID token signed with that key. ``bad`` makes the next token
 wrong in one way: ``iss``, ``aud``, ``nonce``, ``exp``, ``sig`` (signed with another key) or
-``alg`` (HS256). Every token and code it hands out is kept in ``issued`` so tests can check
+``alg`` (HS256), ``kty`` (RS256 with an RSA key under the EC key's kid), ``iat_future``
+(issued an hour ahead) or ``no_iat``. Every token and code it hands out is kept in ``issued`` so tests can check
 that none of them leaks.
 """
 
@@ -22,7 +23,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 import httpx
 import jwt
 import respx
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
 ISSUER = "https://idp.example"
 CLIENT_ID = "cp-client"
@@ -155,6 +156,12 @@ class FakeIdP:
             key = self.other_key
         elif self.bad == "alg":
             key, alg = "shared-secret-shared-secret-shared", "HS256"
+        elif self.bad == "kty":
+            key, alg = rsa.generate_private_key(public_exponent=65537, key_size=2048), "RS256"
+        elif self.bad == "iat_future":
+            claims["iat"] = int(now) + 3600
+        elif self.bad == "no_iat":
+            del claims["iat"]
         return jwt.encode(claims, key, algorithm=alg, headers={"kid": self.kid})
 
 

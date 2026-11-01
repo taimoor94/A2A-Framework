@@ -19,6 +19,8 @@ from oidc_fake import (
     oidc_settings,
     s256,
 )
+
+LOGIN_COOKIE = "a2agw_login"
 from sqlalchemy import select
 
 from a2agw.control.store import LOGIN_STATES, SESSIONS, USERS, csrf_token_for, token_digest
@@ -62,7 +64,20 @@ async def test_login_redirect_has_state_nonce_pkce(tmp_path, idp, make_app, run_
     assert q["state"] not in json.dumps(states) and q["nonce"] not in json.dumps(states)
 
 
-BAD_CASES = ["state", "state_reused", "state_expired", "nonce", "iss", "aud", "exp", "sig", "alg"]
+BAD_CASES = [
+    "state",
+    "state_reused",
+    "state_expired",
+    "nonce",
+    "iss",
+    "aud",
+    "exp",
+    "sig",
+    "alg",
+    "kty",
+    "iat_future",
+    "no_iat",
+]
 
 
 @pytest.mark.parametrize("case", BAD_CASES)
@@ -101,9 +116,74 @@ async def test_callback_rejects_bad_state_nonce_iss_aud_exp(
         "exp": "expired",
         "sig": "signature",
         "alg": "algorithm",
+        "kty": "algorithm",
+        "iat_future": "issued_at",
+        "no_iat": "claims",
     }[case]
     assert refused[-1]["outcome"] == "refused" and refused[-1]["actor"] == "anonymous"
     assert refused[-1]["detail"] == {"reason": expected, "count": 0}  # coalesced per reason
+
+
+@pytest.mark.parametrize("secure", [True, False])
+async def test_login_cookie_binds_the_state_to_the_browser(
+    secure, tmp_path, idp, make_app, run_app
+):
+    """The callback needs the a2agw_login cookie set by /auth/login in the same browser:
+    otherwise someone could send a victim a callback link for their own sign-in."""
+    app = make_app(
+        oidc_settings(
+            f"sqlite+aiosqlite:///{tmp_path / 'cp.db'}", session={"cookie_secure": secure}
+        )
+    )
+    async with run_app(app) as c:
+        start = await c.get("/auth/login", params={"next": "/after"})
+        bind = _cookie(start)[LOGIN_COOKIE]
+        code, state = idp.authorize(start.headers["location"])
+        # no cookie: refused, and the state is left for the browser that started it
+        c.cookies.delete(LOGIN_COOKIE)
+        missing = await c.get("/auth/callback", params={"code": code, "state": state})
+        # another browser's cookie (the attacker's link opened in the victim's browser)
+        other = await c.get("/auth/login")
+        mallory_code, _mallory_state = idp.authorize(other.headers["location"])
+        crossed = await c.get(
+            "/auth/callback", params={"code": mallory_code, "state": state}
+        )  # c now holds the cookie of the second login, not of `state`
+        c.cookies.set(LOGIN_COOKIE, bind.value, domain="cp.example", path="/auth/callback")
+        ok = await c.get("/auth/callback", params={"code": code, "state": state})
+        sessions = await _rows(app, SESSIONS)
+        refused = await audit_rows(app, "cp.login")
+    assert bind["httponly"] is True and bind["path"] == "/auth/callback"
+    assert bind["samesite"].lower() == "lax" and bind["max-age"] == "600"
+    assert bool(bind["secure"]) is secure
+    for r in (missing, crossed):
+        assert r.status_code == 400 and r.json() == {
+            "error": "login_failed",
+            "detail": "sign-in failed",
+        }
+        assert COOKIE not in _cookie(r)
+    reasons = [row["detail"]["reason"] for row in refused if row["outcome"] == "refused"]
+    assert reasons and set(reasons) == {"state"}  # the second refusal may be coalesced
+    assert ok.status_code == 302 and ok.headers["location"] == "/after"
+    cleared = _cookie(ok)[LOGIN_COOKIE]
+    assert cleared.value == "" and cleared["max-age"] == "0" and cleared["path"] == "/auth/callback"
+    assert len(sessions) == 1
+
+
+async def test_login_cookie_of_another_browser_is_refused(tmp_path, idp, make_app, run_app):
+    import httpx
+
+    app = make_app(oidc_settings(f"sqlite+aiosqlite:///{tmp_path / 'cp.db'}"))
+    async with run_app(app) as victim:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="https://cp.example") as mallory:
+            start = await mallory.get("/auth/login")
+            code, state = idp.authorize(start.headers["location"])  # Mallory signs in
+            await victim.get("/auth/login")  # the victim has a login cookie of their own
+            r = await victim.get("/auth/callback", params={"code": code, "state": state})
+            sessions = await _rows(app, SESSIONS)
+            mine = await mallory.get("/auth/callback", params={"code": code, "state": state})
+    assert r.status_code == 400 and COOKIE not in _cookie(r) and sessions == []
+    assert mine.status_code == 302  # the state was not consumed by the refused attempt
 
 
 @pytest.mark.parametrize("secure", [True, False])
@@ -339,6 +419,7 @@ async def test_no_secret_in_logs(tmp_path, idp, make_app, run_app, caplog):
     secrets_seen: list[str] = [CLIENT_SECRET]
     async with run_app(app) as c:
         start = await c.get("/auth/login", params={"next": "/x"})
+        secrets_seen.append(_cookie(start)[LOGIN_COOKIE].value)
         q = {k: v[0] for k, v in parse_qs(urlsplit(start.headers["location"]).query).items()}
         [row] = await _rows(app, LOGIN_STATES)
         secrets_seen += [q["state"], q["nonce"], row["code_verifier"]]

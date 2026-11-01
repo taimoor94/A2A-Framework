@@ -101,7 +101,8 @@ SESSIONS = Table(
     Column("last_used_at", Float, nullable=False),
     Column("expires_at", Float, nullable=False, index=True),
 )
-# A sign-in in progress (10 minutes); deleted at the callback.
+# A sign-in in progress (10 minutes), bound to the browser that started it; deleted at the
+# callback.
 LOGIN_STATES = Table(
     "cp_login_states",
     _metadata,
@@ -110,6 +111,8 @@ LOGIN_STATES = Table(
     Column("code_verifier", String(NAME), nullable=False),
     Column("next_path", Text, nullable=False, default="/"),
     Column("expires_at", Float, nullable=False, index=True),
+    # digest of the a2agw_login cookie set with it: the state is bound to that browser
+    _id("browser_digest", nullable=False),
 )
 API_KEYS = Table(
     "cp_api_keys",
@@ -500,10 +503,12 @@ class ControlStore:
         code_verifier: str,
         next_path: str,
         now: float,
+        browser: str,
         ttl_s: float = LOGIN_STATE_TTL_S,
     ) -> None:
-        """A sign-in in progress. The state and nonce are kept as digests; the PKCE verifier
-        is kept as is (it is sent to the token endpoint), for ``ttl_s`` at most."""
+        """A sign-in in progress, bound to ``browser`` (the value of the browser-binding
+        cookie set with it). The state, nonce and binding are kept as digests; the PKCE
+        verifier is kept as is (it is sent to the token endpoint), for ``ttl_s`` at most."""
         async with self.engine.begin() as conn:
             await conn.execute(
                 LOGIN_STATES.insert().values(
@@ -512,12 +517,19 @@ class ControlStore:
                     code_verifier=code_verifier,
                     next_path=next_path,
                     expires_at=now + ttl_s,
+                    browser_digest=token_digest(browser),
                 )
             )
 
-    async def take_login_state(self, state: str, *, now: float) -> LoginState | None:
+    async def take_login_state(self, state: str, *, now: float, browser: str) -> LoginState | None:
         """The sign-in started with ``state``, deleted as it is read (single use); None when
-        unknown, already taken (also by a concurrent callback) or expired."""
+        unknown, already taken (also by a concurrent callback) or expired.
+
+        ``browser`` is the binding cookie the callback came with. It must match the one the
+        sign-in was started with (compared as digests) before anything is consumed: from
+        another browser (or without the cookie) this returns None and the state stays
+        usable by the browser that started it, so a leaked state or callback link cannot be
+        used to cancel someone else's sign-in."""
         digest = token_digest(state)
         async with self.engine.begin() as conn:
             row = (
@@ -526,6 +538,8 @@ class ControlStore:
                 )
             ).first()
             if row is None:
+                return None
+            if not hmac.compare_digest(token_digest(browser), row.browser_digest):
                 return None
             gone = await conn.execute(
                 delete(LOGIN_STATES).where(LOGIN_STATES.c.state_digest == digest)

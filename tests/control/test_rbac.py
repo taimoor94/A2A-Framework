@@ -238,3 +238,22 @@ async def test_denials_are_coalesced(tmp_path, make_app, run_app):
     assert statuses == [403] * 5
     assert len(rows) == 1
     assert len(flushed) + sum(r["detail"].get("count", 0) for r in flushed) == 5
+
+
+def test_public_writes_must_say_they_check_csrf():
+    """A public route that is not GET/HEAD/OPTIONS has no require() to check CSRF for it:
+    registering one needs csrf_checked=True (the handler checks it, like /auth/logout)."""
+    routes = Routes()
+    for method in ("POST", "PUT", "PATCH", "DELETE"):
+        with pytest.raises(ValueError, match="csrf_checked"):
+            routes.public(method, f"/api/v1/_open_{method.lower()}")
+
+    async def handler() -> None:
+        return None
+
+    routes.public("GET", "/api/v1/_open_get")(handler)  # safe methods need no flag
+    routes.public("POST", "/api/v1/_checked", csrf_checked=True)(handler)
+    assert routes.permissions == {
+        ("GET", "/api/v1/_open_get"): "public",
+        ("POST", "/api/v1/_checked"): "public",
+    }

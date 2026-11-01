@@ -255,8 +255,19 @@ class Routes:
         """A route needing ``permission`` (see ``require``)."""
         return self._add(method, path, permission, [Depends(require(permission))], **kw)
 
-    def public(self, method: str, path: str, **kw: Any) -> Callable[[F], F]:
-        """A route without a permission check (sign-in, /healthz, /api/v1/me)."""
+    def public(
+        self, method: str, path: str, *, csrf_checked: bool = False, **kw: Any
+    ) -> Callable[[F], F]:
+        """A route without a permission check (sign-in, /healthz, /api/v1/me).
+
+        Nothing checks CSRF for a public route, so one that is not GET/HEAD/OPTIONS must
+        pass ``csrf_checked=True``: its handler checks the session's CSRF token itself
+        (like ``/auth/logout``). Without it, registration raises ``ValueError``."""
+        if method.upper() not in SAFE_METHODS and not csrf_checked:
+            raise ValueError(
+                f"public {method.upper()} {path}: pass csrf_checked=True once the handler "
+                "checks the CSRF token itself"
+            )
         return self._add(method, path, "public", [], **kw)
 
     def gateway_route(self, method: str, path: str, **kw: Any) -> Callable[[F], F]:

@@ -2,7 +2,9 @@
 
 ``GET /auth/login`` starts an authorization code flow with PKCE (S256): the state, nonce and
 code verifier are kept in ``cp_login_states`` (the state and nonce as digests), never in the
-browser. ``GET /auth/callback`` takes that state once, exchanges the code at the token
+browser, and the state is bound to the browser by the short-lived ``a2agw_login`` cookie
+(HttpOnly, Path=/auth/callback, 10 minutes; stored as a digest). ``GET /auth/callback``
+needs that cookie, then takes the state once, exchanges the code at the token
 endpoint and validates the ID token (signature from the provider's JWKS with RS256, ES256 or
 EdDSA; ``iss``, ``aud``, ``exp``, ``nonce``). Roles are re-derived from the token at every
 login through ``oidc.role_map``; the user is upserted and a new session is created (a fresh
@@ -55,7 +57,7 @@ from a2agw.control.rbac import (
     unauthorized,
 )
 from a2agw.control.settings import ControlSettings, OidcSettings, Role
-from a2agw.control.store import csrf_token_for, token_digest
+from a2agw.control.store import LoginState, csrf_token_for, token_digest
 from a2agw.ops.audit import AuditEvent
 from a2agw.security.auth import ALLOWED_JWT_ALGORITHMS, JwksCache, JwksUnavailable
 
@@ -66,6 +68,11 @@ DISCOVERY_TTL_S = 300.0
 LEEWAY_S = 60  # clock skew allowed on exp / nbf
 NEXT_MAX_CHARS = 2048
 NO_STORE = {"Cache-Control": "no-store"}
+# Binds a sign-in's state to the browser that started it (RFC 6749 10.12): set by /auth/login,
+# required (and cleared) by /auth/callback, sent only there.
+LOGIN_COOKIE = "a2agw_login"
+LOGIN_COOKIE_PATH = "/auth/callback"
+LOGIN_COOKIE_MAX_AGE_S = 600  # the login state's lifetime
 _USER_ID_MAX = 64
 
 
@@ -236,6 +243,8 @@ class OidcClient:
             raise LoginRefused("idp_unavailable", 502) from None
         if key is None:
             raise LoginRefused("unknown_key")
+        if key.algorithm_name != alg:  # the key's type (and curve) must be the header's alg
+            raise LoginRefused("algorithm")
         try:
             claims: dict[str, Any] = jwt.decode(
                 id_token,
@@ -248,7 +257,7 @@ class OidcClient:
                     "verify_exp": False,
                     "verify_nbf": False,
                     "verify_iat": False,
-                    "require": ["iss", "aud", "sub", "exp"],
+                    "require": ["iss", "aud", "sub", "exp", "iat"],
                 },
             )
         except jwt.InvalidSignatureError:
@@ -257,7 +266,8 @@ class OidcClient:
             raise LoginRefused("issuer") from None
         except jwt.InvalidAudienceError:
             raise LoginRefused("audience") from None
-        except (jwt.InvalidAlgorithmError, jwt.InvalidKeyError):
+        except (jwt.InvalidAlgorithmError, jwt.InvalidKeyError, TypeError, ValueError):
+            # TypeError/ValueError: a key pyjwt cannot use with this algorithm
             raise LoginRefused("algorithm") from None
         except jwt.PyJWTError:
             raise LoginRefused("claims") from None
@@ -267,6 +277,11 @@ class OidcClient:
             raise LoginRefused("expired")
         if nbf is not None and (not isinstance(nbf, int | float) or now + LEEWAY_S < nbf):
             raise LoginRefused("expired")
+        iat = claims.get("iat")
+        if not isinstance(iat, int | float):
+            raise LoginRefused("claims")
+        if iat > now + LEEWAY_S:
+            raise LoginRefused("issued_at")
         aud = claims.get("aud")
         if isinstance(aud, list) and len(aud) > 1 and claims.get("azp") != self.settings.client_id:
             raise LoginRefused("audience")
@@ -324,6 +339,7 @@ async def login(request: Request, next_path: str = Query("/", alias="next")) -> 
         raise HTTPException(400, "next must be a same-origin relative path")
     state = secrets.token_urlsafe(32)
     nonce = secrets.token_urlsafe(32)
+    browser = secrets.token_urlsafe(32)
     verifier = secrets.token_urlsafe(64)
     try:
         url = await oidc.authorization_url(
@@ -342,8 +358,29 @@ async def login(request: Request, next_path: str = Query("/", alias="next")) -> 
         code_verifier=verifier,
         next_path=next_path,
         now=request.app.state.clock(),
+        browser=browser,
     )
-    return RedirectResponse(url, status_code=302, headers=NO_STORE)
+    response = RedirectResponse(url, status_code=302, headers=NO_STORE)
+    response.set_cookie(
+        LOGIN_COOKIE,
+        browser,
+        max_age=LOGIN_COOKIE_MAX_AGE_S,
+        path=LOGIN_COOKIE_PATH,
+        secure=request.app.state.settings.session.cookie_secure,
+        httponly=True,
+        samesite="lax",
+    )
+    return response
+
+
+def _clear_login_cookie(response: Response, settings: ControlSettings) -> None:
+    response.delete_cookie(
+        LOGIN_COOKIE,
+        path=LOGIN_COOKIE_PATH,
+        secure=settings.session.cookie_secure,
+        httponly=True,
+        samesite="lax",
+    )
 
 
 @public("GET", "/auth/callback")
@@ -353,15 +390,25 @@ async def callback(
     state: str | None = None,
     error: str | None = None,
 ) -> Response:
-    """The provider sends the browser back here with ``code`` and ``state``."""
+    """The provider sends the browser back here with ``code`` and ``state``.
+
+    The state must have been started in this browser (the ``a2agw_login`` cookie). Without
+    the cookie, or with another browser's, the sign-in is refused (``reason=state``) and the
+    state is not consumed: it stays usable by the browser that started it, so a leaked
+    callback link cannot be used to cancel a sign-in in progress. The binding cookie is
+    cleared once its state is consumed, whatever the outcome; otherwise it is left (it may
+    belong to a sign-in in progress in this browser) and expires with its state."""
     oidc = _oidc(request)
     app = request.app.state
+    pending: LoginState | None = None
     try:
         if error is not None:
             raise LoginRefused("idp_error")
         if not code or not state:
             raise LoginRefused("missing_params")
-        pending = await app.store.take_login_state(state, now=app.clock())
+        pending = await app.store.take_login_state(
+            state, now=app.clock(), browser=request.cookies.get(LOGIN_COOKIE, "")
+        )
         if pending is None:
             raise LoginRefused("state")
         id_token = await oidc.exchange(
@@ -387,11 +434,14 @@ async def callback(
             ts=app.clock(),
         )
         await _audit(request, event, coalesce=f"login:{refused.reason}")
-        return JSONResponse(
+        failed = JSONResponse(
             {"error": "login_failed", "detail": "sign-in failed"},
             status_code=refused.status,
             headers=NO_STORE,
         )
+        if pending is not None:
+            _clear_login_cookie(failed, app.settings)
+        return failed
     limits = app.settings.session
     session_id, _csrf = await app.store.create_session(
         user.id,
@@ -420,10 +470,11 @@ async def callback(
         httponly=True,
         samesite="lax",
     )
+    _clear_login_cookie(response, app.settings)
     return response
 
 
-@public("POST", "/auth/logout", status_code=204)
+@public("POST", "/auth/logout", status_code=204, csrf_checked=True)
 async def logout(request: Request) -> Response:
     """End the session of the cookie (needs its CSRF token); clears the cookie."""
     app = request.app.state

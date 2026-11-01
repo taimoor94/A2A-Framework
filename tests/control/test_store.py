@@ -243,10 +243,10 @@ async def test_expire_and_purge_are_batched(store, engine):
 
 async def test_purge_expired_login_states_and_sessions(store, engine):
     await store.create_login_state(
-        state="s-old", nonce="n", code_verifier="v", next_path="/", now=0.0
+        state="s-old", nonce="n", code_verifier="v", next_path="/", now=0.0, browser="b"
     )
     await store.create_login_state(
-        state="s-new", nonce="n", code_verifier="v", next_path="/", now=900.0
+        state="s-new", nonce="n", code_verifier="v", next_path="/", now=900.0, browser="b"
     )
     await store.upsert_user("oidc:u", email=None, name=None, roles=["viewer"], now=0.0)
     await store.create_session("oidc:u", now=0.0, absolute_s=100, idle_s=50)
@@ -255,19 +255,31 @@ async def test_purge_expired_login_states_and_sessions(store, engine):
     assert purged == {"events": 0, "commands": 0, "login_states": 1, "sessions": 1}
 
 
-async def test_login_state_is_single_use(store):
+async def test_login_state_is_single_use_and_bound_to_the_browser(store, engine):
     await store.create_login_state(
-        state="st", nonce="the-nonce", code_verifier="ver", next_path="/x", now=1000.0
+        state="st",
+        nonce="the-nonce",
+        code_verifier="ver",
+        next_path="/x",
+        now=1000.0,
+        browser="browser-a",
     )
-    assert await store.take_login_state("other", now=1000.0) is None
-    got = await store.take_login_state("st", now=1001.0)
+    async with engine.connect() as conn:
+        [row] = (await conn.execute(text("SELECT browser_digest FROM cp_login_states"))).all()
+    assert row[0] == token_digest("browser-a")  # the binding cookie only as a digest
+    assert await store.take_login_state("other", now=1000.0, browser="browser-a") is None
+    # another browser (or none): refused, and the state is not consumed
+    assert await store.take_login_state("st", now=1001.0, browser="browser-b") is None
+    assert await store.take_login_state("st", now=1001.0, browser="") is None
+    got = await store.take_login_state("st", now=1001.0, browser="browser-a")
     assert got is not None and got.code_verifier == "ver" and got.next_path == "/x"
     assert got.nonce_digest == token_digest("the-nonce")
-    assert await store.take_login_state("st", now=1001.0) is None  # deleted at first use
+    # deleted at first use
+    assert await store.take_login_state("st", now=1001.0, browser="browser-a") is None
     await store.create_login_state(
-        state="late", nonce="n", code_verifier="v", next_path="/", now=1000.0
+        state="late", nonce="n", code_verifier="v", next_path="/", now=1000.0, browser="b"
     )
-    assert await store.take_login_state("late", now=1000.0 + 600) is None  # 10 minutes
+    assert await store.take_login_state("late", now=1000.0 + 600, browser="b") is None
 
 
 async def test_sessions_idle_absolute_and_disabled_users(store, engine, audit):
