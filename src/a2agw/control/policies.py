@@ -46,7 +46,7 @@ from fastapi import Depends, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import and_, delete, func, or_, select, tuple_
+from sqlalchemy import and_, delete, func, or_, select, tuple_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
@@ -429,44 +429,55 @@ async def add_version(
     return JSONResponse(out, status_code=201)
 
 
+async def replace_assignment(
+    conn: AsyncConnection, gateway_id: str, policy_id: str, version: int | None
+) -> None:
+    """Make ``policy_id`` (``version``, None: the latest) the gateway's one policy, in the
+    caller's transaction. 404 for an unknown gateway, 422 for an unknown policy or
+    version.
+
+    The gateway row is written first (a no-op update, as ``compute_desired`` does): that
+    locks it on PostgreSQL (and takes the write lock on sqlite) until the transaction
+    ends, so assignments to one gateway are serialized and exactly one policy row
+    remains, the one committed last. Without it, two concurrent assignments of different
+    policies under READ COMMITTED could each delete nothing new and insert their own."""
+    locked = await conn.execute(
+        update(GATEWAYS)
+        .where(GATEWAYS.c.id == gateway_id)
+        .values(desired_gen=GATEWAYS.c.desired_gen)
+    )
+    if locked.rowcount != 1:
+        raise _not_found("gateway")
+    known_policy = await conn.execute(select(POLICIES.c.id).where(POLICIES.c.id == policy_id))
+    if known_policy.first() is None:
+        raise _invalid(("policy_id",), msg="unknown policy")
+    if version is not None:
+        known_version = await conn.execute(
+            select(POLICY_VERSIONS.c.version)
+            .where(POLICY_VERSIONS.c.policy_id == policy_id)
+            .where(POLICY_VERSIONS.c.version == version)
+        )
+        if known_version.first() is None:
+            raise _invalid(("version",), msg="unknown version")
+    await conn.execute(
+        delete(ASSIGNMENTS)
+        .where(ASSIGNMENTS.c.gateway_id == gateway_id)
+        .where(ASSIGNMENTS.c.kind == "policy")
+    )
+    await conn.execute(
+        ASSIGNMENTS.insert().values(
+            gateway_id=gateway_id, kind="policy", ref_id=policy_id, ref_version=version
+        )
+    )
+
+
 @route("PUT", "/api/v1/gateways/{gateway_id}/policy", Permission.ASSIGN)
 async def assign_policy(
     gateway_id: str, body: PolicyAssignment, request: Request, actor: Assigner
 ) -> dict[str, Any]:
     store: ControlStore = request.app.state.store
     async with store.engine.begin() as conn:
-        known_gateway = await conn.execute(select(GATEWAYS.c.id).where(GATEWAYS.c.id == gateway_id))
-        if known_gateway.first() is None:
-            raise _not_found("gateway")
-        known_policy = await conn.execute(
-            select(POLICIES.c.id).where(POLICIES.c.id == body.policy_id)
-        )
-        if known_policy.first() is None:
-            raise _invalid(("policy_id",), msg="unknown policy")
-        if body.version is not None:
-            known_version = await conn.execute(
-                select(POLICY_VERSIONS.c.version)
-                .where(POLICY_VERSIONS.c.policy_id == body.policy_id)
-                .where(POLICY_VERSIONS.c.version == body.version)
-            )
-            if known_version.first() is None:
-                raise _invalid(("version",), msg="unknown version")
-        await conn.execute(
-            delete(ASSIGNMENTS)
-            .where(ASSIGNMENTS.c.gateway_id == gateway_id)
-            .where(ASSIGNMENTS.c.kind == "policy")
-        )
-        try:
-            await conn.execute(
-                ASSIGNMENTS.insert().values(
-                    gateway_id=gateway_id,
-                    kind="policy",
-                    ref_id=body.policy_id,
-                    ref_version=body.version,
-                )
-            )
-        except IntegrityError:  # a concurrent assignment of the same policy won
-            raise _conflict("gateway policy changed while it was assigned") from None
+        await replace_assignment(conn, gateway_id, body.policy_id, body.version)
     await channel.mark_dirty(store, [gateway_id])
     await _audit(
         store,

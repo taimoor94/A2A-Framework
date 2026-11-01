@@ -3,6 +3,7 @@ latest) feeding the desired state, and the dry-run over the gateways' audit rows
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -764,3 +765,67 @@ async def test_dry_run_replays_recorded_routing_forbid(db_url, make_app, run_app
         body = (await dry_run(c, admin, still)).json()
         assert body["newly_allowed"] == [] and body["newly_blocked"] == []
         assert body["evaluated"] == 2
+
+
+async def _wait_for_lock_waiter(engine: Any, tries: int = 1000) -> None:
+    """Until another backend is waiting on a lock (pg_stat_activity)."""
+    from sqlalchemy import text
+
+    for _ in range(tries):
+        async with engine.connect() as conn:
+            waiting = (
+                await conn.execute(
+                    text(
+                        "SELECT count(*) FROM pg_stat_activity "
+                        "WHERE wait_event_type = 'Lock' AND datname = current_database()"
+                    )
+                )
+            ).scalar_one()
+        if waiting:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("the second assignment never waited for the first")
+
+
+@pytest.mark.postgres
+async def test_concurrent_assignments_leave_one_policy(pg_url, make_app, run_app):
+    """Two assignments of different policies to one gateway at once: the second waits
+    for the first, and exactly one policy row remains, the one committed last."""
+    from sqlalchemy import select
+
+    from a2agw.control.store import ASSIGNMENTS
+
+    app = make_app(settings_for(pg_url))
+    async with run_app(app) as c:
+        admin = await admin_key(app)
+        store = app.state.store
+        gid, _ = await store.create_gateway("edge-1", actor="t")
+        p0 = (await create(c, admin, "p0", ALLOW_ALL)).json()["id"]
+        p1 = (await create(c, admin, "p1", ALLOW_ALICE)).json()["id"]
+        p2 = (await create(c, admin, "p2", LONE_DENY)).json()["id"]
+        assert (await assign(c, admin, gid, p0, None)).status_code == 200
+
+        conn = await app.state.engine.connect()
+        try:
+            tx = await conn.begin()
+            await policies_mod.replace_assignment(conn, gid, p1, None)  # holds the gateway
+            second = asyncio.create_task(assign(c, admin, gid, p2, 1))
+            await _wait_for_lock_waiter(app.state.engine)
+            assert not second.done()
+            await tx.commit()
+        finally:
+            await conn.close()
+        r = await second
+        assert r.status_code == 200, r.text
+
+        async with app.state.engine.connect() as check:
+            rows = (
+                await check.execute(
+                    select(ASSIGNMENTS.c.ref_id, ASSIGNMENTS.c.ref_version)
+                    .where(ASSIGNMENTS.c.gateway_id == gid)
+                    .where(ASSIGNMENTS.c.kind == "policy")
+                )
+            ).all()
+        assert [tuple(r) for r in rows] == [(p2, 1)]
+        state = await channel.compute_desired(store, gid)
+        assert parse_policy(state.policy) == parse_policy(LONE_DENY)
