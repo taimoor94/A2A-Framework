@@ -79,7 +79,7 @@ def make_repo(tmp_path, name: str, files: dict[str, str]) -> Path:
 WORKER_AGENT = str(Path(__file__).with_name("worker_agent.py"))
 
 
-def worker(mode: str, *, reports_usage: bool = True):
+def worker(mode: str, *, reports_usage: bool = True, timeout_s: float = 30.0):
     """A ``WorkerSpec`` running ``worker_agent.py <mode>`` under ``python -I``."""
     import sys
 
@@ -92,7 +92,7 @@ def worker(mode: str, *, reports_usage: bool = True):
         cost_class="cheap",
         reports_usage=reports_usage,
         env={},
-        timeout_s=30.0,
+        timeout_s=timeout_s,
     )
 
 

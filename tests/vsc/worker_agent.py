@@ -5,12 +5,14 @@ ends with a line ``---FILES---`` and one JSON object ``{"files": {relative_path:
 
 Modes: ``apply`` writes the files and answers ``done``; ``fail`` answers ``failed``;
 ``inject`` is ``apply`` plus a text event carrying an injected instruction; ``usage`` is
-``apply`` plus a usage event; ``noop`` answers ``done`` without writing.
+``apply`` plus a usage event; ``noop`` answers ``done`` without writing; ``hang`` sends one
+``status`` event and never answers; ``crash`` exits with code 3 mid-turn.
 """
 
 import json
 import os
 import sys
+import time
 
 MODE = sys.argv[1]
 MARKER = "---FILES---"
@@ -30,6 +32,13 @@ def apply_files(text):
 
 
 def answer(rid, req):
+    if MODE == "hang":
+        emit(rid, {"type": "status", "text": "working"})
+        while True:
+            time.sleep(60)
+    if MODE == "crash":
+        emit(rid, {"type": "status", "text": "working"})
+        os._exit(3)
     if MODE == "fail":
         emit(rid, {"type": "failed", "error": "worker gave up"})
         return

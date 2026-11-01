@@ -134,44 +134,48 @@ async def run_worker(
     )
     adapter = spec.adapter(ws.path, consult)
     try:
-        await adapter.start()
-        async for ev in adapter.run(ctx):
-            if isinstance(ev, Status):
-                result.status_lines.append(ev.text)
-            elif isinstance(ev, ArtifactChunk):
-                parts.extend(p.text for p in ev.parts if p.text)
-            elif isinstance(ev, Usage):
-                seen_usage = True
-                result.tokens_in += ev.tokens_in
-                result.tokens_out += ev.tokens_out
-                result.cost += ev.cost
-            elif isinstance(ev, Done):
-                if ev.text and ev.text not in parts:
-                    parts.append(ev.text)
-            elif isinstance(ev, Failed):
-                result.failed = ev.error
+        try:
+            await adapter.start()
+            async for ev in adapter.run(ctx):
+                if isinstance(ev, Status):
+                    result.status_lines.append(ev.text)
+                elif isinstance(ev, ArtifactChunk):
+                    parts.extend(p.text for p in ev.parts if p.text)
+                elif isinstance(ev, Usage):
+                    seen_usage = True
+                    result.tokens_in += ev.tokens_in
+                    result.tokens_out += ev.tokens_out
+                    result.cost += ev.cost
+                elif isinstance(ev, Done):
+                    if ev.text and ev.text not in parts:
+                        parts.append(ev.text)
+                elif isinstance(ev, Failed):
+                    result.failed = ev.error
+        except Exception as exc:  # noqa: BLE001 - worker-side failure; CancelledError propagates
+            result.failed = f"{type(exc).__name__}: {str(exc)[:256]}"
+        finally:
+            result.text = _cap("".join(parts))
+            result.usage_reported = spec.reports_usage and seen_usage
+            await adapter.stop()
     finally:
-        await adapter.stop()
-    result.text = _cap("".join(parts))
-    result.usage_reported = spec.reports_usage and seen_usage
-    if audit is not None:
-        await audit.emit(
-            AuditEvent(
-                actor=actor,
-                action="vsc.step",
-                agent_id="deliver",
-                task_id=task.job_id,
-                outcome="worker",
-                detail={
-                    "worker": spec.id,
-                    "step": task.step_id,
-                    "attempt": task.attempt,
-                    "tokens_in": result.tokens_in,
-                    "tokens_out": result.tokens_out,
-                    "cost": result.cost,
-                    "usage_reported": result.usage_reported,
-                    "reason": result.failed or "",
-                },
+        if audit is not None:
+            await audit.emit(
+                AuditEvent(
+                    actor=actor,
+                    action="vsc.step",
+                    agent_id="deliver",
+                    task_id=task.job_id,
+                    outcome="worker",
+                    detail={
+                        "worker": spec.id,
+                        "step": task.step_id,
+                        "attempt": task.attempt,
+                        "tokens_in": result.tokens_in,
+                        "tokens_out": result.tokens_out,
+                        "cost": result.cost,
+                        "usage_reported": result.usage_reported,
+                        "reason": result.failed or "",
+                    },
+                )
             )
-        )
     return result
