@@ -74,3 +74,52 @@ def make_repo(tmp_path, name: str, files: dict[str, str]) -> Path:
     git("add", "-A")
     git("commit", "-m", "initial")
     return repo
+
+
+WORKER_AGENT = str(Path(__file__).with_name("worker_agent.py"))
+
+
+def worker(mode: str, *, reports_usage: bool = True):
+    """A ``WorkerSpec`` running ``worker_agent.py <mode>`` under ``python -I``."""
+    import sys
+
+    from a2agw.vsc.workers import WorkerSpec
+
+    return WorkerSpec(
+        id="fake",
+        command=[sys.executable, "-I", WORKER_AGENT, mode],
+        model="fake-1",
+        cost_class="cheap",
+        reports_usage=reports_usage,
+        env={},
+        timeout_s=30.0,
+    )
+
+
+def worker_task(files: dict[str, str] | None = None, *, failure=None, attempt: int = 1):
+    """A ``WorkerTask`` whose prompt ends with the ``---FILES---`` block ``files`` (if any)."""
+    import json
+
+    from a2agw.vsc.config import BudgetConfig, SystemConfig
+    from a2agw.vsc.plan import PlanStep
+    from a2agw.vsc.spec import ExecutableSpec
+    from a2agw.vsc.workers import WorkerTask
+
+    instructions = "add the greeting"
+    if files is not None:
+        instructions += "\n---FILES---\n" + json.dumps({"files": files})
+    return WorkerTask(
+        job_id="job1",
+        step_id="s1",
+        attempt=attempt,
+        system=SystemConfig(id="core", repo="./core"),
+        spec=ExecutableSpec(
+            request="greet",
+            done="greeting exists",
+            systems=["core"],
+            acceptance=[],
+            budgets=BudgetConfig(),
+        ),
+        step=PlanStep(id="s1", system="core", instructions=instructions),
+        failure=failure,
+    )

@@ -116,6 +116,12 @@ DETAIL_KEYS = frozenset(
         "command",  # control plane: the command kind (e.g. "partner.approve")
         "source",  # control plane: where a change came from
         "hash",  # policy.update / cp.apply: sha256 of the applied document, never its body
+        "worker",  # vsc.step: the worker id
+        "step",  # vsc.step: the plan step id
+        "tokens_in",  # vsc.step: usage the worker reported
+        "tokens_out",
+        "cost",
+        "usage_reported",  # vsc.step: whether the worker reported usage at all
     }
 )
 # PartnerRegistry change events -> audit actions (``registry_audit_action``).
