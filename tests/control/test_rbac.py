@@ -142,6 +142,23 @@ async def test_gateway_routes_reject_user_sessions_and_api_keys(route, tmp_path,
             assert r.status_code == 401, (route, headers.keys(), r.text)
 
 
+def test_gateway_channel_routes_are_in_the_matrix():
+    """The channel's routes (Task 6) are gateway routes, so the test above covers them."""
+    assert {("GET", "/cp/v1/stream"), ("POST", "/cp/v1/report")} <= set(GATEWAY_ROUTES)
+    assert ROUTE_PERMISSIONS[("GET", "/cp/v1/stream")] == "gateway"
+
+
+@pytest.mark.parametrize("route", PERMISSION_ROUTES, ids=lambda r: f"{r[0]} {r[1]}")
+async def test_gateway_tokens_are_not_console_credentials(route, tmp_path, make_app, run_app):
+    """A gateway token on a console route is 401, like an unknown key."""
+    method, path = route
+    app = _app(make_app, tmp_path)
+    async with run_app(app) as c:
+        _gid, token = await app.state.store.create_gateway("gw", actor="t")
+        r = await _call(c, method, path, {"authorization": f"Bearer {token}"})
+        assert r.status_code == 401, (route, r.text)
+
+
 def test_role_permissions_table():
     viewer = {Permission.READ}
     assert ROLE_PERMISSIONS["viewer"] == viewer

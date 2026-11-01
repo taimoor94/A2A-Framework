@@ -38,7 +38,8 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from a2agw.consult.guarded_net import fixed_tier, guarded_async_client
-from a2agw.control import authn
+from a2agw.control import admin as _admin  # noqa: F401 - registers the gateway routes
+from a2agw.control import authn, channel
 from a2agw.control.rbac import ROUTES, Permission, public, route
 from a2agw.control.settings import ControlSettings
 from a2agw.control.store import AUDIT_TABLE, ControlStore
@@ -76,9 +77,10 @@ def error(status: int, detail: str, code: str | None = None) -> JSONResponse:
 
 class Maintenance:
     """The periodic pass: expire commands, purge old events and commands, then run
-    ``hooks`` (each awaited with ``now``). Task 6 adds the desired-state recomputation for
-    dirty assignments as a hook. ``run_once`` is the pass; ``run_forever`` waits
-    ``interval_s`` before each pass, logs a failed pass and keeps going."""
+    ``hooks`` (each awaited with ``now``); the first hook recomputes the desired state of
+    gateways marked dirty (``channel.recompute_dirty``). ``run_once`` is the pass;
+    ``run_forever`` waits ``interval_s`` before each pass, logs a failed pass and keeps
+    going."""
 
     def __init__(
         self,
@@ -92,8 +94,10 @@ class Maintenance:
         self.settings = settings
         self.clock = clock
         self.interval_s = interval_s
-        # TODO(Task 6): recompute desired state when assignments are dirty.
-        self.hooks: list[MaintenanceHook] = []
+        self.hooks: list[MaintenanceHook] = [self._recompute_desired]
+
+    async def _recompute_desired(self, _now: float) -> int:
+        return await channel.recompute_dirty(self.store)
 
     async def run_once(self) -> dict[str, int]:
         now = self.clock()
@@ -202,12 +206,13 @@ def create_app(
     http: httpx.AsyncClient | None = None,
     clock: Callable[[], float] = time.time,
     maintenance_interval_s: float = MAINTENANCE_INTERVAL_S,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> FastAPI:
     """The control-plane app. ``http`` is the client for outbound calls (the OIDC provider,
     partner cards); when omitted the app owns two guarded clients (``http`` for the
     ``public`` tier and ``idp_http``, tier ``partner``, for the OIDC provider) and closes
-    them at shutdown. ``clock`` (epoch seconds) and ``maintenance_interval_s`` are test
-    seams."""
+    them at shutdown. ``clock`` (epoch seconds), ``maintenance_interval_s`` and ``sleep``
+    (the wait between two polls of a gateway stream) are test seams."""
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -241,6 +246,8 @@ def create_app(
                 else None
             )
             app.state.clock = clock
+            app.state.sleep = sleep
+            app.state.gateway_auth = channel.gateway_auth  # /cp/v1: gateway tokens only
             app.state.maintenance = maintenance
             task = asyncio.create_task(maintenance.run_forever(), name="a2agw:cp-maint")
             yield

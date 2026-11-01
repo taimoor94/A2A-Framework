@@ -71,6 +71,9 @@ GATEWAYS = Table(
     Column("last_version_applied", Integer, nullable=False, default=0, server_default="0"),
     Column("status", String(16), nullable=False, default="active"),  # active | revoked
     Column("info_json", Text, nullable=False, default="{}"),
+    # bumped by ``channel.mark_dirty``: the desired state is recomputed while it is ahead
+    # of ``cp_desired.source_gen``
+    Column("desired_gen", Integer, nullable=False, default=0, server_default="0"),
 )
 GATEWAY_TOKENS = Table(
     "cp_gateway_tokens",
@@ -190,6 +193,8 @@ DESIRED = Table(
     Column("doc_json", Text, nullable=False),
     _id("doc_hash", nullable=False),
     Column("computed_at", Float, nullable=False),
+    # the cp_gateways.desired_gen this document was computed from
+    Column("source_gen", Integer, nullable=False, default=0, server_default="0"),
 )
 COMMAND_STATUSES = ("pending", "delivered", "done", "failed", "expired")
 COMMANDS = Table(
@@ -320,6 +325,10 @@ class ControlStore:
         self.audit = audit
         self._clock = clock
 
+    def now(self) -> float:
+        """The store's clock (epoch seconds)."""
+        return self._clock()
+
     async def initialize(self) -> None:
         async def create() -> None:
             async with self.engine.begin() as conn:
@@ -410,6 +419,41 @@ class ControlStore:
             )
         )
         return token
+
+    async def revoke_gateway(self, gateway_id: str, *, actor: str) -> bool:
+        """Revoke a gateway: its status becomes ``revoked`` and every token stops working
+        (an open stream closes at its next poll). Returns False when it was already
+        revoked (nothing changes, nothing is audited); ``KeyError`` for an unknown
+        gateway."""
+        now = self._clock()
+        async with self.engine.begin() as conn:
+            changed = await conn.execute(
+                update(GATEWAYS)
+                .where(GATEWAYS.c.id == gateway_id)
+                .where(GATEWAYS.c.status != "revoked")
+                .values(status="revoked")
+            )
+            if not changed.rowcount:
+                known = await conn.execute(select(GATEWAYS.c.id).where(GATEWAYS.c.id == gateway_id))
+                if known.first() is None:
+                    raise KeyError(f"unknown gateway {gateway_id}")
+                return False
+            await conn.execute(
+                update(GATEWAY_TOKENS)
+                .where(GATEWAY_TOKENS.c.gateway_id == gateway_id)
+                .where(GATEWAY_TOKENS.c.revoked_at.is_(None))
+                .values(revoked_at=now)
+            )
+        await self._audit(
+            AuditEvent(
+                actor=actor,
+                action="cp.gateway.revoke",
+                outcome="revoked",
+                detail={"gateway": gateway_id},
+                ts=now,
+            )
+        )
+        return True
 
     # -- API keys ------------------------------------------------------------------------
 

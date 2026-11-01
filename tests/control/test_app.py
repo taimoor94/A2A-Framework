@@ -231,6 +231,8 @@ def test_core_does_not_import_fastapi():
         control / "app.py",
         control / "rbac.py",
         control / "authn.py",
+        control / "channel.py",
+        control / "admin.py",
         control / "__init__.py",
     }
     importing = []
