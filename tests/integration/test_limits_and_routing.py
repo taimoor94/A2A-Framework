@@ -114,6 +114,40 @@ async def test_consult_refuses_a_partner_forbidden_for_the_current_agent(env):
     assert (await e.host.client.consult("b", "hi")).state == "completed"
 
 
+async def test_forbidden_partner_call_audit_row_says_why(env):
+    """The partner.call row of a routing-forbid refusal carries reason ``routing.forbid``,
+    the rule, and the caller's label: what a control-plane dry-run replays."""
+    policy = engine_for(
+        routing=[
+            {"agent": "x", "partners": ["b"], "mode": "prefer"},
+            {"id": "no-b", "agent": "a", "partners": ["b"], "mode": "forbid"},
+        ]
+    )
+    e = await env(spec("a", Fn(echo)), spec("b", Fn(echo)), policy=policy)
+    await e.register("b")
+    token = current_agent.set("a")
+    try:
+        await e.host.client.consult("b", "hi", classification="internal")
+        await e.host.client.consult("b", "hi")
+        await e.host.client.consult("b", "hi", classification="bogus")
+    finally:
+        current_agent.reset(token)
+    await e.host.audit.drain()
+    rows, _ = await e.host.audit.query({"action": "partner.call"}, 10, ascending=True)
+    labelled, bare, invalid = rows
+    for r in rows:
+        assert r["outcome"] == "unavailable" and r["agent_id"] == "a"
+        assert r["detail"]["reason"] == "routing.forbid" and r["detail"]["rule"] == "no-b"
+    assert labelled["classification"] == "internal"
+    assert bare["classification"] is None and "classification" not in bare["detail"]
+    assert invalid["classification"] is None and invalid["detail"]["classification"] == "invalid"
+    # a call that is not forbidden has no such reason
+    await e.host.client.consult("b", "hi", wait_seconds=0.5)
+    await e.host.audit.drain()
+    rows, _ = await e.host.audit.query({"action": "partner.call"}, 10)
+    assert "reason" not in rows[0]["detail"]
+
+
 def test_readme_and_demo_use_the_policy_filtered_tools():
     from pathlib import Path
 

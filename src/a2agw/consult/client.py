@@ -105,7 +105,7 @@ from a2agw.ops.bus import EventBus, GatewayEvent
 from a2agw.ops.metrics import GatewayMetrics
 from a2agw.ops.telemetry import get_tracer, with_current_traceparent
 from a2agw.security.classify import Classification
-from a2agw.security.policy import Decision, PolicyEngine
+from a2agw.security.policy import Decision, PolicyEngine, forbid_rule
 from a2agw.security.principal import Principal
 
 __all__ = ["PartnerClient", "ToolResult"]
@@ -132,6 +132,7 @@ CIRCUIT_OPEN = "circuit open"  # the result then carries ``retry_after_s``
 NO_BINDING = "no supported binding"
 NO_VERSION = "no supported protocol version"
 FORBIDDEN = "forbidden by policy"  # a routing ``forbid`` rule for the current agent
+ROUTING_FORBID = "routing.forbid"  # partner.call audit reason of that refusal
 FANOUT_LIMIT = "fan-out limit reached for this task"
 MAX_CONSULTS_PER_TASK = 16
 _FANOUT_TRACKED = 10_000  # inbound tasks whose fan-out is counted (oldest dropped beyond)
@@ -224,6 +225,17 @@ ErrorKind = Literal["connect", "unsafe", "server", "transport", "protocol", "oth
 def _caller_id() -> str | None:
     caller = _caller.get()
     return caller.id if caller is not None else None
+
+
+def _label(classification: Classification | str | None) -> Classification | None:
+    """A caller's label as a ``Classification``; None for no label or one that does not
+    parse."""
+    if classification is None or isinstance(classification, Classification):
+        return classification
+    try:
+        return Classification.parse(str(classification))
+    except (ValueError, AttributeError):
+        return None
 
 
 def _grant_detail() -> dict[str, str]:
@@ -830,9 +842,10 @@ class PartnerClient:
                                 partner_id,
                                 inbound_task_id,
                                 None,
-                                classification,
+                                _label(classification),
                                 result.state,
                                 (result.provenance or {}).get("tier"),
+                                extra=self._forbid_detail(partner_id, agent_id, classification),
                             )
                         )
                     return result
@@ -915,7 +928,11 @@ class PartnerClient:
         classification: Classification | str | None,
         outcome: str,
         tier: Any,
+        *,
+        extra: dict[str, Any] | None = None,
     ) -> AuditEvent:
+        """The ``partner.call`` row. ``extra``: more detail, such as the ``reason`` and
+        ``rule`` of a routing forbid (so a replay can tell it from other unavailability)."""
         label = decision.classification if decision is not None else classification
         return AuditEvent(
             actor=principal.id if principal is not None else "system",
@@ -925,7 +942,7 @@ class PartnerClient:
             task_id=inbound_task_id,
             classification=label if isinstance(label, Classification) else None,
             outcome=outcome,
-            detail={"state": outcome, "tier": tier, **_grant_detail()},
+            detail={"state": outcome, "tier": tier, **(extra or {}), **_grant_detail()},
         )
 
     def _forbidden(self, partner_id: str, agent_id: str) -> bool:
@@ -1021,6 +1038,25 @@ class PartnerClient:
             reason=f"egress policy: {decision.reason}",
             provenance=self._provenance(partner_id, rec),
         ), decision
+
+    def _forbid_detail(
+        self, partner_id: str, agent_id: str, classification: Classification | str | None
+    ) -> dict[str, Any]:
+        """Audit detail of a routing-forbid refusal: ``reason`` ``routing.forbid``, the
+        forbidding ``rule`` (None when the refusal came from an evaluation error), and
+        ``classification: invalid`` when the caller's label does not parse (the row's
+        classification column is then empty, as for no label)."""
+        rule = None
+        rec = self._record_or_none(partner_id)
+        if self.policy is not None and rec is not None:
+            try:
+                rule = forbid_rule(self.policy.policy, agent_id, rec)
+            except Exception:  # noqa: BLE001 - the audit row must still be written
+                rule = None
+        detail: dict[str, Any] = {"reason": ROUTING_FORBID, "rule": rule}
+        if classification is not None and _label(classification) is None:
+            detail["classification"] = "invalid"
+        return detail
 
     def _record_or_none(self, partner_id: str) -> PartnerRecord | None:
         try:

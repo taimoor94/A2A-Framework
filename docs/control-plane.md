@@ -256,17 +256,37 @@ and hashes only, never a document.
   - `partner.call` and `egress.deny` rows go through the routing `forbid` rules (with the
     partner's tags and approved card from the catalogue) and then the tier and partner
     ceilings. The level used is the row's `classification`, raised to the candidate's
-    agent default.
-  - The response is `{evaluated, newly_blocked, newly_allowed, truncated,
-    not_replayable, counts}`. Each entry is `{gateway_id, seq, ts, actor_kind, agent_id,
-    partner_id, action, rule}`. The caller appears only as its kind (`api_key`, `jwt`,
-    `anonymous`, `system`) and never by id. Each list holds at most 1 000 entries.
-    `counts` has the full totals and the number of `skipped` rows.
+    agent default. A partner call the gateway refused because of a routing forbid is
+    recorded as `partner.call` with outcome `unavailable` and detail `reason:
+    routing.forbid`, plus the forbidding `rule` and the caller's label. The dry-run
+    counts it as blocked then, so a candidate that lifts the forbid lists it in
+    `newly_allowed` when the ceiling lets it through.
+  - The response shape is:
+
+    ```
+    {"evaluated": int,
+     "newly_blocked": [{gateway_id, seq, ts, actor_kind, agent_id, partner_id, action, rule}],
+     "newly_allowed": [... same entries ...],
+     "truncated": bool,
+     "not_replayable": ["egress content checks"],
+     "counts": {"newly_blocked": int, "newly_allowed": int, "skipped": int}}
+    ```
+
+    `evaluated` counts the rows replayed, and `counts.skipped` the rows read but not
+    replayable. Together they are at most 50 000. Each list holds at most 1 000 entries,
+    newest first, and `counts` has the full totals. `rule` is the candidate's deciding
+    rule, or its reason when no rule decided (`no matching allow rule`). The caller
+    appears only as its kind (`api_key`, `jwt`, `anonymous`, `system`), never by id.
   - A row is skipped, never guessed, when it lacks what replay needs. Skipped rows are:
-    a partner call without a `classification` (unless a forbid rule now blocks it); an
-    `unavailable` partner call without a classification, since the gateway does not
-    report whether a routing forbid caused it; a call whose tier is unknown; and a
-    partner unknown to the catalogue under a forbid rule that matches on tags or skills.
+    - a partner call without a `classification`, unless a forbid rule now blocks it or
+      the row is a recorded routing forbid;
+    - an `unavailable` partner call without a classification and without a `reason`
+      (written by gateways before the reason was recorded): it may have been a forbid,
+      a circuit or anything else;
+    - a recorded forbid whose label did not parse (`detail.classification: invalid`);
+    - a call whose tier is unknown;
+    - a partner unknown to the catalogue under a forbid rule that matches on tags or
+      skills.
   - `not_replayable` lists the checks a replay cannot repeat. `egress content checks`
     is one of them, because the classifier saw message content that audit rows never
     hold. A row's `classification` is the level the gateway computed at the time, so a

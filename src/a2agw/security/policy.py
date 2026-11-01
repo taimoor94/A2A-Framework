@@ -362,7 +362,7 @@ class PolicyEngine:
                 continue
             for pid in rule.partners:
                 target = by_id.get(pid)
-                if target is None or not _route_match(rule.match, target):
+                if target is None or not route_match(rule.match, target):
                     continue
                 if rule.mode == "forbid":
                     forbidden.add(pid)
@@ -385,7 +385,21 @@ def _card_skills(rec: PartnerRecord) -> list[dict[str, Any]]:
     return [s for s in raw if isinstance(s, dict)] if isinstance(raw, list) else []
 
 
-def _route_match(match: RouteMatch | None, rec: PartnerRecord) -> bool:
+def forbid_rule(policy: Policy, agent_id: str, rec: PartnerRecord) -> str | None:
+    """The first routing ``forbid`` rule of ``policy`` that removes ``rec`` for
+    ``agent_id`` (its ``id``, else ``routing[i]``), or None. The same matching as
+    ``PolicyEngine.route``."""
+    for i, rule in enumerate(policy.routing):
+        applies = rule.mode == "forbid" and rule.agent == agent_id and rec.id in rule.partners
+        if applies and route_match(rule.match, rec):
+            return rule.id if rule.id is not None else f"routing[{i}]"
+    return None
+
+
+def route_match(match: RouteMatch | None, rec: PartnerRecord) -> bool:
+    """Whether a routing rule's ``match`` selects ``rec``: ``tags_any`` against the record
+    tags plus the card's skill tags, ``skills_any`` against the card's skill ids (either
+    hit suffices; no or an empty match selects every partner)."""
     if match is None or (not match.tags_any and not match.skills_any):
         return True
     skills = _card_skills(rec)

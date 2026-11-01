@@ -708,3 +708,59 @@ async def test_permissions(role, allowed, sqlite_settings, make_app, run_app):
         r = await c.post("/api/v1/policies/dry-run", json={"doc": ALLOW_ALL}, headers=no_csrf)
         assert r.status_code == 403 and r.json()["error"] == "csrf"
         assert (await c.get("/api/v1/policies")).status_code == 401
+
+
+async def test_dry_run_replays_recorded_routing_forbid(db_url, make_app, run_app, clock):
+    """A partner.call refused by a routing forbid says so (reason ``routing.forbid``), so
+    lifting the forbid shows as newly allowed; the ceiling still applies to its label."""
+    app = make_app(settings_for(db_url))
+    async with run_app(app) as c:
+        admin = await admin_key(app)
+        _gid, token = await app.state.store.create_gateway("edge-1", actor="t")
+        now = clock()
+
+        def forbidden(seq: int, label: str | None, *, invalid: bool = False) -> dict[str, Any]:
+            r = row(
+                seq,
+                "partner.call",
+                ts=now - 100 + seq,
+                partner="acme",
+                classification=label,
+                outcome="unavailable",
+                state="unavailable",
+                tier="public",
+                reason="routing.forbid",
+                rule="no-acme",
+            )
+            if invalid:
+                r["detail"]["classification"] = "invalid"
+            return r
+
+        await report(
+            c,
+            token,
+            [
+                forbidden(1, None),  # no label: the agent default applies
+                forbidden(2, "confidential"),  # above the public ceiling
+                forbidden(3, None, invalid=True),  # unknown label: skipped
+                # an older row, no reason: still ambiguous, skipped
+                row(4, "partner.call", ts=now - 90, partner="acme", outcome="unavailable"),
+            ],
+        )
+        open_ = {"version": 1}
+        body = (await dry_run(c, admin, open_)).json()
+        assert [(e["seq"], e["action"], e["rule"]) for e in body["newly_allowed"]] == [
+            (1, "partner.call", "egress.tier_ceilings[public]")
+        ]
+        assert body["newly_blocked"] == []
+        assert body["evaluated"] == 2 and body["counts"]["skipped"] == 2
+
+        still = {
+            "version": 1,
+            "routing": [
+                {"id": "no-acme", "agent": "billing", "partners": ["acme"], "mode": "forbid"}
+            ],
+        }
+        body = (await dry_run(c, admin, still)).json()
+        assert body["newly_allowed"] == [] and body["newly_blocked"] == []
+        assert body["evaluated"] == 2

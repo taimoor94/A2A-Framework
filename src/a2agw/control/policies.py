@@ -50,6 +50,7 @@ from sqlalchemy import and_, delete, func, or_, select, tuple_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
+from a2agw.consult.client import ROUTING_FORBID
 from a2agw.consult.netguard import Tier
 from a2agw.consult.registry import PartnerRecord
 from a2agw.control import channel
@@ -73,7 +74,7 @@ from a2agw.security.policy import (
     Policy,
     PolicyEngine,
     PolicyError,
-    _route_match,
+    forbid_rule,
     parse_policy,
     policy_hash,
 )
@@ -551,14 +552,6 @@ def _classification(value: Any) -> Classification | None:
         return None
 
 
-def _forbid_rule(policy: Policy, agent_id: str, rec: PartnerRecord) -> str | None:
-    for i, rule in enumerate(policy.routing):
-        applies = rule.mode == "forbid" and rule.agent == agent_id and rec.id in rule.partners
-        if applies and _route_match(rule.match, rec):
-            return _rule_name(rule, "routing", i)
-    return None
-
-
 def _undecidable_match(policy: Policy, agent_id: str, partner_id: str) -> bool:
     """Whether a forbid rule for this agent and partner depends on tags or skills."""
     return any(
@@ -606,17 +599,25 @@ def _replay_call(
     if partner_id is None:
         return None
     classification = _classification(row.get("classification"))
-    if action == "partner.call":
-        # "unavailable" without a classification may have been a routing forbid: the row
-        # does not say why the call was unavailable
+    raw_detail = row.get("detail")
+    detail: dict[str, Any] = raw_detail if isinstance(raw_detail, dict) else {}
+    # a routing-forbid refusal says so (gateways since this release); its row records
+    # the caller's label, so no classification there means no label
+    forbidden_then = action == "partner.call" and detail.get("reason") == ROUTING_FORBID
+    if forbidden_then:
+        if detail.get("classification") == "invalid":
+            return None  # the label did not parse: egress would refuse it anyway, unknown
+        before = False
+    elif action == "partner.call":
+        # an older row: "unavailable" without a classification may have been a routing
+        # forbid, the row does not say why the call was unavailable
         if row.get("outcome") == "unavailable" and classification is None:
             return None
         before = True
     else:
         before = False
     known = partners.get(partner_id)
-    detail = row.get("detail") if isinstance(row.get("detail"), dict) else {}
-    tier = _tier(detail.get("tier")) if isinstance(detail, dict) else None
+    tier = _tier(detail.get("tier"))
     tier = tier or (known.tier if known is not None else None)
     rec = known.record if known is not None else None
     if rec is None:
@@ -625,10 +626,10 @@ def _replay_call(
         rec = PartnerRecord(id=partner_id, card={}, card_hash="", tier=tier or "public")
     elif tier is not None and tier != rec.tier:
         rec = rec.model_copy(update={"tier": tier})
-    forbid = _forbid_rule(policy, agent_id, rec)
+    forbid = forbid_rule(policy, agent_id, rec)
     if forbid is not None:
         return before, False, forbid
-    if classification is None:
+    if classification is None and not forbidden_then:
         return None
     if tier is None and partner_id not in policy.egress.partner_ceilings:
         return None
