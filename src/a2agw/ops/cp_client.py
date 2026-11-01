@@ -120,6 +120,7 @@ NO_POLICY_WARNING = (
 )
 APPLIED_KEY = "applied_state"
 ACKED_KEY = "audit_acked_seq"
+LOCAL_KEY = "partners_local"  # each managed partner's local state (PartnerRegistry.local_state)
 
 Sleep = Callable[[float], Awaitable[None]]
 
@@ -367,6 +368,7 @@ class ControlPlaneConnector:
         self._last_error: str | None = None
         self._halted = False
         self._stopping = False
+        self._hello_seen = False  # the current stream reached hello
         self._offset: float | None = None  # control-plane time minus our clock, from hello
         self._sub: Subscription | None = None
         self._unsent: list[dict[str, Any]] = []  # events of the report being (re)sent
@@ -381,6 +383,10 @@ class ControlPlaneConnector:
         self.waiting_for_state = False
         self.no_policy_assigned = False  # a managed policy of null: locked down
         host.policy_managed = "policy" in self.manage
+        self._local_dirty = False
+        self._local_task: asyncio.Task[None] | None = None
+        if "partners" in self.manage:
+            host.partners.add_listener(self._partner_changed)
         host.control_plane = self
 
     # -- status ----------------------------------------------------------------------------
@@ -423,12 +429,15 @@ class ControlPlaneConnector:
         acked = await store.get(ACKED_KEY)
         self._acked = acked if type(acked) is int and acked > 0 else 0
         saved = await store.get(APPLIED_KEY)
+        local = await store.get(LOCAL_KEY)
         if isinstance(saved, dict):
             try:
                 applied = self._parse_frame(saved)
                 key_ids = saved.get("key_ids")
                 await self._put_in_force(
-                    saved, key_ids=key_ids if isinstance(key_ids, dict) else {}
+                    saved,
+                    key_ids=key_ids if isinstance(key_ids, dict) else {},
+                    local=local if isinstance(local, dict) else {},
                 )
             except _Rejected as e:
                 log.warning(
@@ -582,9 +591,9 @@ class ControlPlaneConnector:
     async def _stream_loop(self) -> None:
         attempt = 0
         while not (self._stopping or self._halted):
+            self._hello_seen = False
             try:
-                if await self._stream_once():
-                    attempt = 0  # got as far as hello: the next failure starts over
+                await self._stream_once()
             except _Halt:
                 await self._set_connected(False)
                 return
@@ -592,6 +601,8 @@ class ControlPlaneConnector:
                 self._last_error = type(e).__name__
                 if not isinstance(e, httpx.HTTPError):
                     log.warning("control plane: stream failed: %s", self._last_error)
+            if self._hello_seen:
+                attempt = 0  # it got as far as hello: back-off starts over, however it ended
             await self._set_connected(False)
             await self._sleep(self._backoff(attempt))
             attempt += 1
@@ -624,7 +635,7 @@ class ControlPlaneConnector:
                     continue
                 if event == "hello":
                     self._on_hello(data)
-                    hello = True
+                    hello = self._hello_seen = True
                     await self._set_connected(True)
                 elif event == "state":
                     await self._bg(self._apply_state(data))
@@ -751,11 +762,16 @@ class ControlPlaneConnector:
         return handles.count_open if handles is not None else None
 
     async def _put_in_force(
-        self, data: dict[str, Any], *, key_ids: dict[str, Any] | None = None
+        self,
+        data: dict[str, Any],
+        *,
+        key_ids: dict[str, Any] | None = None,
+        local: dict[str, Any] | None = None,
     ) -> None:
         """Check, then apply the managed sections of a desired document: partners first,
         then the policy. ``_Rejected`` (nothing applied) when a check fails. ``key_ids``:
-        restoring the cached state (local checks only)."""
+        restoring the cached state (local checks only), with ``local``: each partner's saved
+        local state (a quarantine, a disable, a pending card survive a restart)."""
         policy_doc = data.get("policy")
         if "policy" in self.manage and policy_doc is not None:
             try:
@@ -767,6 +783,7 @@ class ControlPlaneConnector:
                 await self.host.partners.apply_remote(
                     data.get("partners"),
                     key_ids=key_ids,
+                    local=local,
                     open_handles=self._open_handles(),
                     actor=ACTOR,
                 )
@@ -797,6 +814,26 @@ class ControlPlaneConnector:
             if same:
                 return
         await actions.set_policy(host, doc, actor=ACTOR, source="control_plane")
+
+    def _partner_changed(self, rec: Any, event: str) -> None:
+        """Registry listener: save the partners' local state soon (one save at a time;
+        changes meanwhile are picked up by the running one)."""
+        if self._store is None or self._stopping:
+            return
+        self._local_dirty = True
+        if self._local_task is not None and not self._local_task.done():
+            return
+        try:
+            task = asyncio.get_running_loop().create_task(self._save_local())
+        except RuntimeError:  # no loop (a change made outside the gateway's loop)
+            return
+        self._local_task = task
+        self._track(task)
+
+    async def _save_local(self) -> None:
+        while self._local_dirty and self._store is not None:
+            self._local_dirty = False
+            await self._store.set(LOCAL_KEY, self.host.partners.local_state())
 
     async def _save(self, data: dict[str, Any]) -> None:
         assert self._store is not None

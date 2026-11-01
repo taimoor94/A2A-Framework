@@ -121,6 +121,7 @@ class FakeCP:
         self.report_status = 200
         self.refused = 0
         self.report_hang: asyncio.Event | None = None
+        self.break_streams = False
         self.live: asyncio.Queue[bytes] = asyncio.Queue()
         self.acked = 0
         self.ack: Callable[[dict[str, Any]], int] = self._ack_all
@@ -155,6 +156,8 @@ class FakeCP:
             yield sse("hello", {"gateway_id": "gw-1", "server_time": SERVER_TIME})
             for event, data in frames:
                 yield sse(event, data)
+            if self.break_streams:
+                raise ConnectionError("dropped")  # the connection breaks mid-stream
             if end:
                 return
             while True:
@@ -256,9 +259,14 @@ async def gateway(tmp_path, cp, clock, fake_sleep):
     transport = StreamingASGITransport({"cp.example": cp.app})
 
     async def make(
-        db: str = "gw.db", start: bool = True, **cfg: Any
+        db: str = "gw.db",
+        start: bool = True,
+        partner_http: httpx.AsyncClient | None = None,
+        **cfg: Any,
     ) -> tuple[AgentHost, ControlPlaneConnector]:
-        host = AgentHost("http://t", db_url=f"sqlite+aiosqlite:///{tmp_path / db}")
+        host = AgentHost(
+            "http://t", db_url=f"sqlite+aiosqlite:///{tmp_path / db}", partner_http=partner_http
+        )
         host.add(
             AgentSpec(
                 id="alpha",
@@ -733,3 +741,71 @@ async def test_final_report_is_bounded(gateway, cp, monkeypatch):
     await asyncio.wait_for(conn.stop(), 5)
     assert loop.time() - t0 < 3 and not conn._work and conn.stopped
     cp.report_hang.set()
+
+
+CARD_URL = "https://partner.example.com/.well-known/agent-card.json"
+
+
+@pytest.fixture
+async def changed_card():
+    """Partner card fetches answer a significantly changed card (a refresh quarantines)."""
+    import respx
+
+    changed = {**card("P1"), "description": "now does other things"}
+    with respx.mock(assert_all_called=False) as router:
+        router.get(CARD_URL).respond(200, json=changed)
+        async with httpx.AsyncClient() as http:
+            yield http
+
+
+async def test_restart_keeps_local_quarantine_and_reject(gateway, cp, changed_card):
+    """A quarantine found here, a partner.reject and the pending card survive a restart (a
+    managed registry has no partners file: the local state is in a2agw_cp_state)."""
+    from a2agw.ops import actions
+
+    cp.script(("state", state(1, [partner("p1"), partner("p2")])))
+    host, conn = await gateway(partner_http=changed_card)
+    await until(lambda: conn.status()["applied_version"] == 1)
+    assert (await actions.refresh_partner(host, "p1", actor="t"))["result"] == "quarantined"
+    await actions.refresh_partner(host, "p2", actor="t")
+    await actions.reject_partner(host, "p2", actor="t")
+    fetched = host.partners.get("p1").fetched_at
+    pending = host.partners.get("p1").pending_card
+    await conn.stop()
+    cp.stream_status = 503  # the control plane is down for the restart
+    host2, _conn2 = await gateway(partner_http=changed_card)
+    p1, p2 = host2.partners.get("p1"), host2.partners.get("p2")
+    assert p1.status == "quarantined" and p1.pending_card == pending
+    assert p1.fetched_at == fetched  # its refresh schedule is kept, not restarted
+    assert p2.status == "disabled" and p2.pending_card is None
+
+
+async def test_readded_after_draining_keeps_local_status(gateway, cp, changed_card):
+    from a2agw.ops import actions
+
+    cp.script(("state", state(1, [partner("p1")])))
+    host, conn = await gateway(partner_http=changed_card)
+    await until(lambda: conn.status()["applied_version"] == 1)
+    await actions.refresh_partner(host, "p1", actor="t")
+    assert host.partners.get("p1").status == "quarantined"
+    assert host.handles is not None
+    await host.handles.record("pt-1", "p1", "c1", None, None, "TASK_STATE_WORKING")
+    cp.push("state", state(2, []))
+    await until(lambda: conn.status()["applied_version"] == 2)
+    assert host.partners.get("p1").status == "disabled" and "p1" in host.partners.draining
+    cp.push("state", state(3, [partner("p1")]))
+    await until(lambda: conn.status()["applied_version"] == 3)
+    rec = host.partners.get("p1")
+    assert rec.status == "quarantined" and rec.pending_card is not None
+    assert "p1" not in host.partners.draining
+
+
+async def test_backoff_resets_after_a_stream_that_reached_hello(gateway, cp, sleeps):
+    """Streams that connect (hello) and then break keep reconnecting at the first back-off
+    step, however many times they break."""
+    cp.break_streams = True
+    _host, _conn = await gateway(report_interval_s=1000.0)
+    await until(lambda: len(cp.queries) >= 10)
+    backoff = [s for s in sleeps if s != 1000.0]
+    assert len(backoff) >= 9
+    assert all(0.25 <= s <= 0.5 for s in backoff)

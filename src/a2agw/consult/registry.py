@@ -236,6 +236,43 @@ def _significant_differs(old: dict[str, Any], new: dict[str, Any]) -> bool:
     return any(old.get(k) != new.get(k) for k in keys)
 
 
+def _local_entry(entry: Any) -> dict[str, Any] | None:
+    """A ``local_state`` entry if it is well formed (else None: not used). A pending card
+    must still be a valid card."""
+    if not isinstance(entry, dict):
+        return None
+    status, pending, key = (
+        entry.get("status"),
+        entry.get("pending_card"),
+        entry.get("pending_key_id"),
+    )
+    fetched = entry.get("fetched_at")
+    if not isinstance(entry.get("card_hash"), str) or status not in (
+        "active",
+        "quarantined",
+        "disabled",
+    ):
+        return None
+    if key is not None and not isinstance(key, str):
+        return None
+    if isinstance(fetched, bool) or not isinstance(fetched, int | float):
+        return None
+    if pending is not None:
+        if not isinstance(pending, dict):
+            return None
+        try:
+            pending, _ = _normalize(pending)
+        except CardFetchError:
+            return None
+    return {
+        "card_hash": entry["card_hash"],
+        "status": status,
+        "pending_card": pending,
+        "pending_key_id": key,
+        "fetched_at": float(fetched),
+    }
+
+
 class ReloadConflict(RuntimeError):
     """The registry changed between ``prepare_reload`` and ``apply_reload``."""
 
@@ -318,7 +355,9 @@ class PartnerRegistry:
         self._actor: str | None = None  # see ``acting_as``
         # Partners the control plane removed while they had open partner tasks: disabled,
         # and removed by the host's maintenance once those tasks end (``apply_remote``).
-        self.draining: set[str] = set()
+        # {id: the status before draining}: a partner the control plane adds back gets it
+        # again (a local quarantine or disable is never lifted by a re-add).
+        self.draining: dict[str, Status] = {}
 
     # -- fetching -------------------------------------------------------
     async def _fetch(self, card_url: str, tier: Tier, tls_ref: str | None = None) -> dict[str, Any]:
@@ -547,7 +586,7 @@ class PartnerRegistry:
         (``AgentHost`` refuses removals that would orphan them unless forced)."""
         rec = self.get(id)
         del self._records[id]
-        self.draining.discard(id)
+        self.draining.pop(id, None)
         self._changed(rec, "removed")
 
     def enable(self, id: str) -> PartnerRecord:
@@ -845,11 +884,13 @@ class PartnerRegistry:
         newly_disabled: list[PartnerRecord] = []
         for i in plan.draining:  # left out, with open tasks: kept, disabled
             rec = old[i]
+            self.draining.setdefault(i, rec.status)
             if rec.status != "disabled":
                 rec.status = "disabled"
                 newly_disabled.append(rec)
             self._records[i] = rec
-        self.draining = (self.draining | set(plan.draining)) - set(plan.fresh)
+        for i in plan.fresh:
+            self.draining.pop(i, None)
         # The file now is what was read: the base for later merge-safe saves.
         self._disk = dict(plan.raw)
         self._dirty &= set(self._records)
@@ -880,7 +921,11 @@ class PartnerRegistry:
         return {"from_status": prev.status}
 
     async def prepare_remote(
-        self, records: Any, *, key_ids: Mapping[str, str | None] | None = None
+        self,
+        records: Any,
+        *,
+        key_ids: Mapping[str, str | None] | None = None,
+        local: Mapping[str, Any] | None = None,
     ) -> ReloadPlan:
         """Check partner records sent by the control plane and diff them against the
         registry, changing nothing (apply the plan with ``apply_reload``). Every record must
@@ -899,7 +944,11 @@ class PartnerRegistry:
 
         A record whose card equals the one this registry has keeps its local state (status,
         pending card, fetch time): a card change quarantined here stays quarantined. A new
-        card replaces the record (status active)."""
+        card replaces the record (status active). ``local`` ({id: ``local_state`` entry},
+        saved by the gateway) stands in for a record this registry does not hold (after a
+        restart): with the same card hash its status, pending card and fetch time are
+        restored. A partner the control plane adds back while it drains gets the status it
+        had before; a record with a pending card is never active (quarantined)."""
         if not isinstance(records, list):
             raise RemoteStateError("partners")
         fresh: dict[str, PartnerRecord] = {}
@@ -911,12 +960,27 @@ class PartnerRegistry:
         old = self._records
         for pid, rec in fresh.items():
             prev = old.get(pid)
-            if prev is None or prev.card_hash != rec.card_hash:
+            if prev is not None and prev.card_hash == rec.card_hash:
+                # The same approved card: what this gateway learned about it stays.
+                status = self.draining.get(pid, prev.status)
+                pending, pending_key = prev.pending_card, prev.pending_key_id
+                fetched_at = prev.fetched_at
+            elif prev is None and (saved := _local_entry((local or {}).get(pid))) is not None:
+                if saved["card_hash"] != rec.card_hash:
+                    continue
+                status, pending, pending_key, fetched_at = (
+                    saved["status"],
+                    saved["pending_card"],
+                    saved["pending_key_id"],
+                    saved["fetched_at"],
+                )
+            else:
                 continue
-            # The same approved card: what this gateway learned about it stays.
-            rec.status = "active" if pid in self.draining else prev.status
-            rec.pending_card, rec.pending_key_id = prev.pending_card, prev.pending_key_id
-            rec.fetched_at = prev.fetched_at
+            if pending is not None and status == "active":
+                status = "quarantined"
+            rec.status = status
+            rec.pending_card, rec.pending_key_id = pending, pending_key
+            rec.fetched_at = fetched_at
         quarantined = self._quarantine_fresh(fresh)
         updated = [
             i
@@ -978,11 +1042,28 @@ class PartnerRegistry:
         rec.fetched_at = time.time()
         return rec
 
+    def local_state(self) -> dict[str, dict[str, Any]]:
+        """What this gateway knows about each partner beyond the control plane's record
+        (for ``prepare_remote(local=...)`` after a restart): {id: {card_hash, status,
+        pending_card, pending_key_id, fetched_at}}. Draining partners are left out."""
+        return {
+            r.id: {
+                "card_hash": r.card_hash,
+                "status": r.status,
+                "pending_card": r.pending_card,
+                "pending_key_id": r.pending_key_id,
+                "fetched_at": r.fetched_at,
+            }
+            for r in self._records.values()
+            if r.id not in self.draining
+        }
+
     async def apply_remote(
         self,
         records: Any,
         *,
         key_ids: Mapping[str, str | None] | None = None,
+        local: Mapping[str, Any] | None = None,
         open_handles: Callable[[list[str]], Awaitable[dict[str, int]]] | None = None,
         actor: str | None = None,
     ) -> ReloadPlan:
@@ -996,7 +1077,7 @@ class PartnerRegistry:
         ``actor`` (only the final, synchronous step runs as it: changes other code makes
         while the records are checked keep their own actor). Returns the applied plan."""
         for _ in range(REMOTE_TRIES):
-            plan = await self.prepare_remote(records, key_ids=key_ids)
+            plan = await self.prepare_remote(records, key_ids=key_ids, local=local)
             if plan.removed and open_handles is not None:
                 counts = await open_handles(plan.removed)
                 plan.draining = [i for i in plan.removed if counts.get(i, 0)]
