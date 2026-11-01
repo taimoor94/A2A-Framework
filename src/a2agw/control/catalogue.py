@@ -9,8 +9,9 @@ approved partner is in a gateway's desired state, as its approved version
 
 - ``POST /api/v1/partners`` (``partners.register``): fetch the card (SSRF-guarded for the
   tier), validate and verify it, store version 1 as ``pending``.
-- ``GET /api/v1/partners`` (``read``): the list; filters ``tier``, ``status``,
-  ``gateway_id``, and ``q``, the skill search.
+- ``GET /api/v1/partners`` (``read``): the list; filters ``tier``, ``status`` (default
+  ``approved``: other partners appear only when asked for), ``gateway_id``, and ``q``, the
+  skill search.
 - ``GET /api/v1/partners/{id}`` (``read``): record, approved card, pending card, their
   diff, the versions, and what each gateway reported.
 - ``POST .../approve`` (``partners.trust``) ``{version, expected_hash}``: hash-pinned; a
@@ -372,8 +373,9 @@ async def list_partners(
     query = select(PARTNERS).order_by(PARTNERS.c.id)
     if tier is not None:
         query = query.where(PARTNERS.c.tier == tier)
-    if status is not None:
-        query = query.where(PARTNERS.c.status == status)
+    # without a status filter only approved partners are listed (and searched): pending,
+    # quarantined or rejected partners never surface by default
+    query = query.where(PARTNERS.c.status == (status or "approved"))
     if gateway_id is not None:
         query = query.where(
             PARTNERS.c.id.in_(

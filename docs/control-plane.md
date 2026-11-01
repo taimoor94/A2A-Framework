@@ -181,7 +181,7 @@ approved card version. Every write is audited in `cp_audit`.
 | Route | Permission | What it does |
 |---|---|---|
 | `POST /api/v1/partners` `{id, card_url \| card, tier, credential_ref?, tls_ref?, tags?}` | `partners.register` | fetch the card (SSRF-guarded for the tier), validate and verify it; version 1, `pending` |
-| `GET /api/v1/partners?tier=&status=&gateway_id=&q=` | `read` | the list; `q` is the skill search |
+| `GET /api/v1/partners?tier=&status=&gateway_id=&q=` | `read` | the list; `q` is the skill search. Without `status` only `approved` partners are listed and searched |
 | `GET /api/v1/partners/{id}` | `read` | approved card, pending card, their `diff`, the versions, what each gateway reported |
 | `POST /api/v1/partners/{id}/approve` `{version, expected_hash}` | `partners.trust` | approve that version (409 if the hash differs) |
 | `POST /api/v1/partners/{id}/reject`, `.../quarantine` | `partners.trust` | the partner leaves every gateway |
@@ -205,8 +205,11 @@ approved card version. Every write is audited in `cp_audit`.
   and pending cards are checked again for the new tier first.
 - **Gateway reports.** Each gateway's `partner.state` events are kept per gateway: the list
   shows `quarantined_on`, the detail each gateway's status and the hash of the pending card
-  it holds. Only that hash is taken from a gateway, never a card. Approving the version with
-  that hash also queues `partner.approve {id, expected_hash}` for those gateways.
+  it holds. Only that hash is taken from a gateway, never a card, and a report never makes
+  the control plane fetch anything: to see the diff of a gateway-reported quarantine, run
+  `refresh` on the partner (the control plane fetches the card itself and stores the change
+  as a pending version). Approving the version with that hash also queues
+  `partner.approve {id, expected_hash}` for those gateways.
 - **References only.** `credential_ref` and `tls_ref` are names each gateway resolves from
   its own configuration. The control plane holds no partner secret, and it fetches cards
   without a client certificate: register an mTLS-only partner with its card inline.

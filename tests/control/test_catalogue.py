@@ -574,9 +574,15 @@ async def test_skill_search_ranks_skill_name_matches_first(db_url, catalogue_app
         for pid, c_ in (("lingo", named), ("wordy", described), ("tagger", tagged)):
             assert (await register(c, admin, pid, card=c_, tier="partner")).status_code == 201
             assert (await approve(c, admin, pid)).status_code == 200
-        # not approved: never found
+        # not approved: never found by default
         hidden = card("Hidden", skills=[{"id": "h", "name": "Translate", "description": "x"}])
         await register(c, admin, "hidden", card=hidden)
+        # approved once, then rejected or quarantined: not found by default either
+        for pid in ("gone", "held"):
+            await register(c, admin, pid, card=card(pid.title(), skills=hidden["skills"]))
+            await approve(c, admin, pid)
+        await c.post("/api/v1/partners/gone/reject", headers=admin)
+        await c.post("/api/v1/partners/held/quarantine", headers=admin)
 
         r = await c.get("/api/v1/partners", params={"q": "TRANSLATE"}, headers=admin)
         assert r.status_code == 200
@@ -593,14 +599,24 @@ async def test_skill_search_ranks_skill_name_matches_first(db_url, catalogue_app
         assert r.json()["partners"] == []
 
         all_ = (await c.get("/api/v1/partners", headers=admin)).json()["partners"]
-        assert [p["id"] for p in all_] == ["hidden", "lingo", "tagger", "wordy"]
+        assert [p["id"] for p in all_] == ["lingo", "tagger", "wordy"]  # approved only
         lingo = next(p for p in all_ if p["id"] == "lingo")
         assert lingo["name"] == "Lingo" and lingo["skills_count"] == 2
         assert lingo["status"] == "approved" and lingo["current_version"] == 1
         assert "matched_skills" not in lingo
+        # an explicit status filter still lists (and searches) the others
         r = await c.get("/api/v1/partners", params={"status": "pending"}, headers=admin)
         assert [p["id"] for p in r.json()["partners"]] == ["hidden"]
+        for status, pid in (("rejected", "gone"), ("quarantined", "held")):
+            r = await c.get(
+                "/api/v1/partners", params={"status": status, "q": "translate"}, headers=admin
+            )
+            assert [(p["id"], p["matched_skills"]) for p in r.json()["partners"]] == [(pid, ["h"])]
         r = await c.get("/api/v1/partners", params={"tier": "public"}, headers=admin)
+        assert r.json()["partners"] == []  # hidden is public but pending
+        r = await c.get(
+            "/api/v1/partners", params={"tier": "public", "status": "pending"}, headers=admin
+        )
         assert [p["id"] for p in r.json()["partners"]] == ["hidden"]
         r = await c.get("/api/v1/partners", params={"status": "bogus"}, headers=admin)
         assert r.status_code == 422
