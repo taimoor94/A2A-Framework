@@ -114,12 +114,19 @@ async def test_list_connected_flag(db_url, make_app, run_app, clock):
             "connected": False,
             "version_applied": 0,
             "version_desired": 0,
+            "epoch_applied": None,
+            "epoch_desired": None,
             "last_rejection": None,
             "info": {},
         }
         desired = await channel.compute_desired(app.state.store, created["id"])
         info = {"version": "1.4.0", "agents": ["alpha"], "base_url": "https://g"}
-        applied = {"version": desired.version, "hash": desired.hash, "status": "applied"}
+        applied = {
+            "epoch": desired.epoch,
+            "version": desired.version,
+            "hash": desired.hash,
+            "status": "applied",
+        }
         r = await c.post(
             "/cp/v1/report",
             json={"info": info, "applied": applied},
@@ -129,6 +136,7 @@ async def test_list_connected_flag(db_url, make_app, run_app, clock):
         [gw] = (await c.get("/api/v1/gateways", headers=admin)).json()["gateways"]
         assert gw["connected"] is True and gw["last_seen_at"] == clock.t
         assert gw["version_applied"] == gw["version_desired"] == desired.version
+        assert gw["epoch_applied"] == gw["epoch_desired"] == app.state.store.epoch
         assert gw["info"] == info
         clock.advance(2 * KEEPALIVE_S - 1)
         [gw] = (await c.get("/api/v1/gateways", headers=admin)).json()["gateways"]

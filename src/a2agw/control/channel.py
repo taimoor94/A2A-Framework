@@ -8,11 +8,16 @@ digest must be in ``cp_gateway_tokens``, not revoked, for a gateway whose status
 body is ignored.
 
 ``GET /cp/v1/stream`` (server-sent events): ``hello`` first, then ``state`` whenever the
-desired version is ahead of what the gateway has (``applied``, then what this stream sent),
-``command`` for each pending, unexpired command (marked ``delivered`` as it is sent: at most
-once), and a ``: keepalive`` comment every ``stream_keepalive_s``. The handler polls the
-database every ``POLL_S`` (so any replica can serve any gateway), holds no connection
-between polls, and ends at the first poll after its token is revoked.
+desired ``(epoch, version)`` differs from what the gateway has (``epoch`` and ``applied``
+in the query, then what this stream sent; a missing or other epoch, after a database reset,
+counts as behind), ``command`` for each pending, unexpired command (marked ``delivered`` as
+it is sent: at most once), and a ``: keepalive`` comment every ``stream_keepalive_s``. The
+handler polls the database every ``POLL_S`` (so any replica can serve any gateway), holds
+no connection between polls, and ends at the first poll after its token is revoked. Each
+poll is a few indexed lookups (token and gateway by primary key, desired state by primary
+key, pending commands by ``(gateway_id, status, expires_at)``); ``last_seen_at`` is written
+at most every ``SEEN_EVERY_S`` (``SeenWriter``). A poll's database work is shielded from
+the client's disconnect (``Background``).
 
 ``POST /cp/v1/report``: events, audit rows, health, metrics, command results, the applied
 version and gateway info. The body is capped at ``report_max_bytes`` (413) and each list at
@@ -72,6 +77,7 @@ from a2agw.control.store import (
 from a2agw.ops.audit import AuditEvent, canonical_json
 
 POLL_S = 0.5  # how often a stream looks at the database
+SEEN_EVERY_S = 5.0  # last_seen_at is written at most this often per gateway (per process)
 STRING_MAX = 256  # strings in events (and other short fields) are cut to this
 TRACE_ID_MAX = 64
 URL_MAX = 2048
@@ -166,23 +172,35 @@ async def gateway_auth(request: Request) -> str | None:
     return str(gateway_id)
 
 
-async def _seen(store: ControlStore, gateway_id: str, now: float) -> None:
-    async with store.engine.begin() as conn:
-        await conn.execute(
-            update(GATEWAYS).where(GATEWAYS.c.id == gateway_id).values(last_seen_at=now)
-        )
+class SeenWriter:
+    """Writes ``cp_gateways.last_seen_at`` at most once per ``every_s`` per gateway (stream
+    polls and reports alike; ``app.state.seen``). The time of the last write is kept in
+    memory, per process: each replica writes at most that often for the gateways it
+    serves. ``connected`` (seen within two keepalive intervals) stays accurate as long as
+    ``every_s`` is below that window."""
 
+    def __init__(self, every_s: float = SEEN_EVERY_S) -> None:
+        self.every_s = every_s
+        self._written: dict[str, float] = {}
 
-async def _still_live(store: ControlStore, digest: str, gateway_id: str, now: float) -> bool:
-    """Whether the stream's token still works; if so, the gateway was seen ``now``."""
-    async with store.engine.begin() as conn:
-        live = (await conn.execute(_live_token_query(digest))).scalar_one_or_none()
-        if live != gateway_id:
+    async def seen(self, store: ControlStore, gateway_id: str, now: float) -> bool:
+        """Record that the gateway was seen ``now``; returns whether it was written."""
+        last = self._written.get(gateway_id)
+        if last is not None and 0 <= now - last < self.every_s:
             return False
-        await conn.execute(
-            update(GATEWAYS).where(GATEWAYS.c.id == gateway_id).values(last_seen_at=now)
-        )
-    return True
+        self._written[gateway_id] = now
+        async with store.engine.begin() as conn:
+            await conn.execute(
+                update(GATEWAYS).where(GATEWAYS.c.id == gateway_id).values(last_seen_at=now)
+            )
+        return True
+
+
+async def _still_live(store: ControlStore, digest: str, gateway_id: str) -> bool:
+    """Whether the stream's token still works (one primary-key lookup on each table)."""
+    async with store.engine.connect() as conn:
+        live = (await conn.execute(_live_token_query(digest))).scalar_one_or_none()
+    return live == gateway_id
 
 
 # -- desired state -------------------------------------------------------------------------
@@ -191,6 +209,7 @@ async def _still_live(store: ControlStore, digest: str, gateway_id: str, now: fl
 @dataclass(frozen=True)
 class DesiredState:
     gateway_id: str
+    epoch: str  # the store's epoch: versions count within it
     version: int
     hash: str
     partners: list[dict[str, Any]]
@@ -199,6 +218,7 @@ class DesiredState:
     def frame(self) -> dict[str, Any]:
         """The ``state`` frame's data."""
         return {
+            "epoch": self.epoch,
             "version": self.version,
             "hash": self.hash,
             "partners": self.partners,
@@ -367,7 +387,7 @@ async def _compute_once(store: ControlStore, gateway_id: str) -> DesiredState | 
             )
             if moved.rowcount != 1:
                 return None
-    return DesiredState(gateway_id, version, digest, doc["partners"], doc["policy"])
+    return DesiredState(gateway_id, store.epoch, version, digest, doc["partners"], doc["policy"])
 
 
 async def load_desired(store: ControlStore, gateway_id: str) -> DesiredState | None:
@@ -380,7 +400,12 @@ async def load_desired(store: ControlStore, gateway_id: str) -> DesiredState | N
         return None
     doc = _loads(row.doc_json, {})
     return DesiredState(
-        gateway_id, row.version, row.doc_hash, doc.get("partners", []), doc.get("policy")
+        gateway_id,
+        store.epoch,
+        row.version,
+        row.doc_hash,
+        doc.get("partners", []),
+        doc.get("policy"),
     )
 
 
@@ -651,45 +676,97 @@ def _frame(event: str, data: Any) -> str:
     return f"event: {event}\ndata: {_json(data)}\n\n"
 
 
-async def _frames(
-    request: Request, gateway_id: str, digest: str, applied: int
-) -> AsyncIterator[str]:
-    state = request.app.state
-    store: ControlStore = state.store
-    clock: Callable[[], float] = state.clock
-    sleep: Sleep = state.sleep
-    keepalive = state.settings.limits.stream_keepalive_s
-    now = clock()
-    await _emit(
-        store,
-        AuditEvent(
-            actor=gateway_id,
-            action="cp.connect",
-            outcome="connected",
-            detail={"gateway": gateway_id},
-            ts=now,
-        ),
-        coalesce=gateway_id,
-    )
-    yield _frame("hello", {"gateway_id": gateway_id, "server_time": now})
-    sent = applied
-    last_beat = now
-    while True:
-        now = clock()
-        if not await _still_live(store, digest, gateway_id, now):
-            return  # revoked (or rotated away): the stream ends
+class Background:
+    """Database work of streams, run as tasks the client's disconnect cannot cancel.
+
+    Starlette cancels a streaming response's generator when the client goes away. A
+    cancellation that lands inside a database call can leave the connection half-closed
+    (aiosqlite's terminate never completes under it). So each poll's database work runs in
+    its own task, awaited through ``asyncio.shield``: a disconnect cancels the generator at
+    that await, and the poll finishes on its own and returns its connections. The
+    lifespan awaits ``drain`` before it disposes the engine (``app.state.background``)."""
+
+    def __init__(self) -> None:
+        self._tasks: set[asyncio.Task[Any]] = set()
+
+    async def run(self, work: Awaitable[Any]) -> Any:
+        task = asyncio.ensure_future(work)
+        self._tasks.add(task)
+        task.add_done_callback(self._done)
+        return await asyncio.shield(task)
+
+    def _done(self, task: asyncio.Task[Any]) -> None:
+        self._tasks.discard(task)
+        if not task.cancelled():
+            task.exception()  # retrieved: a poll nobody awaits any more may fail quietly
+
+    async def drain(self) -> None:
+        while self._tasks:
+            await asyncio.gather(*list(self._tasks), return_exceptions=True)
+
+
+@dataclass
+class _Poll:
+    """One stream's state between polls: what the gateway has, (epoch, version), from the
+    query and then from what this stream sent. Any difference from the desired (epoch,
+    version) means behind, a version number of another epoch (a reset or replaced
+    database) included."""
+
+    store: ControlStore
+    seen: SeenWriter
+    gateway_id: str
+    digest: str
+    sent: tuple[str | None, int]
+
+    async def once(self, now: float) -> list[str] | None:
+        """The frames of one poll, or None when the token no longer works."""
+        store, gateway_id = self.store, self.gateway_id
+        if not await _still_live(store, self.digest, gateway_id):
+            return None
+        await self.seen.seen(store, gateway_id, now)
+        out: list[str] = []
         desired: DesiredState | None = None
         version = await _clean_version(store, gateway_id)
         if version is None:
             desired = await compute_desired(store, gateway_id)
             version = desired.version
-        if version > sent:
+        if (store.epoch, version) != self.sent:
             desired = desired or await load_desired(store, gateway_id)
             if desired is not None:
-                yield _frame("state", desired.frame())
-                sent = desired.version
-        for command in await take_commands(store, gateway_id, now):
-            yield _frame("command", command.frame())
+                out.append(_frame("state", desired.frame()))
+                self.sent = (desired.epoch, desired.version)
+        out += [_frame("command", c.frame()) for c in await take_commands(store, gateway_id, now)]
+        return out
+
+
+async def _frames(
+    request: Request, gateway_id: str, digest: str, applied: tuple[str | None, int]
+) -> AsyncIterator[str]:
+    state = request.app.state
+    store: ControlStore = state.store
+    clock: Callable[[], float] = state.clock
+    sleep: Sleep = state.sleep
+    background: Background = state.background
+    keepalive = state.settings.limits.stream_keepalive_s
+    now = clock()
+    connected = AuditEvent(
+        actor=gateway_id,
+        action="cp.connect",
+        outcome="connected",
+        detail={"gateway": gateway_id},
+        ts=now,
+    )
+    await background.run(_emit(store, connected, coalesce=gateway_id))
+    yield _frame("hello", {"gateway_id": gateway_id, "server_time": now})
+    poll = _Poll(store, state.seen, gateway_id, digest, applied)
+    last_beat = now
+    while True:
+        now = clock()
+        frames = await background.run(poll.once(now))
+        if frames is None:
+            return  # revoked (or rotated away): the stream ends
+        for frame in frames:
+            yield frame
         if now - last_beat >= keepalive:
             yield ": keepalive\n\n"
             last_beat = now
@@ -700,12 +777,14 @@ async def _frames(
 async def stream(
     request: Request,
     applied: int = Query(0, ge=0),
+    epoch: str | None = Query(None, max_length=64),
     me: str = Depends(require_gateway),
 ) -> StreamingResponse:
-    """The gateway's event stream (server-sent events)."""
+    """The gateway's event stream (server-sent events). ``applied`` and ``epoch``: the
+    desired state the gateway has (no epoch, or another one: it is sent the state)."""
     digest: str = request.state.cp_gateway_token
     return StreamingResponse(
-        _frames(request, me, digest, applied),
+        _frames(request, me, digest, (epoch or None, applied)),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )
@@ -718,6 +797,7 @@ _FORBID = ConfigDict(extra="forbid")
 
 class Applied(BaseModel):
     model_config = _FORBID
+    epoch: str = Field(max_length=64)
     version: int = Field(ge=0, le=SEQ_MAX)
     hash: str = Field(max_length=128)
     status: Literal["applied", "rejected"]
@@ -936,13 +1016,17 @@ class _Ingest:
             "version": applied.version,
             "hash": applied.hash,
         }
+        epoch = _clean(applied.epoch, TRACE_ID_MAX)
         if applied.status == "applied":
             async with self.store.engine.begin() as conn:
                 changed = await conn.execute(
                     update(GATEWAYS)
                     .where(GATEWAYS.c.id == gateway_id)
-                    .where(GATEWAYS.c.last_version_applied != applied.version)
-                    .values(last_version_applied=applied.version)
+                    .where(
+                        (GATEWAYS.c.last_version_applied != applied.version)
+                        | GATEWAYS.c.epoch_applied.is_distinct_from(epoch)
+                    )
+                    .values(last_version_applied=applied.version, epoch_applied=epoch)
                 )
             if changed.rowcount:
                 event = AuditEvent(
@@ -952,6 +1036,7 @@ class _Ingest:
             return
         reason = _clean(applied.reason or "")
         rejection = {
+            "epoch": epoch,
             "version": applied.version,
             "hash": _clean(applied.hash),
             "reason": reason,
@@ -965,7 +1050,9 @@ class _Ingest:
             detail={**detail, "reason": reason},
             ts=now,
         )
-        await _emit(self.store, event, coalesce=f"{gateway_id}:{applied.version}:{applied.hash}")
+        await _emit(
+            self.store, event, coalesce=f"{gateway_id}:{epoch}:{applied.version}:{applied.hash}"
+        )
 
     async def info(self, info: GatewayInfo) -> None:
         agents = [_clean(a) for a in self.cap(info.agents)]
@@ -1000,7 +1087,7 @@ async def report(request: Request, me: str = Depends(require_gateway)) -> dict[s
     body = _parse_report(await _read_capped(request, limits.report_max_bytes))
     store: ControlStore = state.store
     now = state.clock()
-    await _seen(store, me, now)
+    await state.seen.seen(store, me, now)
     ingest = _Ingest(store, me, now, limits.report_max_items)
     accepted = await ingest.events(body.events)
     acked = await ingest.audit(body.audit)

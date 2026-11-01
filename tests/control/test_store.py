@@ -38,6 +38,7 @@ TABLES = {
     "cp_events",
     "cp_gateway_audit",
     "cp_health",
+    "cp_meta",
 }
 
 
@@ -99,6 +100,8 @@ async def test_indexes_and_wide_event_seq(store, engine):
         states = await conn.run_sync(indexes, "cp_login_states")
         seq = await conn.run_sync(seq_type)
     assert ("status", "expires_at") in commands
+    # a stream's per-poll command lookup: one range of one index
+    assert ("gateway_id", "status", "expires_at") in commands
     assert ("expires_at",) in sessions and ("expires_at",) in states
     # 64-bit on Postgres; sqlite keeps INTEGER (its rowid alias for AUTOINCREMENT)
     assert type(seq).__name__ == ("INTEGER" if engine.dialect.name == "sqlite" else "BIGINT")
@@ -107,9 +110,14 @@ async def test_indexes_and_wide_event_seq(store, engine):
 async def test_initialize_idempotent_concurrent(db_url):
     engines = [await create_engine(db_url) for _ in range(4)]
     try:
-        await asyncio.gather(*(ControlStore(e).initialize() for e in engines))
-        await ControlStore(engines[0]).initialize()  # and once more on a ready schema
+        stores = [ControlStore(e) for e in engines]
+        await asyncio.gather(*(s.initialize() for s in stores))
+        again = ControlStore(engines[0])
+        await again.initialize()  # and once more on a ready schema
         assert TABLES <= await _tables(engines[0])
+        # one epoch, chosen by whichever initialize came first, never changed afterwards
+        epochs = {s.epoch for s in [*stores, again]}
+        assert len(epochs) == 1 and len(epochs.pop()) == 32
     finally:
         for e in engines:
             await e.dispose()
@@ -330,3 +338,22 @@ async def test_api_key_lookup_and_revoke(store, audit):
     assert rows[0]["detail"] == {"key_id": key_id} and rows[0]["actor"] == "b"
     with pytest.raises(KeyError):
         await store.revoke_api_key("ak-nope", actor="b")
+
+
+async def test_epoch_is_persisted_and_differs_per_database(db_factory):
+    url_a, url_b = db_factory(), db_factory()
+    epochs = []
+    for url in (url_a, url_a, url_b):
+        engine = await create_engine(url)
+        try:
+            s = ControlStore(engine)
+            await s.initialize()
+            epochs.append(s.epoch)
+        finally:
+            await engine.dispose()
+    assert epochs[0] == epochs[1] != epochs[2]
+
+
+async def test_epoch_needs_initialize(engine):
+    with pytest.raises(RuntimeError):
+        _ = ControlStore(engine).epoch

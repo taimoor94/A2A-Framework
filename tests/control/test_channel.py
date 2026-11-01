@@ -269,7 +269,8 @@ async def test_hello_then_state_when_behind(db_url, make_cp, clock):
             assert data(hello) == {"gateway_id": gw, "server_time": pytest.approx(clock.t, abs=5)}
             [*_, state] = await frames.until(lambda f: f.get("event") == "state")
             body = data(state)
-            assert set(body) == {"version", "hash", "partners", "policy"}
+            assert set(body) == {"epoch", "version", "hash", "partners", "policy"}
+            assert body["epoch"] == app.state.store.epoch
             assert body["version"] == 1 and len(body["hash"]) == 64
             assert body["policy"] == {"rules": ["r2"]}  # not pinned: the latest version
             assert body["partners"] == [
@@ -296,10 +297,31 @@ async def test_no_state_when_up_to_date(db_url, make_cp):
         gw, token = await app.state.store.create_gateway("gw-a", actor="t")
         await seed_partner(app, gw, "p1")
         desired = await channel.compute_desired(app.state.store, gw)
-        async with stream(c, token, f"applied={desired.version}") as frames:
+        query = f"applied={desired.version}&epoch={desired.epoch}"
+        async with stream(c, token, query) as frames:
             got = await frames.until_keepalive()
             got += await frames.until_keepalive()
         assert [f.get("event") for f in got if "event" in f] == ["hello"]
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["applied=7&epoch=0123456789abcdef0123456789abcdef", "applied=7", "applied=1&epoch="],
+    ids=["other epoch, higher version", "no epoch", "empty epoch"],
+)
+async def test_state_resent_after_store_reset(query, db_url, make_cp):
+    """A gateway that applied a version of another store (the control-plane database was
+    reset or replaced) is behind whatever its version: the state is sent."""
+    app = make_cp(settings_for(db_url))
+    async with started(app) as c:
+        gw, token = await app.state.store.create_gateway("gw-a", actor="t")
+        await seed_partner(app, gw, "p1")
+        desired = await channel.compute_desired(app.state.store, gw)
+        assert desired.version == 1
+        async with stream(c, token, query) as frames:
+            [*_, state] = await frames.until(lambda f: f.get("event") == "state")
+        assert data(state)["version"] == 1 and data(state)["epoch"] == desired.epoch
+        assert [p["id"] for p in data(state)["partners"]] == ["p1"]
 
 
 async def test_state_follows_a_change_while_connected(db_url, make_cp):
@@ -695,12 +717,19 @@ async def test_rejected_apply_recorded_and_audited(db_url, make_cp, run_app, clo
     async with run_app(app) as c:
         gw, token = await app.state.store.create_gateway("gw-a", actor="t")
         desired = await channel.compute_desired(app.state.store, gw)
-        applied = {"version": desired.version, "hash": desired.hash, "status": "applied"}
+        applied = {
+            "epoch": desired.epoch,
+            "version": desired.version,
+            "hash": desired.hash,
+            "status": "applied",
+        }
         r = await report(c, token, applied=applied)
         assert r.status_code == 200
         [g] = await rows(app, GATEWAYS, GATEWAYS.c.id == gw)
         assert g.last_version_applied == desired.version
+        assert g.epoch_applied == desired.epoch
         rejected = {
+            "epoch": desired.epoch,
             "version": 2,
             "hash": "a" * 64,
             "status": "rejected",
@@ -712,6 +741,7 @@ async def test_rejected_apply_recorded_and_audited(db_url, make_cp, run_app, clo
         assert g.last_version_applied == desired.version  # unchanged by a rejection
         info = json.loads(g.info_json)
         assert info["last_rejection"] == {
+            "epoch": desired.epoch,
             "version": 2,
             "hash": "a" * 64,
             "reason": ("unknown credential_ref " + "x" * 400)[:256],
@@ -729,8 +759,22 @@ async def test_rejected_apply_recorded_and_audited(db_url, make_cp, run_app, clo
         await report(c, token, info={"version": "1", "agents": [], "base_url": "https://g"})
         [g] = await rows(app, GATEWAYS, GATEWAYS.c.id == gw)
         assert json.loads(g.info_json)["last_rejection"]["version"] == 2
-        bad = await report(c, token, applied={"version": 1, "hash": "h", "status": "maybe"})
+        bad = await report(
+            c, token, applied={"epoch": "e", "version": 1, "hash": "h", "status": "maybe"}
+        )
         assert bad.status_code == 422
+        no_epoch = await report(c, token, applied={"version": 1, "hash": "h", "status": "applied"})
+        assert no_epoch.status_code == 422 and no_epoch.json()["fields"] == ["body.applied.epoch"]
+        # a store reset: the same version number of another epoch is a change, and audited
+        other = {**applied, "epoch": "f" * 32}
+        assert (await report(c, token, applied=other)).status_code == 200
+        [g] = await rows(app, GATEWAYS, GATEWAYS.c.id == gw)
+        assert g.epoch_applied == "f" * 32 and g.last_version_applied == desired.version
+        assert [r["outcome"] for r in await audit_rows(app, "cp.apply")] == [
+            "applied",
+            "rejected",
+            "applied",
+        ]
 
 
 # -- desired state -------------------------------------------------------------------------
@@ -810,3 +854,56 @@ async def test_concurrent_compute_bumps_once(db_url, make_cp, run_app):
         await seed_partner(app, gw, "p1")
         results = await asyncio.gather(*(channel.compute_desired(store, gw) for _ in range(4)))
         assert {r.version for r in results} == {2}
+
+
+# -- last_seen_at writes are throttled -------------------------------------------------------
+
+
+def count_seen_writes(app: Any) -> list[int]:
+    """A counter of the UPDATEs that set cp_gateways.last_seen_at."""
+    from sqlalchemy import event
+
+    counter = [0]
+
+    def before(_conn, _cursor, statement, *_args):
+        normalized = " ".join(statement.split()).lower()
+        if normalized.startswith("update cp_gateways set last_seen_at"):
+            counter[0] += 1
+
+    event.listen(app.state.engine.sync_engine, "before_cursor_execute", before)
+    return counter
+
+
+async def test_last_seen_written_at_most_every_5s(db_url, make_cp, clock):
+    app = make_cp(settings_for(db_url))
+    async with started(app) as c:
+        gw, token = await app.state.store.create_gateway("gw-a", actor="t")
+        writes = count_seen_writes(app)
+        t0 = clock.t
+        # reports: the first one writes, the next ones within 5 s do not
+        await report(c, token)
+        clock.advance(2)
+        await report(c, token)
+        clock.advance(2.9)
+        await report(c, token)
+        assert writes[0] == 1
+        [g] = await rows(app, GATEWAYS, GATEWAYS.c.id == gw)
+        assert g.last_seen_at == t0
+        clock.advance(0.2)  # 5.1 s after the write
+        await report(c, token)
+        assert writes[0] == 2
+        [g] = await rows(app, GATEWAYS, GATEWAYS.c.id == gw)
+        assert g.last_seen_at == clock.t  # 5.1 s after the first write
+        # stream polls (every 0.5 s on the fake clock) share the same throttle
+        writes[0] = 0
+        start = clock.t
+        async with stream(c, token) as frames:
+            while clock.t - start < 4.5:  # 9 polls or so, all within 5 s of the report
+                await frames.until_keepalive()
+            assert writes[0] == 0
+            while clock.t - start < 10.6:
+                await frames.until_keepalive()
+        polls = (clock.t - start) / channel.POLL_S
+        assert polls >= 20 and 1 <= writes[0] <= 3
+        [g] = await rows(app, GATEWAYS, GATEWAYS.c.id == gw)
+        assert g.last_seen_at > t0 + 5.2

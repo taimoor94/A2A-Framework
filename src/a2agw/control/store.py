@@ -38,6 +38,8 @@ from sqlalchemy import (
     select,
     update,
 )
+from sqlalchemy.dialects import postgresql
+from sqlalchemy.dialects import sqlite as sqlite_dialect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -74,6 +76,8 @@ GATEWAYS = Table(
     # bumped by ``channel.mark_dirty``: the desired state is recomputed while it is ahead
     # of ``cp_desired.source_gen``
     Column("desired_gen", Integer, nullable=False, default=0, server_default="0"),
+    # the store epoch of ``last_version_applied`` (see ``ControlStore.epoch``)
+    _id("epoch_applied", nullable=True),
 )
 GATEWAY_TOKENS = Table(
     "cp_gateway_tokens",
@@ -212,6 +216,8 @@ COMMANDS = Table(
     Column("finished_at", Float, nullable=True),
     Column("expires_at", Float, nullable=False),
     Index("ix_cp_commands_status_expires_at", "status", "expires_at"),
+    # a stream's poll for its gateway's pending commands
+    Index("ix_cp_commands_gateway_status_expires_at", "gateway_id", "status", "expires_at"),
 )
 EVENTS = Table(
     "cp_events",
@@ -248,6 +254,14 @@ HEALTH = Table(
     Column("health_json", Text, nullable=False, default="{}"),
     Column("metrics_json", Text, nullable=False, default="{}"),
 )
+# Settings of the store itself; ``epoch`` is chosen once, when the schema is first created.
+META = Table(
+    "cp_meta",
+    _metadata,
+    Column("key", String(ID), primary_key=True),
+    Column("value", Text, nullable=False),
+)
+EPOCH_KEY = "epoch"
 TABLES = tuple(_metadata.sorted_tables)
 
 
@@ -324,6 +338,18 @@ class ControlStore:
         self.engine = engine
         self.audit = audit
         self._clock = clock
+        self._epoch: str | None = None
+
+    @property
+    def epoch(self) -> str:
+        """This database's epoch: 32 random hex characters chosen by the first
+        ``initialize`` and never changed. Desired-state versions count within an epoch, so
+        a gateway that applied a version of another epoch (the database was reset or
+        replaced) is behind whatever its version number. ``RuntimeError`` before
+        ``initialize``."""
+        if self._epoch is None:
+            raise RuntimeError("ControlStore.initialize() has not run")
+        return self._epoch
 
     def now(self) -> float:
         """The store's clock (epoch seconds)."""
@@ -335,6 +361,24 @@ class ControlStore:
                 await conn.run_sync(_metadata.create_all, checkfirst=True)
 
         await retry_ddl(create)
+        self._epoch = await self._ensure_epoch()
+
+    async def _ensure_epoch(self) -> str:
+        """The stored epoch, created first if there is none (a concurrent initialize may
+        win the insert: then its epoch is the one read back)."""
+        insert = (
+            sqlite_dialect.insert if self.engine.dialect.name == "sqlite" else postgresql.insert
+        )
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                insert(META)
+                .values(key=EPOCH_KEY, value=secrets.token_hex(16))
+                .on_conflict_do_nothing()
+            )
+            value = (
+                await conn.execute(select(META.c.value).where(META.c.key == EPOCH_KEY))
+            ).scalar_one()
+        return str(value)
 
     async def _audit(self, ev: AuditEvent) -> None:
         if self.audit is not None:

@@ -219,6 +219,7 @@ def create_app(
         engine = await create_engine(settings.db_url)
         owned: list[httpx.AsyncClient] = []
         task: asyncio.Task[None] | None = None
+        background: channel.Background | None = None
         audit: AuditLog | None = None
         try:
             audit = AuditLog(engine, table_name=AUDIT_TABLE)
@@ -248,6 +249,8 @@ def create_app(
             app.state.clock = clock
             app.state.sleep = sleep
             app.state.gateway_auth = channel.gateway_auth  # /cp/v1: gateway tokens only
+            app.state.seen = channel.SeenWriter()  # last_seen_at, written at most every 5 s
+            background = app.state.background = channel.Background()
             app.state.maintenance = maintenance
             task = asyncio.create_task(maintenance.run_forever(), name="a2agw:cp-maint")
             yield
@@ -256,6 +259,8 @@ def create_app(
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+            if background is not None:  # streams' last polls, before the engine goes
+                await background.drain()
             if audit is not None:
                 await audit.flush_coalesced()
                 await audit.drain()

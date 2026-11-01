@@ -98,6 +98,8 @@ async def list_gateways(request: Request) -> dict[str, Any]:
                 "connected": row.status == "active" and seen is not None and now - seen <= window,
                 "version_applied": row.last_version_applied,
                 "version_desired": row.version_desired or 0,
+                "epoch_applied": row.epoch_applied,
+                "epoch_desired": store.epoch if row.version_desired is not None else None,
                 "last_rejection": last_rejection,
                 "info": info,
             }
