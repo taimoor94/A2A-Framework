@@ -1,21 +1,25 @@
 """Verified System Change on a running gateway: ``attach_vsc`` adds two hosted agents and the
 VSC admin API to an ``AgentHost``.
 
-- ``deliver``: the user-facing job agent (``VscAgentAdapter``). A message in a context with no
-  job submits one (the message text is the request) and runs it in the background; the A2A
-  task stays ``working``, mirroring the job's state changes from the event bus, until the job
-  ends (``Done("job <id> <state>")``), a privileged step waits for approval (the task becomes
-  ``input-required``) or the task's deadline nears (``Done("job <id> continues")``; the job
-  goes on). In the job's context, while it is ``awaiting_approval``, ``approve [note]`` or
-  ``reject [note]`` decides the waiting step (only the job's owner may) and the task follows
-  the job again; any other message is answered with the job's state. With auth configured the
-  caller needs the ``a2agw:vsc`` scope (``a2agw:admin`` implies it).
+- ``deliver``: the user-facing job agent (``VscAgentAdapter``). A caller's message in a context
+  where they have no job submits one (the message text is the request) and runs it in the
+  background; the A2A task stays ``working``, mirroring the job's state changes from the event
+  bus, until the job ends (``Done("job <id> accepted")``, or ``Failed`` for a failed or
+  cancelled job), a privileged step waits for approval (the task becomes ``input-required``)
+  or the task's deadline nears (``Done("job <id> continues")``; the job goes on). In the
+  caller's job context, while it is ``awaiting_approval``, ``approve [note]`` or
+  ``reject [note]`` decides the waiting step and the task follows the job again; any other
+  message is answered with the job's state. Jobs are per (context, owner). With auth
+  configured the caller needs the ``a2agw:vsc`` scope (``a2agw:admin`` implies it). Its
+  sessions are durable: an ``input-required`` task survives a restart.
 - ``vsc-planner``: the planner's agent; ``AgentPlanner`` sends it every planning turn (the
-  claude planner). With ``planner: scripted`` planning runs in process and this agent only
-  says so.
+  claude planner). With auth configured only the principal ``key:vsc-internal`` may call it:
+  an API key minted at startup, held only in this process's memory
+  (``AuthConfig.register_ephemeral_key``). With ``planner: scripted`` planning runs in
+  process and this agent only says so.
 - ``/a2agw/admin/vsc``: jobs, receipts, approvals, cancel, spec edits
-  (``a2agw.vsc.admin.vsc_admin_routes``), behind the admin API's rules: the ``a2agw:vsc`` scope (or ``a2agw:admin``) and the
-  ``X-A2AGW-Admin: 1`` header on every write.
+  (``a2agw.vsc.admin.vsc_admin_routes``), behind the admin API's rules: the ``a2agw:vsc``
+  scope (or ``a2agw:admin``) and the ``X-A2AGW-Admin: 1`` header on every write.
 
 The stores, workspaces, gate and job runner are built when the host starts
 (``VscAgentAdapter.start``, a ``LifecycleAdapter``), on the host's engine, audit log and bus;
@@ -26,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -35,7 +40,7 @@ from a2agw.adapters.callable import CallableAdapter
 from a2agw.core.events import AgentEvent, Done, Failed, NeedInput, Reply, Status
 from a2agw.core.spi import InboundContext
 from a2agw.ops.bus import GatewayEvent, Subscription
-from a2agw.security.auth import VSC_SCOPE, has_scope
+from a2agw.security.auth import VSC_SCOPE, AgentAccess, has_scope
 from a2agw.serve.agent import AgentSpec, SkillSpec
 from a2agw.vsc.admin import vsc_admin_routes
 from a2agw.vsc.config import VscConfig
@@ -63,6 +68,9 @@ log = logging.getLogger(__name__)
 
 DELIVER_AGENT = "deliver"
 PLANNER_AGENT = "vsc-planner"
+# The in-process caller of ``vsc-planner`` (the ephemeral key's principal and scope).
+INTERNAL_PRINCIPAL = "vsc-internal"
+INTERNAL_SCOPE = "a2agw:vsc-internal"
 # The inbound task gives up following its job this long before the task's deadline.
 DEADLINE_MARGIN_S = 5.0
 # How often a following task re-reads the job (bus events can be dropped).
@@ -86,16 +94,23 @@ class VscRuntime:
         self.runner: JobRunner | None = None
         # Resuming the jobs a previous process left unfinished (scheduled by ``start``).
         self.resumed: asyncio.Task[Any] | None = None
+        # The planner turns' API key (auth configured only): minted by ``start``, never logged.
+        self._planner_key: str | None = None
 
     def _default_planner(self, job_id: str) -> Planner:
         if self.cfg.planner == "scripted":
             return ScriptedPlanner()
-        return AgentPlanner(self.host, PLANNER_AGENT, job_id=job_id)
+        return AgentPlanner(self.host, PLANNER_AGENT, job_id=job_id, api_key=self._planner_key)
 
     async def start(self) -> None:
         host = self.host
         if host.engine is None:
             raise RuntimeError("the host has no database engine yet")
+        if host.auth is not None and self._planner_key is None:
+            self._planner_key = secrets.token_hex(32)
+            host.auth.register_ephemeral_key(
+                self._planner_key, INTERNAL_PRINCIPAL, {INTERNAL_SCOPE}
+            )
         store = VscStore(host.engine)
         await store.initialize()
         gate = Gate(self.cfg, host.audit, on_wait=self._on_wait)
@@ -122,6 +137,9 @@ class VscRuntime:
         if self.runner is not None:
             await self.runner.aclose()
         self.runner = self.gate = self.store = None
+        if self._planner_key is not None and self.host.auth is not None:
+            self.host.auth.unregister_ephemeral_key(self._planner_key)
+        self._planner_key = None
 
     async def _resume_all(self) -> None:
         assert self.runner is not None
@@ -160,6 +178,11 @@ class VscRuntime:
             raise RuntimeError("receipts need the audit log")
         return await build_receipt(self.store, self.host.audit, job_id)
 
+    async def step_kind(self, job_id: str, step_id: str) -> str:
+        assert self.store is not None
+        rows = {r["step_id"]: r for r in await self.store.steps(job_id)}
+        return str(rows[step_id]["kind"]) if step_id in rows else "privileged"
+
     async def waiting_step(self, job_id: str) -> str | None:
         """The privileged step whose approval the job is waiting for, if any."""
         assert self.store is not None
@@ -177,6 +200,23 @@ def _decision(text: str) -> tuple[str, str] | None:
     return words[0].lower(), words[1].strip() if len(words) > 1 else ""
 
 
+_PAST = {"approve": "approved", "reject": "rejected"}
+
+
+def _ended(job_id: str, state: str, reason: str | None) -> AgentEvent:
+    """The event that ends the inbound task of a job in a terminal state."""
+    if state == "accepted":
+        return Done(f"job {job_id} accepted")
+    return Failed(f"job {job_id} {state}" + (f" ({reason})" if reason else ""))
+
+
+def _ask(job_id: str, step: str, kind: str) -> NeedInput:
+    return NeedInput(
+        f"job {job_id} awaits approval of step {step} ({kind}): reply 'approve [note]' or "
+        "'reject [note]'"
+    )
+
+
 def _describe(job: dict[str, Any]) -> str:
     text = f"job {job['job_id']}: {job['state']}"
     return f"{text} ({job['reason']})" if job.get("reason") else text
@@ -185,7 +225,7 @@ def _describe(job: dict[str, Any]) -> str:
 class VscAgentAdapter:
     """The ``deliver`` agent (see the module docstring)."""
 
-    durable_sessions = False
+    durable_sessions = True  # an input-required task survives a restart (the job resumes)
 
     def __init__(self, runtime: VscRuntime) -> None:
         self.runtime = runtime
@@ -207,7 +247,7 @@ class VscAgentAdapter:
             yield Failed(f"forbidden: the {VSC_SCOPE} scope is required")
             return
         owner = principal.id if principal is not None else "anonymous"
-        job = await store.job_for_context(ctx.context_id)
+        job = await store.job_for_context(ctx.context_id, owner)
         if job is None:
             request = ctx.text.strip()
             if not request:
@@ -229,9 +269,6 @@ class VscAgentAdapter:
                 sub.close()
             return
         job_id = job["job_id"]
-        if job["owner"] != owner:
-            yield Failed("this context belongs to another caller's job")
-            return
         verdict = _decision(ctx.text)
         step = await rt.waiting_step(job_id) if job["state"] == "awaiting_approval" else None
         if verdict is None or step is None:
@@ -245,18 +282,21 @@ class VscAgentAdapter:
             else:
                 await gate.reject(job_id, step, actor=owner, note=note)
             await store.set_task(job_id, ctx.task_id)
-            yield Status(f"job {job_id}: step {step} {verb}d")
-            async for ev in self._follow(job_id, sub, ctx):
+            yield Status(f"job {job_id}: step {step} {_PAST[verb]}")
+            async for ev in self._follow(job_id, sub, ctx, decided=step):
                 yield ev
         finally:
             sub.close()
 
     async def _follow(
-        self, job_id: str, sub: Subscription, ctx: InboundContext
+        self, job_id: str, sub: Subscription, ctx: InboundContext, *, decided: str | None = None
     ) -> AsyncIterator[AgentEvent]:
         """Mirror the job's state changes until it ends, waits for approval, or the task's
-        deadline nears."""
-        store = self.runtime.store
+        deadline nears. The job row is re-read every ``POLL_S`` without events, so a dropped
+        bus event cannot leave the caller unasked (``decided``: the step this turn just
+        decided, still shown as waiting until the runner moves on)."""
+        rt = self.runtime
+        store = rt.store
         assert store is not None
         deadline = ctx.call.deadline if ctx.call is not None else None
         end = (deadline if deadline is not None else time.time() + 3600.0) - DEADLINE_MARGIN_S
@@ -264,9 +304,17 @@ class VscAgentAdapter:
         while True:
             if check:
                 job = await store.get_job(job_id)
-                if job is None or job["state"] in TERMINAL_STATES:
-                    yield Done(f"job {job_id} {job['state'] if job else 'gone'}")
+                if job is None:
+                    yield Failed(f"job {job_id} gone")
                     return
+                if job["state"] in TERMINAL_STATES:
+                    yield _ended(job_id, job["state"], job["reason"])
+                    return
+                if job["state"] == "awaiting_approval":
+                    step = await rt.waiting_step(job_id)
+                    if step is not None and step != decided:
+                        yield _ask(job_id, step, await rt.step_kind(job_id, step))
+                        return
                 check = False
             remaining = end - time.time()
             if remaining <= 0:
@@ -284,14 +332,10 @@ class VscAgentAdapter:
                 continue
             state = ev.data.get("state")
             if state in TERMINAL_STATES:
-                yield Done(f"job {job_id} {state}")
+                yield _ended(job_id, state, ev.data.get("reason"))
                 return
             if state == "awaiting_approval" and ev.data.get("step"):
-                yield NeedInput(
-                    f"job {job_id} awaits approval of step {ev.data['step']} "
-                    f"({ev.data.get('kind', 'privileged')}): reply 'approve [note]' or "
-                    "'reject [note]'"
-                )
+                yield _ask(job_id, ev.data["step"], ev.data.get("kind", "privileged"))
                 return
             yield Status(f"job {job_id}: {state}")
 
@@ -325,7 +369,8 @@ def attach_vsc(host: AgentHost, cfg: VscConfig, config_dir: Path) -> VscRuntime:
     )
     runtime = VscRuntime(host, cfg, Path(config_dir))
     host.add(deliver_agent(VscAgentAdapter(runtime)))
-    host.add(planner_agent(planner_adapter, PLANNER_AGENT))
+    internal = AgentAccess(allowed_principals=frozenset({f"key:{INTERNAL_PRINCIPAL}"}))
+    host.add(planner_agent(planner_adapter, PLANNER_AGENT, access=internal))
     host.admin_extra_routes += vsc_admin_routes(runtime)
     host.vsc = runtime
     return runtime

@@ -9,6 +9,7 @@ from typing import Any, Literal
 from sqlalchemy import (
     Column,
     Float,
+    Index,
     Integer,
     MetaData,
     String,
@@ -22,7 +23,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects import sqlite as sqlite_dialect
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from a2agw._ddl import retry_ddl
@@ -68,9 +69,11 @@ _jobs = Table(
     Column("active_s", Float, nullable=False, server_default="0"),
     # Every whole-system check passed on the job's current commits.
     Column("whole_passed", Integer, nullable=False, server_default="0"),
-    # The A2A context the job was submitted in (the ``deliver`` agent's), if any.
-    Column("context_id", String, nullable=True, index=True),
+    # The A2A context the job was submitted in (the ``deliver`` agent's), if any: one job per
+    # (context, owner) (``_CONTEXT_INDEX``).
+    Column("context_id", String, nullable=True),
 )
+_CONTEXT_INDEX = Index("ux_vsc_jobs_context_owner", _jobs.c.context_id, _jobs.c.owner, unique=True)
 _steps = Table(
     "vsc_steps",
     _metadata,
@@ -128,6 +131,8 @@ class VscStore:
                     for name in added:
                         if name not in columns:
                             await self._add_column(conn, table, name, added[name])
+                # A table from before the column existed gets its index here.
+                await conn.run_sync(lambda sync: _CONTEXT_INDEX.create(sync, checkfirst=True))
 
         await retry_ddl(migrate)
 
@@ -164,8 +169,11 @@ class VscStore:
             attempts=0,
             context_id=context_id,
         )
-        async with self._engine.begin() as conn:
-            await conn.execute(stmt.on_conflict_do_nothing(index_elements=["job_id"]))
+        try:
+            async with self._engine.begin() as conn:
+                await conn.execute(stmt.on_conflict_do_nothing(index_elements=["job_id"]))
+        except IntegrityError:
+            raise ValueError("this context already has a job") from None
 
     async def _update_job(self, job_id: str, **values: Any) -> None:
         stmt = (
@@ -179,14 +187,9 @@ class VscStore:
             row = (await conn.execute(select(_jobs).where(_jobs.c.job_id == job_id))).first()
         return dict(row._mapping) if row is not None else None
 
-    async def job_for_context(self, context_id: str) -> dict[str, Any] | None:
-        """The job submitted in this A2A context (the earliest, should there be several)."""
-        stmt = (
-            select(_jobs)
-            .where(_jobs.c.context_id == context_id)
-            .order_by(_jobs.c.created_at, _jobs.c.job_id)
-            .limit(1)
-        )
+    async def job_for_context(self, context_id: str, owner: str) -> dict[str, Any] | None:
+        """The owner's job submitted in this A2A context, if any."""
+        stmt = select(_jobs).where(_jobs.c.context_id == context_id, _jobs.c.owner == owner)
         async with self._engine.connect() as conn:
             row = (await conn.execute(stmt)).first()
         return dict(row._mapping) if row is not None else None
@@ -229,11 +232,13 @@ class VscStore:
         await self._update_job(job_id, attempts=_jobs.c.attempts + 1)
 
     async def list_jobs(
-        self, *, state: str | None = None, limit: int = 100
+        self, *, state: str | None = None, owner: str | None = None, limit: int = 100
     ) -> list[dict[str, Any]]:
         stmt = select(_jobs).order_by(_jobs.c.created_at.desc(), _jobs.c.job_id).limit(limit)
         if state is not None:
             stmt = stmt.where(_jobs.c.state == state)
+        if owner is not None:
+            stmt = stmt.where(_jobs.c.owner == owner)
         async with self._engine.connect() as conn:
             return [dict(r._mapping) for r in (await conn.execute(stmt)).all()]
 

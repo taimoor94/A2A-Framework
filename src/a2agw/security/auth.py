@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -16,7 +17,14 @@ import jwt
 from a2a.auth.user import UnauthenticatedUser, User
 from a2a.server.context import ServerCallContext
 from a2a.server.routes.common import DefaultServerCallContextBuilder
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 from starlette.authentication import (
     AuthCredentials,
     AuthenticationBackend,
@@ -103,6 +111,24 @@ class AuthConfig(BaseModel):
     api_keys: dict[str, ApiKeyEntry] = Field(default_factory=dict)  # sha256 hex -> entry
     jwt: JwtConfig | None = None
     allow_anonymous: bool = False
+    # In-process keys (``register_ephemeral_key``): sha256 hex -> entry. Never serialised,
+    # never configured: they live only in this process's memory.
+    _ephemeral: dict[str, ApiKeyEntry] = PrivateAttr(default_factory=dict)
+
+    def register_ephemeral_key(self, key: str, principal_id: str, scopes: Iterable[str]) -> None:
+        """Accept ``key`` (stored as its sha256, like configured keys) as the API-key principal
+        ``key:<principal_id>`` until ``unregister_ephemeral_key``. For callers inside this
+        process (e.g. the VSC planner turns); the key is never logged or returned."""
+        self._ephemeral[hash_api_key(key)] = ApiKeyEntry(
+            principal_id=principal_id, scopes=sorted(scopes)
+        )
+
+    def unregister_ephemeral_key(self, key: str) -> None:
+        self._ephemeral.pop(hash_api_key(key), None)
+
+    def key_entries(self) -> list[tuple[str, ApiKeyEntry]]:
+        """Configured and ephemeral keys, as (sha256 hex, entry)."""
+        return [*self.api_keys.items(), *self._ephemeral.items()]
 
     @field_validator("api_keys", mode="before")
     @classmethod
@@ -262,7 +288,7 @@ class GatewayAuthBackend(AuthenticationBackend):
     def _check_api_key(self, key: str) -> Principal:
         digest = hash_api_key(key)
         match: ApiKeyEntry | None = None
-        for stored, entry in self._config.api_keys.items():  # scan all: no early exit
+        for stored, entry in self._config.key_entries():  # scan all: no early exit
             if hmac.compare_digest(stored.encode(), digest.encode()):
                 match = entry
         if match is None:

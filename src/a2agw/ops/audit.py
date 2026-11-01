@@ -124,6 +124,7 @@ DETAIL_KEYS = frozenset(
         "note",  # vsc.approve: the approver's note (truncated by the caller)
         "usage_reported",  # vsc.step: whether the worker reported usage at all
         "receipt_hash",  # vsc.receipt: sha256 of the receipt bundle
+        "spec_hash",  # vsc.job spec_edited: sha256 of the specification set by hand
     }
 )
 # PartnerRegistry change events -> audit actions (``registry_audit_action``).

@@ -1165,7 +1165,7 @@ def vsc_approve(
     """Approve (or, with --reject, reject) a job's privileged step."""
     verb = "reject" if reject else "approve"
     _vsc_api(config, api_key, "POST", f"{_job_path(job)}/{verb}", {"step_id": step, "note": note})
-    typer.echo(f"{step}: {verb}d")
+    typer.echo(f"{step}: {'rejected' if reject else 'approved'}")
 
 
 @vsc_receipt_app.command("export")

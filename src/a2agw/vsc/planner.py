@@ -17,6 +17,7 @@ from a2a.types import Message, Part, Role, SendMessageRequest, TaskState
 from pydantic import ValidationError
 
 from a2agw.core.spi import InboundAdapter
+from a2agw.security.auth import AgentAccess
 from a2agw.serve.agent import AgentSpec, SkillSpec
 from a2agw.serve.host import AgentHost
 from a2agw.vsc.config import BudgetConfig, CheckConfig, SystemConfig, VscConfig
@@ -159,10 +160,20 @@ def _text_of(msg: Any) -> str:
 
 
 class AgentPlanner:
-    def __init__(self, host: AgentHost, agent_id: str = "vsc-planner", *, job_id: str) -> None:
+    def __init__(
+        self,
+        host: AgentHost,
+        agent_id: str = "vsc-planner",
+        *,
+        job_id: str,
+        api_key: str | None = None,
+    ) -> None:
+        """``api_key`` is sent as ``X-API-Key`` on every turn (the host's internal planner
+        key when auth is configured; None: anonymous)."""
         self._host = host
         self._agent_id = agent_id
         self._job_id = job_id
+        self._api_key = api_key
         self._http: httpx.AsyncClient | None = None
         self._client: Any = None
 
@@ -176,6 +187,7 @@ class AgentPlanner:
             self._http = httpx.AsyncClient(
                 transport=httpx.ASGITransport(app=self._host.app()),
                 base_url=self._host.base_url,
+                headers={"X-API-Key": self._api_key} if self._api_key else None,
             )
             card = self._host.cards[self._agent_id]
             self._client = ClientFactory(
@@ -282,9 +294,12 @@ class AgentPlanner:
         return guard_replan(plan, await self._turn(prompt, parse))
 
 
-def planner_agent(adapter: InboundAdapter, agent_id: str = "vsc-planner") -> AgentSpec:
+def planner_agent(
+    adapter: InboundAdapter, agent_id: str = "vsc-planner", *, access: AgentAccess | None = None
+) -> AgentSpec:
     """The planner's hosted agent (``AgentPlanner`` sends it every planning turn)."""
     return AgentSpec(
+        access=access or AgentAccess(),
         id=agent_id,
         name="VSC planner",
         description="Plans verified changes across systems.",

@@ -4,14 +4,17 @@ the ``a2agw:vsc`` scope or ``a2agw:admin`` (``admin_without_auth`` on a host wit
 and the ``X-A2AGW-Admin: 1`` header on every POST and PUT. JSON bodies; errors are
 ``{"error": ...}`` with 400 (plus ``field``), 404, 409 (plus ``state``) or 503.
 
+- Non-admin principals see and act on their own jobs only (404 for another's; ``GET /jobs``
+  lists their own); ``a2agw:admin`` sees all.
 - ``GET /jobs`` (``state``, ``limit``), ``POST /jobs`` ``{"request"}`` (201; the caller owns it)
 - ``GET /jobs/{id}`` (job, spec, plan, steps, ``waiting_step``), ``GET /jobs/{id}/receipt``
   (409 until the job has finished)
 - ``POST /jobs/{id}/approve`` / ``reject`` ``{"step_id", "note"}`` (409 unless the job is
-  ``awaiting_approval``; 400 for a step that is not a privileged step of its plan)
+  ``awaiting_approval`` and ``step_id`` is the step it waits for; 400 for a step that is not
+  a privileged step of its plan)
 - ``POST /jobs/{id}/cancel``
-- ``PUT /jobs/{id}/spec`` (an ``ExecutableSpec``; 409 outside ``awaiting_spec``, then the job
-  runs from it)
+- ``PUT /jobs/{id}/spec`` (an ``ExecutableSpec``; 409 outside ``awaiting_spec``; audited as
+  ``vsc.job`` ``spec_edited``, then the job runs from it)
 """
 
 from __future__ import annotations
@@ -25,7 +28,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import BaseRoute, Route
 
-from a2agw.ops.admin import ADMIN_PREFIX, guard
+from a2agw.ops.admin import ADMIN_PREFIX, ADMIN_SCOPE, guard
+from a2agw.ops.audit import AuditEvent
 from a2agw.security.auth import VSC_SCOPE, has_scope
 from a2agw.security.principal import PrincipalUser
 from a2agw.vsc.gate import Gate
@@ -40,6 +44,7 @@ if TYPE_CHECKING:
 
 VSC_ADMIN_PREFIX = f"{ADMIN_PREFIX}/vsc"
 MAX_ID_CHARS = 256
+DELIVER_AGENT = "deliver"  # the agent id of the job audit rows (``a2agw.vsc.runner``)
 
 
 class _Bad(Exception):
@@ -54,6 +59,15 @@ def _allowed(host: AgentHost, request: Request) -> bool:
     if host.auth is None:
         return host.admin_without_auth
     return has_scope(user.principal, VSC_SCOPE)
+
+
+def _is_admin(host: AgentHost, request: Request) -> bool:
+    """Admins (``a2agw:admin``; anyone on an ``admin_without_auth`` host) see every job;
+    other ``a2agw:vsc`` principals only their own."""
+    if host.auth is None:
+        return True  # only reached with admin_without_auth (``_allowed``)
+    user = request.scope.get("user")
+    return isinstance(user, PrincipalUser) and ADMIN_SCOPE in user.principal.scopes
 
 
 def _actor(request: Request) -> str:
@@ -110,8 +124,8 @@ def vsc_admin_routes(runtime: VscRuntime) -> list[BaseRoute]:
         job_id = request.path_params["job_id"]
         store, _, _ = parts()
         job = await store.get_job(job_id) if len(job_id) <= MAX_ID_CHARS else None
-        if job is None:
-            raise _NotFound
+        if job is None or (not _is_admin(host, request) and job["owner"] != _actor(request)):
+            raise _NotFound  # another principal's job is not there for this caller
         return job
 
     async def list_jobs(request: Request) -> Response:
@@ -125,7 +139,8 @@ def vsc_admin_routes(runtime: VscRuntime) -> list[BaseRoute]:
             raise _Bad("limit") from None
         if not 1 <= limit <= 500:
             raise _Bad("limit")
-        jobs = await store.list_jobs(state=state, limit=limit)
+        owner = None if _is_admin(host, request) else _actor(request)
+        jobs = await store.list_jobs(state=state, owner=owner, limit=limit)
         return JSONResponse({"jobs": [_summary(j) for j in jobs]})
 
     async def create_job(request: Request) -> Response:
@@ -174,6 +189,9 @@ def vsc_admin_routes(runtime: VscRuntime) -> list[BaseRoute]:
         steps = {s.id: s for s in plan.steps} if plan is not None else {}
         if step_id not in steps or steps[step_id].kind not in PRIVILEGED_KINDS:
             raise _Bad("step_id")
+        waiting = await runtime.waiting_step(job["job_id"])
+        if step_id != waiting:
+            return _error(409, "that step is not waiting for approval", waiting_step=waiting)
         actor = _actor(request)
         if verb == "approve":
             await gate.approve(job["job_id"], step_id, actor=actor, note=note)
@@ -209,9 +227,20 @@ def vsc_admin_routes(runtime: VscRuntime) -> list[BaseRoute]:
         except (ValidationError, ValueError):
             raise _Bad("spec") from None
         await store.set_spec(job["job_id"], spec)
-        runner.start(job["job_id"])
         now = await store.get_job(job["job_id"])
         assert now is not None
+        if host.audit is not None:
+            await host.audit.emit(
+                AuditEvent(
+                    actor=_actor(request),
+                    action="vsc.job",
+                    agent_id=DELIVER_AGENT,
+                    task_id=job["job_id"],
+                    outcome="spec_edited",
+                    detail={"spec_hash": now["spec_hash"]},
+                )
+            )
+        runner.start(job["job_id"])
         return JSONResponse({"job_id": job["job_id"], "spec_hash": now["spec_hash"]})
 
     def route(path: str, category: str, fn: Callable[[Request], Any], method: str) -> Route:
