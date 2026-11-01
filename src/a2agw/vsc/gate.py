@@ -23,11 +23,20 @@ class Rejected(Exception):
         self.note = note
 
 
+class GateNotified(Exception):
+    """The wait announcement (``on_wait``) failed; every waiter on the step fails loudly."""
+
+
 @dataclass(frozen=True)
 class Approval:
     actor: str
     auto: bool
     note: str = ""
+
+
+def _retrieve(fut: asyncio.Future) -> None:
+    if not fut.cancelled():
+        fut.exception()  # mark retrieved: no "never retrieved" noise
 
 
 class Gate:
@@ -44,6 +53,7 @@ class Gate:
         # (job_id, step_id) -> decision; waiters block on the matching future.
         self._decided: dict[tuple[str, str], Approval | Rejected] = {}
         self._waiters: dict[tuple[str, str], asyncio.Future[Approval | Rejected]] = {}
+        self._counts: dict[tuple[str, str], int] = {}
 
     async def wait(self, job_id: str, step: PlanStep) -> Approval:
         if step.kind not in PRIVILEGED_KINDS:
@@ -55,27 +65,47 @@ class Gate:
         if done is None:  # memory is authoritative once set; the log serves a resume
             done = await self._latest_from_audit(job_id, step.id)
         if done is None:
-            fut = self._waiters.get(key)
-            if fut is None:  # the first waiter announces; later ones just wait
-                fut = asyncio.get_running_loop().create_future()
-                self._waiters[key] = fut
-                if self._on_wait is not None:
-                    try:
-                        await self._on_wait(job_id, step)
-                    except BaseException:
-                        if self._waiters.get(key) is fut:
-                            del self._waiters[key]
-                        raise
-            done = self._decided.get(key)  # decided while on_wait ran
-            if done is None:
-                try:
-                    done = await asyncio.shield(fut)
-                finally:
-                    if fut.done() and self._waiters.get(key) is fut:
-                        del self._waiters[key]
+            done = await self._wait_decision(key, job_id, step)
         if isinstance(done, Rejected):
-            raise done
+            raise Rejected(done.note)
         return done
+
+    async def _wait_decision(
+        self, key: tuple[str, str], job_id: str, step: PlanStep
+    ) -> Approval | Rejected:
+        fut = self._waiters.get(key)
+        first = fut is None
+        if fut is None:  # the first waiter announces; later ones just wait
+            fut = asyncio.get_running_loop().create_future()
+            fut.add_done_callback(_retrieve)
+            self._waiters[key] = fut
+        self._counts[key] = self._counts.get(key, 0) + 1
+        try:
+            if first and self._on_wait is not None:
+                try:
+                    await self._on_wait(job_id, step)
+                except asyncio.CancelledError:
+                    # Others may still wait on fut: leave it registered so a later decision
+                    # resolves them (the finally below drops it if nobody is left).
+                    raise
+                except Exception as exc:
+                    if not fut.done():
+                        err = GateNotified(f"wait announcement failed: {exc!r}")
+                        err.__cause__ = exc
+                        fut.set_exception(err)
+                    raise
+            decided = self._decided.get(key)  # decided while on_wait ran
+            if decided is not None:
+                return decided
+            return await asyncio.shield(fut)
+        finally:
+            self._counts[key] -= 1
+            if self._counts[key] <= 0:
+                del self._counts[key]
+                if self._waiters.get(key) is fut:
+                    del self._waiters[key]
+            elif fut.done() and self._waiters.get(key) is fut:
+                del self._waiters[key]
 
     async def approve(self, job_id: str, step_id: str, *, actor: str, note: str = "") -> None:
         await self._decide(job_id, step_id, actor, note, "approved")

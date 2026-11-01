@@ -9,7 +9,7 @@ import pytest
 from a2agw.ops.audit import AuditLog
 from a2agw.serve.store import create_engine
 from a2agw.vsc.config import AutoApprove, VscConfig
-from a2agw.vsc.gate import Approval, Gate, Rejected
+from a2agw.vsc.gate import Approval, Gate, GateNotified, Rejected
 from a2agw.vsc.plan import PlanStep
 
 
@@ -153,3 +153,38 @@ async def test_empty_step_id_rejected(audit):
         await g.approve("j", "", actor="a")
     with pytest.raises(ValueError):
         await g.reject("j", "", actor="a", note="x")
+
+
+async def test_on_wait_failure_fails_every_waiter(audit):
+    async def on_wait(job_id, st):
+        await asyncio.sleep(0.05)
+        raise RuntimeError("notifier down")
+
+    g = Gate(cfg(), audit, on_wait=on_wait)
+    t1 = asyncio.create_task(g.wait("j", step()))
+    await asyncio.sleep(0.01)
+    t2 = asyncio.create_task(g.wait("j", step()))
+    r = await asyncio.wait_for(asyncio.gather(t1, t2, return_exceptions=True), 2)
+    assert all(isinstance(e, (GateNotified, RuntimeError)) for e in r)
+    assert isinstance(r[1], GateNotified)
+    assert isinstance(r[1].__cause__ or r[1].args[0], RuntimeError)
+
+
+async def test_first_waiter_cancelled_in_on_wait_does_not_strand_second(audit):
+    gate_open = asyncio.Event()
+
+    async def on_wait(job_id, st):
+        await gate_open.wait()
+
+    g = Gate(cfg(), audit, on_wait=on_wait)
+    t1 = asyncio.create_task(g.wait("j", step()))
+    await asyncio.sleep(0.01)
+    t2 = asyncio.create_task(g.wait("j", step()))
+    await asyncio.sleep(0.01)
+    t1.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t1
+    await asyncio.sleep(0.01)
+    assert not t2.done()
+    await g.approve("j", "s1", actor="alice")
+    assert (await asyncio.wait_for(t2, 2)).actor == "alice"
