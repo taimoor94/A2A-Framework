@@ -121,6 +121,7 @@ DETAIL_KEYS = frozenset(
         "tokens_in",  # vsc.step: usage the worker reported
         "tokens_out",
         "cost",
+        "note",  # vsc.approve: the approver's note (truncated by the caller)
         "usage_reported",  # vsc.step: whether the worker reported usage at all
     }
 )
