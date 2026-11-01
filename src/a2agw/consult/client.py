@@ -59,6 +59,7 @@ from a2a.types import (
 from a2a.utils.constants import VERSION_HEADER
 from a2a.utils.errors import A2AError, TaskNotCancelableError
 from google.protobuf.json_format import ParseError
+from opentelemetry import trace as otel_trace
 from opentelemetry.trace import Status as SpanStatus
 from opentelemetry.trace import StatusCode
 
@@ -397,6 +398,13 @@ async def _drop_inflight(inflight: InFlight) -> None:
         fut.cancel()
         await asyncio.gather(fut, return_exceptions=True)
         await _aclose(agen)
+
+
+def _current_trace_id() -> str | None:
+    """The trace of the running span (the turn's, as ``task.state`` events name it), or
+    None outside one."""
+    context = otel_trace.get_current_span().get_span_context()
+    return format(context.trace_id, "032x") if context.is_valid else None
 
 
 class PartnerClient:
@@ -782,6 +790,7 @@ class PartnerClient:
                     "task_id": result.task_id,
                     "state": result.state,
                     "duration_ms": round((time.monotonic() - started) * 1000, 1),
+                    "trace_id": _current_trace_id(),
                 },
             )
         )

@@ -452,3 +452,81 @@ async def test_reload_force_refuses_consults_during_the_cancel(linked):
     await linked.audit.drain()
     rows, _ = await linked.audit.query({"action": "partner.disable"})
     assert [r["actor"] for r in rows] == [ACTOR]
+
+
+async def test_compact_task_detail_fits_the_command_result_cap(gw):
+    """``task.get``'s detail: the last 10 messages, text parts clipped to 1 KiB, other parts
+    and artifacts as metadata, totals and ``clipped``; it stays under the 64 KiB cap."""
+    from a2a.server.context import ServerCallContext
+    from a2a.types import Artifact, Message, Part, Role, Task, TaskState, TaskStatus
+    from google.protobuf.json_format import ParseDict
+    from google.protobuf.struct_pb2 import Value
+
+    from a2agw.ops import cp_client
+    from a2agw.security.principal import Principal, PrincipalUser
+
+    ctx = ServerCallContext(user=PrincipalUser(Principal.from_id("key:user")))
+    history = [
+        Message(message_id=f"m{i}", role=Role.ROLE_USER, parts=[Part(text=f"hi {i}")])
+        for i in range(12)
+    ]
+    history[-1] = Message(
+        message_id="m11",
+        role=Role.ROLE_AGENT,
+        parts=[
+            Part(text="é" * 3000),
+            Part(data=ParseDict({"secret": "x" * 100}, Value())),
+            Part(raw=b"BYTES", filename="f.bin", media_type="application/octet-stream"),
+        ],
+    )
+    artifacts = [
+        Artifact(artifact_id="a1", name="report", parts=[Part(text="t" * 50_000)]),
+        Artifact(artifact_id="a2", parts=[Part(raw=b"12345", filename="x.png")]),
+    ]
+    task = Task(
+        id="t-big",
+        context_id="c1",
+        status=TaskStatus(state=TaskState.TASK_STATE_WORKING),
+        history=history,
+        artifacts=artifacts,
+    )
+    await gw.handlers["alpha"].task_store.save(task, ctx)
+    await gw.index.upsert("t-big", "alpha", "key:user", "c1", "TASK_STATE_WORKING", None)
+
+    out = await actions.task_detail(gw, "alpha", "t-big", actor=ACTOR, compact=True)
+    full = await actions.task_detail(gw, "alpha", "t-big", actor=ACTOR)
+
+    assert len(json.dumps(out)) <= cp_client.TASK_GET_RESULT_MAX_BYTES
+    assert len(json.dumps(full)) > cp_client.TASK_GET_RESULT_MAX_BYTES  # the full one would not
+    assert out["history_total"] == 12 and out["artifacts_total"] == 2
+    assert out["clipped"] is True
+    shown = out["task"]["history"]
+    assert [m["message_id"] for m in shown] == [f"m{i}" for i in range(2, 12)]
+    text, data, file = shown[-1]["parts"]
+    assert text["kind"] == "text" and len(text["text"].encode()) <= 1024
+    assert text["size"] == len(("é" * 3000).encode())
+    assert data == {"kind": "data", "name": None, "media_type": None, "size": data["size"]}
+    assert "secret" not in json.dumps(out)
+    assert file == {
+        "kind": "file",
+        "name": "f.bin",
+        "media_type": "application/octet-stream",
+        "size": 5,
+    }
+    a1, a2 = out["task"]["artifacts"]
+    assert a1 == {
+        "artifact_id": "a1",
+        "name": "report",
+        "parts": [{"kind": "text", "name": None, "media_type": None, "size": 50_000}],
+    }
+    assert a2["parts"][0]["name"] == "x.png"
+    assert full["task"]["history"][-1]["parts"][0]["text"] == "é" * 3000  # admin view unchanged
+    assert "clipped" not in full
+
+
+async def test_compact_task_detail_small_task_is_not_clipped(gw):
+    await _seed_task(gw, "t-small", "TASK_STATE_WORKING")
+    out = await actions.task_detail(gw, "alpha", "t-small", actor=ACTOR, compact=True)
+    assert out["clipped"] is False
+    assert out["history_total"] == 0 and out["artifacts_total"] == 0
+    assert out["task"]["id"] == "t-small" and out["task"]["owner"] == "key:user"

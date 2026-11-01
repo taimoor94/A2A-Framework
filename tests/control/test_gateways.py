@@ -137,7 +137,12 @@ async def test_list_connected_flag(db_url, make_app, run_app, clock):
         assert gw["connected"] is True and gw["last_seen_at"] == clock.t
         assert gw["version_applied"] == gw["version_desired"] == desired.version
         assert gw["epoch_applied"] == gw["epoch_desired"] == app.state.store.epoch
-        assert gw["info"] == info
+        assert gw["info"] == {
+            **info,
+            "agents": [
+                {"id": "alpha", "name": None, "version": None, "skills": None, "card_url": None}
+            ],
+        }
         clock.advance(2 * KEEPALIVE_S - 1)
         [gw] = (await c.get("/api/v1/gateways", headers=admin)).json()["gateways"]
         assert gw["connected"] is True

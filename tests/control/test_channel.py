@@ -653,9 +653,13 @@ async def test_report_health_metrics_and_info(sqlite_settings, make_cp, run_app,
         assert json.loads(h.health_json) == {"status": "ok"}
         assert json.loads(h.metrics_json) == {"window_s": 60}
         [g] = await rows(app, GATEWAYS, GATEWAYS.c.id == gw)
+        # an id list (gateways before agent objects) is stored in the object form
         assert json.loads(g.info_json) == {
             "version": "1.4.0",
-            "agents": ["alpha", "beta"],
+            "agents": [
+                {"id": a, "name": None, "version": None, "skills": None, "card_url": None}
+                for a in ("alpha", "beta")
+            ],
             "base_url": "https://g",
         }
         assert g.last_seen_at == clock.t
@@ -1041,3 +1045,62 @@ async def test_shutdown_finishes_with_a_stuck_poll(sqlite_settings, make_cp):
         poll.cancel()
         exit_started = asyncio.get_running_loop().time()
     assert asyncio.get_running_loop().time() - exit_started < 3
+
+
+async def test_report_info_agent_objects_are_bounded(sqlite_settings, make_cp, run_app):
+    app = make_cp(settings_for(sqlite_settings.db_url))
+    async with run_app(app) as c:
+        gw, token = await app.state.store.create_gateway("gw-a", actor="t")
+        agent = {
+            "id": "alpha",
+            "name": "A" * 1000,
+            "version": "2.0",
+            "skills": [f"s{i}" for i in range(500)] + [7],
+            "card_url": "https://g/agents/alpha/.well-known/agent-card.json",
+        }
+        info = {"version": "1", "agents": [agent, "beta"], "base_url": "https://g"}
+        r = await report(c, token, info=info)
+        assert r.status_code == 200, r.text
+        bad = await report(c, token, info={**info, "agents": [{"id": "x", "secret": "y"}]})
+        assert bad.status_code == 422
+        [g] = await rows(app, GATEWAYS, GATEWAYS.c.id == gw)
+    alpha, beta = json.loads(g.info_json)["agents"]
+    assert alpha["id"] == "alpha" and len(alpha["name"]) == channel.STRING_MAX
+    assert alpha["version"] == "2.0" and alpha["card_url"] == agent["card_url"]
+    assert alpha["skills"] == [f"s{i}" for i in range(channel.SKILLS_MAX)]
+    assert beta == {"id": "beta", "name": None, "version": None, "skills": None, "card_url": None}
+
+
+async def test_task_get_results_keep_up_to_64k(db_url, make_cp, clock):
+    app = make_cp(settings_for(db_url))
+    async with started(app):
+        store = app.state.store
+        gw, _token = await store.create_gateway("gw-a", actor="t")
+        get = await channel.enqueue_command(store, gw, "task.get", {}, "oidc:op")
+        other = await channel.enqueue_command(store, gw, "partner.refresh", {}, "oidc:op")
+        await channel.take_commands(store, gw, clock())
+        big = {"task": {"history": "x" * 30_000}}
+        assert await channel.finish_command(store, gw, get, "done", big, now=clock())
+        assert await channel.finish_command(store, gw, other, "done", big, now=clock())
+        assert (await channel.get_command(store, get)).result == big
+        assert (await channel.get_command(store, other)).result == {"truncated": True}
+    assert channel.TASK_GET_RESULT_MAX_BYTES == 65536 and channel.RESULT_MAX_BYTES == 8192
+    # a report carrying such a result fits the default body cap many times over
+    assert ControlSettings(base_url="https://x").limits.report_max_bytes >= 8 * 65536
+
+
+async def test_partner_call_trace_id_is_kept(sqlite_settings, make_cp, run_app):
+    app = make_cp(settings_for(sqlite_settings.db_url))
+    async with run_app(app) as c:
+        _gw, token = await app.state.store.create_gateway("gw-a", actor="t")
+        data = {
+            "partner_id": "p1",
+            "task_id": "t1",
+            "state": "completed",
+            "duration_ms": 3,
+            "trace_id": "a" * 32,
+        }
+        r = await report(c, token, events=[{"kind": "partner.call", "agent_id": "a", "data": data}])
+        assert r.json()["dropped"] == 0
+        [ev] = await rows(app, EVENTS)
+    assert ev.trace_id == "a" * 32 and json.loads(ev.data_json)["trace_id"] == "a" * 32

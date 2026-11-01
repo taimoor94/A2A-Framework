@@ -332,7 +332,19 @@ async def test_applies_state_and_reports_applied(gateway, cp):
     assert cp.stream_headers[0]["authorization"] == f"Bearer {TOKEN}"
     assert all(TOKEN not in u for u in cp.urls)
     info = next(r["info"] for r in cp.reports if r.get("info"))
-    assert info == {"version": info["version"], "agents": ["alpha"], "base_url": "http://t"}
+    assert info == {
+        "version": info["version"],
+        "agents": [
+            {
+                "id": "alpha",
+                "name": "Alpha",
+                "version": "0.1.0",
+                "skills": ["s"],
+                "card_url": "http://t/agents/alpha/.well-known/agent-card.json",
+            }
+        ],
+        "base_url": "http://t",
+    }
     assert set(info) == {"version", "agents", "base_url"}
 
 
@@ -809,3 +821,52 @@ async def test_backoff_resets_after_a_stream_that_reached_hello(gateway, cp, sle
     backoff = [s for s in sleeps if s != 1000.0]
     assert len(backoff) >= 9
     assert all(0.25 <= s <= 0.5 for s in backoff)
+
+
+def test_result_cap_is_64k_for_task_get_only():
+    from a2agw.ops import cp_client
+
+    big = {"blob": "x" * 20_000}
+    assert cp_client._clip(big, "task.get") == big
+    assert cp_client._clip(big, "partner.refresh") == {"truncated": True}
+    huge = {"blob": "x" * (cp_client.TASK_GET_RESULT_MAX_BYTES + 1)}
+    assert cp_client._clip(huge, "task.get") == {"truncated": True}  # the last resort
+
+
+async def test_task_get_command_answers_the_compact_detail(gateway, cp, monkeypatch):
+    from a2agw.ops import actions as actions_mod
+
+    seen: list[dict[str, Any]] = []
+
+    async def detail(host, agent_id, task_id, *, actor, compact=False):
+        seen.append({"agent_id": agent_id, "task_id": task_id, "actor": actor, "compact": compact})
+        return {"task": {"id": task_id}, "clipped": False}
+
+    monkeypatch.setattr(actions_mod, "task_detail", detail)
+    cp.script(("command", command("cmd-g", "task.get", {"agent_id": "alpha", "task_id": "t1"})))
+    await gateway()
+    await until(lambda: cp.results())
+    [result] = cp.results()
+    assert result["status"] == "done" and result["result"]["task"] == {"id": "t1"}
+    assert seen[0]["compact"] is True and seen[0]["actor"].startswith("cp:")
+
+
+def test_info_agents_are_bounded(monkeypatch):
+    from a2agw.ops import cp_client
+
+    class Spec:
+        def __init__(self, i: int) -> None:
+            self.id = f"a{i:04d}"
+            self.name = "N" * 1000
+            self.version = "1"
+            self.skills = [type("S", (), {"id": f"s{j}"})() for j in range(200)]
+
+    class Host:
+        def __init__(self) -> None:
+            self.base_url = "http://t"
+            self.specs = {f"a{i:04d}": Spec(i) for i in range(cp_client.INFO_AGENTS_MAX + 5)}
+
+    agents = cp_client.agent_info(Host())  # type: ignore[arg-type]
+    assert len(agents) == cp_client.INFO_AGENTS_MAX
+    assert all(len(a["name"]) == cp_client.INFO_STRING_MAX for a in agents)
+    assert all(len(a["skills"]) == cp_client.INFO_SKILLS_MAX for a in agents)

@@ -16,15 +16,17 @@ or other filters is a 400 ``bad_request``, so a cursor cannot widen what a calle
   than 60 s, a partner whose breaker a gateway reports open, a partner quarantined on a
   gateway, a desired state a gateway rejected (until it applies a later one).
 - ``GET /api/v1/agents`` (``read``) ``kind=hosted|partner``: the hosted agents each gateway
-  reports (its info lists agent ids only, so name, version and skills are null) and the
+  reports (id, name, version, skill ids, card URL; a gateway that sends bare ids leaves
+  name, version and skills null) and the
   catalogue's partners with their card's name, version and skills, tier, status, and the
   worst breaker state gateways report for them (``health``).
 - ``GET /api/v1/tasks`` (``read``): the latest ``task.state`` of each task; filters
   ``gateway_id``, ``agent_id``, ``state``, ``since``, ``trace_id`` (any event of the task),
   ``q`` (a task id prefix).
 - ``GET /api/v1/tasks/{gateway_id}/{agent_id}/{task_id}`` (``read``): a ``task.get``
-  command for the gateway, waited for ``DETAIL_WAIT_S``: its task detail plus ``timeline``,
-  or 202 ``{command_id, timeline}`` when it does not answer in time.
+  command for the gateway, waited for ``DETAIL_WAIT_S``: its compact task detail (the last
+  messages, clipped, with totals and ``clipped``) plus ``timeline``, or 202
+  ``{command_id, timeline}`` when it does not answer in time.
 - ``GET /api/v1/topology`` (``read``) ``window_m`` 5..1440: who called whom, from
   ``partner.call`` events, with each edge's routing decision under the gateway's desired
   policy (``allowed``, ``forbidden``, ``forced``, ``preferred``).
@@ -487,21 +489,34 @@ async def overview(request: Request) -> dict[str, Any]:
 
 
 def _hosted(gw: GatewayRow, health: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """The gateway's hosted agents as it reported them: objects ``{id, name, version,
+    skills, card_url}`` (bare ids from older gateways and rows: the rest null, the card URL
+    derived from the gateway's layout)."""
     base = _str(gw.info.get("base_url"))
     status = _str(_dict(health).get("status")) if health is not None else None
     state = (status or "unknown") if gw.connected else "disconnected"
     agents = gw.info.get("agents")
-    ids = {a for a in agents if isinstance(a, str)} if isinstance(agents, list) else set()
+    reported: dict[str, dict[str, Any]] = {}
+    for a in agents if isinstance(agents, list) else []:
+        entry = {"id": a} if isinstance(a, str) else _dict(a)
+        if isinstance(entry.get("id"), str):
+            reported.setdefault(entry["id"], entry)
     out = []
-    for agent_id in sorted(ids):
+    for agent_id, entry in sorted(reported.items()):
+        skills = entry.get("skills")
+        card_url = _str(entry.get("card_url"))
+        if card_url is None and base:
+            card_url = f"{base.rstrip('/')}/agents/{agent_id}{CARD_PATH}"
         out.append(
             {
                 "kind": "hosted",
                 "id": agent_id,
-                "name": None,  # a gateway reports its agents' ids only
-                "version": None,
-                "skills": None,
-                "card_url": f"{base.rstrip('/')}/agents/{agent_id}{CARD_PATH}" if base else None,
+                "name": _str(entry.get("name")),
+                "version": _str(entry.get("version")),
+                "skills": [x for x in skills if isinstance(x, str)]
+                if isinstance(skills, list)
+                else None,
+                "card_url": card_url,
                 "gateway_id": gw.id,
                 "health": state,
                 "tier": None,
@@ -693,7 +708,7 @@ def public_detail(result: dict[str, Any]) -> dict[str, Any]:
     shown = {k: v for k, v in task.items() if k != "owner"}
     shown["owner_kind"] = _owner_kind(task.get("owner"))
     handles = result.get("partner_tasks")
-    return {
+    out = {
         "task": shown,
         "partner_tasks": [
             {k: h.get(k) for k in HANDLE_FIELDS}
@@ -702,6 +717,13 @@ def public_detail(result: dict[str, Any]) -> dict[str, Any]:
         ],
         "pending_prompt": result.get("pending_prompt"),
     }
+    # the compact detail's totals and whether anything was cut (gateways since it)
+    for key in ("history_total", "artifacts_total", "partner_tasks_total"):
+        if isinstance(result.get(key), int):
+            out[key] = result[key]
+    if isinstance(result.get("clipped"), bool):
+        out["clipped"] = result["clipped"]
+    return out
 
 
 def _timeline_entry(r: Any) -> dict[str, Any]:
@@ -730,7 +752,8 @@ async def timeline(
     """The events of a task across gateways, oldest first (``TIMELINE_MAX`` at most): its
     own ``task.state`` events, every task state change and partner call sharing one of its
     traces (``traces`` plus those its events carry), and the partner calls of its partner
-    tasks (``handles``: (partner id, task id); a ``partner.call`` event carries no trace)."""
+    tasks (``handles``: (partner id, task id); for events from gateways whose
+    ``partner.call`` carries no trace yet)."""
     e = EVENTS.c
     own = (e.kind == "task.state") & (e.gateway_id == gateway_id) & (e.task_id == task_id)
     async with store.engine.connect() as conn:

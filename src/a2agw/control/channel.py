@@ -92,6 +92,8 @@ TRACE_ID_MAX = 64
 URL_MAX = 2048
 AUDIT_ROW_MAX_BYTES = 8192  # a gateway audit row larger than this (as JSON) is dropped
 RESULT_MAX_BYTES = 8192  # a larger command result is stored as {"truncated": true}
+TASK_GET_RESULT_MAX_BYTES = 65536  # task.get answers the gateway's compact task detail
+SKILLS_MAX = 64  # skill ids kept per reported agent
 TS_PAST_S = 86400.0  # event timestamps are clamped to [now - 1 day, now + 5 minutes]
 TS_FUTURE_S = 300.0
 INT_MAX_EXACT = 2**53  # larger ints are not kept as numbers
@@ -106,7 +108,7 @@ _COMPUTE_TRIES = 5
 # Event kinds and the ``data`` keys kept for each (see a2agw.ops.bus).
 EVENT_KEYS: dict[str, frozenset[str]] = {
     "task.state": frozenset({"task_id", "context_id", "state", "trace_id"}),
-    "partner.call": frozenset({"partner_id", "task_id", "state", "duration_ms"}),
+    "partner.call": frozenset({"partner_id", "task_id", "state", "duration_ms", "trace_id"}),
     "partner.state": frozenset({"partner_id", "status", "event", "pending_hash"}),
     "security.denied": frozenset({"reason", "rule", "principal_kind"}),
 }
@@ -665,6 +667,12 @@ async def take_commands(
     return taken
 
 
+def result_cap(kind: str) -> int:
+    """The largest result (as JSON) kept for a command of ``kind``: 64 KiB for ``task.get``
+    (the gateway's compact task detail), 8 KiB for every other kind."""
+    return TASK_GET_RESULT_MAX_BYTES if kind == "task.get" else RESULT_MAX_BYTES
+
+
 async def finish_command(
     store: ControlStore,
     gateway_id: str,
@@ -674,11 +682,10 @@ async def finish_command(
     *,
     now: float,
 ) -> bool:
-    """Record a gateway's result for one of its delivered commands. False (nothing
-    changes) for a command of another gateway, or one not in ``delivered``."""
+    """Record a gateway's result for one of its delivered commands; one larger than
+    ``result_cap`` is stored as ``{"truncated": true}``. False (nothing changes) for a
+    command of another gateway, or one not in ``delivered``."""
     result_json = _json(result)
-    if len(result_json) > RESULT_MAX_BYTES:
-        result_json = _json({"truncated": True})
     async with store.engine.begin() as conn:
         kind = (
             await conn.execute(
@@ -690,6 +697,8 @@ async def finish_command(
         ).scalar_one_or_none()
         if kind is None:
             return False
+        if len(result_json) > result_cap(kind):
+            result_json = _json({"truncated": True})
         done = await conn.execute(
             update(COMMANDS)
             .where(COMMANDS.c.id == command_id)
@@ -876,10 +885,21 @@ class Applied(BaseModel):
     reason: str | None = None
 
 
+class ReportedAgent(BaseModel):
+    """A hosted agent as gateway info describes it (gateways before this sent bare ids)."""
+
+    model_config = _FORBID
+    id: str
+    name: str | None = None
+    version: str | None = None
+    skills: list[Any] | None = None  # skill ids; anything else is dropped
+    card_url: str | None = None
+
+
 class GatewayInfo(BaseModel):
     model_config = _FORBID
     version: str
-    agents: list[str]
+    agents: list[str | ReportedAgent]
     base_url: str
 
 
@@ -1041,6 +1061,27 @@ async def _record_partner_states(
         )
 
 
+def _agent(agent: str | ReportedAgent) -> dict[str, Any]:
+    """A reported agent as stored: ``{id, name, version, skills, card_url}``, strings cut,
+    at most ``SKILLS_MAX`` skill ids (a bare id has the other fields null)."""
+    if isinstance(agent, str):
+        agent = ReportedAgent(id=agent)
+
+    def text(value: str | None, limit: int = STRING_MAX) -> str | None:
+        return _clean(value, limit) if value is not None else None
+
+    skills = None
+    if agent.skills is not None:
+        skills = [_clean(s) for s in agent.skills if isinstance(s, str)][:SKILLS_MAX]
+    return {
+        "id": _clean(agent.id),
+        "name": text(agent.name),
+        "version": text(agent.version),
+        "skills": skills,
+        "card_url": text(agent.card_url, URL_MAX),
+    }
+
+
 @dataclass
 class _Ingest:
     store: ControlStore
@@ -1188,7 +1229,7 @@ class _Ingest:
         )
 
     async def info(self, info: GatewayInfo) -> None:
-        agents = [_clean(a) for a in self.cap(info.agents)]
+        agents = [_agent(a) for a in self.cap(info.agents)]
         reported = {
             "version": _clean(info.version),
             "agents": agents,

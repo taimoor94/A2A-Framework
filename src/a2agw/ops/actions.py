@@ -30,6 +30,7 @@ are not counted there; a running gateway checks them again on its next partners 
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from collections.abc import Iterable
@@ -69,6 +70,14 @@ PolicySource = Literal["file", "control_plane", "admin"]
 
 HISTORY_MAX = 50  # task detail: the last messages shown
 ARTIFACTS_MAX = 50  # task detail: the last artifacts shown
+# The compact detail (``task_detail(compact=True)``, the control plane's ``task.get``): sized
+# to fit the 64 KiB command result cap.
+COMPACT_HISTORY = 10  # the last messages shown
+COMPACT_PARTS = 4  # parts shown per message (the others are counted in ``clipped``)
+COMPACT_TEXT_BYTES = 1024  # each text part (and the status message), UTF-8
+COMPACT_ARTIFACTS = 20
+COMPACT_HANDLES = 20
+COMPACT_HANDLE_FIELDS = ("partner_id", "task_id", "context_id", "state", "created_at", "end_reason")
 MAX_ANSWER_BYTES = 32 * 1024  # an operator's answer, UTF-8
 ANSWERED_BY_KEY = "a2agw.answered_by"  # message metadata: who answered for the owner
 TASK_FINAL = "task is final"
@@ -511,13 +520,119 @@ def _message(message: Message) -> dict[str, Any]:
     return out
 
 
+def _clip_text(text: str, limit: int = COMPACT_TEXT_BYTES) -> tuple[str, bool]:
+    """``text`` cut to ``limit`` UTF-8 bytes (never inside a character); whether it was."""
+    raw = text.encode()
+    if len(raw) <= limit:
+        return text, False
+    return raw[:limit].decode(errors="ignore"), True
+
+
+def _part_meta(part: Part) -> dict[str, Any]:
+    """A part as metadata only: kind, name, MIME type and size in bytes (never content)."""
+    kind = part.WhichOneof("content")
+    if kind == "text":
+        return {"kind": "text", "name": None, "media_type": None, "size": len(part.text.encode())}
+    if kind == "data":
+        size = len(json.dumps(MessageToDict(part.data)).encode())
+        return {"kind": "data", "name": None, "media_type": None, "size": size}
+    return {
+        "kind": "file",
+        "name": part.filename or None,
+        "media_type": part.media_type or None,
+        "size": len(part.raw) if kind == "raw" else None,
+    }
+
+
+class _Compactor:
+    """Builds the compact detail and remembers whether anything was cut."""
+
+    def __init__(self) -> None:
+        self.clipped = False
+
+    def text(self, text: str | None) -> str | None:
+        if text is None:
+            return None
+        out, cut = _clip_text(text)
+        self.clipped |= cut
+        return out
+
+    def part(self, part: Part) -> dict[str, Any]:
+        meta = _part_meta(part)
+        if meta["kind"] == "text":
+            return {**meta, "text": self.text(part.text)}
+        if meta["kind"] == "data":
+            self.clipped = True  # content left out
+        return meta
+
+    def message(self, message: Message) -> dict[str, Any]:
+        out = _message(message)
+        parts = list(message.parts)
+        if len(parts) > COMPACT_PARTS:
+            self.clipped = True
+        out["parts"] = [self.part(p) for p in parts[:COMPACT_PARTS]]
+        out["parts_total"] = len(parts)
+        return out
+
+    def artifact(self, a: Any) -> dict[str, Any]:
+        if any(p.WhichOneof("content") in ("text", "data") for p in a.parts):
+            self.clipped = True  # artifacts are metadata only
+        return {
+            "artifact_id": a.artifact_id,
+            "name": a.name or None,
+            "parts": [_part_meta(p) for p in list(a.parts)[:COMPACT_PARTS]],
+        }
+
+    def take(self, items: list[Any], n: int) -> list[Any]:
+        if len(items) > n:
+            self.clipped = True
+        return items[-n:] if n else []
+
+
+def _compact(task: Task, row: dict[str, Any], handles: list[dict[str, Any]]) -> dict[str, Any]:
+    """The detail sized for the control plane: the last ``COMPACT_HISTORY`` messages
+    (``COMPACT_PARTS`` parts each, text clipped to ``COMPACT_TEXT_BYTES``, other parts as
+    metadata), artifacts as metadata, totals, and ``clipped`` when anything was cut."""
+    c = _Compactor()
+    status = _text(task.status.message) if task.status.HasField("message") else None
+    status = c.text(status)
+    history = list(task.history)
+    artifacts = list(task.artifacts)
+    return {
+        "task": {
+            "id": task.id,
+            "context_id": task.context_id,
+            "state": TaskState.Name(task.status.state),
+            "owner": row["owner"],
+            "updated_at": row["updated_at"],
+            "trace_id": row.get("trace_id"),
+            "status_message": status,
+            "history": [c.message(m) for m in c.take(history, COMPACT_HISTORY)],
+            "artifacts": [c.artifact(a) for a in c.take(artifacts, COMPACT_ARTIFACTS)],
+        },
+        "partner_tasks": [
+            {k: h.get(k) for k in COMPACT_HANDLE_FIELDS} for h in c.take(handles, COMPACT_HANDLES)
+        ],
+        "pending_prompt": (
+            status if task.status.state == TaskState.TASK_STATE_INPUT_REQUIRED else None
+        ),
+        "history_total": len(history),
+        "artifacts_total": len(artifacts),
+        "partner_tasks_total": len(handles),
+        "clipped": c.clipped,
+    }
+
+
 async def task_detail(
-    host: AgentHost, agent_id: str, task_id: str, *, actor: str
+    host: AgentHost, agent_id: str, task_id: str, *, actor: str, compact: bool = False
 ) -> dict[str, Any]:
     """One task for an operator: its index row, the last ``HISTORY_MAX`` messages and
     ``ARTIFACTS_MAX`` artifacts, the partner tasks it started (outbound handles) and the
     question it is waiting on (``pending_prompt``, input-required only). ``TaskNotFound``
-    for an unknown agent or task. Audited ``admin.read`` (task contents are sensitive)."""
+    for an unknown agent or task. Audited ``admin.read`` (task contents are sensitive).
+
+    ``compact``: the control plane's form (``_compact``), sized to fit its command result
+    cap."""
     try:
         row, handler = await _locate(host, agent_id, task_id)
         task = await _get_task(handler, task_id, _owner_context(row["owner"]))
@@ -529,6 +644,10 @@ async def task_detail(
     state = TaskState.Name(task.status.state)
     status_message = _text(task.status.message) if task.status.HasField("message") else None
     handles = await host.handles.by_inbound(task_id) if host.handles is not None else []
+    if compact:
+        out = _compact(task, row, [dict(h) for h in handles])
+        await _task_audit(host, "admin.read", actor, agent_id, task_id, "ok", reason="tasks.detail")
+        return out
     out = {
         "task": {
             "id": task.id,

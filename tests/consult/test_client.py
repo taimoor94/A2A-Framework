@@ -234,7 +234,7 @@ async def test_consult_completed_text(env, streaming):
     assert rpc_methods(e.transport)[0] == expected
     ev = e.bus.recent()[-1]
     assert ev.kind == "partner.call" and ev.agent_id == "me"
-    assert set(ev.data) == {"partner_id", "task_id", "state", "duration_ms"}
+    assert set(ev.data) == {"partner_id", "task_id", "state", "duration_ms", "trace_id"}
     assert ev.data["partner_id"] == "alpha" and ev.data["state"] == "completed"
     rows = await e.handles.by_inbound("none")
     assert rows == []
@@ -1445,3 +1445,16 @@ async def test_v03_partner_gets_its_own_protocol_version_header(env):
     assert res.state == "completed" and res.text == "echo: hello"
     assert seen and all(v == ["0.3"] for v in seen)
     assert rpc_methods(e.transport)[0] == "message/send"
+
+
+async def test_partner_call_event_carries_the_trace(env, spans):
+    """A ``partner.call`` event names the trace of the turn that made it (the control plane
+    joins it to the task's timeline by it)."""
+    from a2agw.ops.telemetry import get_tracer
+
+    e = await env(spec("alpha", Echo()))
+    with get_tracer().start_as_current_span("turn") as turn:
+        await e.client.consult("alpha", "hello", wait_seconds=5)
+    ev = e.bus.recent()[-1]
+    assert ev.kind == "partner.call"
+    assert ev.data["trace_id"] == format(turn.get_span_context().trace_id, "032x")

@@ -4,8 +4,8 @@ The control plane (`a2agw.control`, the `control` extra) owns the partner catalo
 policies, the users and roles of the Console, and the list of gateways. Gateways connect out
 to it; it never calls a gateway.
 
-This document is filled in as Phase 4a lands. The sections on deployment, roles and the
-`/api/v1` API follow with the tasks that build them.
+This document is filled in as Phase 4a lands. The sections on deployment and roles follow
+with the tasks that build them; the Console's read API is under [Console read API](#console-read-api).
 
 ## Gateways
 
@@ -128,11 +128,20 @@ a `detail` with ids and reasons only).
 |---|---|---|
 | `task.cancel` | `agent_id, task_id` | cancel a task (and the partner tasks it started) |
 | `task.answer` | `agent_id, task_id, text` | answer an `input-required` task for its owner |
-| `task.get` | `agent_id, task_id` | the task's detail |
+| `task.get` | `agent_id, task_id` | the task's compact detail (see below) |
 | `partner.refresh` | `id` | re-fetch the partner's card now |
 | `partner.approve` | `id, expected_hash` | approve a quarantined card change with that hash |
 | `partner.reject` | `id` | refuse a quarantined card change (the partner is disabled) |
 | `tasks.reap` | `agent_id, confirm?, force?` | fail the open tasks of an agent nobody serves |
+
+A result is at most 8 KiB as JSON, 64 KiB for `task.get`; a larger one is reported (and
+kept) as `{"truncated": true}`, the last resort. `task.get` answers a compact detail sized
+to fit: the task's id, context, state, owner, timestamps and trace; its last 10 messages
+with at most 4 parts each, every text part clipped to 1 KiB (UTF-8) and other parts as
+metadata only (`kind`, `name`, `media_type`, `size`); its last 20 artifacts as metadata
+only; its last 20 partner tasks; `history_total`, `artifacts_total`, `partner_tasks_total`;
+and `clipped: true` when anything was cut. The gateway's own admin API keeps the full
+detail.
 
 Commands are delivered at most once. One whose `expires_at` has passed when it arrives
 (measured in control-plane time, from the stream's `hello`) is not run: it is reported
@@ -151,7 +160,13 @@ Every `report_interval_s` the gateway posts what it has to say, in one report:
   are sent again; the control plane stores them once;
 - command results, and the outcome of each state applied or rejected;
 - every `health_interval_s`: health, the metrics snapshot (`/a2agw/admin/metrics`) and the
-  gateway info `{version, agents, base_url}`.
+  gateway info `{version, agents, base_url}`. Each agent is `{id, name, version, skills,
+  card_url}` from the hosted agent's spec (the source of its card): at most 200 agents and
+  64 skill ids each, strings cut to 256 characters. The control plane also accepts the
+  older form, a list of agent ids, and stores it with the other fields null.
+
+`partner.call` events carry the `trace_id` of the turn that made the call (null outside a
+span), as `task.state` events do.
 
 A report that fails is sent again, whole; after a `413` the gateway sends smaller reports
 until one fits. At shutdown the gateway waits for running commands, then posts one last
@@ -170,6 +185,10 @@ for its first state or is locked down because no policy is assigned.
 - One gateway per database: `a2agw_cp_state` holds one gateway's state.
 - Applied and rejected outcomes are reported one per report, so after a burst of states the
   control plane learns the last one a few report intervals later.
+- A report carrying a `task.get` result can be up to 64 KiB larger than one without. Keep
+  the control plane's `limits.report_max_bytes` (1 MiB by default) well above that: after a
+  `413` the gateway halves its report down to a single event and result, which must still
+  fit.
 
 ## Partner catalogue
 
@@ -291,3 +310,71 @@ and hashes only, never a document.
     is one of them, because the classifier saw message content that audit rows never
     hold. A row's `classification` is the level the gateway computed at the time, so a
     candidate that lowers an agent's default cannot lower the level replayed.
+
+## Console read API
+
+Read views are computed on query from what gateways report (events, audit rows, health,
+info) and the catalogue; no materialized tables (the 7-day event retention bounds every
+scan). Every list answers `{items, next_cursor}` with `limit` 1..200 (default 50). A cursor
+is an opaque keyset position bound to its view and filters: a cursor used with other
+filters, or on another list, is a `400 bad_request`, so it never widens what a caller sees.
+
+| Route | Permission | What |
+|---|---|---|
+| `GET /api/v1/overview` | `read` | gateways, tasks per minute, error rate, top partners, alerts |
+| `GET /api/v1/agents?kind=hosted\|partner` | `read` | hosted agents (from gateway info) and catalogue partners |
+| `GET /api/v1/tasks` | `read` | the latest state of each task; filters `gateway_id, agent_id, state, since, trace_id, q` (task id prefix) |
+| `GET /api/v1/tasks/{gateway}/{agent}/{task}` | `read` | the gateway's compact detail (a `task.get` command, waited for 5 s) plus `timeline`; 202 `{command_id, timeline}` when it does not answer in time |
+| `GET /api/v1/topology?window_m=5..1440` | `read` | who called whom, with latency, errors and the policy overlay |
+| `GET /api/v1/audit`, `/audit/export?format=jsonl\|csv`, `/audit/verify` | `audit.read` | both audit sources; streamed export; the control plane's own chain |
+| `GET /api/v1/credentials` | `read` | credential and TLS reference names |
+| `GET /api/v1/users`, `PATCH /api/v1/users/{id}` | `users.manage` | users; `{disabled}` ends the user's sessions at once |
+| `GET`/`POST /api/v1/api-keys`, `POST /api/v1/api-keys/{id}/revoke` | `apikeys.manage` | API keys |
+| `GET /api/v1/settings` | `settings.manage` | effective settings, without secrets (read-only) |
+
+### Definitions
+
+- **Gateways**: `total` counts active gateways; `connected` means seen within two keepalive
+  intervals; `stale` is the rest.
+- **Tasks per minute**: the last 60 one-minute buckets (aligned to the minute, the last one
+  the current minute), each counting the distinct tasks with a `TASK_STATE_SUBMITTED`
+  event in it (new tasks).
+- **Error rate**: over the last 15 minutes, failed and rejected tasks among the tasks that
+  ended (completed, failed, rejected, canceled); 0 when none ended.
+- **Top partners**: the 10 most-called partners of the last hour, with errors (`failed`,
+  `unavailable`, `rejected` calls, as the gateway's metrics count them) and the
+  nearest-rank p95 of call durations.
+- **Alerts**: a gateway not seen for more than 60 s; a partner whose breaker a gateway
+  reports open; a partner a gateway reports quarantined; a desired state a gateway rejected,
+  until it applies that version or a later one.
+- **Topology**: one edge per (gateway, hosted agent, partner) from `partner.call` events in
+  the window, with calls, errors and nearest-rank p50/p95 (the 500 busiest edges). Its
+  policy overlay (`allowed`, `forbidden`, `forced`, `preferred`) is the gateway's routing
+  evaluation under its *stored* desired policy, so it lags an assignment change until the
+  desired state is recomputed (the gateway's next stream poll or the maintenance pass, at
+  most a minute). A gateway with no policy has no routing rule: every edge is allowed.
+- **Task timeline**: every stored event of the task, and every `task.state` and
+  `partner.call` event on any gateway sharing one of its traces, oldest first (500 at most).
+
+### Who sees what
+
+- No read view shows a principal id: a task's owner is shown as its kind (`owner_kind`),
+  and partner tasks drop their caller. The audit views (`audit.read`) show actors.
+- An export is audited (`cp.audit.export`, with its format, source and the names of the
+  filters used), streams up to 100 000 rows, and prefixes every CSV cell that starts with
+  `=`, `+`, `-`, `@`, a tab or a carriage return with `'` (formula injection).
+- An API key is shown once, in the response that creates it. Its role must not carry a
+  permission its creator lacks: nobody makes a key above their own permissions.
+- Settings drop every `*_env` name and mask the password in `db_url`.
+- Task detail results, which hold message text, are kept in `cp_commands` until the
+  maintenance purge removes finished commands (`retention.commands_days`, 7 by default);
+  a command never answered expires after its TTL (60 s) and is purged the same way.
+
+### Known gaps
+
+- **Audit chain breaks**: no gateway reports a chain check yet, so there is no alert for a
+  broken gateway chain. Verify a gateway's chain on the gateway (`a2agw audit verify`).
+- **Credential references** come from the catalogue only: gateways do not report the
+  credential or TLS reference names they hold.
+- Partner calls reported by gateways older than the `trace_id` field join a task's timeline
+  only through the partner tasks in its detail.

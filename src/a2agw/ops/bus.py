@@ -23,7 +23,8 @@ from typing import Any, Literal, Self
 
 # Payloads (``GatewayEvent.data``), all ids and states, never message text or secrets:
 # - task.state: {task_id, context_id, state} (AdapterExecutor)
-# - partner.call: {partner_id, task_id, state, duration_ms} (PartnerClient)
+# - partner.call: {partner_id, task_id, state, duration_ms, trace_id} (PartnerClient; the
+#   trace of the running turn, None outside a span)
 # - partner.state: {partner_id, status, event, pending_hash?} (AgentHost, on every registry
 #   change; pending_hash only while a pending card is held)
 # - security.denied: {reason, rule?, principal_kind} (AgentHost.report_denied, at every

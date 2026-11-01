@@ -27,7 +27,9 @@ three things:
   full queue drops its oldest, counted in ``status()["dropped"]``), the audit rows after
   ``audit_acked_seq`` (ascending, up to ``REPORT_AUDIT_MAX``), command results, the last
   applied or rejected state, and every ``health_interval_s`` health, the metrics snapshot
-  and the gateway info (exactly ``{version, agents, base_url}``). ``audit_acked_seq`` moves
+  and the gateway info (exactly ``{version, agents, base_url}``; each agent is ``{id, name,
+  version, skills, card_url}``, see ``agent_info``). A command result larger than
+  ``result_cap(kind)`` (8 KiB, 64 KiB for ``task.get``) is reported as ``{"truncated": true}``. ``audit_acked_seq`` moves
   only from the response's ``acked_audit_seq``: rows not acknowledged are sent again (the
   control plane stores them idempotently). A report that fails is sent again, whole.
 
@@ -98,6 +100,13 @@ REPORT_EVENTS_MAX = 500
 REPORT_AUDIT_MAX = 500
 REPORT_RESULTS_MAX = 100
 RESULT_MAX_BYTES = 8192  # a larger command result is reported as {"truncated": true}
+# ``task.get`` answers the compact task detail (``actions.task_detail(compact=True)``),
+# sized to fit this; the control plane keeps the same cap for that kind.
+TASK_GET_RESULT_MAX_BYTES = 65536
+INFO_AGENTS_MAX = 200  # gateway info: hosted agents described
+INFO_SKILLS_MAX = 64  # skill ids per agent
+INFO_STRING_MAX = 256  # name, version, skill id
+CARD_PATH = "/.well-known/agent-card.json"  # a hosted agent's card: /agents/{id}<CARD_PATH>
 BACKOFF_MIN_S = 0.5
 BACKOFF_MAX_S = 30.0
 CONNECT_TIMEOUT_S = 10.0
@@ -232,12 +241,42 @@ async def _frames(response: httpx.Response) -> AsyncIterator[tuple[str, str]]:
                 data.append(value)
 
 
-def _clip(result: Any) -> Any:
+def result_cap(kind: Any) -> int:
+    """The largest result (as JSON) reported for a command of ``kind``."""
+    return TASK_GET_RESULT_MAX_BYTES if kind == "task.get" else RESULT_MAX_BYTES
+
+
+def _clip(result: Any, kind: Any = None) -> Any:
     try:
         size = len(json.dumps(result))
     except (TypeError, ValueError):
         return {"error": "unserializable"}
-    return {"truncated": True} if size > RESULT_MAX_BYTES else result
+    return {"truncated": True} if size > result_cap(kind) else result
+
+
+def agent_info(host: AgentHost) -> list[dict[str, Any]]:
+    """The hosted agents as the gateway info describes them, from their specs (the cards
+    are built from them): id, name, version, skill ids and card URL. At most
+    ``INFO_AGENTS_MAX`` agents and ``INFO_SKILLS_MAX`` skills each; strings cut to
+    ``INFO_STRING_MAX``."""
+
+    def cut(value: str) -> str:
+        return value[:INFO_STRING_MAX]
+
+    base = host.base_url.rstrip("/")
+    out = []
+    for agent_id in sorted(host.specs)[:INFO_AGENTS_MAX]:
+        spec = host.specs[agent_id]
+        out.append(
+            {
+                "id": cut(agent_id),
+                "name": cut(spec.name),
+                "version": cut(spec.version),
+                "skills": [cut(s.id) for s in spec.skills[:INFO_SKILLS_MAX]],
+                "card_url": f"{base}/agents/{agent_id}{CARD_PATH}",
+            }
+        )
+    return out
 
 
 def _arg_str(args: dict[str, Any], name: str) -> str:
@@ -274,7 +313,7 @@ async def _task_answer(host: AgentHost, a: dict[str, Any], actor: str) -> Any:
 
 async def _task_get(host: AgentHost, a: dict[str, Any], actor: str) -> Any:
     return await actions.task_detail(
-        host, _arg_str(a, "agent_id"), _arg_str(a, "task_id"), actor=actor
+        host, _arg_str(a, "agent_id"), _arg_str(a, "task_id"), actor=actor, compact=True
     )
 
 
@@ -874,7 +913,7 @@ class ControlPlaneConnector:
                     status, result = "failed", _failure(exc)
                     if result["error"] == "internal":
                         log.warning("control plane: command %s failed: %s", kind, result["detail"])
-        self._results.append({"id": cid, "status": status, "result": _clip(result)})
+        self._results.append({"id": cid, "status": status, "result": _clip(result, kind)})
 
     # -- reports ---------------------------------------------------------------------------
 
@@ -904,7 +943,7 @@ class ControlPlaneConnector:
 
         return {
             "version": __version__,
-            "agents": sorted(self.host.specs),
+            "agents": agent_info(self.host),
             "base_url": self.host.base_url,
         }
 

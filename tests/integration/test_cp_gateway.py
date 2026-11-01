@@ -304,7 +304,10 @@ async def test_gateway_enrolls_receives_partners_and_policy(control_plane, enrol
         row = await gateway_row(app, gw)
         assert row.epoch_applied == app.state.store.epoch
         info = json.loads(row.info_json)
-        assert info["agents"] == ["alpha"] and info["base_url"] == "http://gw.test"
+        assert [a["id"] for a in info["agents"]] == ["alpha"] and info[
+            "base_url"
+        ] == "http://gw.test"
+        assert info["agents"][0]["name"] and info["agents"][0]["skills"]
 
         async def audit_and_health() -> bool:
             async with app.state.engine.connect() as c:

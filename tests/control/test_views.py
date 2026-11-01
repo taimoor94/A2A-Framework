@@ -62,9 +62,22 @@ def task_ev(
 
 
 def call_ev(
-    agent: str, partner: str, state: str, duration: float, ts: float, task_id: str = "pt-1"
+    agent: str,
+    partner: str,
+    state: str,
+    duration: float,
+    ts: float,
+    task_id: str = "pt-1",
+    *,
+    trace: str | None = None,
 ) -> dict[str, Any]:
-    data = {"partner_id": partner, "task_id": task_id, "state": state, "duration_ms": duration}
+    data = {
+        "partner_id": partner,
+        "task_id": task_id,
+        "state": state,
+        "duration_ms": duration,
+        "trace_id": trace,
+    }
     return {"kind": "partner.call", "agent_id": agent, "ts": ts, "data": data}
 
 
@@ -265,6 +278,21 @@ async def test_agents_merge_hosted_and_partners(db_url, make_app, run_app):
             "version": "2.1",
             "skills": [{"id": "pay", "name": "Pay"}, {"id": "refund", "name": "Refund"}],
         }
+        gw2, t2 = await gateway(app, "west")
+        objects = {
+            "version": "0.5.0",
+            "agents": [
+                {
+                    "id": "orders",
+                    "name": "Orders",
+                    "version": "3.1",
+                    "skills": ["place", "track"],
+                    "card_url": "https://w.x/agents/orders/.well-known/agent-card.json",
+                }
+            ],
+            "base_url": "https://w.x",
+        }
+        await report(c, t2, info=objects, health={"status": "ok"})
         await add_partner(app, "p1", card=card, tier="partner")
         await add_partner(app, "p2", status="pending")
         everything = await pages(c, "/api/v1/agents", admin)
@@ -274,8 +302,23 @@ async def test_agents_merge_hosted_and_partners(db_url, make_app, run_app):
 
     assert bad.status_code == 422 and bad.json()["fields"] == ["query.kind"]
     assert everything == hosted + partners
-    assert [(a["gateway_id"], a["id"]) for a in hosted] == [(gw1, "billing"), (gw1, "support")]
-    billing = hosted[0]
+    assert sorted((a["gateway_id"], a["id"]) for a in hosted) == sorted(
+        [(gw1, "billing"), (gw1, "support"), (gw2, "orders")]
+    )
+    billing = next(a for a in hosted if a["id"] == "billing")
+    orders = next(a for a in hosted if a["id"] == "orders")
+    assert orders == {
+        "kind": "hosted",
+        "id": "orders",
+        "name": "Orders",
+        "version": "3.1",
+        "skills": ["place", "track"],
+        "card_url": "https://w.x/agents/orders/.well-known/agent-card.json",
+        "gateway_id": gw2,
+        "health": "ok",
+        "tier": None,
+        "status": None,
+    }
     assert billing == {
         "kind": "hosted",
         "id": "billing",
@@ -506,14 +549,25 @@ async def test_task_detail_202_when_gateway_slow(db_url, cp_http, run_app, clock
         admin = await admin_key(app)
         gw1, t1 = await gateway(app, "east")
         now = clock()
-        await report(c, t1, events=[task_ev("billing", "t1", WORKING, now - 5, trace="tr1")])
+        await report(
+            c,
+            t1,
+            events=[
+                task_ev("billing", "t1", WORKING, now - 5, trace="tr1"),
+                call_ev("billing", "p1", "completed", 4, now - 4, task_id="pt-9", trace="tr1"),
+            ],
+        )
         r = await c.get(f"/api/v1/tasks/{gw1}/billing/t1", headers=admin)
         assert r.status_code == 202, r.text
         body = r.json()
         command = await channel.get_command(app.state.store, body["command_id"])
 
     assert set(body) == {"command_id", "timeline"}
-    assert [(e["task_id"], e["state"]) for e in body["timeline"]] == [("t1", WORKING)]
+    # the partner call carries the turn's trace: it is in the timeline without the detail
+    assert [(e["kind"], e["task_id"], e["state"]) for e in body["timeline"]] == [
+        ("task.state", "t1", WORKING),
+        ("partner.call", "pt-9", "completed"),
+    ]
     assert sum(holder["slept"]) == pytest.approx(views_mod.DETAIL_WAIT_S)
     assert command.status == "pending" and command.kind == "task.get"
 
@@ -861,8 +915,14 @@ def test_public_detail_hides_principals_and_reports_truncation():
             "task": {"id": "t1", "owner": "jwt:carol", "state": WORKING},
             "partner_tasks": [{"partner_id": "p1", "task_id": "pt", "caller_id": "key:x"}, "junk"],
             "pending_prompt": "which account?",
+            "history_total": 40,
+            "artifacts_total": 2,
+            "partner_tasks_total": 1,
+            "clipped": True,
         }
     )
+    assert (shown["history_total"], shown["artifacts_total"]) == (40, 2)
+    assert shown["partner_tasks_total"] == 1 and shown["clipped"] is True
     assert shown["task"] == {"id": "t1", "state": WORKING, "owner_kind": "jwt"}
     assert shown["partner_tasks"] == [
         {
