@@ -59,7 +59,7 @@ from a2agw.security.policy import PolicyEngine, PolicyError, load_policy
 from a2agw.serve.agent import AGENT_ID_PATTERN, AgentSpec, SkillSpec
 from a2agw.serve.host import AgentHost
 from a2agw.serve.push import PushSettings
-from a2agw.vsc.config import VscConfig
+from a2agw.vsc.config import RESERVED_PRINCIPAL_ID, VscConfig
 
 logger = logging.getLogger(__name__)
 
@@ -477,6 +477,12 @@ class GatewayConfig(BaseModel):
                 raise ValueError(f"partner {p.id!r}: unknown tls_ref {p.tls_ref!r}")
         if self.classifier is not None and self.policy_file is None:
             raise ValueError("classifier needs policy_file")
+        if self.auth is not None:
+            for entry in self.auth.api_keys.values():
+                if entry.principal_id == RESERVED_PRINCIPAL_ID:
+                    raise ValueError(
+                        f"auth.api_keys: reserved principal id {RESERVED_PRINCIPAL_ID!r}"
+                    )
         return self
 
 

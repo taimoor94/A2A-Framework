@@ -149,6 +149,20 @@ class AuthConfig(BaseModel):
 class AgentAccess:
     allowed_principals: frozenset[str] | None = None  # None = any authenticated principal
     required_scopes: frozenset[str] = frozenset()
+    # sha256 hex of an API key every call must present as ``X-API-Key``, enforced whether or
+    # not auth is configured (``key_presented``): for agents only an in-process caller holding
+    # a minted key may reach (e.g. ``vsc-planner``).
+    api_key_sha256: str | None = None
+
+
+def key_presented(access: AgentAccess, presented: str | None) -> bool:
+    """Whether ``presented`` (the request's ``X-API-Key``) satisfies ``access.api_key_sha256``
+    (always true when the agent requires no key). Constant-time comparison."""
+    if access.api_key_sha256 is None:
+        return True
+    if not presented:
+        return False
+    return hmac.compare_digest(hash_api_key(presented).encode(), access.api_key_sha256.encode())
 
 
 _SHA256_HEX = re.compile(r"[0-9a-fA-F]{64}")

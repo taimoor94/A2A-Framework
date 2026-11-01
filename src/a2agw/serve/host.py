@@ -85,6 +85,7 @@ from a2agw.security.auth import (
     GatewayCallContextBuilder,
     PermissionDenied,
     authorize,
+    key_presented,
     on_auth_error,
 )
 from a2agw.security.cardsign import CardSigner, CardVerifier
@@ -980,6 +981,13 @@ class _AgentAuthorizer:
                 await send({"type": "websocket.close", "code": 1008})
             return
         is_card = scope["method"] in ("GET", "HEAD") and get_route_path(scope) == CARD_PATH
+        if not is_card and not key_presented(self.spec.access, _api_key_header(scope)):
+            # An agent bound to a minted key (``AgentAccess.api_key_sha256``) refuses every
+            # other caller, with or without auth configured.
+            user = scope.get("user")
+            principal = user.principal if isinstance(user, PrincipalUser) else None
+            await self._deny(scope, receive, send, principal, reason="agent access: key required")
+            return
         if not is_card and (self.enforce or self.policy is not None):
             user = scope.get("user")
             principal = user.principal if isinstance(user, PrincipalUser) else None
@@ -997,6 +1005,13 @@ class _AgentAuthorizer:
                     )
                     return
         await self.app(scope, receive, send)
+
+
+def _api_key_header(scope: Scope) -> str | None:
+    for name, value in scope.get("headers") or []:
+        if name.lower() == b"x-api-key":
+            return value.decode("latin-1")
+    return None
 
 
 async def _agent_not_found(scope: Scope, receive: Receive, send: Send) -> None:

@@ -76,3 +76,15 @@ class LifecycleAdapter(Protocol):
     async def start(self) -> None: ...
 
     async def stop(self) -> None: ...
+
+
+@runtime_checkable
+class CancelAwareAdapter(Protocol):
+    """An adapter that wants to know when one of its tasks is cancelled by a client
+    (``tasks/cancel``), e.g. to stop work that outlives the task's run.
+
+    Duck-typed and additive: the executor awaits ``on_task_cancel(task_id)`` once per task it
+    cancels (after the run, if any, was stopped and the task marked canceled), never for a
+    task that ended on its own. An exception is logged and does not undo the cancel."""
+
+    async def on_task_cancel(self, task_id: str) -> None: ...

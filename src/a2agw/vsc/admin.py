@@ -7,14 +7,17 @@ and the ``X-A2AGW-Admin: 1`` header on every POST and PUT. JSON bodies; errors a
 - Non-admin principals see and act on their own jobs only (404 for another's; ``GET /jobs``
   lists their own); ``a2agw:admin`` sees all.
 - ``GET /jobs`` (``state``, ``limit``), ``POST /jobs`` ``{"request"}`` (201; the caller owns it)
-- ``GET /jobs/{id}`` (job, spec, plan, steps, ``waiting_step``), ``GET /jobs/{id}/receipt``
+- ``GET /jobs/{id}`` (job, spec, plan, steps, ``waiting_step`` and ``waiting``: the step's
+  kind and, for a merge, its target branch and the verified commit), ``GET /jobs/{id}/receipt``
   (409 until the job has finished)
 - ``POST /jobs/{id}/approve`` / ``reject`` ``{"step_id", "note"}`` (409 unless the job is
   ``awaiting_approval`` and ``step_id`` is the step it waits for; 400 for a step that is not
-  a privileged step of its plan)
+  a privileged step of its plan; 403 for an approval by a principal that may not approve:
+  ``vsc.approvers``, ``vsc.allow_self_approval``; admins always may)
 - ``POST /jobs/{id}/cancel``
-- ``PUT /jobs/{id}/spec`` (an ``ExecutableSpec``; 409 outside ``awaiting_spec``; audited as
-  ``vsc.job`` ``spec_edited``, then the job runs from it)
+- ``PUT /jobs/{id}/spec`` (an ``ExecutableSpec``; 409 outside ``awaiting_spec``; its
+  ``request`` is replaced by the job's verbatim request; audited as ``vsc.job``
+  ``spec_edited``, then the job runs from it)
 """
 
 from __future__ import annotations
@@ -32,7 +35,7 @@ from a2agw.ops.admin import ADMIN_PREFIX, ADMIN_SCOPE, guard
 from a2agw.ops.audit import AuditEvent
 from a2agw.security.auth import VSC_SCOPE, has_scope
 from a2agw.security.principal import PrincipalUser
-from a2agw.vsc.gate import Gate
+from a2agw.vsc.gate import Gate, NotApprover
 from a2agw.vsc.plan import PRIVILEGED_KINDS, Plan
 from a2agw.vsc.runner import JobRunner
 from a2agw.vsc.spec import ExecutableSpec, validate_against
@@ -161,11 +164,13 @@ def vsc_admin_routes(runtime: VscRuntime) -> list[BaseRoute]:
         out["spec"] = json.loads(job["spec_json"]) if job["spec_json"] else None
         out["plan"] = json.loads(job["plan_json"]) if job["plan_json"] else None
         out["steps"] = [_step_view(r) for r in await store.steps(job["job_id"])]
-        out["waiting_step"] = (
-            await runtime.waiting_step(job["job_id"])
+        waiting = (
+            await runtime.waiting_detail(job["job_id"])
             if job["state"] == "awaiting_approval"
             else None
         )
+        out["waiting_step"] = waiting["step_id"] if waiting else None
+        out["waiting"] = waiting
         return JSONResponse(out)
 
     async def receipt(request: Request) -> Response:
@@ -194,7 +199,17 @@ def vsc_admin_routes(runtime: VscRuntime) -> list[BaseRoute]:
             return _error(409, "that step is not waiting for approval", waiting_step=waiting)
         actor = _actor(request)
         if verb == "approve":
-            await gate.approve(job["job_id"], step_id, actor=actor, note=note)
+            try:
+                await gate.approve(
+                    job["job_id"],
+                    step_id,
+                    actor=actor,
+                    note=note,
+                    owner=job["owner"],
+                    admin=_is_admin(host, request),
+                )
+            except NotApprover as e:
+                return _error(403, "forbidden", detail=str(e))
         else:
             await gate.reject(job["job_id"], step_id, actor=actor, note=note)
         return JSONResponse({"job_id": job["job_id"], "step_id": step_id, "decision": verb})
@@ -223,6 +238,7 @@ def vsc_admin_routes(runtime: VscRuntime) -> list[BaseRoute]:
             )
         try:
             spec = ExecutableSpec.model_validate(body)
+            spec = spec.model_copy(update={"request": job["request"]})
             validate_against(spec, runtime.cfg)
         except (ValidationError, ValueError):
             raise _Bad("spec") from None

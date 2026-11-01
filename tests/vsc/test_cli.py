@@ -57,6 +57,7 @@ def _config(tmp_path) -> str:
             "systems": [{"id": "alpha", "repo": "./repo-a", "tests": TESTS}],
             "workers": [{"id": w.id, "command": w.command, "cost_class": "cheap"}],
             "planner": "scripted",
+            "allow_self_approval": True,  # the CLI's caller owns the job and approves it
         },
     }
     path = tmp_path / "a2agw.yaml"

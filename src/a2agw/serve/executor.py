@@ -675,6 +675,12 @@ class AdapterExecutor(AgentExecutor):
             TaskState.TASK_STATE_CANCELED,
             metadata=run.usage_metadata() if run is not None else None,
         )
+        hook = getattr(self.spec.adapter, "on_task_cancel", None)  # CancelAwareAdapter
+        if hook is not None:
+            try:
+                await hook(task_id)
+            except Exception:
+                logger.exception("on_task_cancel hook failed for task %s", task_id)
         if self.on_cancel is not None:
             try:
                 # The cascade acts for the canceller (the task's owner): its token, if any.

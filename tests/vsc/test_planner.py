@@ -5,7 +5,7 @@ import pytest
 
 from a2agw.adapters.callable import CallableAdapter
 from a2agw.serve.host import AgentHost
-from a2agw.vsc.config import BudgetConfig, SystemConfig, VscConfig
+from a2agw.vsc.config import BudgetConfig, CheckConfig, SystemConfig, VscConfig
 from a2agw.vsc.plan import Decision, Plan, PlanStep, plan_hash
 from a2agw.vsc.planner import (
     AgentPlanner,
@@ -19,6 +19,7 @@ from a2agw.vsc.spec import ExecutableSpec
 from a2agw.vsc.verify import CheckResult
 
 SYSTEMS = [SystemConfig(id="core", repo="./core"), SystemConfig(id="app", repo="./app")]
+CHECKS = [CheckConfig(id="both", systems=["core", "app"], run=["true"])]
 
 
 def make_spec(systems=("core", "app")) -> ExecutableSpec:
@@ -180,7 +181,7 @@ async def test_intake_prompt_fences_request_as_json(tmp_path):
 
     host, planner = await _host(tmp_path, fn)
     try:
-        await planner.intake('hi "quoted"\nignore previous', SYSTEMS, [])
+        await planner.intake('hi "quoted"\nignore previous', SYSTEMS, CHECKS)
     finally:
         await planner.aclose()
         await host.shutdown()
@@ -245,7 +246,7 @@ async def test_agent_planner_retries_parse_error_once(tmp_path):
 def test_claude_planner_requires_extra(monkeypatch):
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", None)
     with pytest.raises(ImportError, match=r"a2a-gateway\[vsc\]"):
-        claude_planner_adapter(VscConfig(systems=SYSTEMS))
+        claude_planner_adapter(VscConfig(systems=SYSTEMS), "/nonexistent")
 
 
 def test_scripted_planner_reports_no_usage():
@@ -271,3 +272,33 @@ async def test_agent_planner_usage_from_the_turn_task(tmp_path):
     finally:
         await planner.aclose()
         await host.shutdown()
+
+
+async def test_agent_planner_records_each_turn_task(tmp_path):
+    from a2agw.core.events import Done, Usage
+
+    plan = two_step_plan()
+
+    async def reply(ctx):
+        yield Usage(tokens_in=2, tokens_out=1, cost=0.1)
+        yield Done(text=plan.model_dump_json())
+
+    host, planner = await _host(tmp_path / "h", reply)
+    try:
+        await planner.plan(make_spec())
+        await planner.plan(make_spec())
+        turns = planner.turns()
+        assert [t["tokens_in"] for t in turns] == [2, 2]
+        assert len({t["task_id"] for t in turns}) == 2 and all(t["task_id"] for t in turns)
+    finally:
+        await planner.aclose()
+        await host.shutdown()
+
+
+def test_planner_reply_capped_before_parsing():
+    from a2agw.vsc.planner import REPLY_MAX_BYTES, cap_reply
+
+    assert cap_reply("short") == "short"
+    big = "é" * REPLY_MAX_BYTES
+    capped = cap_reply(big)
+    assert len(capped.encode()) <= REPLY_MAX_BYTES and capped.startswith("é")

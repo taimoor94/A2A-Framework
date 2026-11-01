@@ -39,7 +39,7 @@ def _headers(name: str, **extra: str) -> dict[str, str]:
     return {"X-API-Key": f"key-{name}", **extra}
 
 
-def _cfg(tmp_path, planner: str = "scripted") -> VscConfig:
+def _cfg(tmp_path, planner: str = "scripted", **extra) -> VscConfig:
     repo = tmp_path / "repo-a"
     if not repo.exists():
         make_repo(tmp_path, "repo-a", REPO_FILES)
@@ -49,13 +49,14 @@ def _cfg(tmp_path, planner: str = "scripted") -> VscConfig:
         workers=[WorkerConfig(id=w.id, command=w.command, cost_class="cheap")],
         planner=planner,
         workspace_dir="ws",
+        **{"allow_self_approval": True, **extra},
     )
 
 
 @asynccontextmanager
-async def _gateway(tmp_path, planner: str = "scripted"):
+async def _gateway(tmp_path, planner: str = "scripted", **extra):
     host = AgentHost("http://t", db_url=f"sqlite+aiosqlite:///{tmp_path / 'g.db'}", auth=_auth())
-    cfg = _cfg(tmp_path, planner)
+    cfg = _cfg(tmp_path, planner, **extra)
     runtime = attach_vsc(host, cfg, tmp_path)
     await host.startup()
     await runtime.resumed  # jobs the test creates are its own
@@ -206,7 +207,9 @@ async def test_planner_turns_use_the_internal_key(tmp_path, monkeypatch):
             )  # fmt: skip
         return Plan(steps=[edit("alpha")]).model_dump_json()
 
-    monkeypatch.setattr(vsc_host, "claude_planner_adapter", lambda cfg: CallableAdapter(planner))
+    monkeypatch.setattr(
+        vsc_host, "claude_planner_adapter", lambda cfg, cwd: CallableAdapter(planner)
+    )
     async with _gateway(tmp_path, planner="claude") as (host, runtime, http):
         task = await _send(host, "greet", context_id="ctx-p")
         assert task.status.state == TaskState.TASK_STATE_COMPLETED, task
@@ -404,6 +407,8 @@ def test_build_host_attaches_vsc(tmp_path, planner):
         "  systems:\n    - {id: core, repo: ./core}\n"
         "  workers:\n    - {id: w, command: [echo]}\n"
         f"  planner: {planner}\n"
+        "  allow_self_approval: true\n"
+        "admin_without_auth: true\n"
     )
     host = build_host(load_config(tmp_path / "a2agw.yaml"), config_dir=tmp_path)
     assert {"deliver", "vsc-planner"} <= set(host.specs)
@@ -485,3 +490,195 @@ async def test_one_job_per_context_and_owner(tmp_path):
         with pytest.raises(ValueError, match="already has a job"):
             await store.create_job("c", "x", "key:vsc", context_id="c")
         assert (await store.job_for_context("c", "key:vsc2"))["job_id"] == "b"
+
+
+def test_vsc_without_auth_is_refused_unless_opted_in(tmp_path):
+    from a2agw.config import ConfigError
+
+    make_repo(tmp_path, "core", {"a.txt": "a"})
+    base = (
+        "base_url: http://x\n"
+        "vsc:\n"
+        "  systems:\n    - {id: core, repo: ./core}\n"
+        "  workers:\n    - {id: w, command: [echo]}\n"
+        "  planner: scripted\n"
+    )
+    neither, gateway_only = base, base + "admin_without_auth: true\n"
+    vsc_only = base + "  allow_self_approval: true\n"
+    for text in (neither, gateway_only, vsc_only):
+        (tmp_path / "a2agw.yaml").write_text(text)
+        with pytest.raises(ConfigError, match="vsc needs auth"):
+            build_host(load_config(tmp_path / "a2agw.yaml"), config_dir=tmp_path)
+
+
+def test_reserved_principal_id_rejected_in_config(tmp_path):
+    from a2agw.config import ConfigError
+
+    (tmp_path / "a2agw.yaml").write_text(
+        "base_url: http://x\n"
+        "auth:\n  api_keys:\n"
+        f"    {hash_api_key('k')}: {{principal_id: vsc-internal, scopes: []}}\n"
+    )
+    with pytest.raises(ConfigError, match="reserved principal id"):
+        load_config(tmp_path / "a2agw.yaml")
+
+
+async def test_planner_agent_needs_the_minted_key_even_without_auth(tmp_path):
+    host = AgentHost(
+        "http://t", db_url=f"sqlite+aiosqlite:///{tmp_path / 'g.db'}", admin_without_auth=True
+    )
+    runtime = attach_vsc(host, _cfg(tmp_path), tmp_path)
+    await host.startup()
+    await runtime.resumed
+    http = httpx.AsyncClient(transport=httpx.ASGITransport(app=host.app()), base_url="http://t")
+    try:
+        rpc = {"jsonrpc": "2.0", "id": 1, "method": "SendMessage", "params": {}}
+        for headers in ({}, {"X-API-Key": "guess"}):
+            r = await http.post("/agents/vsc-planner/", json=rpc, headers=headers)
+            assert r.status_code == 403
+        r = await http.post(
+            "/agents/vsc-planner/", json=rpc, headers={"X-API-Key": runtime._planner_key}
+        )
+        assert r.status_code != 403  # admitted (the empty request itself is invalid)
+        card = await http.get("/agents/vsc-planner/.well-known/agent-card.json")
+        assert card.status_code == 200
+    finally:
+        await http.aclose()
+        await host.shutdown()
+
+
+def test_claude_planner_options_are_locked_down(tmp_path):
+    pytest.importorskip("claude_agent_sdk")
+    from a2agw.vsc.planner import BUILTIN_TOOLS, claude_planner_options
+
+    opts = claude_planner_options(str(tmp_path))
+    assert opts.tools == [] and opts.allowed_tools == []
+    assert set(opts.disallowed_tools) == set(BUILTIN_TOOLS) and "Bash" in opts.disallowed_tools
+    assert opts.setting_sources == [] and opts.mcp_servers == {} and opts.strict_mcp_config
+    assert opts.cwd == str(tmp_path) and opts.max_turns == 4
+
+
+def test_attach_gives_the_claude_planner_a_private_empty_cwd(tmp_path, monkeypatch):
+    import os
+    import stat
+
+    from a2agw.adapters.callable import CallableAdapter
+    from a2agw.vsc import host as vsc_host
+
+    seen = []
+    monkeypatch.setattr(
+        vsc_host,
+        "claude_planner_adapter",
+        lambda cfg, cwd: seen.append(cwd) or CallableAdapter(lambda ctx: "x"),
+    )
+    host = AgentHost("http://t", db_url=f"sqlite+aiosqlite:///{tmp_path / 'g.db'}", auth=_auth())
+    runtime = attach_vsc(host, _cfg(tmp_path, planner="claude"), tmp_path)
+    (cwd,) = seen
+    assert runtime.planner_cwd == cwd and os.listdir(cwd) == []
+    assert stat.S_IMODE(os.stat(cwd).st_mode) == 0o700
+    assert not cwd.startswith(str(tmp_path)) and os.getcwd() != cwd
+    os.rmdir(cwd)
+
+
+async def test_self_approval_refused_unless_allowed(tmp_path):
+    async with _gateway(tmp_path, allow_self_approval=False) as (host, runtime, http):
+        runtime.planner_factory = lambda job_id: FixedPlanner([edit("alpha"), merge_step()])
+        task = await _send(host, "greet", context_id="ctx-s")
+        assert task.status.state == TaskState.TASK_STATE_INPUT_REQUIRED, task
+        job = await runtime.store.job_for_context("ctx-s", "key:vsc")
+        # the prompt names the target branch and the verified commit
+        heads = json.loads(job["verified_heads_json"])
+        assert "main" in _status_text(task) and heads["repo-a"] in _status_text(task)
+        no = await _send(host, "approve", context_id="ctx-s", task_id=task.id)
+        assert no.status.state == TaskState.TASK_STATE_FAILED and "forbidden" in _status_text(no)
+        url = f"{ADMIN}/jobs/{job['job_id']}/approve"
+        body = {"step_id": "merge-alpha"}
+        r = await http.post(url, json=body, headers=_headers("vsc", **WRITE))
+        assert r.status_code == 403
+        r = await http.get(f"{ADMIN}/jobs/{job['job_id']}", headers=_headers("vsc"))
+        waiting = r.json()["waiting"]
+        assert waiting == {
+            "step_id": "merge-alpha",
+            "kind": "merge",
+            "system": "alpha",
+            "target_branch": "main",
+            "head": heads["repo-a"],
+        }
+        r = await http.post(url, json=body, headers=_headers("admin", **WRITE))  # admins may
+        assert r.status_code == 200, r.text
+
+        async def accepted() -> bool:
+            return (await runtime.store.get_job(job["job_id"]))["state"] == "accepted"
+
+        await until(accepted)
+
+
+async def test_only_listed_approvers_approve(tmp_path):
+    async with _gateway(tmp_path, approvers=["key:vsc2"]) as (_host, runtime, http):
+        runtime.planner_factory = lambda job_id: FixedPlanner([edit("alpha"), merge_step()])
+        r = await http.post(
+            f"{ADMIN}/jobs", json={"request": "greet"}, headers=_headers("vsc", **WRITE)
+        )
+        job_id = r.json()["job_id"]
+
+        async def waiting() -> bool:
+            return (await runtime.store.get_job(job_id))["state"] == "awaiting_approval"
+
+        await until(waiting)
+        url = f"{ADMIN}/jobs/{job_id}/approve"
+        body = {"step_id": "merge-alpha"}
+        # the owner (self approval allowed, but not an approver) is refused
+        assert (await http.post(url, json=body, headers=_headers("vsc", **WRITE))).status_code == 403
+        rows, _ = await _host.audit.query({"action": "vsc.approve"}, 50)
+        assert rows == []
+
+
+async def test_cancelling_the_task_cancels_the_job(tmp_path):
+    async with _gateway(tmp_path) as (host, runtime, _http):
+        runtime.planner_factory = lambda job_id: FixedPlanner([edit("alpha"), merge_step()])
+        task = await _send(host, "greet", context_id="ctx-c")
+        assert task.status.state == TaskState.TASK_STATE_INPUT_REQUIRED, task
+        job = await runtime.store.job_for_context("ctx-c", "key:vsc")
+        from a2a.types import CancelTaskRequest
+
+        owner_http = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=host.app()),
+            base_url="http://t",
+            headers=_headers("vsc"),
+            timeout=60,
+        )
+        try:
+            client = ClientFactory(ClientConfig(httpx_client=owner_http, streaming=False)).create(
+                host.cards["deliver"]
+            )
+            done = await client.cancel_task(CancelTaskRequest(id=task.id))
+            assert done.status.state == TaskState.TASK_STATE_CANCELED
+        finally:
+            await owner_http.aclose()
+
+        async def cancelled() -> bool:
+            return (await runtime.store.get_job(job["job_id"]))["state"] == "cancelled"
+
+        await until(cancelled)
+        rows, _ = await host.audit.query({"action": "vsc.job"}, 50)
+        last = [x for x in rows if x["task_id"] == job["job_id"] and x["outcome"] == "cancelled"]
+        assert last and last[0]["actor"] == "key:vsc"
+
+
+async def test_spec_review_asks_over_a2a_then_resumes_on_put(tmp_path):
+    async with _gateway(tmp_path, require_spec_review=True) as (host, runtime, http):
+        runtime.planner_factory = lambda job_id: FixedPlanner([edit("alpha")])
+        task = await _send(host, "greet", context_id="ctx-v")
+        assert task.status.state == TaskState.TASK_STATE_INPUT_REQUIRED, task
+        job = await runtime.store.job_for_context("ctx-v", "key:vsc")
+        assert job["state"] == "awaiting_spec" and job["spec_hash"] in _status_text(task)
+        spec = json.loads(job["spec_json"])
+        r = await http.put(
+            f"{ADMIN}/jobs/{job['job_id']}/spec", json=spec, headers=_headers("vsc", **WRITE)
+        )
+        assert r.status_code == 200, r.text
+
+        async def accepted() -> bool:
+            return (await runtime.store.get_job(job["job_id"]))["state"] == "accepted"
+
+        await until(accepted)

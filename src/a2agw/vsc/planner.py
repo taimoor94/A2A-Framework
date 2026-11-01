@@ -80,6 +80,32 @@ REPLAN_PROMPT = (
 )
 
 _KINDS = ("retry", "escalate", "replan", "stop")
+# A planner reply is cut to this many bytes before it is parsed.
+REPLY_MAX_BYTES = 256 * 1024
+# Claude Code's built-in tools: the planner gets none of them (``claude_planner_options``).
+BUILTIN_TOOLS = (
+    "Agent",
+    "Bash",
+    "BashOutput",
+    "Edit",
+    "ExitPlanMode",
+    "Glob",
+    "Grep",
+    "KillShell",
+    "LS",
+    "MultiEdit",
+    "NotebookEdit",
+    "NotebookRead",
+    "Read",
+    "SlashCommand",
+    "Skill",
+    "Task",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch",
+    "Write",
+)
+PLANNER_MAX_TURNS = 4
 
 
 class PlannerError(RuntimeError):
@@ -168,6 +194,12 @@ def _text_of(msg: Any) -> str:
     return "".join(p.text for p in msg.parts if p.WhichOneof("content") == "text")
 
 
+def cap_reply(text: str) -> str:
+    """``text`` cut to ``REPLY_MAX_BYTES`` (UTF-8) before any parsing."""
+    data = text.encode()
+    return text if len(data) <= REPLY_MAX_BYTES else data[:REPLY_MAX_BYTES].decode(errors="ignore")
+
+
 class AgentPlanner:
     def __init__(
         self,
@@ -186,6 +218,11 @@ class AgentPlanner:
         self._http: httpx.AsyncClient | None = None
         self._client: Any = None
         self._usage: tuple[int, int, float] = (0, 0, 0.0)
+        self._turns: list[dict[str, Any]] = []
+
+    def turns(self) -> list[dict[str, Any]]:
+        """Every A2A turn so far: its task id and the usage its task record carries."""
+        return list(self._turns)
 
     def usage(self) -> tuple[int, int, float]:
         """Summed from each turn's task record (the ``a2agw.usage`` metadata the host's
@@ -194,13 +231,16 @@ class AgentPlanner:
 
     def _add_usage(self, task: Any) -> None:
         recorded = MessageToDict(task.metadata).get(USAGE_KEY)
+        turn = {"task_id": task.id, "tokens_in": 0, "tokens_out": 0, "cost": 0.0}
         if isinstance(recorded, dict):
-            i, o, c = self._usage
-            self._usage = (
-                i + int(recorded.get("tokens_in", 0)),
-                o + int(recorded.get("tokens_out", 0)),
-                c + float(recorded.get("cost", 0.0)),
+            turn.update(
+                tokens_in=int(recorded.get("tokens_in", 0)),
+                tokens_out=int(recorded.get("tokens_out", 0)),
+                cost=float(recorded.get("cost", 0.0)),
             )
+            i, o, c = self._usage
+            self._usage = (i + turn["tokens_in"], o + turn["tokens_out"], c + turn["cost"])
+        self._turns.append(turn)
 
     async def aclose(self) -> None:
         if self._http is not None:
@@ -239,7 +279,7 @@ class AgentPlanner:
                 chunks.extend(_text_of(a) for a in task.artifacts)
                 if task.status.HasField("message"):
                     chunks.append(_text_of(task.status.message))
-        return "\n".join(c for c in chunks if c)
+        return cap_reply("\n".join(c for c in chunks if c))
 
     async def _turn(self, prompt: str, parse: Callable[[str], Any]) -> Any:
         reply = await self._ask(prompt)
@@ -342,11 +382,33 @@ def planner_agent(
     )
 
 
-def claude_planner_adapter(cfg: VscConfig) -> InboundAdapter:
+def claude_planner_options(cwd: str) -> Any:
+    """The claude planner's ``ClaudeAgentOptions``: no tool at all (every built-in disabled,
+    no MCP server, no settings, skills or plugins loaded), a private empty working directory,
+    and at most ``PLANNER_MAX_TURNS`` turns. It only reads its prompt and answers."""
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    return ClaudeAgentOptions(
+        system_prompt=PLANNER_SYSTEM,
+        max_turns=PLANNER_MAX_TURNS,
+        tools=[],  # --tools "": no built-in tool is available
+        allowed_tools=[],
+        disallowed_tools=list(BUILTIN_TOOLS),
+        mcp_servers={},
+        strict_mcp_config=True,  # ignore any .mcp.json the CLI could find
+        setting_sources=[],  # no user, project or local settings
+        plugins=[],
+        cwd=cwd,
+    )
+
+
+def claude_planner_adapter(cfg: VscConfig, cwd: str) -> InboundAdapter:
+    """The ``vsc-planner`` adapter (``claude_planner_options``); ``cwd`` is a private empty
+    directory the caller owns."""
     try:
-        from claude_agent_sdk import ClaudeAgentOptions
+        import claude_agent_sdk  # noqa: F401
 
         from a2agw.adapters.claude_agent import ClaudeAgentAdapter
     except ImportError as e:
         raise ImportError(VSC_EXTRA_HINT) from e
-    return ClaudeAgentAdapter(ClaudeAgentOptions(system_prompt=PLANNER_SYSTEM, max_turns=8))
+    return ClaudeAgentAdapter(claude_planner_options(cwd))
