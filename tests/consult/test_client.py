@@ -1458,3 +1458,18 @@ async def test_partner_call_event_carries_the_trace(env, spans):
     ev = e.bus.recent()[-1]
     assert ev.kind == "partner.call"
     assert ev.data["trace_id"] == format(turn.get_span_context().trace_id, "032x")
+
+
+async def test_partner_call_event_names_the_calling_agent(env):
+    """A host's client is shared by its agents: the ``partner.call`` event names the agent
+    whose turn made the call (the control plane's topology edge), like the metrics and the
+    audit row do, not the client's default agent id."""
+    from a2agw.context.call_context import use_agent
+
+    e = await env(spec("alpha", Echo()))
+    with use_agent("planner"):
+        await e.client.consult("alpha", "hello", wait_seconds=5)
+    ev = e.bus.recent()[-1]
+    assert ev.kind == "partner.call" and ev.agent_id == "planner"
+    await e.client.consult("alpha", "hello", wait_seconds=5)  # outside a turn: the default
+    assert e.bus.recent()[-1].agent_id == "me"

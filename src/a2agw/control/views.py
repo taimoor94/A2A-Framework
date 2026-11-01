@@ -1394,7 +1394,7 @@ async def verify_audit(request: Request) -> dict[str, Any]:
 async def list_credentials(request: Request, page: PageQuery) -> dict[str, Any]:
     """The credential and TLS reference names catalogue partners use, with the partners
     and the gateways they are assigned to. Gateways report no reference names (their info
-    is version, agents and base URL), so the catalogue is the only source."""
+    is version, agents, base URL and limits), so the catalogue is the only source."""
     keyset = Keyset("credentials", {}, (str, str), page)
     store: ControlStore = request.app.state.store
     query = select(PARTNERS.c.id, PARTNERS.c.credential_ref, PARTNERS.c.tls_ref).where(

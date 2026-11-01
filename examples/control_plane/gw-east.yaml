@@ -1,0 +1,14 @@
+# gw-east: a gateway whose partners and policy come from the control plane.
+# Run: A2AGW_CP_TOKEN=<its token> a2agw serve -c examples/control_plane/gw-east.yaml --port 8001
+base_url: ${A2AGW_BASE_URL:-http://localhost:8001}
+db_url: ${A2AGW_DB_URL:-sqlite+aiosqlite:///gw-east.db}
+
+agents:                          # walkthrough_agents.py sits next to this file
+  - spec: "walkthrough_agents:planner"
+
+# No partners: and no policy_file: the control plane manages both (a managed section
+# cannot also be configured here).
+control_plane:
+  url: ${A2AGW_CONTROL_URL:-http://localhost:8100}   # https in production
+  token_env: A2AGW_CP_TOKEN      # the variable holding this gateway's token (never inline)
+  manage: [partners, policy]

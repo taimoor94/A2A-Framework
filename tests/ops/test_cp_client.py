@@ -122,6 +122,7 @@ class FakeCP:
         self.refused = 0
         self.report_hang: asyncio.Event | None = None
         self.break_streams = False
+        self.end_streams = asyncio.Event()  # set: open streams end (the server closes them)
         self.live: asyncio.Queue[bytes] = asyncio.Queue()
         self.acked = 0
         self.ack: Callable[[dict[str, Any]], int] = self._ack_all
@@ -160,7 +161,7 @@ class FakeCP:
                 raise ConnectionError("dropped")  # the connection breaks mid-stream
             if end:
                 return
-            while True:
+            while not self.end_streams.is_set():
                 try:
                     yield await asyncio.wait_for(self.live.get(), 0.01)
                 except TimeoutError:
@@ -344,8 +345,15 @@ async def test_applies_state_and_reports_applied(gateway, cp):
             }
         ],
         "base_url": "http://t",
+        # the effective limits, shown read-only by the control plane (defaults here)
+        "limits": {
+            "max_concurrent_tasks_per_caller": 32,
+            "max_consults_per_task": 16,
+            "max_open_sidecar_tasks_per_caller": 64,
+            "max_body_bytes": 10 * 1024 * 1024,
+            "max_parts": 64,
+        },
     }
-    assert set(info) == {"version", "agents", "base_url"}
 
 
 async def test_ignores_older_or_equal_version(gateway, cp):
@@ -521,6 +529,18 @@ async def test_401_stops_and_names_env_not_token(gateway, cp, sleeps, caplog):
     errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert len(errors) == 1 and TOKEN_ENV in errors[0].getMessage()
     assert all(TOKEN not in r.getMessage() for r in caplog.records)
+
+
+async def test_unauthorized_stays_the_last_error_once_stopped(gateway, cp):
+    """A 401 on a report stops the connector while its stream is still open; that stream
+    ending afterwards must not overwrite why it stopped (healthz keeps "unauthorized")."""
+    cp.report_status = 401
+    _host, conn = await gateway()
+    await until(lambda: conn.status()["last_error_kind"] == "unauthorized")
+    cp.end_streams.set()  # the open stream ends after the refusal
+    await until(lambda: conn.stopped)
+    assert conn.status()["last_error_kind"] == "unauthorized"
+    assert conn.status()["connected"] is False
 
 
 async def test_audit_resent_until_acked_no_duplicates(gateway, cp):

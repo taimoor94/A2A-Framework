@@ -1,0 +1,20 @@
+# The optional control plane of compose.yaml (profile `control-plane`):
+#   docker compose -f examples/docker/compose.yaml --profile control-plane up --build
+# Mounted at /config; its state lives in the control-data volume. Secrets never go here:
+# a *_env key names the environment variable holding one.
+base_url: ${A2AGW_CONTROL_BASE_URL:-http://localhost:8100}
+db_url: ${A2AGW_CONTROL_DB_URL:-sqlite+aiosqlite:////data/a2agw-control.db}
+
+# Sign-in for people (OIDC); without it, use API keys:
+#   docker compose -f examples/docker/compose.yaml --profile control-plane run --rm \
+#     control-plane control create-api-key --name bootstrap --role admin \
+#     -c /config/control.compose.yaml
+# oidc:
+#   issuer: https://idp.example.com
+#   client_id: a2agw-console
+#   client_secret_env: A2AGW_CONTROL_OIDC_SECRET   # pass it in the service's environment
+#   role_map: {platform-admins: admin, security-team: security, sre: operator}
+
+retention:
+  events_days: 7
+  commands_days: 7

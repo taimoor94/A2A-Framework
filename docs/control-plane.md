@@ -2,18 +2,150 @@
 
 The control plane (`a2agw.control`, the `control` extra) owns the partner catalogue, the
 policies, the users and roles of the Console, and the list of gateways. Gateways connect out
-to it; it never calls a gateway.
+to it; it never calls a gateway. Each gateway keeps enforcing everything locally (SSRF
+checks, card signatures, the policy, its own audit chain): the control plane decides what a
+gateway runs, never how safely it runs it.
 
-This document is filled in as Phase 4a lands. The sections on deployment and roles follow
-with the tasks that build them; the Console's read API is under [Console read API](#console-read-api).
+- [Deployment](#deployment): install, `control.yaml`, sign-in, API keys.
+- [Roles and permissions](#roles-and-permissions).
+- [API overview](#api-overview): every route and the permission it needs.
+- [Managed and local mode](#managed-and-local-mode).
+- [Gateways](#gateways): enrollment, the connection, desired state, fail static, commands,
+  reports.
+- [Partner catalogue](#partner-catalogue), [Policies](#policies),
+  [Operator actions](#operator-actions), [Console read API](#console-read-api).
+- [Retention](#retention), [Running several replicas](#running-several-replicas),
+  [Known limitations](#known-limitations).
+
+[`examples/control_plane`](../examples/control_plane/README.md) walks through one control
+plane and two gateways with `curl`; `tests/integration/test_phase4a_control_plane.py` runs
+the same story as a test.
+
+## Deployment
+
+```bash
+pip install 'a2a-gateway[control]'       # FastAPI; add [postgres] for PostgreSQL
+a2agw control init                       # writes a commented control.yaml
+a2agw control serve -c control.yaml --host 0.0.0.0 --port 8100
+```
+
+`serve` checks the database before the server starts. Put TLS in front of it (a reverse
+proxy or a load balancer) and set `base_url` to the https URL people and gateways use:
+gateways refuse a plain-http control plane unless `A2AGW_DEV=1`. The Docker example has an
+optional `control-plane` service behind a compose profile
+(`docker compose -f examples/docker/compose.yaml --profile control-plane up`).
+
+`control.yaml` is loaded with the gateway's config rules: `${VAR}` and `${VAR:-default}`
+read the environment, unknown keys are errors, errors name dotted field paths and never
+values, and an inline secret (`client_secret: ...`, a password in `db_url`) is refused with
+a hint to use `*_env`.
+
+| Key | Default | What |
+|---|---|---|
+| `base_url` | required | the public URL of the control plane (the OIDC redirect is built from it) |
+| `db_url` | `sqlite+aiosqlite:///a2agw-control.db` | SQLite for one replica, PostgreSQL for several |
+| `oidc` | none | `{issuer, client_id, client_secret_env, scopes, roles_claim, role_map}`: sign-in for people |
+| `session` | `{absolute_s: 28800, idle_s: 3600, cookie_secure: true}` | Console sessions |
+| `retention` | `{events_days: 7, commands_days: 7}` | see [Retention](#retention) |
+| `limits` | `{report_max_bytes: 1048576, report_max_items: 1000, stream_keepalive_s: 15}` | what gateways may send, and the stream keepalive |
+| `trust` | none | the gateway's `trust` shape: keys for partner card signatures (`require_signed` tiers) |
+
+**Sign-in.** People sign in through the OIDC provider (authorization code flow with PKCE,
+run by the control plane itself: the browser never holds a token). The ID token is checked
+(`iss`, `aud`, `exp`, `nonce`, signature from the provider's JWKS) and the user's roles are
+re-derived from `roles_claim` through `role_map` at every sign-in: a user with no mapped
+group has no permission. A session is the `a2agw_session` cookie (HttpOnly, Secure,
+SameSite=Lax); `GET /api/v1/me` answers `{id, name, email, roles, permissions,
+csrf_token}`, and every session request that is not GET/HEAD/OPTIONS must send that token
+in `X-A2AGW-CSRF` (403 `csrf` otherwise). `POST /auth/logout` ends the session. Every call
+to the provider goes through the SSRF guard at the `partner` tier.
+
+**API keys** are for automation: `Authorization: Bearer <key>`, with one role each, and not
+subject to CSRF. Bootstrap the first admin key with
+`a2agw control create-api-key --name bootstrap --role admin -c control.yaml` (printed once);
+later keys come from `POST /api/v1/api-keys`, whose role must not carry a permission the
+caller lacks. `a2agw control create-gateway --name N` registers a gateway from the command
+line the same way. Keys, gateway tokens, session ids and CSRF tokens are stored only as
+SHA-256 digests; the one response that creates a key or a token is the only place it is
+ever shown.
+
+## Roles and permissions
+
+A user or key with several roles gets the union of their permissions.
+
+| Permission | What it allows | viewer | operator | security | admin |
+|---|---|:-:|:-:|:-:|:-:|
+| `read` | every read view, the catalogue, the policies, command status, the OpenAPI document | yes | yes | yes | yes |
+| `tasks.operate` | cancel, answer, reap, refresh a partner on one gateway |  | yes |  | yes |
+| `partners.trust` | approve, reject, quarantine partners; change their tier, refs and tags |  |  | yes | yes |
+| `policy.edit` | save policy versions, dry-run |  |  | yes | yes |
+| `audit.read` | the audit views, export and chain check |  |  | yes | yes |
+| `partners.register` | register a partner, refresh its card |  |  |  | yes |
+| `assign` | assign partners and policies to gateways |  |  |  | yes |
+| `gateways.manage` | register, list, rotate and revoke gateways |  |  |  | yes |
+| `users.manage` | list users, disable them |  |  |  | yes |
+| `apikeys.manage` | create, list and revoke API keys |  |  |  | yes |
+| `settings.manage` | read the effective settings |  |  |  | yes |
+
+No credentials is a 401; a missing permission is a 403 `forbidden`, audited as `cp.denied`
+(coalesced per actor and permission). The `/cp/v1` routes take gateway tokens only: a
+session or an API key never passes there, and a gateway token never passes on `/api/v1`.
+
+## API overview
+
+The OpenAPI document is `GET /api/openapi.json` (permission `read`); the interactive docs
+are off. Errors have one shape, `{"error": "<code>", "detail": "<message>"}`; a validation
+error is a 422 whose `fields` are dotted paths of the offending inputs, never their values,
+and an unexpected failure is a bare 500 `internal` (the log has its class and the
+`X-Request-ID`, never its message). Lists answer `{items, next_cursor}` (see
+[Console read API](#console-read-api)).
+
+| Area | Routes | Permission |
+|---|---|---|
+| Health | `GET /healthz` | public |
+| Sign-in | `GET /auth/login`, `GET /auth/callback`, `POST /auth/logout`, `GET /api/v1/me` | public (the last two need a session) |
+| Gateways | `GET`/`POST /api/v1/gateways`, `POST /api/v1/gateways/{id}/tokens`, `POST /api/v1/gateways/{id}/revoke` | `gateways.manage` |
+| Assignment | `PUT /api/v1/gateways/{id}/partners`, `PUT /api/v1/gateways/{id}/policy` | `assign` |
+| Catalogue | `GET /api/v1/partners`, `GET /api/v1/partners/{id}` | `read` |
+| | `POST /api/v1/partners`, `POST /api/v1/partners/{id}/refresh` | `partners.register` |
+| | `POST /api/v1/partners/{id}/approve`, `.../reject`, `.../quarantine`, `PUT .../settings` | `partners.trust` |
+| Policies | `GET /api/v1/policies`, `GET /api/v1/policies/{id}` | `read` |
+| | `POST /api/v1/policies`, `POST /api/v1/policies/{id}/versions`, `POST /api/v1/policies/dry-run` | `policy.edit` |
+| Operator actions | `POST /api/v1/tasks/{gw}/{agent}/{task}/cancel`, `.../answer`, `POST /api/v1/gateways/{id}/reap`, `POST /api/v1/partners/{id}/gateways/{gw}/refresh` | `tasks.operate` |
+| | `GET /api/v1/commands/{id}` | `read` |
+| Read views | `GET /api/v1/overview`, `/agents`, `/tasks`, `/tasks/{gw}/{agent}/{task}`, `/topology`, `/credentials` | `read` |
+| Audit | `GET /api/v1/audit`, `/audit/export`, `/audit/verify` | `audit.read` |
+| Users and keys | `GET /api/v1/users`, `PATCH /api/v1/users/{id}` | `users.manage` |
+| | `GET`/`POST /api/v1/api-keys`, `POST /api/v1/api-keys/{id}/revoke` | `apikeys.manage` |
+| Settings | `GET /api/v1/settings` (read-only) | `settings.manage` |
+| Gateway channel | `GET /cp/v1/stream`, `POST /cp/v1/report` | gateway token |
+
+## Managed and local mode
+
+Without a `control_plane` section a gateway is in local mode and behaves exactly as before:
+its partners come from `partners:` and the partners file, its policy from `policy_file`
+(or the admin API), and nothing connects out. With a `control_plane` section it is managed
+for the sections listed in `manage` (both by default):
+
+- `manage: [partners, policy]`: the control plane owns both. The gateway has no partners
+  file, `partners:` and `policy_file` are configuration errors, the `a2agw partners`
+  commands do not apply, and `PUT /a2agw/admin/policy` answers 409.
+- `manage: [partners]`: the catalogue owns the partners; the policy stays local
+  (`policy_file` or the admin API).
+- `manage: [policy]`: the control plane owns the policy; partners stay local.
+
+Either way a managed gateway connects, reports events, audit rows, health and metrics, and
+runs operator commands. Everything not managed (agents, auth, limits, TLS, credentials,
+telemetry) stays in the gateway's own config file.
 
 ## Gateways
 
 ### Enrolling a gateway
 
 1. Register the gateway on the control plane: `POST /api/v1/gateways {"name": "eu-1"}`
-   (permission `gateways.manage`) answers `{id, name, token}`. The token is shown only in
-   that response; the control plane keeps its SHA-256 digest.
+   (permission `gateways.manage`) answers `{id, name, token}` (or, on the control plane's
+   host, `a2agw control create-gateway --name eu-1 -c control.yaml`). The token is shown
+   only there; the control plane keeps its SHA-256 digest.
 2. Give the token to the gateway in an environment variable (never in the config file), and
    add a `control_plane` section to its `a2agw.yaml`:
 
@@ -39,8 +171,10 @@ Without a `control_plane` section the gateway behaves exactly as before.
 Rotating the token (`POST /api/v1/gateways/{id}/tokens`) or revoking the gateway
 (`POST /api/v1/gateways/{id}/revoke`) closes its open stream at the next poll. A gateway
 whose token is refused (401) stops its connector: it logs one error naming `token_env`
-(never the token) and `/a2agw/admin/healthz` shows `last_error_kind: "unauthorized"`.
-Restart it with the new token.
+(never the token) and `/a2agw/admin/healthz` shows `last_error_kind: "unauthorized"` from
+then on (a stream that ends afterwards does not replace it). It keeps serving its last
+applied state. Restart it with the new token; a revoked gateway is gone for good (register
+it again).
 
 ### The connection
 
@@ -118,7 +252,8 @@ connection changes nothing in force.
 ### Commands
 
 The stream also carries commands queued by operators (`command` frames with `id`, `kind`,
-`args`, `expires_at` and `actor`). Each runs the gateway's shared write operation
+`args`, `expires_at` and `actor`; see [Operator actions](#operator-actions) for the routes
+that queue them). Each runs the gateway's shared write operation
 (`a2agw.ops.actions`), audited on the gateway as actor `cp:<actor>`, and its result is
 reported: `done` with the operation's result, or `failed` with `{"error": ...}` (`not_found`,
 `conflict`, `refused`, `invalid_args`, `unknown_command`, `card`, `internal`; refusals add
@@ -161,10 +296,17 @@ Every `report_interval_s` the gateway posts what it has to say, in one report:
 - command results (at most 8 `task.get` results per report, the rest in the next ones), and
   the outcome of each state applied or rejected;
 - every `health_interval_s`: health, the metrics snapshot (`/a2agw/admin/metrics`) and the
-  gateway info `{version, agents, base_url}`. Each agent is `{id, name, version, skills,
-  card_url}` from the hosted agent's spec (the source of its card): at most 200 agents and
-  64 skill ids each, strings cut to 256 characters. The control plane also accepts the
-  older form, a list of agent ids, and stores it with the other fields null.
+  gateway info `{version, agents, base_url, limits}`. `limits` are the gateway's effective
+  limits (`max_concurrent_tasks_per_caller`, `max_consults_per_task`,
+  `max_open_sidecar_tasks_per_caller`, `max_body_bytes`, `max_parts`), shown read-only in
+  the gateway list (`info.limits`); the control plane keeps those names with numbers only.
+  Each agent is `{id, name, version, skills, card_url}` from the hosted agent's spec (the
+  source of its card): at most 200 agents and 64 skill ids each, strings cut to 256
+  characters. The control plane also accepts the older form, a list of agent ids, and
+  stores it with the other fields null.
+
+`partner.call` events name the agent whose turn made the call (`agent_id`), so a topology
+edge is (gateway, calling agent, partner).
 
 `partner.call` events carry the `trace_id` of the turn that made the call (null outside a
 span), as `task.state` events do.
@@ -312,6 +454,33 @@ and hashes only, never a document.
     hold. A row's `classification` is the level the gateway computed at the time, so a
     candidate that lowers an agent's default cannot lower the level replayed.
 
+## Operator actions
+
+Each action is queued as a command for one gateway (see [Commands](#commands)), audited as
+`cp.command` (the operator, the gateway and the kind; never an answer's text), and
+expires 60 s after it is queued.
+
+| Route | Command |
+|---|---|
+| `POST /api/v1/tasks/{gateway}/{agent}/{task}/cancel` | `task.cancel`: the task and the partner tasks it started |
+| `POST /api/v1/tasks/{gateway}/{agent}/{task}/answer` `{text}` | `task.answer`: only an `input-required` task (`auth-required` is refused); `text` at most 32 KiB |
+| `POST /api/v1/gateways/{gateway}/reap` `{agent_id, confirm?, force?}` | `tasks.reap` |
+| `POST /api/v1/partners/{id}/gateways/{gateway}/refresh` | `partner.refresh` on that gateway (a change quarantines there) |
+
+The request waits up to 10 s for the gateway (no database connection is held meanwhile):
+
+- 200 `{command_id, status: "done", result}`;
+- 409 `{command_id, status: "failed" | "expired", result}` when the gateway reports a
+  failure (`not_found`, `conflict`, ...) or the command expired before delivery;
+- 202 `{command_id, status: "pending" | "delivered"}` otherwise. Follow it with
+  `GET /api/v1/commands/{id}` (`read`), which shows who queued it as a kind only (`console`
+  or `key`).
+
+At most 16 requests wait at once per process; the others answer 202 at once. A command is
+delivered at most once and never after it expired. A delivered command stays `delivered`
+until the gateway reports it, or until the maintenance pass marks it `expired` after its
+TTL; a result that arrives after that is ignored.
+
 ## Console read API
 
 Read views are computed on query from what gateways report (events, audit rows, health,
@@ -372,7 +541,63 @@ filters, or on another list, is a `400 bad_request`, so it never widens what a c
   maintenance purge removes finished commands (`retention.commands_days`, 7 by default);
   a command never answered expires after its TTL (60 s) and is purged the same way.
 
-### Known gaps
+## Retention
+
+The maintenance pass (every 60 s, in every replica) expires commands past their TTL, then
+deletes in batches:
+
+- gateway events (`cp_events`) older than `retention.events_days` (7). Every read view
+  (tasks, overview, topology, timelines) is computed from these events, so it covers at
+  most that window;
+- finished commands, results included, `retention.commands_days` (7) after they finished.
+  `task.get` results hold clipped message text;
+- expired sessions and sign-in states.
+
+Audit rows are never deleted by the control plane: its own chain (`cp_audit`) and the
+gateway rows it copied (`cp_gateway_audit`) stay until you archive them
+(`GET /api/v1/audit/export`) and prune the database yourself. A gateway's own audit log
+lives in the gateway's database.
+
+## Running several replicas
+
+Several control-plane replicas can serve one PostgreSQL database (SQLite is for one
+replica). There is no messaging between replicas: everything goes through the database.
+
+- **Streams poll the store.** Each gateway stream polls the database every 0.5 s for its
+  desired state and its commands, so a change made on any replica reaches the gateway at
+  its stream's next poll, whichever replica holds the stream. Reports can land on any
+  replica.
+- **Shared state is in the database**: sessions, sign-in states (so a sign-in may start on
+  one replica and finish on another), API keys, gateway tokens, the commands queue, the
+  desired state and its versions. Version bumps are compare-and-set, so concurrent
+  recomputes bump once.
+- **Per process**: the task-detail sharing and its waiter cap (two replicas asked for the
+  same task's detail at once may each queue a `task.get`), the operator-action waiter cap,
+  the OIDC discovery and JWKS caches, and the `last_seen_at` write throttle.
+- **Consult tokens stay per gateway process.** They are the gateway's, not the control
+  plane's: a sidecar agent's call to `consult_url` must still reach the gateway process
+  that issued its token (see the README's known limitations).
+
+## Known limitations
+
+Accepted for Phase 4a:
+
+- **Single tenant.** One control plane serves one organization. The spec's tenants
+  (Settings screen) are deferred, and the tables have no tenant column yet.
+- **Limits and budgets aren't policy yet.** The spec's Policies screen covers "limits,
+  budgets", but the gateway keeps limits in its config file (`limits:`), not in the policy
+  document, and token or cost budgets aren't enforced yet (§11a.3). The control plane shows
+  each gateway's effective limits read-only (from `info`); distributing them is deferred.
+- **Settings are file-managed.** `GET /api/v1/settings` is read-only.
+- **Traces are only as good as the events.** The timeline comes from forwarded events, not
+  OTel spans; a full span view needs an OTLP backend. Trace ids exist only where the
+  gateway runs with an OpenTelemetry tracer provider (`telemetry:`); without one, a
+  timeline joins gateways only through the partner tasks in a task's detail.
+- **Egress content checks can't be replayed** in the dry-run: the message text is never
+  stored.
+- **Answering `auth-required` prompts from the Console is refused** by design.
+
+Also:
 
 - **Audit chain breaks**: no gateway reports a chain check yet, so there is no alert for a
   broken gateway chain. Verify a gateway's chain on the gateway (`a2agw audit verify`).
@@ -380,3 +605,5 @@ filters, or on another list, is a `400 bad_request`, so it never widens what a c
   credential or TLS reference names they hold.
 - Partner calls reported by gateways older than the `trace_id` field join a task's timeline
   only through the partner tasks in its detail.
+- **Registering is an admin permission.** `partners.register` belongs to admin only;
+  security reviews and trusts (approve, reject, quarantine) what an admin registered.

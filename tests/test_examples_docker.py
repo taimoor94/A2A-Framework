@@ -11,9 +11,11 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 from google.protobuf.json_format import MessageToDict
 
 from a2agw.config import build_host, load_config, register_partners
+from a2agw.control.settings import load_control_settings
 from a2agw.serve.agent import build_card
 
 DOCKER = Path(__file__).resolve().parents[1] / "examples" / "docker"
@@ -72,12 +74,14 @@ def test_echo_card_file_is_the_echo_agents_card(monkeypatch):
     assert json.loads((DOCKER / "cards" / "echo.json").read_text()) == served
 
 
-def test_compose_file_is_valid():
+def _compose_config(*profile: str) -> dict:
     if shutil.which("docker") is None:
         pytest.skip("docker is not on PATH")
     env = {**os.environ, "POSTGRES_PASSWORD": "pw", **ENV}
+    args = ["docker", "compose", "-f", str(DOCKER / "compose.yaml")]
+    args += [x for p in profile for x in ("--profile", p)]
     out = subprocess.run(
-        ["docker", "compose", "-f", str(DOCKER / "compose.yaml"), "config", "--format", "json"],
+        [*args, "config", "--format", "json"],
         env=env,
         check=False,
         capture_output=True,
@@ -87,10 +91,58 @@ def test_compose_file_is_valid():
     if out.returncode != 0 and "Cannot connect" in out.stderr:
         pytest.skip("docker compose unavailable")
     assert out.returncode == 0, out.stderr
-    services = json.loads(out.stdout)["services"]
+    return json.loads(out.stdout)["services"]
+
+
+def test_compose_file_is_valid():
+    services = _compose_config()
     assert services["coder"]["environment"]["CONSULT_PARTNER"] == "echo"
     assert services["coder"]["environment"]["CODER_SECRET"] == ENV["CODER_SECRET"]
     assert services["gateway"]["environment"]["GATEWAY_SELF_KEY"] == ENV["GATEWAY_SELF_KEY"]
+    assert "control-plane" not in services  # only with its profile
+
+
+def test_compose_control_plane_profile_is_valid():
+    services = _compose_config("control-plane")
+    cp = services["control-plane"]
+    assert cp["command"][:2] == ["control", "serve"]
+    assert {"gateway", "postgres", "coder"} <= services.keys()
+
+
+# -- the optional control plane (profile control-plane) ------------------------------------
+
+
+def _compose() -> dict:
+    return yaml.safe_load((DOCKER / "compose.yaml").read_text())
+
+
+def test_control_plane_service_is_behind_its_profile():
+    services = _compose()["services"]
+    cp = services["control-plane"]
+    assert cp["profiles"] == ["control-plane"]
+    # the default `up` is unchanged: no other service needs a profile or the control plane
+    for name, svc in services.items():
+        if name != "control-plane":
+            assert "profiles" not in svc and "control-plane" not in svc.get("depends_on", {})
+    assert "control" in cp["build"]["args"]["EXTRAS"].split(",")
+    assert cp["ports"] == ["127.0.0.1:8100:8100"]  # loopback only, like the gateway
+    assert cp["read_only"] is True and "control-data:/data" in cp["volumes"]
+    assert "control-data" in _compose()["volumes"]
+    assert "8100/healthz" in " ".join(cp["healthcheck"]["test"])
+
+
+def test_control_plane_service_config_loads_without_secrets():
+    cp = _compose()["services"]["control-plane"]
+    i = cp["command"].index("-c")
+    config = cp["command"][i + 1]
+    assert config.startswith("/config/")
+    path = DOCKER / config.removeprefix("/config/")
+    settings = load_control_settings(path, env={})  # inline secrets would be refused here
+    assert settings.db_url == "sqlite+aiosqlite:////data/a2agw-control.db"  # in the volume
+    assert settings.base_url == "http://localhost:8100"
+    # the service's environment names no secret: a secret comes in through a *_env variable
+    for name in cp.get("environment", {}):
+        assert not any(w in name.lower() for w in ("secret", "password", "token", "key"))
 
 
 def test_compose_explains_the_internal_tier():

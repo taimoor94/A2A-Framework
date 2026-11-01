@@ -2,7 +2,8 @@
 
 - SSRF: one list of URL payloads run against every outbound surface that takes a URL from
   configuration or from a caller: partner card fetch, ``a2agw partners add``, push webhook
-  configs, the inbound JWT JWKS and the card-signature JWKS.
+  configs, the inbound JWT JWKS, the card-signature JWKS and the control plane's partner
+  catalogue (``POST /api/v1/partners``).
 - Oversized and malformed inbound requests (body, parts, unknown parts, NUL, nesting).
 - Call-context forgery: hop, cycle, deadline and budget claims an attacker controls.
 - Forged call-context JWS.
@@ -435,6 +436,35 @@ async def jwks_card(tmp_path, url: str) -> bool:
     return True
 
 
+async def cp_card_fetch(tmp_path, url: str, tier: str) -> bool:
+    """The control plane's catalogue: ``POST /api/v1/partners`` with ``card_url``, on an app
+    that owns its outbound clients (each card fetched through a guarded client for the
+    partner's tier). Accepted means the partner was registered; a refusal must be the
+    catalogue's 422 ``card`` (never a 500)."""
+    pytest.importorskip("fastapi")
+    from a2agw.control.app import create_app
+    from a2agw.control.settings import ControlSettings
+
+    db = tmp_path / f"cp-{uuid.uuid4().hex[:8]}.db"
+    app = create_app(
+        ControlSettings(base_url="https://cp.example", db_url=f"sqlite+aiosqlite:///{db}"),
+        maintenance_interval_s=3600,
+    )
+    async with app.router.lifespan_context(app):
+        _kid, key = await app.state.store.create_api_key("ssrf", "admin", actor="test")
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="https://cp.example") as c:
+            r = await c.post(
+                "/api/v1/partners",
+                json={"id": "p", "tier": tier, "card_url": url},
+                headers={"authorization": f"Bearer {key}"},
+            )
+    if r.status_code == 201:
+        return True
+    assert r.status_code == 422 and r.json()["error"] == "card", (r.status_code, r.text)
+    return False
+
+
 # -- SSRF ---------------------------------------------------------------------------------
 
 
@@ -524,6 +554,24 @@ async def test_ssrf_inbound_jwks_internal_tier(net, hosts, url):
 async def test_ssrf_card_signature_jwks(net, tmp_path, url):
     assert not await jwks_card(tmp_path, url)
     assert net.forbidden("public") == []
+
+
+async def test_ssrf_harness_sees_allowed_connects_cp(net, tmp_path):
+    """Control for the control plane's surface: a public host is tried."""
+    assert not await cp_card_fetch(tmp_path, "https://example.com/", "public")
+    assert net.connects == [PUBLIC_IP]
+
+
+@pytest.mark.parametrize("url", ALL)
+async def test_cp_card_fetch_ssrf_matrix(net, tmp_path, url):
+    assert not await cp_card_fetch(tmp_path, url, "public")
+    assert net.forbidden("public") == []
+
+
+@pytest.mark.parametrize("url", EVERY_TIER)
+async def test_cp_card_fetch_ssrf_matrix_internal_tier(net, tmp_path, url):
+    assert not await cp_card_fetch(tmp_path, url, "internal")
+    assert net.forbidden("internal") == []
 
 
 # -- oversized and malformed inbound requests ---------------------------------------------

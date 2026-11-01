@@ -8,6 +8,10 @@
 #                       a2agw.compose.yaml
 # Run from the repository root:
 #   docker compose -f examples/docker/compose.yaml up --build
+# With the optional control plane (http://localhost:8100, docs/control-plane.md):
+#   docker compose -f examples/docker/compose.yaml --profile control-plane up --build
+# The gateway here keeps its own partners and policy; a gateway the control plane manages
+# has a control_plane: section instead (examples/control_plane).
 services:
   gateway:
     build:
@@ -68,6 +72,30 @@ services:
       timeout: 3s
       retries: 10
 
+  control-plane:
+    profiles: [control-plane]          # only with --profile control-plane
+    build:
+      context: ../..
+      args:
+        EXTRAS: postgres,control
+    ports:
+      - "127.0.0.1:8100:8100"
+    environment:
+      A2AGW_CONTROL_BASE_URL: ${A2AGW_CONTROL_BASE_URL:-http://localhost:8100}
+    command: ["control", "serve", "-c", "/config/control.compose.yaml", "--host", "0.0.0.0", "--port", "8100"]
+    volumes:
+      - ./:/config:ro
+      - control-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8100/healthz', timeout=3).status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
 volumes:
   gateway-data:
   pgdata:
+  control-data:

@@ -448,6 +448,73 @@ async def test_token_cannot_read_other_gateway(db_url, make_cp):
         assert {e.gateway_id for e in await rows(app, HEALTH)} == {gw_a}
 
 
+async def test_gateway_cannot_post_events_as_other_gateway(db_url, make_cp):
+    """Whatever a report names (a gateway id at the top, in events, in audit rows, an
+    applied state, the other gateway's command), it lands under the token's gateway only:
+    the other gateway's events, audit copies, health, partner states, applied version and
+    commands are untouched."""
+    from a2agw.control.store import PARTNER_STATES
+
+    app = make_cp(settings_for(db_url))
+    async with started(app) as c:
+        store = app.state.store
+        gw_a, token_a = await store.create_gateway("gw-a", actor="t")
+        gw_b, token_b = await store.create_gateway("gw-b", actor="t")
+        cmd_b = await channel.enqueue_command(store, gw_b, "task.cancel", {}, "oidc:op")
+        async with stream(c, token_b) as frames:  # delivered to gw-b
+            await frames.until(lambda f: f.get("event") == "command")
+        desired_b = await channel.compute_desired(store, gw_b)
+        [b_before] = await rows(app, GATEWAYS, GATEWAYS.c.id == gw_b)
+        r = await report(
+            c,
+            token_a,
+            gateway_id=gw_b,
+            events=[
+                {
+                    "kind": "task.state",
+                    "agent_id": "x",
+                    "ts": 1.0,
+                    "gateway_id": gw_b,
+                    "data": {"task_id": "t1", "state": "TASK_STATE_WORKING", "gateway_id": gw_b},
+                },
+                {
+                    "kind": "partner.state",
+                    "agent_id": "x",
+                    "ts": 1.0,
+                    "data": {
+                        "partner_id": "p",
+                        "status": "quarantined",
+                        "event": "quarantined",
+                        "pending_hash": "h",
+                        "gateway_id": gw_b,
+                    },
+                },
+            ],
+            audit=[{"seq": 1, "action": "inbound.admit", "gateway_id": gw_b}],
+            health={"status": "ok", "gateway_id": gw_b},
+            applied={
+                "epoch": store.epoch,
+                "version": desired_b.version,
+                "hash": desired_b.hash,
+                "status": "applied",
+            },
+            results=[{"id": cmd_b, "status": "done", "result": {"forged": True}}],
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["dropped"] == 1  # the other gateway's command result
+        assert {e.gateway_id for e in await rows(app, EVENTS)} == {gw_a}
+        assert {e.gateway_id for e in await rows(app, GATEWAY_AUDIT)} == {gw_a}
+        assert {e.gateway_id for e in await rows(app, HEALTH)} == {gw_a}
+        assert {s.gateway_id for s in await rows(app, PARTNER_STATES)} == {gw_a}
+        [b_after] = await rows(app, GATEWAYS, GATEWAYS.c.id == gw_b)
+        assert b_after == b_before  # applied version, epoch, info, last seen
+        [cmd] = await rows(app, COMMANDS, COMMANDS.c.id == cmd_b)
+        assert cmd.status == "delivered" and cmd.result_json is None
+        # gw-b's own token still finishes its command
+        r = await report(c, token_b, results=[{"id": cmd_b, "status": "done", "result": {}}])
+        assert r.json()["dropped"] == 0
+
+
 # -- reports -------------------------------------------------------------------------------
 
 
@@ -663,6 +730,39 @@ async def test_report_health_metrics_and_info(sqlite_settings, make_cp, run_app,
             "base_url": "https://g",
         }
         assert g.last_seen_at == clock.t
+
+
+async def test_report_info_keeps_the_known_numeric_limits(sqlite_settings, make_cp, run_app):
+    """A gateway's effective limits (``info.limits``) are kept for the gateway list: known
+    names with finite numbers only; anything else is dropped."""
+    app = make_cp(settings_for(sqlite_settings.db_url))
+    async with run_app(app) as c:
+        gw, token = await app.state.store.create_gateway("gw-a", actor="t")
+        limits = {
+            "max_concurrent_tasks_per_caller": 32,
+            "max_consults_per_task": 16,
+            "max_open_sidecar_tasks_per_caller": 64,
+            "max_body_bytes": 10485760,
+            "max_parts": True,  # not a number
+            "surprise": 1,  # not a known limit
+        }
+        info = {"version": "1", "agents": [], "base_url": "https://g", "limits": limits}
+        assert (await report(c, token, info=info)).status_code == 200
+        [g] = await rows(app, GATEWAYS, GATEWAYS.c.id == gw)
+        assert json.loads(g.info_json)["limits"] == {
+            "max_concurrent_tasks_per_caller": 32,
+            "max_consults_per_task": 16,
+            "max_open_sidecar_tasks_per_caller": 64,
+            "max_body_bytes": 10485760,
+        }
+        r = await c.get("/api/v1/gateways", headers=await _admin(app))
+        [shown] = r.json()["gateways"]
+        assert shown["info"]["limits"]["max_consults_per_task"] == 16
+
+
+async def _admin(app: Any) -> dict[str, str]:
+    _kid, key = await app.state.store.create_api_key("t", "admin", actor="t")
+    return bearer(key)
 
 
 async def test_result_for_foreign_command_ignored(db_url, make_cp, clock):

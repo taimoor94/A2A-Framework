@@ -17,6 +17,7 @@ A framework-agnostic gateway for the [A2A (Agent2Agent) protocol](https://a2a-pr
 - Security hardening (all configurable in `a2agw.yaml`): signed Agent Cards (ours signed, partners' verified and quarantined on a key change), OAuth2 client credentials and token exchange, mTLS both ways, a policy engine (authz, egress classification ceilings, routing), a hash-chained audit log, signed call contexts between gateways, and guarded push notifications. See [Security hardening](#security-hardening).
 - A CLI: `init [--secure]`, `serve`, `mcp`, `partners`, `card validate`, `call`, `audit export|verify`, `tasks reap`.
 - A Docker image and a compose example (gateway, PostgreSQL, a Node webhook agent). See [Docker](#docker).
+- A control plane for many gateways (`pip install a2a-gateway[control]`): a central partner catalogue with hash-pinned approval, versioned policies with a dry-run, OIDC sign-in and API keys with four roles, operator actions (cancel, answer), cross-gateway task timelines and topology, and the audit log of every gateway in one place. Gateways connect out to it and keep serving when it is down. See [Control plane](#control-plane).
 - **Conformance:** the inbound side passes the A2A TCK at MUST level. See [docs/conformance.md](docs/conformance.md).
 
 ## Install
@@ -34,6 +35,7 @@ uv add "a2a-gateway[ag2]"          # adds the AG2 (1.x) adapter
 uv add "a2a-gateway[llamaindex]"   # adds the LlamaIndex adapter
 uv add "a2a-gateway[crewai]"       # adds the CrewAI adapter (own environment, not part of [all])
 uv add "a2a-gateway[mcp]"          # adds the outbound MCP server (/a2agw/mcp, `a2agw mcp`)
+uv add "a2a-gateway[control]"      # adds the control plane (`a2agw control`, FastAPI)
 ```
 
 `[all]` installs every extra except `adk`. google-adk caps `opentelemetry-api`/`opentelemetry-sdk` at 1.44 and `websockets` below 16, so installing it can downgrade those packages; add `[adk]` explicitly when you want the ADK adapter.
@@ -647,6 +649,12 @@ secrets come from your environment, never from the file:
 POSTGRES_PASSWORD=... CODER_SECRET=... GATEWAY_SELF_KEY=... docker compose -f examples/docker/compose.yaml up --build
 ```
 
+Add `--profile control-plane` to also run the [control plane](#control-plane) on
+`127.0.0.1:8100` (built with `EXTRAS=postgres,control`, its config in
+`examples/docker/control.compose.yaml`, its state in the `control-data` volume). The compose
+gateway keeps its own partners and policy; a managed gateway has a `control_plane:` section
+instead (see `examples/control_plane`).
+
 The examples ship a placeholder admin key hash (all zeros), so the admin API stays disabled.
 Generate a key and its hash, then put the hash under `auth.api_keys` (or use `a2agw init --secure`):
 
@@ -671,6 +679,53 @@ as that agent), and send the key as `X-API-Key` (for example
 
 The image tests are opt-in: `A2AGW_DOCKER_TESTS=1 uv run pytest tests/docker -q` (they also check
 that the image's a2a-sdk, mcp, httpx and starlette match `uv.lock`).
+
+## Control plane
+
+The control plane (`a2agw control`, the `control` extra) is one service for many gateways.
+It owns the partner catalogue, the policies, the Console's users and roles, and the list
+of gateways. Each gateway connects out to it (the control plane never calls a gateway),
+receives the partners and the policy assigned to it, runs the commands operators queue,
+and reports its events, audit rows, health and metrics. Everything the Console needs is an
+authenticated, role-checked API under `/api/v1` (OpenAPI at `/api/openapi.json`).
+
+```bash
+pip install 'a2a-gateway[control]'
+a2agw control init                                   # a commented control.yaml
+a2agw control serve -c control.yaml --port 8100      # behind TLS in production
+a2agw control create-api-key --name bootstrap --role admin -c control.yaml   # shown once
+curl -X POST -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  https://cp.example.com/api/v1/gateways -d '{"name": "eu-1"}'           # its token, once
+```
+
+Then give the gateway its token in an environment variable and a `control_plane:` section
+(see [Configuration](#configuration)). What it does:
+
+- **Partner catalogue.** Register a partner once (the card is fetched and checked with the
+  gateway's own SSRF and signature code), approve the card version you reviewed by its
+  hash, assign it to gateways. A card change found by a refresh is a pending version with
+  a diff until it is approved; a gateway that quarantined the change itself gets the
+  approval as a command.
+- **Policies.** Versioned policy documents (the `policy_file` schema), assigned per
+  gateway (pinned or following the latest), with a dry-run that replays recent gateway
+  audit rows against a candidate and lists what it would newly block or allow.
+- **People and automation.** Sign-in through your OIDC provider (roles from an ID-token
+  claim) and API keys, with four roles: `viewer` (read), `operator` (cancel, answer, reap),
+  `security` (approve partners, edit policies, read the audit log), `admin` (everything,
+  including registering partners, assigning, gateways, users and keys).
+- **Operations.** Overview, tasks, a task's timeline across gateways (joined by trace),
+  the call topology with the policy's routing decision per edge, cancel and answer through
+  the gateway that owns the task, and the audit log of the control plane and every gateway
+  (export as JSONL or CSV, chain check).
+- **Fail static.** A gateway applies a desired state only when every local check passes,
+  serves its last applied state while the control plane is unreachable (also across its
+  own restart), and is locked down on a first start until a state arrives. Revoking a
+  gateway's token ends its stream within one keepalive interval.
+
+[docs/control-plane.md](docs/control-plane.md) is the operator reference (deployment, roles
+and permissions, every route, fail-static behaviour, command semantics, retention, several
+replicas). [`examples/control_plane`](examples/control_plane/README.md) walks through one
+control plane and two gateways.
 
 ## Observability
 
@@ -773,8 +828,13 @@ telemetry:
 #        max_concurrent_deliveries?, max_pending_tasks?}
 
 # Phase 4: a control plane that owns this gateway's partners and/or policy
-# control_plane: {url, token_env, tls_ref?, manage?: [partners, policy],
-#                 report_interval_s?: 1.0, health_interval_s?: 15}
+# control_plane:
+#   url: https://cp.example.com     # https (plain http only with A2AGW_DEV=1)
+#   token_env: A2AGW_CP_TOKEN       # the variable holding this gateway's token (never inline)
+#   tls_ref: cp                     # optional: a tls entry (mTLS to the control plane)
+#   manage: [partners, policy]      # default: both; a managed section is not set here
+#   report_interval_s: 1.0
+#   health_interval_s: 15
 ```
 
 **Managed gateways.** With a `control_plane` section the gateway connects out to the control plane, receives its partners and policy from it (each partner still SSRF-checked and signature-verified locally; a state that fails any check is rejected whole and the previous one stays), runs operator commands, and reports events, audit rows, health and metrics. It is fail static: the last applied state is cached in its database and served when the control plane is down, and a first start without one is locked down (`cp:unconfigured`) until a state arrives (a managed policy the control plane leaves unassigned is the same lockdown, never an open gateway). A managed section cannot also be configured locally (`policy_file` with `manage: [policy]`, `partners:` with `manage: [partners]`). `/a2agw/admin/healthz` shows the connection. See [docs/control-plane.md](docs/control-plane.md#gateways).
@@ -804,7 +864,7 @@ When auth is not configured, every caller is the same principal, `anonymous`: id
 
 CI (`.github/workflows/ci.yml`) runs three jobs: the main gate (`uv sync --locked`, `uv run ruff check`, `uv run pytest -q -W error`), the CrewAI tests (`scripts/test-crewai.sh`), and a fresh resolution of `.[all]` without the lock against the adapter and gateway tests (ADK and CrewAI excluded), so the combination users install is tested too.
 
-The core never imports a framework; adapters live in `a2agw.adapters.<name>` behind extras. See the [design spec](docs/superpowers/specs/2026-10-25-a2a-gateway-framework-design.md), the [Phase 1 plan](docs/superpowers/plans/2026-10-25-phase1-core.md), the [Phase 2 plan](docs/superpowers/plans/2026-10-26-phase2-hardening.md) and the [Phase 3 plan](docs/superpowers/plans/2026-10-26-phase3-gateway.md).
+The core never imports a framework; adapters live in `a2agw.adapters.<name>` behind extras. See the [design spec](docs/superpowers/specs/2026-10-25-a2a-gateway-framework-design.md), the [Phase 1 plan](docs/superpowers/plans/2026-10-25-phase1-core.md), the [Phase 2 plan](docs/superpowers/plans/2026-10-26-phase2-hardening.md), the [Phase 3 plan](docs/superpowers/plans/2026-10-26-phase3-gateway.md) and the [Phase 4a plan](docs/superpowers/plans/2026-10-30-phase4a-control-plane.md).
 
 ## Upgrading from Phase 1
 
@@ -837,11 +897,20 @@ The core never imports a framework; adapters live in `a2agw.adapters.<name>` beh
 - A `PartnerClient` used without a handle store (library use outside `AgentHost`) records no handles, so every embedded follow-up (check, cancel, wait, reply, `context_id`) answers `unknown task` or `unknown context`: fail closed. Give it an `OutboundHandleStore` to use follow-ups.
 - Consult tokens live in the memory of the gateway process that issued them (only their digests, never persisted): a webhook or stdio agent's call to `consult_url` must reach that same process. Behind a load balancer, route `consult_url` to the issuing replica (sticky routing, e.g. a per-replica `consult_url`) or run one replica; another replica answers `401`.
 
+**Control plane (Phase 4a).** See [docs/control-plane.md](docs/control-plane.md#known-limitations) for the full list.
+
+- **Single tenant.** One control plane serves one organization. The spec's tenants (Settings screen) are deferred, and the tables have no tenant column yet.
+- **Limits and budgets aren't policy yet.** The spec's Policies screen covers "limits, budgets", but the gateway keeps limits in its config file (`limits:`), not in the policy document, and token or cost budgets aren't enforced yet (§11a.3). The control plane shows each gateway's effective limits read-only (from `info`); distributing them is deferred.
+- **Settings are file-managed.** `GET /api/v1/settings` is read-only.
+- **Traces are only as good as the events.** The timeline comes from forwarded events, not OTel spans; a full span view needs an OTLP backend.
+- **Egress content checks can't be replayed** in the dry-run: the message text is never stored.
+- **Answering `auth-required` prompts from the Console is refused** by design.
+
 ## Roadmap
 
-Phase 1 (the core), Phase 2 (hardening: signed cards and quarantine, OAuth2 client credentials and token exchange, mTLS, the policy engine with classification, the audit log, push notifications, PostgreSQL, the SSRF guard with DNS-rebinding pinning, signed call contexts, and the boundary/attack test matrix in [docs/boundary-conditions.md](docs/boundary-conditions.md)) and Phase 3 (the gateway: the sidecar with webhook and stdio agents, the outbound REST API and MCP server, adapters for the OpenAI Agents SDK, the Claude Agent SDK, ADK, AG2, LlamaIndex and CrewAI, and the Docker image; done when a Node agent and an MCP-only agent joined the demo network) are implemented and described above. The optional partner-push receiver for sidecar agents (§11a.7) is deferred to Phase 4+ (see [Known limitations](#known-limitations)). Everything below is planned and not implemented yet.
+Phase 1 (the core), Phase 2 (hardening: signed cards and quarantine, OAuth2 client credentials and token exchange, mTLS, the policy engine with classification, the audit log, push notifications, PostgreSQL, the SSRF guard with DNS-rebinding pinning, signed call contexts, and the boundary/attack test matrix in [docs/boundary-conditions.md](docs/boundary-conditions.md)), Phase 3 (the gateway: the sidecar with webhook and stdio agents, the outbound REST API and MCP server, adapters for the OpenAI Agents SDK, the Claude Agent SDK, ADK, AG2, LlamaIndex and CrewAI, and the Docker image; done when a Node agent and an MCP-only agent joined the demo network) and Phase 4a (the [control plane](#control-plane): the partner catalogue, versioned policies with a dry-run, OIDC sign-in, API keys and roles, operator actions, the read views and the audit log across gateways, fail-static gateways; done when one test ran every Console operation through `/api/v1` against a control plane and two gateways) are implemented and described above. The optional partner-push receiver for sidecar agents (§11a.7) is deferred to Phase 4+ (see [Known limitations](#known-limitations)). Everything below is planned and not implemented yet.
 
-- **Phase 4, control plane:** a central registry, and the Console (a web UI to register and approve partners, edit policy, and inspect cross-agent traces), with SSO and RBAC.
+- **Phase 4, the Console:** the web UI on the control plane's API (register and approve partners, edit policy, inspect cross-agent traces), then tenants and policy-managed limits and budgets (see the control plane's known limitations).
 - **Phase 5, clusters and projects:** agent teams (Clusters) with an orchestrator, a project board, and human-in-the-loop in the Console.
 
 gRPC is not offered today.

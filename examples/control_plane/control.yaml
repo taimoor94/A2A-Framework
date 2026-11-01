@@ -1,0 +1,38 @@
+# The control plane of the walkthrough (README.md next to this file).
+# Run: a2agw control serve -c examples/control_plane/control.yaml
+# Secrets never go in this file: a *_env key names the environment variable holding one.
+
+# The URL browsers and gateways use to reach the control plane. Use https in production;
+# gateways refuse a plain-http control plane unless A2AGW_DEV=1.
+base_url: ${A2AGW_CONTROL_BASE_URL:-http://localhost:8100}
+
+# SQLite for one replica; PostgreSQL (a2a-gateway[postgres]) for several, e.g.
+#   db_url: postgresql+asyncpg://cp:${A2AGW_CONTROL_DB_PASSWORD}@db/cp
+db_url: ${A2AGW_CONTROL_DB_URL:-sqlite+aiosqlite:///a2agw-control.db}
+
+# People sign in through your OpenID Connect provider; automation uses API keys
+# (a2agw control create-api-key). Uncomment and point it at your provider:
+# oidc:
+#   issuer: https://idp.example.com
+#   client_id: a2agw-console
+#   client_secret_env: A2AGW_CONTROL_OIDC_SECRET   # the secret itself lives in this variable
+#   roles_claim: groups
+#   role_map:                    # IdP group -> viewer | operator | security | admin
+#     platform-admins: admin
+#     security-team: security
+#     sre: operator
+#     everyone: viewer
+
+session:
+  absolute_s: 28800
+  idle_s: 3600
+  cookie_secure: true            # false only for a plain-http trial in a browser
+
+retention:
+  events_days: 7                 # gateway events (tasks, partner calls) behind the views
+  commands_days: 7               # finished operator commands and task details
+
+limits:
+  report_max_bytes: 1048576
+  report_max_items: 1000
+  stream_keepalive_s: 15

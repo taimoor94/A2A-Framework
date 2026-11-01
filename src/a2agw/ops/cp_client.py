@@ -27,8 +27,9 @@ three things:
   full queue drops its oldest, counted in ``status()["dropped"]``), the audit rows after
   ``audit_acked_seq`` (ascending, up to ``REPORT_AUDIT_MAX``), command results, the last
   applied or rejected state, and every ``health_interval_s`` health, the metrics snapshot
-  and the gateway info (exactly ``{version, agents, base_url}``; each agent is ``{id, name,
-  version, skills, card_url}``, see ``agent_info``). A command result larger than
+  and the gateway info (exactly ``{version, agents, base_url, limits}``; each agent is
+  ``{id, name, version, skills, card_url}``, see ``agent_info``; ``limits`` are the
+  effective limits, see ``limits_info``). A command result larger than
   ``result_cap(kind)`` (8 KiB, 64 KiB for ``task.get``) is reported as ``{"truncated": true}``. ``audit_acked_seq`` moves
   only from the response's ``acked_audit_seq``: rows not acknowledged are sent again (the
   control plane stores them idempotently). A report that fails is sent again, whole.
@@ -278,6 +279,18 @@ def agent_info(host: AgentHost) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+def limits_info(host: AgentHost) -> dict[str, int]:
+    """The gateway's effective limits as the gateway info reports them (the control plane
+    shows them read-only; they stay in the gateway's config file)."""
+    return {
+        "max_concurrent_tasks_per_caller": host.caller_limiter.max_per_caller,
+        "max_consults_per_task": host.max_consults_per_task,
+        "max_open_sidecar_tasks_per_caller": host.max_open_sidecar_tasks_per_caller,
+        "max_body_bytes": host.max_body_bytes,
+        "max_parts": host.max_parts,
+    }
 
 
 def _arg_str(args: dict[str, Any], name: str) -> str:
@@ -601,6 +614,12 @@ class ControlPlaneConnector:
     def _headers(self, token: str) -> dict[str, str]:
         return {"Authorization": f"Bearer {token}"}
 
+    def _error(self, kind: str) -> None:
+        """Record why the connection or a report failed, unless the connector already
+        stopped: then the reason it stopped (``unauthorized``, ``no_token``) stays."""
+        if not self._halted:
+            self._last_error = kind
+
     def _halt(self, kind: str, message: str) -> None:
         """Stop for good (until a restart): one ERROR, ``last_error_kind`` = ``kind``."""
         if not self._halted:
@@ -639,7 +658,7 @@ class ControlPlaneConnector:
                 await self._set_connected(False)
                 return
             except Exception as e:  # noqa: BLE001 - any failure: reconnect after a back-off
-                self._last_error = type(e).__name__
+                self._error(type(e).__name__)
                 if not isinstance(e, httpx.HTTPError):
                     log.warning("control plane: stream failed: %s", self._last_error)
             if self._hello_seen:
@@ -664,7 +683,7 @@ class ControlPlaneConnector:
             if r.status_code == 401:
                 self._unauthorized()
             if r.status_code != 200:
-                self._last_error = f"http_{r.status_code}"
+                self._error(f"http_{r.status_code}")
                 return False
             async for event, raw in _frames(r):
                 try:
@@ -682,7 +701,7 @@ class ControlPlaneConnector:
                     await self._bg(self._apply_state(data))
                 elif event == "command":
                     self._start_command(data)
-        self._last_error = "stream_ended"
+        self._error("stream_ended")
         return hello
 
     def _on_hello(self, data: dict[str, Any]) -> None:
@@ -959,7 +978,7 @@ class ControlPlaneConnector:
                 if not isinstance(e, httpx.HTTPError):
                     log.warning("control plane: report failed: %s", type(e).__name__)
                 if not self._connected:
-                    self._last_error = type(e).__name__
+                    self._error(type(e).__name__)
                 ok = False
             failures = 0 if ok else failures + 1
             delay = interval if ok else min(BACKOFF_MAX_S, interval * 2 ** min(failures, 16))
@@ -975,6 +994,7 @@ class ControlPlaneConnector:
             "version": __version__,
             "agents": agent_info(self.host),
             "base_url": self.host.base_url,
+            "limits": limits_info(self.host),
         }
 
     async def _report_once(self) -> bool:
@@ -1030,10 +1050,10 @@ class ControlPlaneConnector:
             self._unauthorized()
         if r.status_code == 413:
             self._batch = max(1, self._batch // 2)  # smaller reports until one fits
-            self._last_error = "http_413"
+            self._error("http_413")
             return False
         if r.status_code != 200:
-            self._last_error = f"http_{r.status_code}"
+            self._error(f"http_{r.status_code}")
             return False
         del self._unsent[: len(events)]
         self._sent_results(results)

@@ -784,7 +784,7 @@ class PartnerClient:
         self.bus.publish(
             GatewayEvent(
                 kind="partner.call",
-                agent_id=self.agent_id,
+                agent_id=caller_agent or self.agent_id,  # the agent whose turn called
                 data={
                     "partner_id": result.partner,
                     "task_id": result.task_id,

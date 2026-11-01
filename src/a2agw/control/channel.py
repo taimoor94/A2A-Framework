@@ -925,11 +925,25 @@ class ReportedAgent(BaseModel):
     card_url: str | None = None
 
 
+# The gateway's effective limits kept from ``info.limits`` (shown read-only; anything else
+# a gateway sends there is dropped).
+LIMIT_KEYS = frozenset(
+    {
+        "max_concurrent_tasks_per_caller",
+        "max_consults_per_task",
+        "max_open_sidecar_tasks_per_caller",
+        "max_body_bytes",
+        "max_parts",
+    }
+)
+
+
 class GatewayInfo(BaseModel):
     model_config = _FORBID
     version: str
     agents: list[str | ReportedAgent]
     base_url: str
+    limits: dict[str, Any] | None = None  # gateways before it sent none
 
 
 class Report(BaseModel):
@@ -1259,11 +1273,15 @@ class _Ingest:
 
     async def info(self, info: GatewayInfo) -> None:
         agents = [_agent(a) for a in self.cap(info.agents)]
-        reported = {
+        reported: dict[str, Any] = {
             "version": _clean(info.version),
             "agents": agents,
             "base_url": _clean(info.base_url, URL_MAX),
         }
+        if info.limits is not None:
+            reported["limits"] = {
+                k: v for k, v in info.limits.items() if k in LIMIT_KEYS and _finite_number(v)
+            }
         await self._update_info(lambda stored: {**stored, **reported})
 
     async def _update_info(self, change: Callable[[dict[str, Any]], dict[str, Any]]) -> None:
