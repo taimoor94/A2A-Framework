@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 import pytest
-from oidc_fake import audit_rows
+from oidc_fake import audit_rows, signed_in
 from sqlalchemy import select
 from test_channel import data, started, stream
 
@@ -378,3 +378,68 @@ async def test_waiters_are_bounded(db_url, cp_http, run_app, clock, monkeypatch)
         assert all(r.status_code == 202 for r in responses)
         assert len({r.json()["command_id"] for r in responses}) == 5  # none shared
         assert app.state.operations.waiting == 0
+
+
+async def test_delivered_past_expiry_is_never_shown_expired_before_it_finishes(
+    db_url, cp_http, run_app, clock
+):
+    """A delivered command the gateway finishes after its expiry reads delivered, then
+    done: a final status never flips."""
+    app = make(db_url, clock, cp_http, silent)
+    async with run_app(app) as c:
+        _kid, op = await key(app, "operator")
+        gw, _tok = await gateway(app)
+        store = app.state.store
+        r = await c.post(CANCEL.format(gw=gw), headers=op)
+        cid = r.json()["command_id"]
+        clock.advance(59)
+        [cmd] = await channel.take_commands(store, gw, clock())
+        clock.advance(1.5)  # past expires_at, still delivered
+        shown = (await c.get(f"/api/v1/commands/{cid}", headers=op)).json()
+        assert shown["status"] == "delivered"
+        # an action waiting on it ends 202 delivered, not 409 expired
+        assert cmd.expires_at < clock()
+        await channel.finish_command(store, gw, cmd.id, "done", {"state": "X"}, now=clock())
+        shown = (await c.get(f"/api/v1/commands/{cid}", headers=op)).json()
+        assert shown["status"] == "done" and shown["result"] == {"state": "X"}
+
+
+async def test_action_wait_ending_on_delivered_answers_202_delivered(
+    db_url, cp_http, run_app, clock
+):
+    holder: dict[str, Any] = {}
+
+    async def sleep(_s: float) -> None:
+        if not holder.get("done"):
+            holder["done"] = True
+            app = holder["app"]
+            await channel.take_commands(app.state.store, holder["gw"], clock())
+            clock.advance(100)  # delivered, then past its expiry before the wait ends
+        await asyncio.sleep(0)
+
+    app = make(db_url, clock, cp_http, sleep)
+    async with run_app(app) as c:
+        _kid, op = await key(app, "operator")
+        gw, _tok = await gateway(app)
+        holder.update(app=app, gw=gw)
+        r = await c.post(CANCEL.format(gw=gw), headers=op)
+        assert r.status_code == 202 and r.json()["status"] == "delivered"
+
+
+async def test_session_post_needs_csrf(db_url, cp_http, run_app, clock):
+    app = make(db_url, clock, cp_http, silent)
+    async with run_app(app) as c:
+        session = await signed_in(app, ["operator"])
+        cookie = {"cookie": session["cookie"]}
+        gw, _tok = await gateway(app)
+        for path, body in (
+            (CANCEL.format(gw=gw), None),
+            (f"/api/v1/tasks/{gw}/billing/t1/answer", {"text": "x"}),
+            (f"/api/v1/gateways/{gw}/reap", {"agent_id": "billing"}),
+        ):
+            refused = await c.post(path, json=body, headers=cookie)
+            assert refused.status_code == 403 and refused.json()["error"] == "csrf", path
+        assert await command_rows(app) == []
+        ok = await c.post(CANCEL.format(gw=gw), headers=session)
+        assert ok.status_code == 202
+        assert len(await command_rows(app)) == 1

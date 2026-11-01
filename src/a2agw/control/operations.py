@@ -114,9 +114,11 @@ async def _operate(request: Request, actor: Actor, gateway_id: str, kind: str, a
 
 
 def _status(command: channel.CommandRow, now: float) -> str:
-    """The command's status; one still open past its expiry is ``expired`` already (the
-    maintenance pass only records it later, and the stream never delivers it)."""
-    if command.status in OPEN and command.expires_at <= now:
+    """The command's status; one still ``pending`` past its expiry is ``expired`` already
+    (final: the stream never delivers it, the maintenance pass only records it later). A
+    ``delivered`` one stays so until the gateway's result or the sweep: the gateway may
+    still report it done."""
+    if command.status == "pending" and command.expires_at <= now:
         return "expired"
     return command.status
 
