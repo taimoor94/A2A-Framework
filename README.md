@@ -15,8 +15,9 @@ A framework-agnostic gateway for the [A2A (Agent2Agent) protocol](https://a2a-pr
 - OpenTelemetry tracing, JSON logs, and a read-only admin API with an SSE event stream.
 - SQLite or PostgreSQL (`pip install a2a-gateway[postgres]`) task store, with recovery of in-flight tasks on restart. Several gateways can share one PostgreSQL database if each serves different agent ids (one gateway per agent id per database); the audit chain is serialized across them by an advisory lock. SQLite is for a single process.
 - Security hardening (all configurable in `a2agw.yaml`): signed Agent Cards (ours signed, partners' verified and quarantined on a key change), OAuth2 client credentials and token exchange, mTLS both ways, a policy engine (authz, egress classification ceilings, routing), a hash-chained audit log, signed call contexts between gateways, and guarded push notifications. See [Security hardening](#security-hardening).
-- A CLI: `init [--secure]`, `serve`, `mcp`, `partners`, `card validate`, `call`, `audit export|verify`, `tasks reap`.
+- A CLI: `init [--secure]`, `serve`, `mcp`, `partners`, `card validate`, `call`, `audit export|verify`, `tasks reap`, `vsc submit|status|approve|receipt|spec|bench`.
 - A Docker image and a compose example (gateway, PostgreSQL, a Node webhook agent). See [Docker](#docker).
+- **Verified System Change:** one change request becomes a test-proven change across several repositories or sub-systems, one local branch each, with a whole-system check and an offline-verifiable receipt. Coding agents do the work; executable checks, not an LLM, decide whether it is accepted. See [Verified System Change](#verified-system-change).
 - **Conformance:** the inbound side passes the A2A TCK at MUST level. See [docs/conformance.md](docs/conformance.md).
 
 ## Install
@@ -34,6 +35,7 @@ uv add "a2a-gateway[ag2]"          # adds the AG2 (1.x) adapter
 uv add "a2a-gateway[llamaindex]"   # adds the LlamaIndex adapter
 uv add "a2a-gateway[crewai]"       # adds the CrewAI adapter (own environment, not part of [all])
 uv add "a2a-gateway[mcp]"          # adds the outbound MCP server (/a2agw/mcp, `a2agw mcp`)
+uv add "a2a-gateway[vsc]"          # adds the Verified System Change planner (Claude Agent SDK)
 ```
 
 `[all]` installs every extra except `adk`. google-adk caps `opentelemetry-api`/`opentelemetry-sdk` at 1.44 and `websockets` below 16, so installing it can downgrade those packages; add `[adk]` explicitly when you want the ADK adapter.
@@ -427,6 +429,27 @@ trace and one audit chain, both checked at the end. Run it with
 `uv run python examples/software_team/run_demo.py` (needs Node 24; `--phase1` runs the
 Python-only network without Node or MCP).
 
+## Verified System Change
+
+A gateway with a `vsc:` section in `a2agw.yaml` delivers changes. It declares the connected systems (a repository, or a sub-tree of one, with its own gate and tests), the whole-system checks that join them, and the coding agents that do the work:
+
+```yaml
+vsc:
+  systems:
+    - {id: core, repo: ., path: src/a2agw, gate: [python, -m, ruff, check, .]}
+    - {id: node-coder, repo: ., path: examples/node_coder, gate: [node, --check, agent.mjs]}
+  checks:
+    - id: sidecar
+      systems: [core, node-coder]
+      run: [env, PYTHONPATH=src, python, -m, pytest, -q, tests/integration/test_phase3_demo.py]
+  workers:
+    - {id: claude-code, command: [python, bridges/claude_code.py], cost_class: strong}  # your bridge
+```
+
+Send a request to the `deliver` agent (or `a2agw vsc submit "..."`). The planner writes an executable specification (acceptance tests per system and for the whole system) and a fixed plan; each step runs one worker in an isolated git worktree; ranked checks (path confinement, the system's gate, the acceptance tests, its own tests, contracts) decide each step, then the whole-system checks decide the job. A failure goes back to the planner, which may retry, escalate to a stronger worker or reword instructions, never add steps. Privileged steps (a local fast-forward merge, deploy, migrate, send) wait in `input-required` for `approve` or `reject` unless the policy auto-approves them. Tokens, cost, attempts and active time are budgeted per job and fail closed. The receipt (`a2agw vsc receipt export`, `a2agw vsc receipt verify`) records the spec and plan hashes, every attempt, check, approval and usage, bound to the audit chain and checkable offline.
+
+`tests/integration/test_vsc_self.py` runs a job on a clone of this repository that changes the core, the Node coder and the sidecar contract in one branch. [`examples/vsc_estate`](examples/vsc_estate/README.md) is a three-repository demo estate with ten scenarios, and `a2agw vsc bench` compares VSC with a single agent at a matched token budget. The full reference (configuration, the job's stages, the admin API, workers, budgets, receipts, the benchmark, security notes and limitations) is [docs/vsc.md](docs/vsc.md).
+
 ## Security defaults
 
 - **Trust tiers.** Every partner has a tier: `internal`, `partner`, or `public`. The SSRF guard checks outbound card and endpoint URLs. Outside the `internal` tier, hostnames are resolved and private, loopback, link-local, and metadata addresses are refused. The `internal` tier skips the address checks (cloud metadata addresses excepted), so use it only for agents you operate. See [Security model: outbound connections](#security-model-outbound-connections).
@@ -813,14 +836,16 @@ The core never imports a framework; adapters live in `a2agw.adapters.<name>` beh
 - The CrewAI adapter needs an environment of its own (crewai pins `mcp<2` and `openai<3`), so a CrewAI crew and the MCP server cannot share one gateway process.
 - Embedded partner-task follow-ups belong to the inbound task that started them: a new A2A task in the same `contextId` (a new message rather than an input-required reply) cannot check, cancel, wait on, reply to or continue the previous task's partner tasks and conversations (`unknown task` / `unknown context`); they are cascade-cancelled when that task ends anyway.
 - A `PartnerClient` used without a handle store (library use outside `AgentHost`) records no handles, so every embedded follow-up (check, cancel, wait, reply, `context_id`) answers `unknown task` or `unknown context`: fail closed. Give it an `OutboundHandleStore` to use follow-ups.
+- **Verified System Change (Phase 5a)** works on local repositories and delivers local branches (no push, no pull requests); workers run without an OS sandbox, confined by instruction and by a diff check, so a worker can still run `git push` or copy a readable file into its workspace; the runner does not check that a job's acceptance tests failed before the change; the LLM reviewer and best-of-N retries are not built; jobs run in one gateway process; no bridges for Claude Code, Codex CLI or OpenHands ship yet. The full list is in [docs/vsc.md](docs/vsc.md#known-limitations).
 - Consult tokens live in the memory of the gateway process that issued them (only their digests, never persisted): a webhook or stdio agent's call to `consult_url` must reach that same process. Behind a load balancer, route `consult_url` to the issuing replica (sticky routing, e.g. a per-replica `consult_url`) or run one replica; another replica answers `401`.
 
 ## Roadmap
 
-Phase 1 (the core), Phase 2 (hardening: signed cards and quarantine, OAuth2 client credentials and token exchange, mTLS, the policy engine with classification, the audit log, push notifications, PostgreSQL, the SSRF guard with DNS-rebinding pinning, signed call contexts, and the boundary/attack test matrix in [docs/boundary-conditions.md](docs/boundary-conditions.md)) and Phase 3 (the gateway: the sidecar with webhook and stdio agents, the outbound REST API and MCP server, adapters for the OpenAI Agents SDK, the Claude Agent SDK, ADK, AG2, LlamaIndex and CrewAI, and the Docker image; done when a Node agent and an MCP-only agent joined the demo network) are implemented and described above. The optional partner-push receiver for sidecar agents (§11a.7) is deferred to Phase 4+ (see [Known limitations](#known-limitations)). Everything below is planned and not implemented yet.
+Phase 1 (the core), Phase 2 (hardening: signed cards and quarantine, OAuth2 client credentials and token exchange, mTLS, the policy engine with classification, the audit log, push notifications, PostgreSQL, the SSRF guard with DNS-rebinding pinning, signed call contexts, and the boundary/attack test matrix in [docs/boundary-conditions.md](docs/boundary-conditions.md)) and Phase 3 (the gateway: the sidecar with webhook and stdio agents, the outbound REST API and MCP server, adapters for the OpenAI Agents SDK, the Claude Agent SDK, ADK, AG2, LlamaIndex and CrewAI, and the Docker image; done when a Node agent and an MCP-only agent joined the demo network) are implemented and described above, and so is Phase 5a, Verified System Change on local repositories: the `vsc:` config, the job runner with durable steps, the planner, workers in git worktrees, the ranked verifier and whole-system checks, the approval gate with a local merge, receipts, the injection suite, corpus mining and the benchmark harness with its single-agent baseline (see [Verified System Change](#verified-system-change)). The optional partner-push receiver for sidecar agents (§11a.7) is deferred to Phase 4+ (see [Known limitations](#known-limitations)). Everything below is planned and not implemented yet.
 
-- **Phase 4, control plane:** a central registry, and the Console (a web UI to register and approve partners, edit policy, and inspect cross-agent traces), with SSO and RBAC.
-- **Phase 5, clusters and projects:** agent teams (Clusters) with an orchestrator, a project board, and human-in-the-loop in the Console.
+- **Phase 4a, control plane:** a central registry and control-plane commands, with SSO and RBAC; VSC jobs and receipts join its views and metrics (jobs by state, acceptance rate, cost per accepted change, wall time) once it lands.
+- **Phase 5b, system map and contracts:** tree-sitter and SCIP indexers and a cross-repository system map, contract checks across repositories, failure-class reporting, pushes and pull requests through forge clients, and the public WideSWE subset in the benchmark.
+- **Phase 5c, customer-ready:** sandboxed workspaces (E2B, with an egress allowlist), distributed steps on DBOS or Temporal, the Console (a web UI for partners, policy, traces, jobs and receipts, formerly Phase 4b), per-customer cost reporting, and a SOC 2 control mapping.
 
 gRPC is not offered today.
 

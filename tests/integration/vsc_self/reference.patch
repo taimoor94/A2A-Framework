@@ -1,0 +1,67 @@
+diff --git a/docs/sidecar.md b/docs/sidecar.md
+index 9bfa3cb..d28cc16 100644
+--- a/docs/sidecar.md
++++ b/docs/sidecar.md
+@@ -97,7 +97,7 @@ Events:
+ 
+ | `type` | Fields | Meaning |
+ |---|---|---|
+-| `status` | `text` | A progress message (task stays `working`) |
++| `status` | `text`, `progress?` | A progress message (task stays `working`); `progress`, if given, is a number from 0 to 1 saying how far the turn is (validated, not forwarded to the A2A caller) |
+ | `text` | `text` | A piece of the answer; pieces are appended to one streamed artifact named `output` |
+ | `artifact` | `parts`, `name?`, `artifact_id?`, `append?` (false), `last?` (true) | An artifact chunk; `parts` are A2A `Part` objects in JSON |
+ | `usage` | `tokens_in`, `tokens_out`, `cost` | Token and cost accounting, summed into the task's metadata |
+diff --git a/examples/node_coder/agent.mjs b/examples/node_coder/agent.mjs
+index 3b2cb83..96a3792 100644
+--- a/examples/node_coder/agent.mjs
++++ b/examples/node_coder/agent.mjs
+@@ -123,11 +123,11 @@ function draft(text) {
+ }
+ 
+ async function turn(invoke, emit, signal) {
+-  emit({ type: "status", text: "drafting code" });
++  emit({ type: "status", text: "drafting code", progress: 0 });
+   const code = draft(invoke.text);
+   let review = "no review (no consult grant)";
+   if (invoke.consult) {
+-    emit({ type: "status", text: `asking ${PARTNER} for a review` });
++    emit({ type: "status", text: `asking ${PARTNER} for a review`, progress: 0.5 });
+     try {
+       const answer = await consult(
+         invoke.consult,
+diff --git a/src/a2agw/gateway/protocol.py b/src/a2agw/gateway/protocol.py
+index df44694..8821bf8 100644
+--- a/src/a2agw/gateway/protocol.py
++++ b/src/a2agw/gateway/protocol.py
+@@ -103,7 +103,7 @@ def sign(secret: str, ts: str, body: bytes) -> str:
+ 
+ # type -> (required fields, optional fields)
+ _FIELDS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+-    "status": (frozenset({"text"}), frozenset()),
++    "status": (frozenset({"text"}), frozenset({"progress"})),
+     "artifact": (frozenset({"parts"}), frozenset({"name", "artifact_id", "append", "last"})),
+     "text": (frozenset({"text"}), frozenset()),
+     "need_input": (frozenset({"question"}), frozenset()),
+@@ -138,6 +138,13 @@ def _count(obj: dict[str, Any], key: str) -> int:
+     return v
+ 
+ 
++def _progress(v: Any) -> float:
++    """``status.progress``: how far the turn is, a number from 0 to 1 (optional)."""
++    if isinstance(v, bool) or not isinstance(v, int | float) or not 0 <= v <= 1:
++        raise ProtocolError("status.progress must be a number from 0 to 1")
++    return float(v)
++
++
+ def _parts(raw: Any) -> list[Part]:
+     if not isinstance(raw, list) or not raw:
+         raise ProtocolError("artifact.parts must be a non-empty list")
+@@ -173,6 +180,8 @@ def parse_event(obj: Any) -> AgentEvent | str:
+         raise ProtocolError(f"{kind}: missing field {min(required - keys)}")
+ 
+     if kind == "status":
++        if "progress" in obj:
++            _progress(obj["progress"])  # validated, not forwarded: the A2A status has no slot
+         return Status(_str(obj, "text"))
+     if kind == "artifact":
+         return ArtifactChunk(
