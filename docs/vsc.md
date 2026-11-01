@@ -45,7 +45,13 @@ VSC needs a database (`db_url`) and, for receipts, the audit log.
 
 The worked example is this repository: four connected systems in three languages, joined by
 the integration tests. The test `tests/integration/test_vsc_self.py` loads this block, points it
-at a throwaway clone and runs a job with it, so it stays correct.
+at a throwaway clone and runs a job with it. What it executes: the `core`, `node-coder` and
+`sidecar-contract` systems (gates, path confinement; `core`'s tests narrowed to
+`tests/gateway/test_protocol.py` for speed), the `sidecar` check, and the `python` substitution
+(`python` becomes the test's interpreter). Documented only: the `docker` system, the `compose`
+check, `core`'s full test list, the `workers` block and `budgets` (the test uses its own
+scripted worker and the budgets as written). For those the test checks shape only: `docker` and
+`compose` parse into `VscConfig` and every path they reference exists in the clone.
 
 <!-- vsc-self-config: tests/integration/test_vsc_self.py parses the next yaml block -->
 ```yaml
@@ -55,6 +61,7 @@ vsc:
       repo: .
       path: src/a2agw
       default_branch: main
+      # --no-cache / -p no:cacheprovider keep tools from writing cache files into the workspace
       gate: [python, -m, ruff, check, --no-cache, .]
       tests: [env, PYTHONPATH=.., python, -m, pytest, -q, -p, no:cacheprovider,
               ../../tests/gateway, ../../tests/serve, ../../tests/adapters]
@@ -316,8 +323,8 @@ attempt (worker, usage, whether usage was reported, every check with its command
 duration and log hash, the diff's sha256 and the commit), the whole-system checks, every
 approval with its principal, the job's totals (tokens, cost, attempts, active time) and the
 slice of the audit chain from the job's first row to its last. Diffs and logs are never stored,
-only their hashes; check stderr tails are redacted. The receipt is built once; a `vsc.receipt`
-audit row carries its hash.
+only their hashes; check stderr tails are redacted. The receipt is built once and returned unchanged on
+later calls; a `vsc.receipt` audit row carries its hash.
 
 `a2agw vsc receipt verify <file>` needs nothing but the file. What it proves, in the receipt
 module's own words:

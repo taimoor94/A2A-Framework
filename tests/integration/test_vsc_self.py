@@ -17,6 +17,10 @@ reference solution (``vsc_self/reference.patch``): ``docs/sidecar.md`` alone is 
 step's 16 KiB instructions, so whole files (the ``apply`` mode) cannot be sent.
 The acceptance tests (``vsc_self/accept_*.py``) are proved to fail on the base before the job.
 
+The clone is of the committed HEAD (a dirty working tree is not cloned), so ``reference.patch``
+must apply to the committed HEAD. The clone's branch is pinned to ``main`` (``checkout -B``), so
+a detached HEAD in CI cannot make ``default_branch`` ``HEAD``.
+
 If ``reference.patch`` stops applying (the three files changed), regenerate it: make the change
 in a scratch clone and ``git diff --no-renames`` there.
 
@@ -28,6 +32,7 @@ installed ``a2agw`` (an editable install of the real checkout) must not shadow t
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -50,6 +55,9 @@ from a2agw.vsc.store import VscStore
 from a2agw.vsc.verify import reproduction_before, run_check
 from a2agw.vsc.workers import WorkerSpec
 from a2agw.vsc.workspace import WorkspaceManager
+
+if shutil.which("node") is None and os.environ.get("CI"):
+    raise RuntimeError("node is not on PATH, but CI is set: the self test must not be skipped")
 
 pytestmark = [
     pytest.mark.skipif(shutil.which("node") is None, reason="node is not on PATH"),
@@ -108,12 +116,23 @@ def self_config(repo: Path, branch: str) -> VscConfig:
     whole-system acceptance test."""
     doc = documented_config()
     assert [s.id for s in doc.systems] == ["core", "node-coder", "sidecar-contract", "docker"]
+    assert [c.id for c in doc.checks] == ["sidecar", "compose"]
+    # Documented only (not executed): `docker`, `compose`; check their shape and referenced paths.
+    docker = next(s for s in doc.systems if s.id == "docker")
+    compose = next(c for c in doc.checks if c.id == "compose")
+    assert (ROOT / docker.path).is_dir(), docker.path
+    for arg in [*(docker.tests or []), *compose.run]:
+        if "/" in arg and not arg.startswith("PYTHONPATH") and arg != "/opt/vsc-bridges/claude_code.py":
+            base = ROOT / docker.path if arg.startswith("../") else ROOT
+            assert (base / arg).exists(), arg
 
     def cmd(command: list[str] | None) -> list[str] | None:
         return None if command is None else [PY if a == "python" else a for a in command]
 
     systems = []
     for s in doc.systems:
+        if s.id == "docker":
+            continue  # documented only
         tests = _pytest("..", "../../tests/gateway/test_protocol.py") if s.id == "core" else s.tests
         systems.append(
             s.model_copy(
@@ -127,6 +146,8 @@ def self_config(repo: Path, branch: str) -> VscConfig:
         )
     checks = []
     for c in doc.checks:
+        if c.id == "compose":
+            continue  # documented only
         run = cmd(c.run)
         assert run is not None
         if c.id == "sidecar":
@@ -226,10 +247,16 @@ def system_of(path: str) -> str | None:
 
 
 async def test_vsc_delivers_change_across_core_and_node_coder(tmp_path):
-    real_head, real_status = _git(ROOT, "rev-parse", "HEAD"), _git(ROOT, "status", "--porcelain")
+    def tracked_state() -> tuple[str, str]:  # tracked files only: parallel runs add untracked ones
+        return _git(ROOT, "rev-parse", "HEAD"), _git(
+            ROOT, "status", "--porcelain", "--untracked-files=no"
+        )
+
+    real_state = tracked_state()
     repo = tmp_path / REPO_ID
     _git(tmp_path, "clone", "-q", "--no-hardlinks", str(ROOT), str(repo))
-    branch = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    branch = "main"
+    _git(repo, "checkout", "-q", "-B", branch)  # never "HEAD", whatever the checkout state
     base = _git(repo, "rev-parse", "HEAD")
     cfg = self_config(repo, branch)
     systems = {s.id: s for s in cfg.systems}
@@ -329,5 +356,4 @@ async def test_vsc_delivers_change_across_core_and_node_coder(tmp_path):
         await engine.dispose()
 
     # The real checkout was never touched.
-    assert _git(ROOT, "rev-parse", "HEAD") == real_head
-    assert _git(ROOT, "status", "--porcelain") == real_status
+    assert tracked_state() == real_state
