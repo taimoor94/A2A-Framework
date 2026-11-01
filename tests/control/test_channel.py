@@ -353,6 +353,7 @@ async def test_commands_delivered_once_and_marked(db_url, make_cp, clock):
                 "kind": "partner.reload",
                 "args": {"partner_id": "p1"},
                 "expires_at": pytest.approx(clock.t, abs=60),
+                "actor": "oidc:op",
             }
             # one enqueued while the stream is open arrives on it too
             second = await channel.enqueue_command(store, gw, "task.cancel", {}, "oidc:op")

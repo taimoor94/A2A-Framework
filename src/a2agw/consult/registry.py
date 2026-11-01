@@ -11,7 +11,7 @@ import os
 import re
 import stat
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,7 +24,14 @@ from a2a.client.card_resolver import parse_agent_card
 from a2a.types import AgentCard
 from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH
 from google.protobuf.json_format import MessageToDict
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from a2agw.consult.guarded_net import fixed_tier
 from a2agw.consult.netguard import (
@@ -54,6 +61,12 @@ _SETTINGS = ("tier", "credential_ref", "tls_ref", "tags")
 # Quarantine reasons of the require_signed invariant (see ``PartnerRegistry.signed_violation``).
 UNSIGNED = "unsigned card"
 KEY_UNTRUSTED = "signing key no longer trusted"
+# The fields of a partner record the control plane sends (its approved version); status,
+# pending cards, verified key ids and fetch times are the gateway's own.
+REMOTE_FIELDS = frozenset(
+    {"id", "card", "card_hash", "tier", "credential_ref", "tls_ref", "tags", "card_url"}
+)
+REMOTE_TRIES = 5  # apply_remote: plans retried when the registry changed while one was checked
 
 
 LOCK_RETRY_S = 0.02
@@ -227,6 +240,16 @@ class ReloadConflict(RuntimeError):
     """The registry changed between ``prepare_reload`` and ``apply_reload``."""
 
 
+class RemoteStateError(ValueError):
+    """Partner records from the control plane that fail a local check. ``reason`` is the
+    dotted path of the offending fields (``partners.0.card_hash``) or the failed check's
+    error class (``UnsafeURL``, ``CardSignatureError``); never a value."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 @dataclass
 class ReloadPlan:
     """A validated partners file and its diff against the registry (``prepare_reload``)."""
@@ -239,6 +262,10 @@ class ReloadPlan:
     # Records of the file that break the require_signed invariant, quarantined in the plan.
     quarantined: dict[str, str] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)  # each entry as read from the file
+    # Partners left out of the new set that still have open partner tasks: kept, disabled,
+    # until maintenance sees their tasks end (``PartnerRegistry.draining``). Not in
+    # ``removed``.
+    draining: list[str] = field(default_factory=list)
 
     def changes(self) -> dict[str, list[str]]:
         return {"added": self.added, "updated": self.updated, "removed": self.removed}
@@ -288,6 +315,9 @@ class PartnerRegistry:
         self.change_info: dict[str, Any] | None = None
         self._listeners: list[Callable[[PartnerRecord, str], None]] = []
         self._actor: str | None = None  # see ``acting_as``
+        # Partners the control plane removed while they had open partner tasks: disabled,
+        # and removed by the host's maintenance once those tasks end (``apply_remote``).
+        self.draining: set[str] = set()
 
     # -- fetching -------------------------------------------------------
     async def _fetch(self, card_url: str, tier: Tier, tls_ref: str | None = None) -> dict[str, Any]:
@@ -516,6 +546,7 @@ class PartnerRegistry:
         (``AgentHost`` refuses removals that would orphan them unless forced)."""
         rec = self.get(id)
         del self._records[id]
+        self.draining.discard(id)
         self._changed(rec, "removed")
 
     def enable(self, id: str) -> PartnerRecord:
@@ -810,10 +841,20 @@ class PartnerRegistry:
         old = self._records
         keep = set(old) - set(plan.updated)
         self._records = {i: old[i] if i in keep else r for i, r in plan.fresh.items()}
+        newly_disabled: list[PartnerRecord] = []
+        for i in plan.draining:  # left out, with open tasks: kept, disabled
+            rec = old[i]
+            if rec.status != "disabled":
+                rec.status = "disabled"
+                newly_disabled.append(rec)
+            self._records[i] = rec
+        self.draining = (self.draining | set(plan.draining)) - set(plan.fresh)
         # The file now is what was read: the base for later merge-safe saves.
         self._disk = dict(plan.raw)
         self._dirty &= set(self._records)
         self._version += 1
+        for rec in newly_disabled:
+            self._notify(rec, "disabled", {"reason": "removed with open partner tasks"})
         if self.on_change is not None or self._listeners:
             for event, ids, source in (
                 ("added", plan.added, self._records),
@@ -836,6 +877,137 @@ class PartnerRegistry:
         if event != "updated" or prev is None or prev.status == rec.status:
             return None
         return {"from_status": prev.status}
+
+    async def prepare_remote(
+        self, records: Any, *, key_ids: Mapping[str, str | None] | None = None
+    ) -> ReloadPlan:
+        """Check partner records sent by the control plane and diff them against the
+        registry, changing nothing (apply the plan with ``apply_reload``). Every record must
+        pass the local checks or ``RemoteStateError`` is raised and nothing is planned:
+
+        - only ``REMOTE_FIELDS``, valid as a ``PartnerRecord``, ids unique, a ``tls_ref``
+          this gateway has;
+        - ``card_hash`` equal to the hash of ``card``, and ``card`` a valid Agent Card;
+        - SSRF: every interface URL passes ``check_url`` for the record's tier;
+        - signature: tiers in ``require_signed`` need a card that verifies here.
+
+        ``key_ids`` ({partner id: verified key id}) restores records already checked when
+        they were first applied (the gateway's cached state): no network then, only syntax
+        checks, and the require_signed invariant is checked against those key ids
+        (``signed_violation``: a record that breaks it is quarantined in the plan).
+
+        A record whose card equals the one this registry has keeps its local state (status,
+        pending card, fetch time): a card change quarantined here stays quarantined. A new
+        card replaces the record (status active)."""
+        if not isinstance(records, list):
+            raise RemoteStateError("partners")
+        fresh: dict[str, PartnerRecord] = {}
+        for i, item in enumerate(records):
+            rec = await self._check_remote(item, f"partners.{i}", key_ids)
+            if rec.id in fresh:
+                raise RemoteStateError(f"partners.{i}.id")
+            fresh[rec.id] = rec
+        old = self._records
+        for pid, rec in fresh.items():
+            prev = old.get(pid)
+            if prev is None or prev.card_hash != rec.card_hash:
+                continue
+            # The same approved card: what this gateway learned about it stays.
+            rec.status = "active" if pid in self.draining else prev.status
+            rec.pending_card, rec.pending_key_id = prev.pending_card, prev.pending_key_id
+            rec.fetched_at = prev.fetched_at
+        quarantined = self._quarantine_fresh(fresh)
+        updated = [
+            i
+            for i in fresh
+            if i in old and fresh[i].model_dump(mode="json") != old[i].model_dump(mode="json")
+        ]
+        return ReloadPlan(
+            fresh=fresh,
+            added=[i for i in fresh if i not in old],
+            updated=updated,
+            removed=[i for i in old if i not in fresh],
+            version=self._version,
+            quarantined=quarantined,
+        )
+
+    async def _check_remote(
+        self, item: Any, where: str, key_ids: Mapping[str, str | None] | None
+    ) -> PartnerRecord:
+        if not isinstance(item, dict):
+            raise RemoteStateError(where)
+        extra = sorted(str(k) for k in set(item) - REMOTE_FIELDS)
+        if extra:
+            raise RemoteStateError(",".join(f"{where}.{k}" for k in extra))
+        try:
+            rec = PartnerRecord.model_validate(item)
+        except ValidationError as e:
+            paths = (
+                ".".join([where, *(str(p) for p in err["loc"])])
+                for err in e.errors(include_input=False, include_url=False)
+            )
+            raise RemoteStateError(",".join(dict.fromkeys(paths))) from None
+        if card_hash(rec.card) != rec.card_hash:
+            raise RemoteStateError(f"{where}.card_hash")
+        if rec.tls_ref is not None and rec.tls_ref not in self.tls:
+            raise RemoteStateError(f"{where}.tls_ref")
+        try:
+            card, proto = _normalize(rec.card)
+        except CardFetchError:
+            raise RemoteStateError(f"{where}.card") from None
+        try:
+            if rec.card_url is not None:
+                check_url_syntax(rec.card_url)
+            for iface in proto.supported_interfaces:
+                if key_ids is None:
+                    await check_url(iface.url, rec.tier)
+                else:
+                    check_url_syntax(iface.url)
+        except UnsafeURL as e:
+            raise RemoteStateError(type(e).__name__) from None
+        if key_ids is None:
+            try:
+                key_id = await self._verify_signature(proto, rec.tier)
+            except CardSignatureError:
+                raise RemoteStateError("CardSignatureError") from None
+        else:
+            key_id = key_ids.get(rec.id)
+        rec.card, rec.card_hash = card, card_hash(card)
+        rec.signed_key_id = key_id
+        rec.fetched_at = time.time()
+        return rec
+
+    async def apply_remote(
+        self,
+        records: Any,
+        *,
+        key_ids: Mapping[str, str | None] | None = None,
+        open_handles: Callable[[list[str]], Awaitable[dict[str, int]]] | None = None,
+        actor: str | None = None,
+    ) -> ReloadPlan:
+        """Make the registry the control plane's partner set: ``prepare_remote`` (every
+        record checked, ``RemoteStateError`` changes nothing), then ``apply_reload``.
+        Partners left out are removed, except those with open partner tasks
+        (``open_handles``: {partner id: count}): those are disabled at once and kept in
+        ``draining`` until the host's maintenance sees their tasks end. A plan the registry
+        outdated while it was checked (a card refresh meanwhile) is made again, up to
+        ``REMOTE_TRIES`` times, then ``ReloadConflict``. The changes are reported with
+        ``actor`` (only the final, synchronous step runs as it: changes other code makes
+        while the records are checked keep their own actor). Returns the applied plan."""
+        for _ in range(REMOTE_TRIES):
+            plan = await self.prepare_remote(records, key_ids=key_ids)
+            if plan.removed and open_handles is not None:
+                counts = await open_handles(plan.removed)
+                plan.draining = [i for i in plan.removed if counts.get(i, 0)]
+                plan.removed = [i for i in plan.removed if not counts.get(i, 0)]
+            if plan.version == self._version:
+                if actor is None:
+                    self.apply_reload(plan)
+                else:
+                    with self.acting_as(actor):
+                        self.apply_reload(plan)
+                return plan
+        raise ReloadConflict("partner registry kept changing while the remote set was checked")
 
     def reload(self) -> dict[str, list[str]]:
         """Re-read the partners file (e.g. after ``a2agw partners add`` on a running host):

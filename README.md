@@ -686,7 +686,7 @@ The admin API is mounted on the host. Every route but `healthz` needs the `a2agw
 
 | Endpoint | Returns |
 |---|---|
-| `GET /a2agw/admin/healthz` | Liveness (no auth) |
+| `GET /a2agw/admin/healthz` | Liveness (no auth); with a control plane, `control_plane: {connected, applied_version, last_error_kind, queue, dropped, warning?}` |
 | `GET /a2agw/admin/agents` | Hosted agents and their skills |
 | `GET /a2agw/admin/partners` | Partners with tier, status, card hash, breaker state, in-flight calls |
 | `GET /a2agw/admin/partners/{id}` | The full record: approved card, pending card, its hash (`pending_hash`) and the card `diff` (ref names only, never secrets) |
@@ -771,7 +771,13 @@ telemetry:
 # classifier: regex_pii                              # needs policy_file
 # push: {allow_private?, timeout_s?, max_attempts?, encryption_key_env?, max_configs_per_task?,
 #        max_concurrent_deliveries?, max_pending_tasks?}
+
+# Phase 4: a control plane that owns this gateway's partners and/or policy
+# control_plane: {url, token_env, tls_ref?, manage?: [partners, policy],
+#                 report_interval_s?: 1.0, health_interval_s?: 15}
 ```
+
+**Managed gateways.** With a `control_plane` section the gateway connects out to the control plane, receives its partners and policy from it (each partner still SSRF-checked and signature-verified locally; a state that fails any check is rejected whole and the previous one stays), runs operator commands, and reports events, audit rows, health and metrics. It is fail static: the last applied state is cached in its database and served when the control plane is down, and a first start without one is locked down (`cp:unconfigured`) until a state arrives. A managed section cannot also be configured locally (`policy_file` with `manage: [policy]`, `partners:` with `manage: [partners]`). `/a2agw/admin/healthz` shows the connection. See [docs/control-plane.md](docs/control-plane.md#gateways).
 
 Generate an API-key hash with `printf %s "$KEY" | shasum -a 256 | cut -d' ' -f1` (in Python: `a2agw.security.auth.hash_api_key(key)`), or let `a2agw init --secure` generate a key and its hash.
 

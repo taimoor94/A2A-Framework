@@ -55,7 +55,7 @@ from a2agw.gateway.auth import MCP_EXTRA_HINT
 from a2agw.security.auth import AuthConfig
 from a2agw.security.cardsign import CardSigner, CardVerifier, load_public_key
 from a2agw.security.classify import RegexPiiClassifier
-from a2agw.security.policy import PolicyEngine, PolicyError, load_policy
+from a2agw.security.policy import PolicyEngine, PolicyError, load_policy, parse_policy
 from a2agw.serve.agent import AGENT_ID_PATTERN, AgentSpec, SkillSpec
 from a2agw.serve.host import AgentHost
 from a2agw.serve.push import PushSettings
@@ -430,6 +430,44 @@ class ServerTlsConfig(BaseModel):
         return self
 
 
+ManagedSection = Literal["partners", "policy"]
+_MANAGED_ALL: tuple[ManagedSection, ...] = ("partners", "policy")
+
+
+class ControlPlaneConfig(BaseModel):
+    """The control plane this gateway connects out to (``a2agw.ops.cp_client``).
+
+    ``token_env`` names the environment variable holding the gateway token (read when the
+    connector connects; never logged). ``tls_ref`` names an entry of the ``tls`` section: a
+    client certificate for mTLS to the control plane. ``manage``: the sections the control
+    plane owns; a managed section cannot also be configured locally (``partners:`` /
+    ``policy_file``)."""
+
+    model_config = _FORBID
+    url: str
+    token_env: str = Field(pattern=_ENV_NAME)
+    tls_ref: str | None = None
+    manage: list[ManagedSection] = Field(default_factory=lambda: list(_MANAGED_ALL))
+    report_interval_s: float = Field(default=1.0, gt=0)
+    health_interval_s: float = Field(default=15, gt=0)
+
+    @field_validator("url")
+    @classmethod
+    def _https(cls, v: str) -> str:
+        try:
+            check_url_syntax(v)
+        except UnsafeURL as e:
+            raise ValueError(str(e)) from None
+        return _https_only(v).rstrip("/")
+
+    @field_validator("manage")
+    @classmethod
+    def _unique(cls, v: list[ManagedSection]) -> list[ManagedSection]:
+        if len(set(v)) != len(v):
+            raise ValueError("manage lists a section twice")
+        return v
+
+
 class GatewayConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     base_url: str
@@ -456,6 +494,7 @@ class GatewayConfig(BaseModel):
     audit: bool = True
     server_tls: ServerTlsConfig | None = None
     sidecar: SidecarConfig = Field(default_factory=SidecarConfig)
+    control_plane: ControlPlaneConfig | None = None
 
     @model_validator(mode="after")
     def _refs_exist(self) -> GatewayConfig:
@@ -475,9 +514,27 @@ class GatewayConfig(BaseModel):
                 raise ValueError(f"partner {p.id!r}: unknown credential_ref {cref!r}")
             if p.tls_ref is not None and p.tls_ref not in self.tls:
                 raise ValueError(f"partner {p.id!r}: unknown tls_ref {p.tls_ref!r}")
-        if self.classifier is not None and self.policy_file is None:
-            raise ValueError("classifier needs policy_file")
+        if self.classifier is not None and self.policy_file is None and not self.managed("policy"):
+            raise ValueError("classifier needs policy_file (or a control plane managing policy)")
+        cp = self.control_plane
+        if cp is not None:
+            if cp.tls_ref is not None and cp.tls_ref not in self.tls:
+                raise ValueError(f"control_plane: unknown tls_ref {cp.tls_ref!r}")
+            if self.managed("policy") and self.policy_file is not None:
+                raise ValueError(
+                    "policy_file and control_plane.manage [policy] conflict: the control "
+                    "plane owns the policy (remove one)"
+                )
+            if self.managed("partners") and self.partners:
+                raise ValueError(
+                    "partners and control_plane.manage [partners] conflict: the control "
+                    "plane owns the partners (remove one)"
+                )
         return self
+
+    def managed(self, section: ManagedSection) -> bool:
+        """Whether the control plane owns ``section`` ("partners" or "policy")."""
+        return self.control_plane is not None and section in self.control_plane.manage
 
 
 def _interpolate_tree(node: Any, env: dict[str, str], source: str) -> Any:
@@ -843,6 +900,13 @@ def _context_verifier(
 
 
 def _policy(cfg: GatewayConfig, config_dir: Path) -> PolicyEngine | None:
+    classifier = RegexPiiClassifier() if cfg.classifier == "regex_pii" else None
+    if cfg.managed("policy"):
+        # Locked down from the start: the connector restores the last applied policy (or
+        # keeps this lockdown) before the host serves.
+        from a2agw.ops.cp_client import LOCKDOWN_POLICY
+
+        return PolicyEngine(parse_policy(LOCKDOWN_POLICY), classifier=classifier)
     if cfg.policy_file is None:
         return None
     path = config_file(config_dir, cfg.policy_file, "policy_file")
@@ -850,7 +914,6 @@ def _policy(cfg: GatewayConfig, config_dir: Path) -> PolicyEngine | None:
         policy = load_policy(path)
     except PolicyError as e:
         raise ConfigError(f"policy_file: {e}") from None
-    classifier = RegexPiiClassifier() if cfg.classifier == "regex_pii" else None
     return PolicyEngine(policy, classifier=classifier)
 
 
@@ -913,7 +976,8 @@ def build_host(cfg: GatewayConfig, *, config_dir: Path | str = ".") -> AgentHost
             cfg.base_url,
             auth=cfg.auth,
             db_url=cfg.db_url,
-            partners_path=partners_path(cfg, config_dir),
+            # A control plane managing partners owns the set: no partners file.
+            partners_path=None if cfg.managed("partners") else partners_path(cfg, config_dir),
             credentials=credentials,
             admin_without_auth=cfg.admin_without_auth,
             outbound_ttl_s=cfg.outbound_ttl_s,
@@ -943,6 +1007,10 @@ def build_host(cfg: GatewayConfig, *, config_dir: Path | str = ".") -> AgentHost
             host.add(_load_agent(entry.spec, config_dir))
         else:
             host.add(_external_agent(entry, f"agents.{i}", config_dir))
+    if cfg.control_plane is not None:
+        from a2agw.ops.cp_client import ControlPlaneConnector
+
+        ControlPlaneConnector(host, cfg.control_plane)  # attaches itself to the host
     return host
 
 
@@ -1031,6 +1099,7 @@ def _apply_drift(reg: PartnerRegistry, p: PartnerConfig) -> None:
 
 __all__ = [
     "ConfigError",
+    "ControlPlaneConfig",
     "ExternalAgentConfig",
     "GatewayConfig",
     "McpConfig",

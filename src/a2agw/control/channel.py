@@ -498,12 +498,14 @@ class CommandRow:
     expires_at: float
 
     def frame(self) -> dict[str, Any]:
-        """The ``command`` frame's data."""
+        """The ``command`` frame's data. ``actor`` (who queued it) is what the gateway runs
+        it as: ``cp:<actor>``, so the gateway's own audit trail names the operator."""
         return {
             "id": self.id,
             "kind": self.kind,
             "args": self.args,
             "expires_at": self.expires_at,
+            "actor": self.actor,
         }
 
 

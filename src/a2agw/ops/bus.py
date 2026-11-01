@@ -43,12 +43,30 @@ class GatewayEvent:
 
 
 class Subscription:
-    """A live stream of events. Use ``async for``, or ``async with`` to unregister."""
+    """A live stream of events. Use ``async for``, or ``async with`` to unregister, or
+    ``take`` to drain it without waiting. ``dropped`` counts this subscriber's events lost
+    to a full queue (the bus's ``dropped`` counts every subscriber's)."""
 
     def __init__(self, bus: EventBus, queue: asyncio.Queue[Any]) -> None:
         self._bus = bus
         self._queue = queue
         self._closed = False
+        self.dropped = 0
+
+    @property
+    def pending(self) -> int:
+        """Events queued and not yet read."""
+        return 0 if self._closed else self._queue.qsize()
+
+    def take(self, n: int) -> list[GatewayEvent]:
+        """Up to ``n`` queued events, oldest first, without waiting."""
+        out: list[GatewayEvent] = []
+        while len(out) < n and not self._queue.empty():
+            item = self._queue.get_nowait()
+            if item is _CLOSED:
+                break
+            out.append(item)
+        return out
 
     def __aiter__(self) -> Self:
         return self
@@ -95,10 +113,12 @@ class EventBus:
     def publish(self, ev: GatewayEvent) -> None:
         """Record and fan out an event. Never awaits or blocks."""
         self._recent.append(ev)
-        for q in self._subscribers:
+        for sub in self._subs:
+            q = sub._queue
             if q.full():
                 q.get_nowait()
                 self.dropped += 1
+                sub.dropped += 1
             q.put_nowait(ev)
 
     def subscribe(self, maxsize: int = 1000) -> Subscription:

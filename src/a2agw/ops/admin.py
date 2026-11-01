@@ -212,6 +212,9 @@ def admin_routes(host: AgentHost) -> list[Route]:
         log = getattr(host, "audit", None)
         if log is not None:
             body["audit_errors"] = log.audit_errors
+        connector = getattr(host, "control_plane", None)
+        if connector is not None:
+            body["control_plane"] = connector.health()
         return JSONResponse(body)
 
     async def agents(_: Request) -> Response:

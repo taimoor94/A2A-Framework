@@ -141,6 +141,7 @@ from a2agw.serve.store import (
 
 if TYPE_CHECKING:
     from a2agw.gateway.mcp_server import McpHttpApp
+    from a2agw.ops.cp_client import ControlPlaneConnector
 
 CARD_PATH = "/.well-known/agent-card.json"
 logger = logging.getLogger(__name__)
@@ -1158,6 +1159,10 @@ class AgentHost:
         # API's PUT /policy is refused (set by the control-plane connector).
         self.policy_source: str | None = "file" if policy is not None else None
         self.policy_managed = False
+        # The control-plane connector (``a2agw.ops.cp_client``), which attaches itself:
+        # startup restores its cached state before serving and starts it at the end,
+        # shutdown stops it first.
+        self.control_plane: ControlPlaneConnector | None = None
         # (agent id, task id) of operator answers being sent (``actions.answer_task``): a
         # second answer to the same task meanwhile is refused, never a second resume.
         self.answers_in_flight: set[tuple[str, str]] = set()
@@ -1275,9 +1280,13 @@ class AgentHost:
             for ev in early:
                 await audit.emit(ev)
         self.partners.load()
-        self._warn_unknown_routing_partners()
+        self.warn_unknown_routing_partners()
         handles = self.handles = OutboundHandleStore(engine)
         await handles.initialize()
+        if self.control_plane is not None:
+            # Fail static: the last applied desired state (or a lockdown) is in force
+            # before anything is served.
+            await self.control_plane.restore()
         self.client = PartnerClient(
             self.partners,
             credentials=self.credentials,
@@ -1444,6 +1453,8 @@ class AgentHost:
                 foreign,
             )
         self._maintenance = asyncio.create_task(self._maintenance_loop(), name="a2agw:maint")
+        if self.control_plane is not None:
+            await self.control_plane.start()
 
     async def maintain(self, *, now: float | None = None) -> ExpireReport:
         """One maintenance pass: end outbound handles older than ``outbound_ttl_s`` (their
@@ -1469,9 +1480,27 @@ class AgentHost:
             owners={self.sidecar_owner(a) for a in self.sidecar_agent_ids()},
         )
         await self.ledger.purge(now)
+        await self.remove_drained_partners()
         await self.refresh_due_partners(now=now)
         self.partners.flush()  # changes a busy partners file lock kept unsaved
         return report
+
+    async def remove_drained_partners(self) -> list[str]:
+        """Remove the partners the control plane dropped while they still had open partner
+        tasks (``PartnerRegistry.draining``: disabled meanwhile) once those tasks have
+        ended. Returns the ids removed (audited ``partner.remove``, actor
+        "control_plane")."""
+        draining = sorted(self.partners.draining)
+        if not draining or self.handles is None:
+            return []
+        counts = await self.handles.count_open(draining)
+        removed = []
+        with self.partners.acting_as("control_plane"):
+            for pid in draining:
+                if counts.get(pid, 0) == 0 and pid in self.partners.draining:
+                    self.partners.remove(pid)
+                    removed.append(pid)
+        return removed
 
     async def refresh_due_partners(self, *, now: float | None = None) -> dict[str, str]:
         """Spec 7.3 / 8.7: refresh the cards of URL partners whose ``fetched_at + ttl_s`` has
@@ -1651,7 +1680,7 @@ class AgentHost:
             executor.policy = engine
         if self.client is not None:
             self.client.policy = engine
-        self._warn_unknown_routing_partners()
+        self.warn_unknown_routing_partners()
         detail: dict[str, Any] = {"reason": source}
         if policy is not None:
             detail["hash"] = policy_hash(policy)
@@ -1671,7 +1700,7 @@ class AgentHost:
         elif self.audit_enabled and len(self._early_audit) < _EARLY_AUDIT_MAX:
             self._early_audit.append(ev)
 
-    def _warn_unknown_routing_partners(self) -> None:
+    def warn_unknown_routing_partners(self) -> None:
         if self.policy is None:
             return
         known = {r.id for r in self.partners.all()}
@@ -1796,7 +1825,7 @@ class AgentHost:
                 cancelled,
                 cancel_errors,
             )
-        self._warn_unknown_routing_partners()
+        self.warn_unknown_routing_partners()
         return {
             **changes,
             "open_handles": open_handles,
@@ -1841,9 +1870,12 @@ class AgentHost:
         return self.push_senders[agent_id].counters()
 
     async def shutdown(self) -> None:
-        # Order matters: end event streams, stop the executors and the adapters with a
-        # lifecycle, flush pending push deliveries (bounded), let the partner client drain its
-        # cancellation cleanups (they need the engine), then dispose the engine.
+        # Order matters: stop the control-plane connector (bounded), end event streams,
+        # stop the executors and the adapters with a lifecycle, flush pending push
+        # deliveries (bounded), let the partner client drain its cancellation cleanups (they
+        # need the engine), then dispose the engine.
+        if self.control_plane is not None:
+            await self.control_plane.stop()
         self.bus.close_all()
         if self._maintenance is not None:
             self._maintenance.cancel()
