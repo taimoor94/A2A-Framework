@@ -8,13 +8,15 @@ fact. Diffs are never stored, only their sha256 (taken from the step's recorded 
 hashes and each embedded audit row's digest.
 
 The bundle's audit rows are the contiguous slice of the chain from the job's first row to its
-last (rows of concurrent jobs in between included, as they are part of the chain). The first row's
-``prev_hash`` is trusted as given; every later row must link to the one before it. Offline this
-proves the slice is internally consistent; that it is the gateway's own is shown by comparing
+last. Only the job's own rows are embedded in full; every other row in the span (a concurrent
+job's) is an opaque stub ``{seq, prev_hash, hash}`` that keeps the chain linkable without
+disclosing anything. The first row's ``prev_hash`` is trusted as given; every later row must link
+to the one before it. Offline this proves the slice is internally consistent; that it is the gateway's own is shown by comparing
 ``receipt_hash`` with the ``vsc.receipt`` row in the gateway's log."""
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -26,11 +28,13 @@ from a2agw.ops.audit import AuditEvent, AuditLog, canonical_json, row_digest
 from a2agw.vsc.plan import Plan, plan_hash
 from a2agw.vsc.spec import ExecutableSpec, spec_hash
 from a2agw.vsc.store import VscStore
-from a2agw.vsc.workspace import WorkspaceManager
 
 VERSION = "a2agw.receipt/1"
 _AGENT = "deliver"
 _PAGE = 500
+_FINISHED = ("accepted", "failed", "cancelled")
+_STUB_KEYS = {"seq", "prev_hash", "hash"}
+_locks: dict[str, asyncio.Lock] = {}
 
 
 def _hash(receipt: dict[str, Any]) -> str:
@@ -54,8 +58,12 @@ async def _slice(audit: AuditLog, job_id: str) -> tuple[list[dict[str, Any]], li
     cursor = str(first - 1) if first > 1 else None
     while True:
         rows, cursor = await audit.query({}, _PAGE, cursor, ascending=True)
-        chain += [r for r in rows if r["seq"] <= last]
-        if cursor is None or chain[-1]["seq"] >= last:
+        chain += [
+            r if r["task_id"] == job_id else {k: r[k] for k in sorted(_STUB_KEYS)}
+            for r in rows
+            if r["seq"] <= last
+        ]
+        if cursor is None or not rows or rows[-1]["seq"] >= last:
             return mine, chain
 
 
@@ -63,17 +71,23 @@ def _loads(text: str | None) -> dict[str, Any]:
     return json.loads(text) if text else {}
 
 
-async def build_receipt(
-    store: VscStore, audit: AuditLog, workspaces: WorkspaceManager, job_id: str
-) -> dict[str, Any]:
-    """The job's receipt, built once: a repeat returns the stored one. ``workspaces`` is kept
-    for the interface; diff hashes come from the attempts' recorded results."""
+async def build_receipt(store: VscStore, audit: AuditLog, job_id: str) -> dict[str, Any]:
+    """The job's receipt, built once: a repeat returns the stored one. Diff hashes come from the
+    attempts' recorded results. A job that has not finished has no receipt."""
+    lock = _locks.setdefault(job_id, asyncio.Lock())
+    async with lock:
+        return await _build(store, audit, job_id)
+
+
+async def _build(store: VscStore, audit: AuditLog, job_id: str) -> dict[str, Any]:
     existing = await store.get_receipt(job_id)
     if existing is not None:
         return existing["receipt"]
     job = await store.get_job(job_id)
     if job is None:
         raise KeyError(f"unknown job {job_id}")
+    if job["state"] not in _FINISHED:
+        raise ValueError("job is not finished")
     rows, chain = await _slice(audit, job_id)
     steps: list[dict[str, Any]] = []
     approvals: list[dict[str, Any]] = [
@@ -168,7 +182,9 @@ def _audit_problems(receipt: dict[str, Any]) -> list[str]:
     prev: dict[str, Any] | None = None
     for row in rows:
         try:
-            if row_digest(row) != row["hash"]:
+            if not isinstance(row, dict):
+                raise TypeError("row is not an object")
+            if set(row) != _STUB_KEYS and row_digest(row) != row["hash"]:
                 problems.append(f"audit: row {row.get('seq')} hash mismatch")
             if prev is not None:
                 if row["seq"] <= prev["seq"]:
@@ -179,15 +195,20 @@ def _audit_problems(receipt: dict[str, Any]) -> list[str]:
             problems.append("audit: malformed row")
             break
         prev = row
-    if rows and (audit.get("first_seq"), audit.get("last_seq")) != (
-        rows[0].get("seq"),
-        rows[-1].get("seq"),
+    dicts = [r for r in rows if isinstance(r, dict)]
+    if (
+        dicts
+        and len(dicts) == len(rows)
+        and (audit.get("first_seq"), audit.get("last_seq"))
+        != (rows[0].get("seq"), rows[-1].get("seq"))
     ):
         problems.append("audit: first_seq/last_seq do not match the rows")
-    for row in rows:
-        if row.get("action") == "vsc.receipt" and (row.get("detail") or {}).get(
-            "receipt_hash"
-        ) != receipt.get("receipt_hash"):
+    for row in dicts:
+        if (
+            row.get("action") == "vsc.receipt"
+            and row.get("task_id") == receipt.get("job_id")
+            and (row.get("detail") or {}).get("receipt_hash") != receipt.get("receipt_hash")
+        ):
             problems.append("audit: vsc.receipt row does not match receipt_hash")
     return problems
 

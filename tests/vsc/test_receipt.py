@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -14,7 +15,6 @@ from a2agw.ops.audit import AuditLog, canonical_json
 from a2agw.serve.store import create_engine
 from a2agw.vsc.receipt import build_receipt, export_receipt, verify_receipt
 from a2agw.vsc.store import VscStore
-from a2agw.vsc.workspace import WorkspaceManager
 
 from .test_runner import Env, FixedPlanner, edit, two_repo_cfg, worker
 
@@ -38,8 +38,7 @@ async def built(env):
     job_id = await runner.submit("greet everywhere systems: alpha, beta", owner="key:a")
     job = await runner.run(job_id)
     assert job["state"] == "accepted", job
-    ws = WorkspaceManager(env.tmp / "root", cfg.systems, env.tmp)
-    receipt = await build_receipt(env.store, env.audit, ws, job_id)
+    receipt = await build_receipt(env.store, env.audit, job_id)
     return env, job_id, receipt
 
 
@@ -62,9 +61,7 @@ async def test_receipt_hash_covers_everything(built):
         assert verify_receipt(tampered), key
     stored = await env.store.get_receipt(job_id)
     assert stored["receipt"] == receipt and stored["receipt_hash"] == receipt["receipt_hash"]
-    again = await build_receipt(
-        env.store, env.audit, WorkspaceManager(env.tmp / "root", [], env.tmp), job_id
-    )
+    again = await build_receipt(env.store, env.audit, job_id)
     assert again == receipt  # built once
 
 
@@ -124,3 +121,62 @@ async def test_export_mode_0600(built, tmp_path):
     export_receipt(receipt, path)
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert verify_receipt(json.loads(path.read_text())) == []
+
+
+async def _two_jobs(env):
+    cfg = two_repo_cfg(env.tmp)
+    r1 = env.runner(cfg, FixedPlanner([edit("alpha")]), [worker("apply")])
+    r2 = env.runner(cfg, FixedPlanner([edit("beta")]), [worker("apply")])
+    j1 = await r1.submit("greet alpha systems: alpha", owner="key:a")
+    j2 = await r2.submit("greet beta systems: beta", owner="key:b")
+    await asyncio.gather(r1.run(j1), r2.run(j2))
+    assert await env.state(j1) == "accepted" and await env.state(j2) == "accepted"
+    return j1, j2
+
+
+async def test_interleaved_jobs_both_verify_and_hide_foreign_rows(env):
+    j1, j2 = await _two_jobs(env)
+    r1 = await build_receipt(env.store, env.audit, j1)
+    r2 = await build_receipt(env.store, env.audit, j2)  # appended a vsc.receipt for j1 first
+    for mine, other, receipt in ((j1, j2, r1), (j2, j1, r2)):
+        assert verify_receipt(receipt) == []
+        rows = receipt["audit"]["rows"]
+        stubs = [r for r in rows if set(r) == {"seq", "prev_hash", "hash"}]
+        assert stubs, "the other job's rows must be interleaved for this test to mean anything"
+        assert all(r.get("task_id") == mine for r in rows if "task_id" in r)
+        assert other not in json.dumps(receipt)
+    # a tampered stub hash breaks the chain
+    bad = copy.deepcopy(r1)
+    stub = next(r for r in bad["audit"]["rows"] if set(r) == {"seq", "prev_hash", "hash"})
+    stub["hash"] = "0" * 64
+    body = {k: v for k, v in bad.items() if k != "receipt_hash"}
+    bad["receipt_hash"] = hashlib.sha256(canonical_json(body).encode()).hexdigest()
+    assert any("audit" in p for p in verify_receipt(bad))
+
+
+async def test_unfinished_job_refused(env):
+    cfg = two_repo_cfg(env.tmp)
+    runner = env.runner(cfg, FixedPlanner([edit("alpha")]), [worker("apply")])
+    job_id = await runner.submit("greet alpha systems: alpha", owner="key:a")
+    await env.store.set_state(job_id, "running")
+    with pytest.raises(ValueError, match="not finished"):
+        await build_receipt(env.store, env.audit, job_id)
+    assert await env.store.get_receipt(job_id) is None
+
+
+async def test_concurrent_builds_append_one_receipt_row(env):
+    j1, _ = await _two_jobs(env)
+    built = await asyncio.gather(*(build_receipt(env.store, env.audit, j1) for _ in range(4)))
+    assert all(r == built[0] for r in built)
+    rows, _ = await env.audit.query({"action": "vsc.receipt"}, 50, ascending=True)
+    assert [r["task_id"] for r in rows] == [j1]
+
+
+async def test_non_dict_audit_row_is_a_problem(built):
+    _, _, receipt = built
+    bad = copy.deepcopy(receipt)
+    bad["audit"]["rows"][1] = "garbage"
+    assert any("audit" in p for p in verify_receipt(bad))
+    empty = copy.deepcopy(receipt)
+    empty["audit"]["rows"] = []
+    verify_receipt(empty)  # no crash
