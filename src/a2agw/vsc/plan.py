@@ -52,6 +52,15 @@ class Decision(BaseModel):
     step_id: str | None = None
     text: str = Field(max_length=DECISION_MAX_CHARS)
     kind: Literal["plan", "retry", "escalate", "replan", "gate", "stop"]
+    plan: Plan | None = None  # carried by a replan decision only; text is then a short reason
+
+    @model_validator(mode="after")
+    def _plan_only_for_replan(self) -> Decision:
+        if self.kind == "replan" and self.plan is None:
+            raise ValueError("a replan decision must carry a plan")
+        if self.kind != "replan" and self.plan is not None:
+            raise ValueError("plan is only for replan decisions")
+        return self
 
 
 class Plan(BaseModel):
@@ -79,6 +88,9 @@ class Plan(BaseModel):
         if sum(map(len, _layers(self.steps))) != len(self.steps):
             raise ValueError("plan has a dependency cycle")
         return self
+
+
+Decision.model_rebuild()
 
 
 def _layers(steps: list[PlanStep]) -> list[list[PlanStep]]:

@@ -69,7 +69,9 @@ async def test_replan_with_new_steps_is_refused(tmp_path):
     changed = Plan(steps=[PlanStep(id="s1", system="core", instructions="a")])
 
     async def run(plan, name):
-        text = json.dumps({"kind": "replan", "text": plan.model_dump_json()})
+        text = json.dumps(
+            {"kind": "replan", "text": "r", "plan": json.loads(plan.model_dump_json())}
+        )
         host, planner = await _host(tmp_path / name, lambda ctx: text)
         try:
             return await planner.replan(spec, old, failure(), [])
@@ -80,11 +82,11 @@ async def test_replan_with_new_steps_is_refused(tmp_path):
     d = await run(changed, "a")
     assert d.kind == "stop" and d.text == "plan_immutable"
     d = await run(old, "b")
-    assert d.kind == "replan" and plan_hash(Plan.model_validate_json(d.text)) == plan_hash(old)
+    assert d.kind == "replan" and d.plan is not None and plan_hash(d.plan) == plan_hash(old)
 
 
 async def _replan_decision(tmp_path, old, new):
-    text = json.dumps({"kind": "replan", "text": new.model_dump_json()})
+    text = json.dumps({"kind": "replan", "text": "r", "plan": json.loads(new.model_dump_json())})
     host, planner = await _host(tmp_path, lambda ctx: text)
     try:
         return await planner.replan(make_spec(), old, failure(), [])
@@ -98,13 +100,43 @@ async def test_replan_with_changed_instructions_is_accepted(tmp_path):
     new = two_step_plan("completely different instructions")
     d = await _replan_decision(tmp_path, old, new)
     assert d.kind == "replan"
-    assert Plan.model_validate_json(d.text).steps[0].instructions.startswith("completely")
+    assert d.plan is not None and d.plan.steps[0].instructions.startswith("completely")
+
+
+async def test_large_replan_plan_is_carried_and_accepted(tmp_path):
+    old = Plan(
+        steps=[
+            PlanStep(id=f"s{i}", system="core", kind="deploy", instructions="a") for i in range(3)
+        ]
+    )
+    new = Plan(
+        steps=[
+            PlanStep(id=f"s{i}", system="core", kind="deploy", instructions="x" * 5120)
+            for i in range(3)
+        ]
+    )
+    assert len(new.model_dump_json()) > 4096
+    d = await _replan_decision(tmp_path, old, new)
+    assert d.kind == "replan" and d.plan is not None
+    assert d.plan.steps[2].instructions == "x" * 5120
+
+
+async def test_replan_with_unparseable_plan_is_a_stop(tmp_path):
+    host, planner = await _host(
+        tmp_path, lambda ctx: json.dumps({"kind": "replan", "text": "r", "plan": {"steps": []}})
+    )
+    try:
+        d = await planner.replan(make_spec(), two_step_plan(), failure(), [])
+    finally:
+        await planner.aclose()
+        await host.shutdown()
+    assert d.kind == "stop" and d.plan is None and d.text
 
 
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda p: p.steps[0].__setattr__("system", "app"),
+        lambda p: p.steps[0].__setattr__("system", "other"),
         lambda p: p.steps[0].__setattr__("kind", "deploy"),
         lambda p: p.steps[1].__setattr__("depends_on", ["s1"]),
         lambda p: p.steps.pop(),

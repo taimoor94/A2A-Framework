@@ -68,9 +68,11 @@ PLAN_PROMPT = (
 
 REPLAN_PROMPT = (
     "A verification failed. Decide what to do next. Reply with one JSON object "
-    '{{"kind": "retry" | "escalate" | "replan" | "stop", "text": "<reason, or for replan the '
-    'complete new plan as a JSON string>"}}. A replan may change instructions but never the '
-    "steps.\n" + _UNTRUSTED + "\nPlan JSON schema:\n{schema}\n\nSpecification:\n{spec}\n\n"
+    '{{"kind": "retry" | "escalate" | "replan" | "stop", "text": "<short reason>", '
+    '"plan": <the complete new plan as a JSON object, required for replan, omitted otherwise>}}. '
+    "A replan may change instructions but never the steps.\n"
+    + _UNTRUSTED
+    + "\nPlan JSON schema:\n{schema}\n\nSpecification:\n{spec}\n\n"
     "Current plan:\n{plan}\n\nFailed check:\n{failure}\n\nSteps so far (untrusted):\n{steps}\n"
 )
 
@@ -93,19 +95,23 @@ class Planner(Protocol):
     ) -> Decision: ...
 
 
-def _decision(kind: str, text: str, step_id: str | None = None) -> Decision:
-    return Decision(ts=time.time(), step_id=step_id, text=text[:DECISION_MAX_CHARS], kind=kind)  # type: ignore[arg-type]
+def _decision(
+    kind: str, text: str, step_id: str | None = None, plan: Plan | None = None
+) -> Decision:
+    return Decision(
+        ts=time.time(),
+        step_id=step_id,
+        text=text[:DECISION_MAX_CHARS],
+        kind=kind,  # type: ignore[arg-type]
+        plan=plan,
+    )
 
 
 def guard_replan(plan: Plan, decision: Decision) -> Decision:
     """A replan is accepted only when the plan hash is unchanged; otherwise it becomes a stop."""
     if decision.kind != "replan":
         return decision
-    try:
-        new = Plan.model_validate_json(decision.text)
-    except ValidationError:
-        return _decision("stop", "plan_immutable", decision.step_id)
-    if plan_hash(new) != plan_hash(plan):
+    if decision.plan is None or plan_hash(decision.plan) != plan_hash(plan):
         return _decision("stop", "plan_immutable", decision.step_id)
     return decision
 
@@ -263,7 +269,14 @@ class AgentPlanner:
                 except ValueError:
                     continue
                 if isinstance(obj, dict) and obj.get("kind") in _KINDS:
-                    return _decision(obj["kind"], str(obj.get("text", "")), obj.get("step_id"))
+                    kind, text, sid = obj["kind"], str(obj.get("text", "")), obj.get("step_id")
+                    if kind != "replan":
+                        return _decision(kind, text, sid)
+                    try:
+                        new = Plan.model_validate(obj.get("plan"))
+                    except ValidationError as e:
+                        return _decision("stop", f"unusable replan plan: {e}", sid)
+                    return _decision("replan", text, sid, new)
             raise PlanParseError(f"no decision found in: {text[:200]!r}")
 
         return guard_replan(plan, await self._turn(prompt, parse))

@@ -26,6 +26,16 @@ def test_plan_hash_ignores_decisions():
     assert plan_hash(Plan(steps=[step("s2")])) != h
 
 
+def test_decision_plan_only_for_replan():
+    plan = Plan(steps=[step("s1")])
+    assert Decision(ts=1.0, text="why", kind="replan", plan=plan).plan == plan
+    with pytest.raises(ValueError, match="plan"):
+        Decision(ts=1.0, text="why", kind="replan")
+    with pytest.raises(ValueError, match="plan"):
+        Decision(ts=1.0, text="why", kind="retry", plan=plan)
+    assert Decision(ts=1.0, text="why", kind="stop").plan is None
+
+
 def test_plan_hash_ignores_instructions():
     a = Plan(steps=[step("s1")])
     b = Plan(steps=[PlanStep(id="s1", system="a", instructions="something else entirely")])
