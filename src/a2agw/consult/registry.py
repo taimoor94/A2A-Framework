@@ -242,8 +242,9 @@ class ReloadConflict(RuntimeError):
 
 class RemoteStateError(ValueError):
     """Partner records from the control plane that fail a local check. ``reason`` is the
-    dotted path of the offending fields (``partners.0.card_hash``) or the failed check's
-    error class (``UnsafeURL``, ``CardSignatureError``); never a value."""
+    dotted path of the offending fields (``partners.0.card_hash``) or the partner and the
+    failed check's error class (``acme: UnsafeURL``, ``acme: CardSignatureError``); never a
+    URL, a message or a secret."""
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
@@ -964,12 +965,12 @@ class PartnerRegistry:
                 else:
                     check_url_syntax(iface.url)
         except UnsafeURL as e:
-            raise RemoteStateError(type(e).__name__) from None
+            raise RemoteStateError(f"{rec.id}: {type(e).__name__}") from None
         if key_ids is None:
             try:
                 key_id = await self._verify_signature(proto, rec.tier)
             except CardSignatureError:
-                raise RemoteStateError("CardSignatureError") from None
+                raise RemoteStateError(f"{rec.id}: CardSignatureError") from None
         else:
             key_id = key_ids.get(rec.id)
         rec.card, rec.card_hash = card, card_hash(card)

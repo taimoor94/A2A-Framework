@@ -120,6 +120,7 @@ class FakeCP:
         self.stream_status = 200
         self.report_status = 200
         self.refused = 0
+        self.report_hang: asyncio.Event | None = None
         self.live: asyncio.Queue[bytes] = asyncio.Queue()
         self.acked = 0
         self.ack: Callable[[dict[str, Any]], int] = self._ack_all
@@ -167,6 +168,8 @@ class FakeCP:
 
     async def report(self, request: Request) -> Response:
         body = await request.json()
+        if self.report_hang is not None:
+            await self.report_hang.wait()
         if self.report_status != 200:  # refused: not taken (the gateway sends it again)
             self.refused += 1
             return JSONResponse({"error": "nope"}, status_code=self.report_status)
@@ -372,7 +375,7 @@ async def test_rejects_state_with_unsafe_endpoint_keeps_previous(gateway, cp):
     host, _conn = await gateway()
     await until(lambda: len(cp.applied()) >= 2)
     assert cp.applied()[1]["status"] == "rejected"
-    assert cp.applied()[1]["reason"] == "UnsafeURL"
+    assert cp.applied()[1]["reason"] == "p2: UnsafeURL"  # the partner, never the URL
     assert [r.id for r in host.partners.all()] == ["p1"]
     assert host.policy is not None and host.policy.policy.authz
 
@@ -649,7 +652,7 @@ async def test_stop_is_bounded_and_leaves_no_task(gateway, cp, monkeypatch):
     cp.script(("command", command("cmd-s", "task.get", {"agent_id": "a", "task_id": "t"})))
     _host, conn = await gateway()
     await asyncio.wait_for(started.wait(), 10)
-    [work] = list(conn._work)
+    [work] = [t for t in conn._work if t.get_name() == "a2agw:cp-cmd-s"]
     await asyncio.wait_for(conn.stop(), 5)
     assert work.cancelled() and conn.stopped and not conn._work
 
@@ -667,3 +670,66 @@ async def test_stop_is_bounded_and_leaves_no_task(gateway, cp, monkeypatch):
         await stopping
     await asyncio.wait(running, timeout=5)
     assert all(t.done() for t in running)
+
+
+async def test_null_managed_policy_is_lockdown(gateway, cp):
+    """A desired state that assigns no policy does not open the gateway: it is locked down,
+    audited, and healthz says why."""
+    from a2agw.ops.cp_client import LOCKDOWN_RULE_ID, NO_POLICY_WARNING
+
+    cp.script(("state", state(1, [partner("p1")])), ("state", state(2, [partner("p1")], None)))
+    host, conn = await gateway()
+    await until(lambda: len(cp.applied()) >= 2)
+    assert cp.applied()[1]["status"] == "applied"
+    assert host.policy is not None
+    [rule] = host.policy.policy.authz
+    assert rule.id == LOCKDOWN_RULE_ID and rule.effect == "deny" and rule.principal == "*"
+    assert conn.health()["warning"] == NO_POLICY_WARNING
+    assert not conn.waiting_for_state
+    updates = await audit_rows(host, "policy.update")
+    assert updates[-1]["detail"]["hash"] == policy_hash(host.policy.policy)
+    # a policy assigned again lifts it
+    cp.push("state", state(3, [partner("p1")]))
+    await until(lambda: len(cp.applied()) >= 3)
+    assert policy_hash(host.policy.policy) == policy_hash(parse_policy(POLICY))
+    assert "warning" not in conn.health()
+
+
+async def test_null_policy_in_cached_state_restores_lockdown(gateway, cp):
+    cp.script(("state", state(1, [partner("p1")], None)))
+    _host, conn = await gateway()
+    await until(lambda: cp.applied())
+    await conn.stop()
+    host2, conn2 = await gateway(start=False)
+    cp.stream_status = 503
+    await host2.startup()
+    assert host2.policy is not None and host2.policy.policy.authz[0].effect == "deny"
+    assert conn2.no_policy_assigned and conn2.status()["applied_version"] == 1
+
+
+async def test_stop_posts_a_final_report(gateway, cp):
+    from a2agw.ops.bus import GatewayEvent
+
+    host, conn = await gateway()
+    await until(lambda: cp.reports)  # the loop is running
+    host.bus.publish(GatewayEvent(kind="task.state", agent_id="alpha", data={"task_id": "last"}))
+    await conn.stop()  # no await between the publish and the stop: only stop can send it
+    sent = [e["data"]["task_id"] for r in cp.reports for e in r.get("events", [])]
+    assert "last" in sent
+
+
+async def test_final_report_is_bounded(gateway, cp, monkeypatch):
+    from a2agw.ops import cp_client
+    from a2agw.ops.bus import GatewayEvent
+
+    monkeypatch.setattr(cp_client, "FINAL_REPORT_S", 0.05)
+    monkeypatch.setattr(cp_client, "STOP_TIMEOUT_S", 0.5)  # a report in flight hangs too
+    host, conn = await gateway()
+    await until(lambda: cp.reports)
+    cp.report_hang = asyncio.Event()  # the control plane stops answering
+    host.bus.publish(GatewayEvent(kind="task.state", agent_id="alpha", data={"task_id": "x"}))
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    await asyncio.wait_for(conn.stop(), 5)
+    assert loop.time() - t0 < 3 and not conn._work and conn.stopped
+    cp.report_hang.set()

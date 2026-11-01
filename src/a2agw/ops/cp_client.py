@@ -35,7 +35,8 @@ Fail static: with managed sections, the host's startup calls ``restore`` before 
 The last applied state is loaded from ``a2agw_cp_state`` and put in force again (local
 checks only, no network), so a gateway restarted while the control plane is down serves its
 last partners and policy. With no cached state, managed partners are empty and a managed
-policy is a lockdown (a lone deny, rule id ``cp:unconfigured``, audited ``policy.update``);
+policy is a lockdown (a lone deny, rule id ``cp:unconfigured``, audited ``policy.update``),
+as is a desired state that assigns no policy (``policy: null``) to a managed policy;
 a WARNING in the log and in ``/a2agw/admin/healthz`` says the gateway waits for its first
 state. A lost connection changes nothing that is in force.
 
@@ -49,7 +50,8 @@ header, and never logged.
 
 The database work of each step (applying a state, a report, an audit row) runs as a task
 the loops' cancellation cannot interrupt; ``stop`` cancels the loops, then waits for that
-work and for running commands, ``STOP_TIMEOUT_S`` at most, and cancels what is left.
+work and for running commands, posts one last report (``FINAL_REPORT_S`` at most), all
+within ``STOP_TIMEOUT_S``, and cancels what is left.
 
 One gateway per database: ``a2agw_cp_state`` holds this gateway's state under fixed keys.
 """
@@ -102,6 +104,7 @@ CONNECT_TIMEOUT_S = 10.0
 STREAM_IDLE_S = 90.0  # no frame (keepalives included) for this long: reconnect
 REPORT_TIMEOUT_S = 15.0
 STOP_TIMEOUT_S = 5.0
+FINAL_REPORT_S = 2.0  # stop: the last report's share of STOP_TIMEOUT_S
 CANCEL_WAIT_S = 1.0
 COMMAND_CONCURRENCY = 8
 APPLIED_PENDING_MAX = 16  # applied / rejected outcomes kept for reporting
@@ -112,6 +115,9 @@ LOCKDOWN_POLICY: dict[str, Any] = {
     "authz": [{"id": LOCKDOWN_RULE_ID, "principal": "*", "agents": "*", "effect": "deny"}],
 }
 WAITING_WARNING = "waiting for its first desired state from the control plane"
+NO_POLICY_WARNING = (
+    "the control plane assigns no policy to this gateway: locked down (every call denied)"
+)
 APPLIED_KEY = "applied_state"
 ACKED_KEY = "audit_acked_seq"
 
@@ -373,6 +379,7 @@ class ControlPlaneConnector:
         self._work: set[asyncio.Task[Any]] = set()
         self._command_gate = asyncio.Semaphore(COMMAND_CONCURRENCY)
         self.waiting_for_state = False
+        self.no_policy_assigned = False  # a managed policy of null: locked down
         host.policy_managed = "policy" in self.manage
         host.control_plane = self
 
@@ -398,6 +405,8 @@ class ControlPlaneConnector:
         out = self.status()
         if self.waiting_for_state:
             out["warning"] = WAITING_WARNING
+        elif self.no_policy_assigned:
+            out["warning"] = NO_POLICY_WARNING
         return out
 
     # -- lifecycle -------------------------------------------------------------------------
@@ -459,29 +468,40 @@ class ControlPlaneConnector:
         ]
 
     async def stop(self) -> None:
-        """Stop the loops and wait (``STOP_TIMEOUT_S`` at most) for the work they started;
-        what is still running then is cancelled. Cancelling ``stop`` itself cancels
-        everything at once (no task is left behind)."""
+        """Stop the loops, wait for the work they started (running commands included), then
+        post one last report (``FINAL_REPORT_S`` at most) so recent events and results are
+        not lost; all within ``STOP_TIMEOUT_S``. What is still running then is cancelled.
+        Cancelling ``stop`` itself cancels everything at once (no task is left behind)."""
         self._stopping = True
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + STOP_TIMEOUT_S
         loops, self._loops = self._loops, []
         for t in loops:
             t.cancel()
-        running = [*loops, *self._work]
+        tracked: list[asyncio.Task[Any]] = [*loops]
         try:
-            if running:
-                await asyncio.wait(running, timeout=STOP_TIMEOUT_S)
-            stragglers = [t for t in running if not t.done()]
+            pending = [*loops, *self._work]
+            if pending:
+                await asyncio.wait(pending, timeout=max(0.0, STOP_TIMEOUT_S - FINAL_REPORT_S))
+            tracked += self._work
+            if loops and not self._halted and (self._http or self._own_http) is not None:
+                final = asyncio.ensure_future(self._report_once())
+                self._track(final)
+                tracked.append(final)
+                left = min(FINAL_REPORT_S, deadline - loop.time())
+                await asyncio.wait([final], timeout=max(0.0, left))
+            tracked += self._work
+            stragglers = list({t for t in tracked if not t.done()})
             if stragglers:
                 log.warning(
-                    "control plane: cancelling %d task(s) still running after %.1fs",
+                    "control plane: cancelling %d task(s) still running at shutdown",
                     len(stragglers),
-                    STOP_TIMEOUT_S,
                 )
                 for t in stragglers:
                     t.cancel()
                 await asyncio.wait(stragglers, timeout=CANCEL_WAIT_S)
         except asyncio.CancelledError:
-            for t in running:
+            for t in {*tracked, *self._work}:
                 t.cancel()
             raise
         finally:
@@ -757,7 +777,11 @@ class ControlPlaneConnector:
             if "policy" not in self.manage:
                 self.host.warn_unknown_routing_partners()
         if "policy" in self.manage:
-            await self._set_policy(policy_doc)
+            # No policy assigned is not "no policy": the gateway stays locked down.
+            self.no_policy_assigned = policy_doc is None
+            await self._set_policy(LOCKDOWN_POLICY if policy_doc is None else policy_doc)
+            if policy_doc is None:
+                log.warning("control plane: %s", NO_POLICY_WARNING)
 
     async def _set_policy(self, doc: dict[str, Any] | None) -> None:
         """Put ``doc`` in force through ``actions.set_policy`` (``None``: no policy), unless

@@ -74,8 +74,8 @@ lock, partners first, then the policy, and only if every local check passes:
 If anything fails, nothing from that state is applied: the previous partners and policy stay
 in force. The gateway reports `applied: {status: "rejected", reason}` (the reason is the
 dotted path of the offending fields, such as `partners.0.card_hash` or
-`policy.authz.0.principal`, or the failed check's error class, such as `UnsafeURL` or
-`CardSignatureError`; never a value) and audits `cp.reject`. The control plane shows it as
+`policy.authz.0.principal`, or the partner and the failed check's error class, such as
+`acme: UnsafeURL` or `acme: CardSignatureError`; never a value, URL or message) and audits `cp.reject`. The control plane shows it as
 the gateway's last rejection.
 
 An applied state is saved in the gateway's database (`a2agw_cp_state`, key
@@ -88,8 +88,12 @@ the gateway's own refresh found stays quarantined until it is approved (a new ap
 from the control plane, or a `partner.approve` command). A new card from the control plane
 replaces the record. A partner left out of the desired state is removed, unless it still has
 open partner tasks: then it is disabled at once (no new consult starts) and removed by the
-gateway's maintenance pass once those tasks have ended. A managed policy of `null` (no
-policy assigned) means no policy: Phase 1 access rules only.
+gateway's maintenance pass once those tasks have ended.
+
+A managed policy of `null` (the control plane assigns no policy to the gateway) does not
+open it: the gateway is locked down exactly as on a first start (the lone deny
+`cp:unconfigured`, audited as `policy.update`), and `/a2agw/admin/healthz` says no policy is
+assigned. Assigning a policy lifts the lockdown.
 
 **Versions and epochs.** Versions grow within the control plane's store epoch. A state of the
 epoch already applied with a version that is not higher than the applied one is ignored. A
@@ -150,14 +154,16 @@ Every `report_interval_s` the gateway posts what it has to say, in one report:
   gateway info `{version, agents, base_url}`.
 
 A report that fails is sent again, whole; after a `413` the gateway sends smaller reports
-until one fits.
+until one fits. At shutdown the gateway waits for running commands, then posts one last
+report (2 s at most, within the connector's 5 s shutdown bound), so the latest events and
+results are not lost.
 
 ### Status
 
 `/a2agw/admin/healthz` has a `control_plane` object: `connected`, `applied_version`,
 `last_error_kind` (`unauthorized`, `no_token`, `http_<status>`, `stream_ended` or an error
 class), `queue` (events not yet reported), `dropped`, and `warning` while the gateway waits
-for its first state.
+for its first state or is locked down because no policy is assigned.
 
 ### Limits
 
