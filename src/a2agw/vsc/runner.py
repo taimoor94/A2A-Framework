@@ -2,7 +2,9 @@
 
 intake -> plan -> edit steps (by dependency layer; steps in one repository serialised in plan
 order, different repositories in parallel), each an attempt loop of worker -> ranked checks ->
-planner decision -> whole-system checks -> privileged steps through the gate -> ``accepted``.
+planner decision -> whole-system checks -> privileged steps through the gate -> ``accepted``. Just before each
+whole-system check the files of the spec's whole-system acceptance tests for that check are
+written into the workspaces of the repositories their paths name (``verify.write_whole_files``).
 
 Every attempt is a new ``vsc_steps`` row; an attempt number is never reused, and an attempt
 that is cancelled (job cancel, deadline, a failing sibling) is closed ``failed`` with
@@ -51,7 +53,14 @@ from a2agw.vsc.plan import (
 from a2agw.vsc.planner import Planner, PlannerError, guard_replan
 from a2agw.vsc.spec import REQUEST_MAX_CHARS, ExecutableSpec, validate_against
 from a2agw.vsc.store import JobState, StepState, VscStore
-from a2agw.vsc.verify import CheckResult, all_passed, verify_step, verify_whole
+from a2agw.vsc.verify import (
+    CheckKind,
+    CheckResult,
+    all_passed,
+    verify_step,
+    verify_whole,
+    write_whole_files,
+)
 from a2agw.vsc.workers import WorkerSpec, WorkerTask, run_worker
 from a2agw.vsc.workspace import MergeRefused, Workspace, WorkspaceManager
 
@@ -82,18 +91,22 @@ def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
-def _worker_failure(spec: WorkerSpec, error: str) -> CheckResult:
+def _check_failure(kind: CheckKind, id: str, reason: str) -> CheckResult:
     return CheckResult(
-        kind="worker",
-        id=spec.id,
+        kind=kind,
+        id=id,
         command=[],
         exit_code=None,
         passed=False,
         duration_s=0.0,
         log_sha256=_EMPTY_SHA,
         stderr_tail="",
-        reason=f"worker: {error}"[:512],
+        reason=reason[:512],
     )
+
+
+def _worker_failure(spec: WorkerSpec, error: str) -> CheckResult:
+    return _check_failure("worker", spec.id, f"worker: {error}")
 
 
 async def _all_or_cancel(coros: list[Coroutine[Any, Any, None]]) -> None:
@@ -496,7 +509,14 @@ class JobRunner:
                     sid: await self._ws.create(ctx.job_id, sid) for sid in check.systems
                 }
                 timeout = min(check.timeout_s, max(1.0, ctx.budget.deadline - loop.time()))
-                res = await verify_whole(check, wss, timeout_s=timeout)
+                # whole-system acceptance files go in just before the check (an edit attempt's
+                # reset removes them again, so no step ever sees or commits them)
+                by_repo = {ws.repo_id: ws for ws in wss.values()}
+                err = write_whole_files(ctx.spec.acceptance, check.id, by_repo)
+                if err:
+                    res = _check_failure("whole_system", check.id, err)
+                else:
+                    res = await verify_whole(check, wss, timeout_s=timeout)
                 await self._audit_check(ctx.job_id, [res], res.passed)
                 if not res.passed:
                     failed = (check, res)

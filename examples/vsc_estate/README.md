@@ -102,6 +102,25 @@ It also checks that the contract suite passes on the base commits, with nothing 
 The estate tests carry the `estate` marker: the gate runs them, and `uv run pytest -m "not
 estate"` leaves them out of a quick local run.
 
+## Benchmark
+
+The scenarios are the `estate` corpus of the VSC benchmark (`a2agw.vsc.bench`). Each task
+runs on a freshly initialised estate; a whole-system acceptance test's files are written into
+the named repositories' workspaces just before the `estate` check runs.
+
+```sh
+uv run a2agw vsc bench run --corpus estate --mode oracle --out bench-out   # validates the corpus
+uv run a2agw vsc bench run --corpus estate --mode vsc --out bench-out -c my-a2agw.yaml
+uv run a2agw vsc bench run --corpus estate --mode single --out bench-out -c my-a2agw.yaml
+uv run a2agw vsc bench report bench-out                                    # bench-out/report.md
+```
+
+`vsc` and `single` need workers (this directory's `a2agw.yaml` has none): pass a config whose
+`vsc:` section is this one plus your `workers`. Run `vsc` before `single`: `single` then gets
+the token budget the `vsc` run used on each task. `a2agw vsc bench mine <repo> --out <dir>`
+mines more tasks from a repository's history (commits that change several configured systems
+and add tests that fail on the parent); `--corpus <dir>` runs them.
+
 ## Adding a scenario
 
 1. `init_estate.py` a scratch copy, make the change there and write the acceptance tests.

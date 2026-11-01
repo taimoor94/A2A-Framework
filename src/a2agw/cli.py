@@ -58,6 +58,10 @@ vsc_spec_app = typer.Typer(help="Edit a job's executable specification.", no_arg
 app.add_typer(vsc_app, name="vsc")
 vsc_app.add_typer(vsc_receipt_app, name="receipt")
 vsc_app.add_typer(vsc_spec_app, name="spec")
+vsc_bench_app = typer.Typer(
+    help="The VSC benchmark, run locally against the config's vsc: section.", no_args_is_help=True
+)
+vsc_app.add_typer(vsc_bench_app, name="bench")
 
 
 class DatabaseError(Exception):
@@ -1216,3 +1220,89 @@ def vsc_spec_edit(
         raise ValueError(f"{file} must contain an object")  # noqa: TRY004
     data = _vsc_api(config, api_key, "PUT", f"{_job_path(job)}/spec", spec)
     typer.echo(f"spec {data.get('spec_hash')} set; job {job} continues")
+
+
+# -- vsc bench -------------------------------------------------------------------------------
+# Local: these read the config's ``vsc:`` section and run in this process (no gateway).
+
+
+def _vsc_section(config: Path) -> Any:
+    cfg = load_config(config).vsc
+    if cfg is None:
+        raise ValueError(f"{config}: no vsc: section")
+    return cfg
+
+
+@vsc_bench_app.command("mine")
+@guarded
+def vsc_bench_mine(
+    repo: Path,
+    out: Annotated[Path, typer.Option("--out", help="Directory for the task files.")],
+    config: ConfigOpt = Path("a2agw.yaml"),
+    min_systems: Annotated[int, typer.Option("--min-systems", min=1)] = 2,
+    limit: Annotated[int, typer.Option("--limit", min=1)] = 50,
+) -> None:
+    """Mine tasks from REPO's first-parent history (commits changing several configured systems
+    that add failing tests); one JSON file per task in --out."""
+    from a2agw.vsc.bench import mine_history, save_tasks
+
+    cfg = _vsc_section(config)
+    root = repo.resolve()
+    systems = [s for s in cfg.systems if (config.parent / s.repo).resolve() == root]
+    if not systems:
+        raise ValueError(f"no configured system lives in {repo}")
+    tasks = mine_history(root, systems, min_systems=min_systems, limit=limit)
+    save_tasks(tasks, out)
+    for t in tasks:
+        typer.echo(f"{t.id}: {', '.join(t.systems)}")
+    typer.echo(f"{len(tasks)} task(s) written to {out}")
+
+
+@vsc_bench_app.command("run")
+@guarded
+def vsc_bench_run(
+    corpus: Annotated[
+        str, typer.Option("--corpus", help="'estate', an estate directory or a task directory.")
+    ],
+    mode: Annotated[str, typer.Option("--mode", help="vsc, single or oracle.")],
+    out: Annotated[Path, typer.Option("--out", help="Results go to OUT/<mode>/<task>.json.")],
+    config: Annotated[
+        Path | None,
+        typer.Option(
+            "-c", "--config", help="Gateway config (default: the estate's for --corpus estate)."
+        ),
+    ] = None,
+) -> None:
+    """Run every task of the corpus in one mode and write a result per task."""
+    from a2agw.vsc.bench import ESTATE_DIR, load_corpus, run_bench
+
+    if mode not in ("vsc", "single", "oracle"):
+        raise ValueError("--mode must be vsc, single or oracle")
+    if config is None:
+        config = ESTATE_DIR / "a2agw.yaml" if corpus == "estate" else Path("a2agw.yaml")
+    cfg = _vsc_section(config)
+    tasks = load_corpus(corpus)
+    results = asyncio.run(
+        run_bench(
+            tasks,
+            mode=cast(Literal["vsc", "single", "oracle"], mode),
+            cfg=cfg,
+            budget=cfg.budgets,
+            out=out,
+            config_dir=config.parent,
+        )
+    )
+    for r in results:
+        line = f"{r.task_id}: {'solved' if r.solved else r.failure_class}"
+        typer.echo(line + (f" ({r.reason})" if r.reason and not r.solved else ""))
+    solved = sum(r.solved for r in results)
+    typer.echo(f"{mode}: {solved}/{len(results)} solved; results in {out / mode}")
+
+
+@vsc_bench_app.command("report")
+@guarded
+def vsc_bench_report(out: Path) -> None:
+    """Write OUT/report.md from the results under OUT and print it."""
+    from a2agw.vsc.bench import load_results, report
+
+    typer.echo(report(load_results(out), out))

@@ -10,7 +10,9 @@ PYTHON, UV_, NODE_, npm_config_, GIT_`` taken from ``os.environ``, merged with t
 ``env`` (the caller wins). Redaction of the stderr tail is a best-effort second layer.
 
 Acceptance files (``AcceptanceTest.files``) are paths relative to the *workspace root*; the test
-command itself runs in the system's ``path`` sub-tree of that root.
+command itself runs in the system's ``path`` sub-tree of that root. A whole-system test's
+(``system`` unset) files instead start with a repository id (``contract/tests/test_x.py``): each
+is written into that repository's workspace, without the id (``write_whole_files``).
 """
 
 from __future__ import annotations
@@ -275,6 +277,28 @@ def _write_files(root: Path, files: Mapping[str, str]) -> str | None:
             return f"acceptance file outside the workspace: {rel}"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content)
+    return None
+
+
+def write_whole_files(
+    acceptance: Iterable[AcceptanceTest], check_id: str, workspaces: Mapping[str, Workspace]
+) -> str | None:
+    """Write the files of every whole-system acceptance test of ``check_id`` into the workspace
+    of the repository each path names by its first segment (``workspaces`` maps repository id
+    to workspace); an error text if a path names no workspace of the check or escapes it."""
+    for test in acceptance:
+        if test.system is not None or test.check != check_id:
+            continue
+        groups: dict[str, dict[str, str]] = {}
+        for rel, content in test.files.items():
+            repo_id, _, rest = rel.partition("/")
+            if repo_id not in workspaces or not rest:
+                return f"acceptance file names no repository of the check: {rel}"
+            groups.setdefault(repo_id, {})[rest] = content
+        for repo_id, files in groups.items():
+            err = _write_files(workspaces[repo_id].path, files)
+            if err:
+                return err
     return None
 
 

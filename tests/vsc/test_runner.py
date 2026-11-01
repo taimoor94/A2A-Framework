@@ -20,6 +20,7 @@ from a2agw.vsc.gate import Gate
 from a2agw.vsc.plan import Decision, Plan, PlanStep, plan_hash
 from a2agw.vsc.planner import ScriptedPlanner
 from a2agw.vsc.runner import Budget, BudgetExceeded, JobRunner, RetryPolicy
+from a2agw.vsc.spec import AcceptanceTest
 from a2agw.vsc.store import VscStore
 from a2agw.vsc.workspace import WorkspaceManager
 
@@ -585,3 +586,71 @@ async def test_submitted_and_planning_jobs_resume(env):
     assert {j["state"] for j in jobs} == {"accepted"}
     assert planner2.intakes == 1  # only the job without a stored spec redoes intake
     assert planner2.plans == 2
+
+
+class AcceptancePlanner(FixedPlanner):
+    """FixedPlanner whose spec carries the given acceptance tests."""
+
+    def __init__(self, steps, acceptance) -> None:
+        super().__init__(steps)
+        self._acceptance = acceptance
+
+    async def intake(self, request, systems, checks):
+        spec = await super().intake(request, systems, checks)
+        return spec.model_copy(update={"acceptance": self._acceptance})
+
+
+WHOLE_FILE = "tests/whole_e2e.txt"
+ABSENT = [PY, "-c", f"import os, sys; sys.exit(1 if os.path.exists({WHOLE_FILE!r}) else 0)"]
+PRESENT = [
+    PY,
+    "-c",
+    (
+        "import os, sys; p = lambda k: os.path.join(os.environ[k], *'tests/whole_e2e.txt'.split('/'));"
+        " sys.exit(0 if open(p('VSC_WS_ALPHA')).read() == 'a' and open(p('VSC_WS_BETA')).read() == 'b'"
+        " else 1)"
+    ),
+]
+
+
+async def test_whole_system_acceptance_files_written_before_check(env):
+    """A whole-system acceptance test's files (``<repo id>/<path>``) are in the named repository's
+    workspace when the check runs, and not before: the per-system tests assert their absence."""
+    a = make_repo(env.tmp, "repo-a", REPO_FILES)
+    b = make_repo(env.tmp, "repo-b", REPO_FILES)
+    cfg = VscConfig(
+        systems=[
+            SystemConfig(id="alpha", repo=str(a), tests=ABSENT),
+            SystemConfig(id="beta", repo=str(b), tests=ABSENT),
+        ],
+        checks=[CheckConfig(id="whole", systems=["alpha", "beta"], run=PRESENT, timeout_s=60)],
+    )
+    acceptance = [
+        AcceptanceTest(
+            id="e2e",
+            check="whole",
+            files={f"repo-a/{WHOLE_FILE}": "a", f"repo-b/{WHOLE_FILE}": "b"},
+        ),
+    ]
+    planner = AcceptancePlanner([edit("alpha"), edit("beta")], acceptance)
+    r = env.runner(cfg, planner, [worker("apply")])
+    job_id = await r.submit("greet systems: alpha, beta", owner="key:a")
+    job = await r.run(job_id)
+    assert job["state"] == "accepted", job
+    assert [x["outcome"] for x in await env.whole_checks(job_id)] == ["passed"]
+    for repo in ("repo-a", "repo-b"):
+        with pytest.raises(subprocess.CalledProcessError):  # never committed on the job branch
+            git(env.tmp / repo, "cat-file", "-e", f"vsc/{job_id}/{repo}:{WHOLE_FILE}")
+
+
+async def test_whole_system_acceptance_file_outside_workspace_fails_check(env):
+    cfg = two_repo_cfg(env.tmp)
+    acceptance = [AcceptanceTest(id="e2e", check="whole", files={"repo-a/../../escape.txt": "x"})]
+    planner = AcceptancePlanner([edit("alpha"), edit("beta")], acceptance)
+    r = env.runner(cfg, planner, [worker("apply")])
+    job_id = await r.submit("greet systems: alpha, beta", owner="key:a")
+    job = await r.run(job_id)
+    assert (job["state"], job["reason"]) == ("failed", "whole_system"), job
+    reasons = [x["detail"]["reason"] for x in await env.whole_checks(job_id)]
+    assert reasons and all("outside the workspace" in x for x in reasons), reasons
+    assert not (env.tmp / "escape.txt").exists()
