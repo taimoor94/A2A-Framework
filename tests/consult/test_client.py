@@ -920,11 +920,11 @@ async def test_internal_error_is_raised_not_blamed_on_partner(env, monkeypatch):
 
 
 async def test_cancel_for_inbound_runs_concurrently_within_bound(env):
-    a, b = Gated(), Gated()
-    e = await env(spec("pa", a), spec("pb", b))
-    ra = await e.client.consult("pa", "go", wait_seconds=HANDLE_WAIT_S, inbound_task_id="in-c")
-    rb = await e.client.consult("pb", "go", wait_seconds=HANDLE_WAIT_S, inbound_task_id="in-c")
-    assert ra.state == rb.state == "working"
+    # The open handles are recorded directly: no partner task runs, so nothing depends on how
+    # fast a loaded machine answers a consult, and none finishes while the host shuts down.
+    e = await env()
+    await e.handles.record("ta", "pa", "ca", "in-c", "o", "TASK_STATE_WORKING")
+    await e.handles.record("tb", "pb", "cb", "in-c", "o", "TASK_STATE_WORKING")
     started: list[str] = []
 
     async def cancel(partner_id, task_id, **kw):
@@ -936,12 +936,12 @@ async def test_cancel_for_inbound_runs_concurrently_within_bound(env):
         return ToolResult(partner=partner_id, task_id=task_id, state="canceled")
 
     e.client.cancel = cancel  # type: ignore[method-assign]
+    # The bound only ends the wait: pb's cancel finishes on its first step, which runs before
+    # the bound's timer can (it was scheduled first), however late the loop gets to them.
     e.client.default_deadline_s = 0.3
     # Both cancels run at once: pb's answer counts although pa's never comes.
     assert await asyncio.wait_for(e.client.cancel_for_inbound("in-c"), 30) == 1
     assert sorted(started) == ["pa", "pb"]
-    a.gate.set()
-    b.gate.set()
 
 
 def _blocking(real, writing: asyncio.Event, release: asyncio.Event, done: asyncio.Event):

@@ -178,6 +178,22 @@ _EXIT_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 # Default bound on uvicorn's wait for open requests at shutdown.
 GRACEFUL_TIMEOUT_S = 10.0
 DEFAULT_MAX_OPEN_SIDECAR_TASKS = 64
+# Bound on one agent's request handler closing at shutdown (see ``AgentHost._close_handler``).
+HANDLER_CLOSE_S = 5.0
+
+
+async def _bounded(close: Awaitable[None], timeout: float, agent_id: str) -> bool:
+    """Run ``close`` for at most ``timeout`` seconds, then cancel it and wait for it (for at
+    most ``timeout`` again). True when it ended by itself in time. An error is logged (its
+    class only), not raised: shutdown carries on."""
+    task = asyncio.ensure_future(close)
+    done, _ = await asyncio.wait({task}, timeout=timeout)
+    if not done:
+        task.cancel()
+        await asyncio.wait({task}, timeout=timeout)
+    if task.done() and not task.cancelled() and (exc := task.exception()) is not None:
+        logger.error("agent %s: request handler close failed: %s", agent_id, type(exc).__name__)
+    return bool(done)
 
 
 @contextmanager
@@ -1835,8 +1851,7 @@ class AgentHost:
             self._maintenance = None
         if self._mcp is not None:
             await self._mcp.stop()  # its sessions' calls in flight end here
-        for handler in self.handlers.values():
-            await handler.aclose()
+        await asyncio.gather(*(self._close_handler(a, h) for a, h in self.handlers.items()))
         await self._stop_adapters()
         if self.push_senders:
             await asyncio.gather(*(s.aclose(DRAIN_TIMEOUT_S) for s in self.push_senders.values()))
@@ -1851,6 +1866,25 @@ class AgentHost:
         if self.engine is not None:
             await self.engine.dispose()
             self.engine = None
+
+    async def _close_handler(self, agent_id: str, handler: LimitedRequestHandler) -> None:
+        """Close an agent's request handler (its running tasks), bounded by ``HANDLER_CLOSE_S``.
+
+        The SDK's ``ActiveTask.aclose`` cancels each task's producer once. A producer that
+        already consumed a cancellation can then wait forever in its graceful queue close: a
+        queue whose consumer was cancelled mid-event is never drained. That happens when a
+        task finishes just as the host shuts down, and shutdown would never return (nor the
+        engine be disposed). Cancelling the close cancels the producer again, which ends the
+        wait; a second close (the SDK allows several) drains what the first did not reach."""
+        if await _bounded(handler.aclose(), HANDLER_CLOSE_S, agent_id):
+            return
+        logger.warning(
+            "agent %s: request handler did not close within %s s; its tasks were cancelled",
+            agent_id,
+            HANDLER_CLOSE_S,
+        )
+        if not await _bounded(handler.aclose(), HANDLER_CLOSE_S, agent_id):
+            logger.error("agent %s: request handler did not close", agent_id)
 
     async def _stop_adapters(self) -> None:
         """Stop the adapters started at startup, concurrently (one slow shutdown does not

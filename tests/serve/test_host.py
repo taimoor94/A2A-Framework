@@ -637,6 +637,40 @@ async def test_startup_failure_disposes_engine(tmp_path, monkeypatch):
     assert host.engine is None and host.client is None
 
 
+async def test_shutdown_is_bounded_when_a_handler_close_never_ends(tmp_path, monkeypatch):
+    """The SDK's ``ActiveTask.aclose`` cancels a task's producer once. A producer whose
+    cancellation it already consumed can then wait forever in a graceful queue close (a sink
+    whose consumer was cancelled mid-event never drains). Past ``HANDLER_CLOSE_S`` the close
+    is cancelled, which cancels the producer again and ends that wait; a second close drains
+    what the first did not reach; the engine is disposed either way."""
+    from a2agw.serve import host as host_mod
+
+    monkeypatch.setattr(host_mod, "HANDLER_CLOSE_S", 0.01)
+    host = AgentHost("http://t", db_url=f"sqlite+aiosqlite:///{tmp_path / 'h.db'}", audit=False)
+    host.add(spec("alpha"))
+    await host.startup()
+    handler = host.handlers["alpha"]
+    real_aclose = handler.aclose
+    calls: list[str] = []
+
+    async def aclose() -> None:
+        if not calls:
+            calls.append("first")
+            try:
+                await asyncio.Event().wait()  # wedged: ends only when cancelled
+            except asyncio.CancelledError:
+                calls.append("cancelled")
+                raise
+        calls.append("again")
+        await real_aclose()
+
+    handler.aclose = aclose  # type: ignore[method-assign]
+    # Not a time bound on the fix: without it, shutdown never returns.
+    await asyncio.wait_for(host.shutdown(), 60)
+    assert calls == ["first", "cancelled", "again"]
+    assert host.engine is None
+
+
 _PROXY_ENV = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy")
 
 
