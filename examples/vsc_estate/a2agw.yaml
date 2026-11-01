@@ -7,6 +7,10 @@
 # pyyaml and pytest).
 base_url: ${A2AGW_BASE_URL:-http://localhost:8000}
 db_url: ${A2AGW_DB_URL:-sqlite+aiosqlite:///a2agw.db}
+# VSC refuses a gateway without `auth` unless this development opt-in is set (and then every
+# caller is `anonymous`, so it must also allow self approval below). Configure `auth` instead
+# for real use.
+admin_without_auth: true
 
 vsc:
   systems:
@@ -34,4 +38,5 @@ vsc:
       run: [python, -m, pytest, -q, tests]
       timeout_s: 300
   planner: scripted
+  allow_self_approval: true  # development only (no auth: owner and approver are both anonymous)
   workers: []  # fill in your workers (Claude Code, Codex CLI, ...) before running a job

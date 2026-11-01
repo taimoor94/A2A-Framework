@@ -135,57 +135,95 @@ Notes on this section, which apply to any other:
 | Key | Meaning |
 |---|---|
 | `systems[]` | `id` (`[a-z0-9][a-z0-9-]*`), `repo` (local path), `path` (sub-tree, default `.`), `default_branch` (default `main`), `gate`, `tests` (commands, optional), `index` (5b) |
-| `checks[]` | whole-system checks: `id`, `systems` (two or more), `run` (command), `timeout_s` (default 1800). A job runs every check whose systems are all in its spec |
+| `checks[]` | whole-system checks: `id`, `systems` (two or more), `run` (command), `timeout_s` (default 1800). A job runs every check that names a system it edits (systems it does not edit take part at their base). A spec or plan of two or more systems is refused unless checks cover each of them together with another |
 | `workers[]` | `id`, `command`, `model`, `cost_class` (`cheap`, `standard`, `strong`), `reports_usage` (default true), `env` (added to the worker's environment), `timeout_s` (default 1800) |
 | `budgets` | `tokens` (2 000 000), `cost_usd` (50), `attempts` (3, per step), `deadline_s` (7200, active time) |
 | `planner` | `claude` (default; the `vsc-planner` agent through the Claude Agent SDK) or `scripted` (deterministic, for tests and demos: one edit step per system, the request as instructions) |
 | `workspace_dir` | where job worktrees go (default `.a2agw/vsc`) |
-| `auto_approve[]` | `{system, action}` pairs (`action`: `merge`, `deploy`, `migrate`, `send`) that skip the human gate |
+| `auto_approve[]` | `{system, action}` pairs (`action`: `merge`, `deploy`, `migrate`, `send`) that skip the human gate; a `merge` rule also names its `target_branch` (required) and covers only that branch |
+| `require_spec_review` | pause every job after intake in `awaiting_spec` until the spec is confirmed or edited with `PUT /jobs/{id}/spec` (default false) |
+| `approvers[]` | principal ids (`key:ops`, `jwt:alice`) whose approvals count; empty (default): anyone but the job's owner. Admins (`a2agw:admin`) may always approve |
+| `allow_self_approval` | let a job's owner approve its own privileged steps when `approvers` is empty (default false; required without `auth`) |
+| `merge_targets[]` | branches a `merge` step may target besides each system's `default_branch` (default none) |
+
+VSC needs `auth`: a gateway without it refuses to attach VSC unless both `admin_without_auth:
+true` and `vsc.allow_self_approval: true` are set (development only; every caller is then
+`anonymous`, owner and approver alike). An API key may not use the principal id
+`vsc-internal` (reserved for the planner's caller).
 
 `examples/vsc_estate/a2agw.yaml` is the second worked example: three repositories (Python,
 Node, an OpenAPI contract) and a whole-system contract suite; see its README.
 
 ## How a job runs
 
-The seven stages of the design, and what 5a does in each:
+The stages of the design, and what 5a does in each:
 
 1. **Intake.** The planner turns the request into an `ExecutableSpec`: the request (verbatim,
    untrusted), a statement of done, the affected systems, acceptance tests (per system, plus
    whole-system tests that name a check), contracts and budgets. The spec is hashed; "accepted"
-   always refers to that hash. (The `awaiting_spec` state and the spec-edit route exist, but the
-   runner does not pause for a spec review in 5a.)
+   always refers to that hash; the spec's `request` is always the caller's verbatim text.
+   With `require_spec_review: true` the job then waits in `awaiting_spec` (audited with the
+   spec hash; the A2A task becomes `input-required`) until `PUT /jobs/{id}/spec` (or `a2agw vsc
+   spec edit`) confirms or replaces the spec. The spec is refused (failing closed) when it names
+   an unknown system or check, repeats an acceptance id, has a per-system acceptance test for a
+   system outside the spec, a whole-system test whose check covers none of its systems, or two
+   or more systems not covered by whole-system checks.
 2. **System map.** Phase 5b. In 5a the affected systems come from the spec, checked against the
    configured systems.
 3. **Plan.** The planner writes the plan once: ordered steps, one edit step per system, with
    dependencies, contracts and instructions, plus optional privileged steps (`merge`, `deploy`,
    `migrate`, `send`). The plan's hash covers its structure (ids, systems, kinds,
    dependencies, contracts, merge targets); instructions may be reworded later, the steps never.
-   The planner sees acceptance test *names*, never their contents.
-4. **Workers.** Edit steps run by dependency layer: steps in one repository one after another
+   The planner sees acceptance test *names*, never their contents. A plan is refused when an
+   edit step depends on a privileged step, a merge targets anything but the system's
+   `default_branch` or a `merge_targets` entry, its edited systems are not covered by checks, or
+   an acceptance test would never run (its system is not edited, or its check names no edited
+   system).
+4. **Fail on base.** Before the first worker attempt, every per-system acceptance test runs on
+   its system's base in a throwaway checkout and must fail; every whole-system check with
+   whole-system acceptance tests runs over the bases with their files written in and must fail.
+   A test that passes on base (or whose run is inconclusive: spawn error, timeout, output cap)
+   fails the job `verification` before any worker token is spent. A system with nothing that
+   could execute (no `gate`, no `tests`, no acceptance test with its own `run`, and no
+   whole-system acceptance test of a check that names it, like `sidecar-contract` above) fails
+   the job `no checks`. Each result is a `vsc.check` row and part of the receipt (`reproductions`).
+5. **Workers.** Edit steps run by dependency layer: steps in one repository one after another
    in plan order, different repositories in parallel. Each attempt resets the workspace to the
    last passed step, launches the step's worker as a stdio process in the workspace and hands it
    the spec, its system, its contracts, the previous failure (if any) and the instructions.
-5. **Verifier.** Ranked checks on the attempt's own change, stopping at the first failure:
-   `path_confinement` (no change outside the system's `path`), the system's `gate`, each
-   per-system acceptance test (`reproduction_after`, with the test's files written into the
-   workspace), the system's `tests` (`regression`), then `contract` (the system's side of each
-   contract that has a test file). A passed step is committed on the job branch. When every
-   edit step has passed, the whole-system checks run with their acceptance files written in;
-   a failure sends the job back to the planner (below).
-6. **Gate.** Privileged steps wait in `awaiting_approval` for a human unless `auto_approve`
+6. **Verifier.** The worker's tree (tracked and untracked files, never ignored ones) becomes a
+   candidate commit first; the diff hash and the `touched_tests` flags (changes under `tests/`,
+   `test/`, `__tests__/`, to `conftest.py`, `pytest.ini`, `tox.ini`, `noxfile.py`, a
+   `pyproject.toml` `[tool.pytest]` section or `package.json` `test*` scripts) come from it.
+   Then ranked checks run in a fresh detached checkout of that commit (`clean -fdx`), stopping
+   at the first failure: `path_confinement` (no change outside the system's `path`), the
+   system's `gate`, each per-system acceptance test (`reproduction_after`, with the test's
+   files written into that checkout only), the system's `tests` (`regression`), then `contract`
+   (the system's side of each contract that has a test file). A verification that executed no
+   check fails (`no checks`). A passed candidate becomes the job branch's head; acceptance
+   files never reach a job branch. The next attempt starts from the last passed commit the job
+   recorded, whatever the worker did to the branch. When every edit step has passed, every
+   check that names an edited system runs over throwaway checkouts of the passed commits (the
+   bases for untouched systems) with its acceptance files written in; a failure sends the job
+   back to the planner (below). The heads they passed on are recorded per repository.
+7. **Gate.** Privileged steps wait in `awaiting_approval` for a human unless `auto_approve`
    allows them. A `merge` step then fast-forwards its `target_branch` in the main repository to
-   the job branch (refused unless it is a fast-forward); `deploy`, `migrate` and `send` are
-   approval records only in 5a.
-7. **Receipt.** When the job is accepted (and on demand for a failed or cancelled job), the
+   the verified head, and only while the job branch still points at it (refused otherwise, or
+   unless it is a fast-forward of an existing local branch that is the system's
+   `default_branch` or listed in `merge_targets`); `deploy`, `migrate` and `send` are approval
+   records only in 5a.
+8. **Receipt.** When the job is accepted (and on demand for a failed or cancelled job), the
    receipt is built from the job's rows and its audit rows and anchored in the audit chain.
 
 Job states: `submitted` → `planning` → `running` → `verifying` → (`awaiting_approval`) →
-`accepted`, or `failed` (reason `planner`, `verification`, `whole_system`, `budget` with the
-limit hit, `rejected`, `merge_refused` or `error`) or `cancelled`. Every attempt is a new step
+`accepted` (with `awaiting_spec` after intake when `require_spec_review` is set), or `failed`
+(reason `planner`, `verification`, `no checks`, `whole_system`, `budget` with the limit hit,
+`rejected`, `merge_refused`, `resume` or `error`) or `cancelled`. Every attempt is a new step
 row; nothing is reused. A restarted gateway resumes every unfinished job: an attempt a dead
-process left running is closed as interrupted, half-done worktrees are discarded or reset to
-the last passed step, approvals already given stay given, and a job whose whole-system checks
-had passed goes straight back to the gate.
+process left running is closed as interrupted, half-done worktrees are reset to the last passed
+step, approvals already given stay given, and a job whose whole-system checks had passed goes
+straight back to the gate. A job that cannot be resumed (its workspace is gone, git fails) fails
+`resume`; the other jobs still resume.
 
 ## The `deliver` agent over A2A
 
@@ -199,13 +237,20 @@ and approve them:
   the job goes on; send any message in the same context to ask for its state.
 - **Approve.** When a privileged step waits, the task becomes `input-required` with the
   question "job <id> awaits approval of step <step> (<kind>): reply 'approve [note]' or
-  'reject [note]'". Reply in the same context with `approve` or `reject` and an optional note;
-  the task then follows the job again. An `input-required` task survives a gateway restart.
+  'reject [note]'"; for a merge the question also names the target branch and the verified
+  commit it would fast-forward to. Reply in the same context with `approve` or `reject` and an
+  optional note; the task then follows the job again. Since the reply comes from the job's
+  owner, an A2A approval needs `allow_self_approval` (or the owner listed in `approvers`, or an
+  admin principal); otherwise approve through the admin API as another principal. An
+  `input-required` task survives a gateway restart.
+- **Spec review.** With `require_spec_review`, the task becomes `input-required` after intake
+  with the spec hash; confirm or edit the spec with `PUT /a2agw/admin/vsc/jobs/{id}/spec`.
+- **Cancel.** Cancelling the task (`tasks/cancel`) cancels the job it follows.
 - Jobs are per (context, owner). With `auth` configured the caller needs the `a2agw:vsc`
   scope (`a2agw:admin` implies it).
 
-`vsc-planner` is the planner's own agent: with `auth` configured only the gateway itself may
-call it (see [Security notes](#security-notes)).
+`vsc-planner` is the planner's own agent: only the gateway itself may call it (see
+[Security notes](#security-notes)).
 
 ## Admin API
 
@@ -219,12 +264,12 @@ jobs only (404 for anyone else's).
 |---|---|
 | `GET /jobs?state=&limit=` | list jobs (own jobs unless admin; `limit` 1-500, default 100) |
 | `POST /jobs` `{"request"}` | submit; 201 `{"job_id", "state"}`; the caller owns it |
-| `GET /jobs/{id}` | the job, its request, spec, plan, steps and `waiting_step` |
+| `GET /jobs/{id}` | the job, its request, spec, plan, steps, `waiting_step` and `waiting` (the step's kind; for a merge its target branch and the verified commit) |
 | `GET /jobs/{id}/receipt` | the receipt (409 until the job has finished) |
-| `POST /jobs/{id}/approve` `{"step_id", "note"}` | approve the waiting step (409 unless the job is `awaiting_approval` and `step_id` is the step it waits for) |
+| `POST /jobs/{id}/approve` `{"step_id", "note"}` | approve the waiting step (409 unless the job is `awaiting_approval` and `step_id` is the step it waits for; 403 unless the caller may approve: an admin, a listed `approvers` entry, or, with no list, anyone but the owner unless `allow_self_approval`) |
 | `POST /jobs/{id}/reject` `{"step_id", "note"}` | reject it; the job fails `rejected` |
 | `POST /jobs/{id}/cancel` | cancel; running workers and checks are stopped |
-| `PUT /jobs/{id}/spec` | replace the spec (an `ExecutableSpec`; 409 outside `awaiting_spec`; audited as `spec_edited`) |
+| `PUT /jobs/{id}/spec` | confirm or replace the spec (an `ExecutableSpec`, validated like intake's; its `request` is replaced by the job's verbatim request; 409 outside `awaiting_spec`; audited as `spec_edited`); the job then plans and runs |
 
 ## CLI
 
@@ -284,7 +329,9 @@ its own budget):
 - **Tokens and cost** are charged after every worker and planner turn; exceeding one fails the
   job `budget` (`limit: tokens` or `cost`).
 - **Attempts** are per step, counted from the step's stored rows, so the bound holds across
-  whole-system rounds and restarts.
+  whole-system rounds and restarts. An interrupted attempt (cancel, deadline, a failing
+  sibling, a restart) does not count; interrupted attempts are capped apart at twice the
+  budget (`budget`, `limit: interrupted`).
 - **Deadline** bounds active time (planning, running, verifying); time waiting for an approval
   never counts. Every check's timeout is cut to the time left.
 
@@ -304,24 +351,34 @@ decision is an audit row (`vsc.approve`, with the principal and the note), so a 
 finds an earlier approval instead of asking again; the most recent decision wins. A rejection
 fails the job `rejected`.
 
-`auto_approve` lists `{system, action}` pairs that pass without a human:
+Who may approve: an admin (`a2agw:admin`) always; otherwise a principal listed in
+`vsc.approvers` when the list is set, or anyone but the job's owner when it is empty (the owner
+too with `allow_self_approval: true`). Anyone who may see the job may reject it.
+
+`auto_approve` lists `{system, action}` pairs that pass without a human; a merge rule names
+the one target branch it covers:
 
 ```yaml
 vsc:
   auto_approve:
-    - {system: core, action: merge}     # fast-forward main in the local repository unattended
+    - {system: core, action: merge, target_branch: main}  # fast-forward main unattended
 ```
 
-The receipt records an automatic approval with actor `policy`. Nothing a worker, a repository
+An automatic approval is a `vsc.approve` audit row with actor `policy` and outcome `auto`, and
+the receipt lists it. Nothing a worker, a repository
 or a request says can approve a step: only a principal with the scope, or this policy.
 
 ## Receipts
 
 `GET /a2agw/admin/vsc/jobs/{id}/receipt` (or `a2agw vsc receipt export <job> <file>`) returns
-the job's receipt, `a2agw.receipt/1`: the spec and its hash, the plan and its hash, every step
-attempt (worker, usage, whether usage was reported, every check with its command, exit status,
-duration and log hash, the diff's sha256 and the commit), the whole-system checks, every
-approval with its principal, the job's totals (tokens, cost, attempts, active time) and the
+the job's receipt, `a2agw.receipt/1`: the spec and its hash, the plan and its hash, the
+`deliver` task ids that drove the job, the planner's turns (task id and usage each), each
+repository's base and verified head, every step attempt (worker, usage, whether usage was
+reported, every check with its command, exit status, duration and log hash, the diff's sha256,
+the base and the commit, `touched_tests`; for a merge its target, verified head and result),
+the fail-on-base reproductions and the whole-system checks (command, exit code, log hash, the
+heads they ran on), every approval with its principal (policy approvals included), the job's
+totals (tokens, cost, attempts, active time) and the
 slice of the audit chain from the job's first row to its last. Diffs and logs are never stored,
 only their hashes; check stderr tails are redacted. The receipt is built once and returned unchanged on
 later calls; a `vsc.receipt` audit row carries its hash.
@@ -404,9 +461,22 @@ recorded as known gaps (below), not hidden.
   secret-named variables' values and common token shapes (bearer tokens, API keys, JWTs,
   private keys, URL passwords) masked. It is a best-effort second layer: keep secrets out of
   test output.
-- **Internal planner key.** With `auth` configured, `vsc-planner` admits only the principal
-  `key:vsc-internal`, an API key the gateway mints at startup and holds only in memory. Jobs
-  cannot be driven by calling the planner directly.
+- **Internal planner key.** `vsc-planner` admits only the holder of an API key the gateway
+  mints when VSC is attached and holds only in memory, with or without `auth`
+  (`AgentAccess.api_key_sha256`); with `auth` the key is also the principal `key:vsc-internal`,
+  the only one the agent admits. Jobs cannot be driven by calling the planner directly.
+- **A planner without tools.** The claude planner runs with every Claude Code built-in tool
+  disabled (`tools=[]` plus all of them in `disallowed_tools`), no MCP server
+  (`strict_mcp_config`), no settings, skills or plugins (`setting_sources=[]`), at most four
+  turns, in a private empty temporary directory (mode 0700), never the gateway's directory.
+  Its replies are cut to 256 KiB before parsing.
+- **Verification outside the worker's tree.** Checks run in detached throwaway checkouts of the
+  candidate commit cleaned with `clean -fdx`, so ignored files a worker leaves behind never
+  reach them, and the acceptance files are never written into a workspace or committed.
+- **Git hygiene.** Every git process the gateway starts gets the allowlisted environment (minus
+  `GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`), runs with `core.hooksPath=/dev/null` (no
+  repository hook runs), commits with `--no-verify` and `commit.gpgsign=false`, and is killed
+  with its process group when the job is cancelled.
 - **Owner scoping.** `a2agw:vsc` holders see, approve and cancel their own jobs only;
   `a2agw:admin` sees all. Every write needs `X-A2AGW-Admin: 1` (CSRF).
 - **Workspaces hold no credentials** of the gateway's, and nothing is pushed: the only write
@@ -424,9 +494,8 @@ Phase 5a, local and single-process by design:
   still run `git push` from its workspace or copy a file it can read into the workspace and pass
   verification (the injection suite's `action-push` and `action-exfil` cases). Sandboxes with an
   egress allowlist are Phase 5c.
-- **No fail-on-base check per job.** The runner checks that acceptance tests pass after the
-  change, not that they failed before it; mining and the estate tests prove that for the
-  benchmark corpora, but a planner-written test in a live job is not checked against the base.
+- **Test edits are flagged, not refused.** A change to tests or test configuration is listed in
+  `touched_tests` in the step result and the receipt for a reviewer; it does not fail the step.
 - **Contract checks are thin.** A contract without a test file passes as "no contract test",
   and a system's regression run can pass by skipping tests; only whole-system checks that
   enforce zero skips (the estate's) catch that.
@@ -436,8 +505,6 @@ Phase 5a, local and single-process by design:
   substitution of an unavailable worker, and no option to refuse workers that report no usage.
 - **The LLM reviewer is not produced.** The `review` check kind exists; advisory review lands
   with the Console (5c).
-- **No spec review pause.** `awaiting_spec` and `PUT .../spec` exist, but the runner does not
-  stop for a review after intake.
 - **Single process.** One gateway process runs a job (SQLite or PostgreSQL store); distributed
   workers (DBOS or Temporal) are Phase 5c.
 - **No system map.** Affected systems come from the spec; indexers and the map are Phase 5b.
