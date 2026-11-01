@@ -1,0 +1,163 @@
+id: release-stock-on-cancel
+request: |
+  Cancelling an order does not give its stock back. The order is marked cancelled in
+  orders-api but the units it reserved stay reserved in inventory-service, so after a few
+  cancellations the shop shows products as sold out that are sitting in the warehouse.
+  When an order is cancelled, release the stock of every line in inventory. A second cancel
+  must not release anything again (it is already refused with 409). If inventory cannot
+  release the stock, answer 502 and leave the order placed rather than cancelling it with
+  its stock lost. Update the orders contract with the new behaviour and the 502.
+systems: [orders-api, inventory-service, contract]
+acceptance:
+  - id: orders-cancel-releases
+    system: orders-api
+    files:
+      tests/test_cancel_releases_stock.py: |
+        """Cancelling an order gives its stock back to inventory, exactly once."""
+
+
+        def place(client, *lines):
+            res = client.post("/orders", json={"lines": [{"sku": s, "qty": q} for s, q in lines]})
+            assert res.status_code == 201, res.text
+            return res.json()
+
+
+        def test_cancel_releases_every_line(client, inventory):
+            order = place(client, ("WIDGET-1", 3), ("GADGET-2", 2))
+            assert (inventory.stock("WIDGET-1"), inventory.stock("GADGET-2")) == (17, 3)
+            res = client.post(f"/orders/{order['id']}/cancel")
+            assert res.status_code == 200
+            assert res.json()["status"] == "cancelled"
+            assert (inventory.stock("WIDGET-1"), inventory.stock("GADGET-2")) == (20, 5)
+            assert sorted(inventory.calls("release")) == [
+                ("GADGET-2", {"qty": 2}),
+                ("WIDGET-1", {"qty": 3}),
+            ]
+
+
+        def test_cancelling_twice_releases_once(client, inventory):
+            order = place(client, ("WIDGET-1", 4))
+            assert client.post(f"/orders/{order['id']}/cancel").status_code == 200
+            assert client.post(f"/orders/{order['id']}/cancel").status_code == 409
+            assert inventory.stock("WIDGET-1") == 20
+            assert len(inventory.calls("release")) == 1
+
+
+        def test_other_orders_keep_their_stock(client, inventory):
+            keep = place(client, ("WIDGET-1", 5))
+            drop = place(client, ("WIDGET-1", 1))
+            client.post(f"/orders/{drop['id']}/cancel")
+            assert inventory.stock("WIDGET-1") == 15
+            assert client.get(f"/orders/{keep['id']}").json()["status"] == "placed"
+  - id: estate-cancel-releases
+    system: null
+    check: estate
+    files:
+      contract/tests/test_cancel_releases_stock_e2e.py: |
+        """End to end: a cancelled order's stock is back in inventory-service."""
+
+        from estate import conforms, new_product, stock
+
+
+        def test_cancel_puts_the_stock_back(orders, inventory, orders_api):
+            a = new_product(inventory, stock=8)
+            b = new_product(inventory, stock=3)
+            res = orders.post("/orders", json={"lines": [{"sku": a, "qty": 5}, {"sku": b, "qty": 3}]})
+            assert res.status_code == 201, res.text
+            assert (stock(inventory, a), stock(inventory, b)) == (3, 0)
+            cancelled = orders.post(f"/orders/{res.json()['id']}/cancel")
+            assert conforms(orders_api, "POST", "/orders/{order_id}/cancel", cancelled)["status"] == (
+                "cancelled"
+            )
+            assert (stock(inventory, a), stock(inventory, b)) == (8, 3)
+
+
+        def test_released_stock_can_be_ordered_again(orders, inventory):
+            sku = new_product(inventory, stock=2)
+            first = orders.post("/orders", json={"lines": [{"sku": sku, "qty": 2}]}).json()
+            assert orders.post("/orders", json={"lines": [{"sku": sku, "qty": 1}]}).status_code == 409
+            orders.post(f"/orders/{first['id']}/cancel")
+            assert orders.post("/orders", json={"lines": [{"sku": sku, "qty": 2}]}).status_code == 201
+reference_patch: |+
+  diff --git a/contract/openapi/orders.yaml b/contract/openapi/orders.yaml
+  index cdd5f2c..68bf4fd 100644
+  --- a/contract/openapi/orders.yaml
+  +++ b/contract/openapi/orders.yaml
+  @@ -59,6 +59,9 @@ paths:
+       parameters:
+         - {$ref: "#/components/parameters/OrderId"}
+       post:
+  +      description: >-
+  +        Cancel a placed order and release the stock of every line in inventory-service. When
+  +        inventory cannot release all of it (502) the order stays placed and nothing is released.
+         responses:
+           "200":
+             description: cancelled
+  @@ -67,6 +70,7 @@ paths:
+                 schema: {$ref: "#/components/schemas/Order"}
+           "404": {$ref: "#/components/responses/Error"}
+           "409": {$ref: "#/components/responses/Error"}
+  +        "502": {$ref: "#/components/responses/Error"}
+   components:
+     parameters:
+       OrderId:
+  diff --git a/orders-api/app.py b/orders-api/app.py
+  index 1fb5d99..9a2b0dd 100644
+  --- a/orders-api/app.py
+  +++ b/orders-api/app.py
+  @@ -6,7 +6,7 @@ repository.
+       GET  /orders               every order, oldest first
+       POST /orders               place an order {"lines": [{"sku": ..., "qty": ...}]}
+       GET  /orders/{id}          one order
+  -    POST /orders/{id}/cancel   cancel an order
+  +    POST /orders/{id}/cancel   cancel an order and release its stock
+
+   Run it with ``python app.py``. Environment: ``PORT`` (default 8000), ``HOST`` (default
+   127.0.0.1), ``ORDERS_DB`` (default ``orders.db``), ``INVENTORY_URL`` (default
+  @@ -15,6 +15,7 @@ Run it with ``python app.py``. Environment: ``PORT`` (default 8000), ``HOST`` (d
+
+   from __future__ import annotations
+
+  +import logging
+   import os
+   import sqlite3
+   from collections.abc import Iterator
+  @@ -28,6 +29,8 @@ from starlette.requests import Request
+   from starlette.responses import JSONResponse
+   from starlette.routing import Route
+
+  +log = logging.getLogger("orders")
+  +
+   SCHEMA = """
+   CREATE TABLE IF NOT EXISTS orders (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+  @@ -70,6 +73,9 @@ class InventoryClient:
+       async def reserve(self, sku: str, qty: int) -> dict[str, Any]:
+           return await self._post(f"/products/{quote(sku, safe='')}/reserve", {"qty": qty})
+
+  +    async def release(self, sku: str, qty: int) -> dict[str, Any]:
+  +        return await self._post(f"/products/{quote(sku, safe='')}/release", {"qty": qty})
+  +
+       async def aclose(self) -> None:
+           await self._http.aclose()
+
+  @@ -188,6 +194,19 @@ def create_app(
+               return error(404, "order not found")
+           if order["status"] == "cancelled":
+               return error(409, "order already cancelled")
+  +        released: list[dict[str, Any]] = []
+  +        try:
+  +            for line in order["lines"]:
+  +                await inventory.release(line["sku"], line["qty"])
+  +                released.append(line)
+  +        except InventoryError:
+  +            # all or nothing: take back what was released, the order stays placed
+  +            for line in released:
+  +                try:
+  +                    await inventory.reserve(line["sku"], line["qty"])
+  +                except InventoryError as e:
+  +                    log.error("order %d: could not re-reserve %s: %s", order["id"], line["sku"], e)
+  +            return error(502, "inventory unavailable")
+           store.set_status(order["id"], "cancelled")
+           return JSONResponse(store.get(order["id"]))
+

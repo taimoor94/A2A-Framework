@@ -1,0 +1,502 @@
+id: rename-qty-to-quantity
+request: |
+  The field name "qty" keeps confusing partners integrating with us, and the API style guide
+  says no abbreviations. Rename it to "quantity" everywhere in the public contract: order
+  lines in orders-api requests and responses, and the stock change body of inventory-service
+  /reserve and /release (orders-api must send the new name when it calls inventory). This is
+  a coordinated breaking change, contract version 1.1.0: both services must refuse a body
+  that still sends "qty" with a 400 whose error message mentions "quantity", rather than
+  silently ignoring it. Update both OpenAPI documents and every test that uses the old name.
+  The database column does not need renaming.
+systems: [orders-api, inventory-service, contract]
+acceptance:
+  - id: inventory-quantity
+    system: inventory-service
+    files:
+      test/quantity.test.mjs: |
+        import assert from "node:assert/strict";
+        import { test } from "node:test";
+
+        import { call, useServer } from "./helpers.mjs";
+
+        const ctx = useServer([{ sku: "Q-1", name: "Q", stock: 10, price_cents: 1 }]);
+
+        test("reserve and release take quantity", async () => {
+          const r = await call(ctx, "POST", "/products/Q-1/reserve", { quantity: 3 });
+          assert.equal(r.status, 200);
+          assert.equal(r.body.stock, 7);
+          const back = await call(ctx, "POST", "/products/Q-1/release", { quantity: 3 });
+          assert.equal(back.status, 200);
+          assert.equal(back.body.stock, 10);
+        });
+
+        test("the old qty field is refused with a clear message", async () => {
+          const r = await call(ctx, "POST", "/products/Q-1/reserve", { qty: 3 });
+          assert.equal(r.status, 400);
+          assert.match(r.body.error, /quantity/);
+          assert.equal((await call(ctx, "GET", "/products/Q-1")).body.stock, 10);
+        });
+
+        test("quantity must be a positive integer", async () => {
+          for (const quantity of [0, -2, 2.5, "3"]) {
+            const r = await call(ctx, "POST", "/products/Q-1/release", { quantity });
+            assert.equal(r.status, 400);
+          }
+        });
+  - id: orders-quantity
+    system: orders-api
+    files:
+      tests/test_quantity_field.py: |
+        """Order lines carry "quantity" (contract 1.1), in requests, responses and calls to inventory."""
+
+        import json
+
+        import httpx
+        import pytest
+        from app import create_app
+        from starlette.testclient import TestClient
+
+
+        class QuantityInventory:
+            """An inventory that speaks contract 1.1 only: it refuses the old "qty" field."""
+
+            def __init__(self):
+                self.stock = {"WIDGET-1": 20}
+                self.bodies = []
+
+            def handle(self, request):
+                sku, action = request.url.path.strip("/").split("/")[1:3]
+                body = json.loads(request.content)
+                self.bodies.append(body)
+                if "quantity" not in body or "qty" in body:
+                    return httpx.Response(400, json={"error": "quantity must be a positive integer"})
+                if action == "reserve":
+                    self.stock[sku] -= body["quantity"]
+                return httpx.Response(200, json={"sku": sku, "stock": self.stock[sku]})
+
+
+        @pytest.fixture
+        def setup(tmp_path):
+            fake = QuantityInventory()
+            app = create_app(
+                str(tmp_path / "q.db"), "http://inv", transport=httpx.MockTransport(fake.handle)
+            )
+            with TestClient(app) as c:
+                yield c, fake
+
+
+        def test_orders_take_and_return_quantity(setup):
+            client, fake = setup
+            res = client.post("/orders", json={"lines": [{"sku": "WIDGET-1", "quantity": 4}]})
+            assert res.status_code == 201, res.text
+            order = res.json()
+            assert order["lines"] == [{"sku": "WIDGET-1", "quantity": 4}]
+            assert client.get(f"/orders/{order['id']}").json()["lines"] == order["lines"]
+            assert client.get("/orders").json()["orders"][0]["lines"] == order["lines"]
+            assert fake.bodies == [{"quantity": 4}]
+            assert fake.stock["WIDGET-1"] == 16
+
+
+        def test_the_old_field_is_refused(setup):
+            client, fake = setup
+            res = client.post("/orders", json={"lines": [{"sku": "WIDGET-1", "qty": 4}]})
+            assert res.status_code == 400
+            assert "quantity" in res.json()["error"]
+            assert fake.bodies == []
+  - id: estate-quantity
+    system: null
+    check: estate
+    files:
+      contract/tests/test_quantity_field_e2e.py: |
+        """End to end on contract 1.1: "quantity" everywhere, "qty" refused by both services."""
+
+        from estate import conforms, new_product, stock
+
+
+        def test_order_lines_use_quantity(orders, inventory, orders_api):
+            sku = new_product(inventory, stock=6)
+            res = orders.post("/orders", json={"lines": [{"sku": sku, "quantity": 2}]})
+            assert res.status_code == 201, res.text
+            order = conforms(orders_api, "POST", "/orders", res)
+            assert order["lines"] == [{"sku": sku, "quantity": 2}]
+            assert stock(inventory, sku) == 4
+
+
+        def test_inventory_stock_changes_use_quantity(inventory, inventory_api):
+            sku = new_product(inventory, stock=6)
+            res = inventory.post(f"/products/{sku}/reserve", json={"quantity": 5})
+            assert conforms(inventory_api, "POST", "/products/{sku}/reserve", res)["stock"] == 1
+
+
+        def test_qty_is_refused_by_both(orders, inventory, orders_api, inventory_api):
+            sku = new_product(inventory, stock=6)
+            res = orders.post("/orders", json={"lines": [{"sku": sku, "qty": 2}]})
+            assert res.status_code == 400
+            conforms(orders_api, "POST", "/orders", res)
+            direct = inventory.post(f"/products/{sku}/reserve", json={"qty": 2})
+            assert direct.status_code == 400
+            conforms(inventory_api, "POST", "/products/{sku}/reserve", direct)
+            assert stock(inventory, sku) == 6
+
+
+        def test_the_documents_describe_quantity(orders_api, inventory_api):
+            line = orders_api["components"]["schemas"]["OrderLine"]
+            assert "quantity" in line["required"] and "qty" not in line["properties"]
+            change = inventory_api["components"]["schemas"]["StockChange"]
+            assert "quantity" in change["required"] and "qty" not in change["properties"]
+reference_patch: |
+  diff --git a/contract/openapi/inventory.yaml b/contract/openapi/inventory.yaml
+  index ed1324c..2aa5f77 100644
+  --- a/contract/openapi/inventory.yaml
+  +++ b/contract/openapi/inventory.yaml
+  @@ -1,8 +1,10 @@
+   openapi: 3.1.0
+   info:
+     title: inventory-service
+  -  version: 1.0.0
+  -  description: Product catalogue and stock. Owned by the inventory team; called by orders-api.
+  +  version: 1.1.0
+  +  description: >-
+  +    Product catalogue and stock. Owned by the inventory team; called by orders-api.
+  +    1.1.0: the stock change field "qty" is now "quantity"; "qty" is refused with 400.
+   paths:
+     /healthz:
+       get:
+  @@ -130,10 +132,10 @@ components:
+           price_cents: {type: integer, minimum: 0}
+       StockChange:
+         type: object
+  -      required: [qty]
+  +      required: [quantity]
+         additionalProperties: false
+         properties:
+  -        qty: {type: integer, minimum: 1}
+  +        quantity: {type: integer, minimum: 1}
+       StockLevel:
+         type: object
+         required: [sku, stock]
+  diff --git a/contract/openapi/orders.yaml b/contract/openapi/orders.yaml
+  index cdd5f2c..8798714 100644
+  --- a/contract/openapi/orders.yaml
+  +++ b/contract/openapi/orders.yaml
+  @@ -1,8 +1,10 @@
+   openapi: 3.1.0
+   info:
+     title: orders-api
+  -  version: 1.0.0
+  -  description: Customer orders. Owned by the orders team; reserves stock in inventory-service.
+  +  version: 1.1.0
+  +  description: >-
+  +    Customer orders. Owned by the orders team; reserves stock in inventory-service.
+  +    1.1.0: the order line field "qty" is now "quantity"; "qty" is refused with 400.
+   paths:
+     /healthz:
+       get:
+  @@ -102,11 +104,11 @@ components:
+             items: {$ref: "#/components/schemas/OrderLine"}
+       OrderLine:
+         type: object
+  -      required: [sku, qty]
+  +      required: [sku, quantity]
+         additionalProperties: false
+         properties:
+           sku: {type: string}
+  -        qty: {type: integer, minimum: 1}
+  +        quantity: {type: integer, minimum: 1}
+       Order:
+         type: object
+         required: [id, status, created_at, lines]
+  diff --git a/contract/tests/test_contract.py b/contract/tests/test_contract.py
+  index ebf69e0..330f99e 100644
+  --- a/contract/tests/test_contract.py
+  +++ b/contract/tests/test_contract.py
+  @@ -7,7 +7,7 @@ from estate import conforms, new_product, stock
+
+
+   def place(orders, *lines):
+  -    return orders.post("/orders", json={"lines": [{"sku": s, "qty": q} for s, q in lines]})
+  +    return orders.post("/orders", json={"lines": [{"sku": s, "quantity": q} for s, q in lines]})
+
+
+   @pytest.mark.parametrize("name", ["orders", "inventory"])
+  @@ -53,7 +53,7 @@ def test_placing_an_order_reserves_inventory(orders, inventory, orders_api):
+       assert res.status_code == 201, res.text
+       order = conforms(orders_api, "POST", "/orders", res)
+       assert order["status"] == "placed"
+  -    assert order["lines"] == [{"sku": sku, "qty": 4}]
+  +    assert order["lines"] == [{"sku": sku, "quantity": 4}]
+       assert stock(inventory, sku) == 6
+       got = conforms(orders_api, "GET", "/orders/{order_id}", orders.get(f"/orders/{order['id']}"))
+       assert got == order
+  @@ -63,7 +63,7 @@ def test_placing_an_order_reserves_inventory(orders, inventory, orders_api):
+
+   def test_insufficient_stock_is_refused_by_both(orders, inventory, orders_api, inventory_api):
+       sku = new_product(inventory, stock=2)
+  -    direct = inventory.post(f"/products/{sku}/reserve", json={"qty": 3})
+  +    direct = inventory.post(f"/products/{sku}/reserve", json={"quantity": 3})
+       assert direct.status_code == 409
+       conforms(inventory_api, "POST", "/products/{sku}/reserve", direct)
+       res = place(orders, (sku, 3))
+  @@ -90,7 +90,7 @@ def test_cancel_flow(orders, inventory, orders_api):
+
+   def test_reserve_and_release_conform(inventory, inventory_api):
+       sku = new_product(inventory, stock=3)
+  -    r = inventory.post(f"/products/{sku}/reserve", json={"qty": 2})
+  +    r = inventory.post(f"/products/{sku}/reserve", json={"quantity": 2})
+       assert conforms(inventory_api, "POST", "/products/{sku}/reserve", r) == {"sku": sku, "stock": 1}
+  -    r = inventory.post(f"/products/{sku}/release", json={"qty": 2})
+  +    r = inventory.post(f"/products/{sku}/release", json={"quantity": 2})
+       assert conforms(inventory_api, "POST", "/products/{sku}/release", r) == {"sku": sku, "stock": 3}
+  diff --git a/inventory-service/server.mjs b/inventory-service/server.mjs
+  index cab2abe..d28196a 100644
+  --- a/inventory-service/server.mjs
+  +++ b/inventory-service/server.mjs
+  @@ -6,8 +6,8 @@
+   //   POST   /products                   add a product {sku, name, stock, price_cents}
+   //   GET    /products/:sku              one product
+   //   DELETE /products/:sku              remove a product
+  -//   POST   /products/:sku/reserve      take {qty} units out of stock (409 when short)
+  -//   POST   /products/:sku/release      put {qty} units back
+  +//   POST   /products/:sku/reserve      take {quantity} units out of stock (409 when short)
+  +//   POST   /products/:sku/release      put {quantity} units back
+   //
+   // Environment (when run as a program):
+   //   PORT  port to listen on (default 8001; 0 picks a free one)
+  @@ -36,7 +36,7 @@ class HttpError extends Error {
+   }
+
+   const isCount = (v) => Number.isInteger(v) && v >= 0;
+  -const isQty = (v) => Number.isInteger(v) && v > 0;
+  +const isQuantity = (v) => Number.isInteger(v) && v > 0;
+
+   function send(res, status, body) {
+     if (body === undefined) {
+  @@ -77,9 +77,10 @@ export function createInventory(seed = SEED) {
+       return product;
+     }
+
+  -  function qtyOf(body) {
+  -    if (!isQty(body.qty)) throw new HttpError(400, "qty must be a positive integer");
+  -    return body.qty;
+  +  function quantityOf(body) {
+  +    if ("qty" in body) throw new HttpError(400, '"qty" was renamed to "quantity"');
+  +    if (!isQuantity(body.quantity)) throw new HttpError(400, "quantity must be a positive integer");
+  +    return body.quantity;
+     }
+
+     const routes = {
+  @@ -106,16 +107,16 @@ export function createInventory(seed = SEED) {
+       },
+       "POST /products/:sku/reserve": (sku, body) => {
+         const product = find(sku);
+  -      const qty = qtyOf(body);
+  -      if (product.stock < qty) {
+  +      const quantity = quantityOf(body);
+  +      if (product.stock < quantity) {
+           throw new HttpError(409, "insufficient stock", { sku, available: product.stock });
+         }
+  -      product.stock -= qty;
+  +      product.stock -= quantity;
+         return [200, { sku, stock: product.stock }];
+       },
+       "POST /products/:sku/release": (sku, body) => {
+         const product = find(sku);
+  -      product.stock += qtyOf(body);
+  +      product.stock += quantityOf(body);
+         return [200, { sku, stock: product.stock }];
+       },
+     };
+  diff --git a/inventory-service/test/inventory.test.mjs b/inventory-service/test/inventory.test.mjs
+  index c64da39..5274af4 100644
+  --- a/inventory-service/test/inventory.test.mjs
+  +++ b/inventory-service/test/inventory.test.mjs
+  @@ -41,24 +41,24 @@ test("creates a product and refuses a duplicate or invalid one", async () => {
+   });
+
+   test("reserves and releases stock", async () => {
+  -  const r = await call(ctx, "POST", "/products/A-1/reserve", { qty: 4 });
+  +  const r = await call(ctx, "POST", "/products/A-1/reserve", { quantity: 4 });
+     assert.equal(r.status, 200);
+     assert.deepEqual(r.body, { sku: "A-1", stock: 6 });
+  -  const back = await call(ctx, "POST", "/products/A-1/release", { qty: 4 });
+  +  const back = await call(ctx, "POST", "/products/A-1/release", { quantity: 4 });
+     assert.deepEqual(back.body, { sku: "A-1", stock: 10 });
+   });
+
+   test("refuses to reserve more than the stock", async () => {
+  -  const r = await call(ctx, "POST", "/products/B-2/reserve", { qty: 2 });
+  +  const r = await call(ctx, "POST", "/products/B-2/reserve", { quantity: 2 });
+     assert.equal(r.status, 409);
+     assert.equal(r.body.error, "insufficient stock");
+     assert.equal(r.body.available, 1);
+     assert.equal((await call(ctx, "GET", "/products/B-2")).body.stock, 1);
+   });
+
+  -test("rejects a bad qty or body", async () => {
+  -  for (const qty of [0, -1, 1.5, "2"]) {
+  -    assert.equal((await call(ctx, "POST", "/products/A-1/reserve", { qty })).status, 400);
+  +test("rejects a bad quantity or body", async () => {
+  +  for (const quantity of [0, -1, 1.5, "2"]) {
+  +    assert.equal((await call(ctx, "POST", "/products/A-1/reserve", { quantity })).status, 400);
+     }
+     const res = await fetch(`${ctx.url}/products/A-1/reserve`, { method: "POST", body: "[" });
+     assert.equal(res.status, 400);
+  diff --git a/orders-api/app.py b/orders-api/app.py
+  index 1fb5d99..2e29837 100644
+  --- a/orders-api/app.py
+  +++ b/orders-api/app.py
+  @@ -4,7 +4,7 @@ repository.
+
+       GET  /healthz              readiness probe
+       GET  /orders               every order, oldest first
+  -    POST /orders               place an order {"lines": [{"sku": ..., "qty": ...}]}
+  +    POST /orders               place an order {"lines": [{"sku": ..., "quantity": ...}]}
+       GET  /orders/{id}          one order
+       POST /orders/{id}/cancel   cancel an order
+
+  @@ -38,7 +38,7 @@ CREATE TABLE IF NOT EXISTS order_lines (
+       order_id INTEGER NOT NULL REFERENCES orders (id),
+       line_no INTEGER NOT NULL,
+       sku TEXT NOT NULL,
+  -    qty INTEGER NOT NULL,
+  +    qty INTEGER NOT NULL,  -- the API calls it "quantity" (contract 1.1)
+       PRIMARY KEY (order_id, line_no)
+   );
+   """
+  @@ -67,8 +67,9 @@ class InventoryClient:
+               raise InventoryError(res.status_code, data)
+           return data
+
+  -    async def reserve(self, sku: str, qty: int) -> dict[str, Any]:
+  -        return await self._post(f"/products/{quote(sku, safe='')}/reserve", {"qty": qty})
+  +    async def reserve(self, sku: str, quantity: int) -> dict[str, Any]:
+  +        path = f"/products/{quote(sku, safe='')}/reserve"
+  +        return await self._post(path, {"quantity": quantity})
+
+       async def aclose(self) -> None:
+           await self._http.aclose()
+  @@ -92,14 +93,15 @@ class Store:
+               order_id = db.execute("INSERT INTO orders (status) VALUES ('placed')").lastrowid
+               db.executemany(
+                   "INSERT INTO order_lines (order_id, line_no, sku, qty) VALUES (?, ?, ?, ?)",
+  -                [(order_id, n, line["sku"], line["qty"]) for n, line in enumerate(lines)],
+  +                [(order_id, n, line["sku"], line["quantity"]) for n, line in enumerate(lines)],
+               )
+           assert order_id is not None
+           return order_id
+
+       def _order(self, db: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+           lines = db.execute(
+  -            "SELECT sku, qty FROM order_lines WHERE order_id = ? ORDER BY line_no", (row["id"],)
+  +            "SELECT sku, qty AS quantity FROM order_lines WHERE order_id = ? ORDER BY line_no",
+  +            (row["id"],),
+           ).fetchall()
+           return {
+               "id": row["id"],
+  @@ -134,10 +136,16 @@ def parse_lines(body: Any) -> list[dict[str, Any]] | None:
+       for line in lines:
+           if not isinstance(line, dict) or not isinstance(line.get("sku"), str):
+               return None
+  -        qty = line.get("qty")
+  -        if not isinstance(qty, int) or isinstance(qty, bool) or qty <= 0:
+  +        quantity = line.get("quantity")
+  +        if not isinstance(quantity, int) or isinstance(quantity, bool) or quantity <= 0:
+               return None
+  -    return [{"sku": line["sku"], "qty": line["qty"]} for line in lines]
+  +    return [{"sku": line["sku"], "quantity": line["quantity"]} for line in lines]
+  +
+  +
+  +def renamed_field(body: Any) -> bool:
+  +    """A line still sends the field "qty", renamed to "quantity" in contract 1.1."""
+  +    lines = body.get("lines") if isinstance(body, dict) else None
+  +    return isinstance(lines, list) and any(isinstance(x, dict) and "qty" in x for x in lines)
+
+
+   def create_app(
+  @@ -157,12 +165,14 @@ def create_app(
+               body = await request.json()
+           except ValueError:
+               return error(400, "body must be JSON")
+  +        if renamed_field(body):
+  +            return error(400, '"qty" was renamed to "quantity"')
+           lines = parse_lines(body)
+           if lines is None:
+  -            return error(400, "lines must be a non-empty list of {sku, qty > 0}")
+  +            return error(400, "lines must be a non-empty list of {sku, quantity > 0}")
+           for line in lines:
+               try:
+  -                await inventory.reserve(line["sku"], line["qty"])
+  +                await inventory.reserve(line["sku"], line["quantity"])
+               except InventoryError as e:
+                   if e.status == 404:
+                       return error(422, "unknown product", sku=line["sku"])
+  diff --git a/orders-api/tests/conftest.py b/orders-api/tests/conftest.py
+  index a99c74d..5534181 100644
+  --- a/orders-api/tests/conftest.py
+  +++ b/orders-api/tests/conftest.py
+  @@ -53,11 +53,11 @@ class FakeInventory:
+           if len(parts) == 2 and request.method == "GET":
+               return httpx.Response(200, json=product)
+           if len(parts) == 3 and request.method == "POST":
+  -            qty = json.loads(request.content or b"{}").get("qty")
+  -            if not isinstance(qty, int) or qty <= 0:
+  -                return httpx.Response(400, json={"error": "qty must be a positive integer"})
+  +            quantity = json.loads(request.content or b"{}").get("quantity")
+  +            if not isinstance(quantity, int) or quantity <= 0:
+  +                return httpx.Response(400, json={"error": "quantity must be a positive integer"})
+               if parts[2] == "reserve":
+  -                if product["stock"] < qty:
+  +                if product["stock"] < quantity:
+                       return httpx.Response(
+                           409,
+                           json={
+  @@ -66,10 +66,10 @@ class FakeInventory:
+                               "available": product["stock"],
+                           },
+                       )
+  -                product["stock"] -= qty
+  +                product["stock"] -= quantity
+                   return httpx.Response(200, json={"sku": product["sku"], "stock": product["stock"]})
+               if parts[2] == "release":
+  -                product["stock"] += qty
+  +                product["stock"] += quantity
+                   return httpx.Response(200, json={"sku": product["sku"], "stock": product["stock"]})
+           return httpx.Response(404, json={"error": "not found"})
+
+  diff --git a/orders-api/tests/test_orders.py b/orders-api/tests/test_orders.py
+  index 87926f1..28941f3 100644
+  --- a/orders-api/tests/test_orders.py
+  +++ b/orders-api/tests/test_orders.py
+  @@ -1,5 +1,5 @@
+   def place(client, *lines):
+  -    return client.post("/orders", json={"lines": [{"sku": s, "qty": q} for s, q in lines]})
+  +    return client.post("/orders", json={"lines": [{"sku": s, "quantity": q} for s, q in lines]})
+
+
+   def test_healthz(client):
+  @@ -11,7 +11,7 @@ def test_place_order_reserves_stock(client, inventory):
+       assert res.status_code == 201
+       order = res.json()
+       assert order["status"] == "placed"
+  -    assert order["lines"] == [{"sku": "WIDGET-1", "qty": 3}]
+  +    assert order["lines"] == [{"sku": "WIDGET-1", "quantity": 3}]
+       assert inventory.stock("WIDGET-1") == 17
+
+
+  @@ -45,9 +45,9 @@ def test_invalid_bodies_are_400(client):
+       for body in (
+           {},
+           {"lines": []},
+  -        {"lines": [{"sku": "WIDGET-1", "qty": 0}]},
+  -        {"lines": [{"sku": "WIDGET-1", "qty": True}]},
+  -        {"lines": [{"qty": 1}]},
+  +        {"lines": [{"sku": "WIDGET-1", "quantity": 0}]},
+  +        {"lines": [{"sku": "WIDGET-1", "quantity": True}]},
+  +        {"lines": [{"quantity": 1}]},
+       ):
+           assert client.post("/orders", json=body).status_code == 400, body
+       assert client.post("/orders", content=b"{").status_code == 400
+notes: |
+  A cross-repository rename: the regression suites of all three repositories use "qty", so
+  the change is only complete when they are updated too. The orders acceptance test brings
+  its own inventory fake that speaks the new contract only.

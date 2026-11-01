@@ -1,0 +1,253 @@
+id: pagination-on-list-orders
+request: |
+  GET /orders returns every order ever placed in one response. It is now several megabytes,
+  times out on the admin dashboard and will only get worse. Paginate it: GET /orders takes
+  an optional limit (1 to 200, default 50) and returns {"orders": [...], "next_cursor": ...}
+  with orders still oldest first. next_cursor is an opaque string to pass back as ?cursor=
+  for the next page, and null on the last page. Paging must be stable while new orders come
+  in: following the cursors visits every order exactly once, and orders placed meanwhile
+  show up on a later page. A bad limit or a cursor we did not issue is a 400. Document the
+  parameters and the response in the orders contract, and keep the contract tests working
+  when there are more orders than fit on one page.
+systems: [orders-api, contract]
+acceptance:
+  - id: orders-pagination
+    system: orders-api
+    files:
+      tests/test_list_pagination.py: |
+        """GET /orders returns pages: ?limit= (1..200, default 50) and an opaque next_cursor."""
+
+        import pytest
+
+
+        def place(client, n):
+            ids = []
+            for _ in range(n):
+                res = client.post("/orders", json={"lines": [{"sku": "WIDGET-1", "qty": 1}]})
+                assert res.status_code == 201
+                ids.append(res.json()["id"])
+            return ids
+
+
+        def ids(page):
+            return [o["id"] for o in page["orders"]]
+
+
+        @pytest.fixture
+        def stocked(inventory):
+            inventory.products["WIDGET-1"]["stock"] = 10_000
+            return inventory
+
+
+        def test_following_next_cursor_visits_every_order_once(client, stocked):
+            placed = place(client, 5)
+            first = client.get("/orders", params={"limit": 2}).json()
+            assert ids(first) == placed[:2]
+            assert isinstance(first["next_cursor"], str) and first["next_cursor"]
+            second = client.get("/orders", params={"limit": 2, "cursor": first["next_cursor"]}).json()
+            assert ids(second) == placed[2:4]
+            third = client.get("/orders", params={"limit": 2, "cursor": second["next_cursor"]}).json()
+            assert ids(third) == placed[4:]
+            assert third["next_cursor"] is None
+
+
+        def test_the_default_page_is_50(client, stocked):
+            placed = place(client, 53)
+            first = client.get("/orders").json()
+            assert ids(first) == placed[:50]
+            rest = client.get("/orders", params={"cursor": first["next_cursor"]}).json()
+            assert ids(rest) == placed[50:]
+            assert rest["next_cursor"] is None
+
+
+        def test_an_exact_last_page_has_no_cursor(client, stocked):
+            place(client, 2)
+            page = client.get("/orders", params={"limit": 2}).json()
+            assert len(page["orders"]) == 2 and page["next_cursor"] is None
+
+
+        def test_orders_placed_while_paging_show_up_later(client, stocked):
+            placed = place(client, 3)
+            first = client.get("/orders", params={"limit": 2}).json()
+            placed += place(client, 2)
+            nxt = client.get("/orders", params={"limit": 10, "cursor": first["next_cursor"]}).json()
+            assert ids(nxt) == placed[2:]
+
+
+        def test_an_empty_list(client):
+            assert client.get("/orders").json() == {"orders": [], "next_cursor": None}
+
+
+        @pytest.mark.parametrize(
+            "params",
+            [{"limit": "0"}, {"limit": "201"}, {"limit": "ten"}, {"limit": "-1"}, {"cursor": "x!"}],
+        )
+        def test_bad_paging_parameters_are_400(client, params):
+            assert client.get("/orders", params=params).status_code == 400
+
+
+        def test_200_is_allowed(client, stocked):
+            place(client, 3)
+            assert len(client.get("/orders", params={"limit": 200}).json()["orders"]) == 3
+reference_patch: |
+  diff --git a/contract/openapi/orders.yaml b/contract/openapi/orders.yaml
+  index cdd5f2c..64ed2a6 100644
+  --- a/contract/openapi/orders.yaml
+  +++ b/contract/openapi/orders.yaml
+  @@ -14,19 +14,37 @@ paths:
+                 schema: {$ref: "#/components/schemas/Health"}
+     /orders:
+       get:
+  +      description: >-
+  +        Orders, oldest first, one page at a time. Follow next_cursor until it is null; orders
+  +        placed while paging appear on a later page.
+  +      parameters:
+  +        - name: limit
+  +          in: query
+  +          required: false
+  +          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+  +        - name: cursor
+  +          in: query
+  +          required: false
+  +          description: the next_cursor of the previous page (opaque)
+  +          schema: {type: string}
+         responses:
+           "200":
+  -          description: every order, oldest first
+  +          description: one page of orders
+             content:
+               application/json:
+                 schema:
+                   type: object
+  -                required: [orders]
+  +                required: [orders, next_cursor]
+                   additionalProperties: false
+                   properties:
+                     orders:
+                       type: array
+  +                    maxItems: 200
+                       items: {$ref: "#/components/schemas/Order"}
+  +                  next_cursor:
+  +                    type: [string, "null"]
+  +                    description: null on the last page
+  +        "400": {$ref: "#/components/responses/Error"}
+       post:
+         description: Place an order; every line reserves stock in inventory-service.
+         requestBody:
+  diff --git a/contract/tests/test_contract.py b/contract/tests/test_contract.py
+  index ebf69e0..2bc01b3 100644
+  --- a/contract/tests/test_contract.py
+  +++ b/contract/tests/test_contract.py
+  @@ -57,8 +57,15 @@ def test_placing_an_order_reserves_inventory(orders, inventory, orders_api):
+       assert stock(inventory, sku) == 6
+       got = conforms(orders_api, "GET", "/orders/{order_id}", orders.get(f"/orders/{order['id']}"))
+       assert got == order
+  -    listed = conforms(orders_api, "GET", "/orders", orders.get("/orders"))
+  -    assert order["id"] in [o["id"] for o in listed["orders"]]
+  +    seen, cursor = [], None
+  +    while True:  # page through every order
+  +        params = {"limit": 100} if cursor is None else {"limit": 100, "cursor": cursor}
+  +        page = conforms(orders_api, "GET", "/orders", orders.get("/orders", params=params))
+  +        seen += [o["id"] for o in page["orders"]]
+  +        cursor = page["next_cursor"]
+  +        if cursor is None:
+  +            break
+  +    assert order["id"] in seen
+
+
+   def test_insufficient_stock_is_refused_by_both(orders, inventory, orders_api, inventory_api):
+  diff --git a/orders-api/app.py b/orders-api/app.py
+  index 1fb5d99..9f4e0dc 100644
+  --- a/orders-api/app.py
+  +++ b/orders-api/app.py
+  @@ -3,7 +3,7 @@ inventory service over HTTP. The HTTP contract is ``openapi/orders.yaml`` in the
+   repository.
+
+       GET  /healthz              readiness probe
+  -    GET  /orders               every order, oldest first
+  +    GET  /orders               orders, oldest first, a page at a time (?limit=&cursor=)
+       POST /orders               place an order {"lines": [{"sku": ..., "qty": ...}]}
+       GET  /orders/{id}          one order
+       POST /orders/{id}/cancel   cancel an order
+  @@ -15,6 +15,8 @@ Run it with ``python app.py``. Environment: ``PORT`` (default 8000), ``HOST`` (d
+
+   from __future__ import annotations
+
+  +import base64
+  +import binascii
+   import os
+   import sqlite3
+   from collections.abc import Iterator
+  @@ -42,6 +44,8 @@ CREATE TABLE IF NOT EXISTS order_lines (
+       PRIMARY KEY (order_id, line_no)
+   );
+   """
+  +DEFAULT_PAGE = 50
+  +MAX_PAGE = 200
+
+
+   class InventoryError(Exception):
+  @@ -113,10 +117,13 @@ class Store:
+               row = db.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+               return None if row is None else self._order(db, row)
+
+  -    def all(self) -> list[dict[str, Any]]:
+  +    def page(self, after_id: int, limit: int) -> tuple[list[dict[str, Any]], bool]:
+  +        """Up to ``limit`` orders with an id above ``after_id``, and whether more follow."""
+           with self.connect() as db:
+  -            rows = db.execute("SELECT * FROM orders ORDER BY id").fetchall()
+  -            return [self._order(db, row) for row in rows]
+  +            rows = db.execute(
+  +                "SELECT * FROM orders WHERE id > ? ORDER BY id LIMIT ?", (after_id, limit + 1)
+  +            ).fetchall()
+  +            return [self._order(db, row) for row in rows[:limit]], len(rows) > limit
+
+       def set_status(self, order_id: int, status: str) -> None:
+           with self.connect() as db:
+  @@ -127,6 +134,22 @@ def error(status: int, message: str, **extra: Any) -> JSONResponse:
+       return JSONResponse({"error": message, **extra}, status_code=status)
+
+
+  +def encode_cursor(order_id: int) -> str:
+  +    return base64.urlsafe_b64encode(f"after:{order_id}".encode()).decode().rstrip("=")
+  +
+  +
+  +def decode_cursor(cursor: str) -> int | None:
+  +    """The order id an opaque cursor continues after; None if it is not one of ours."""
+  +    try:
+  +        text = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)).decode()
+  +    except (binascii.Error, UnicodeDecodeError, ValueError):
+  +        return None
+  +    prefix, _, number = text.partition(":")
+  +    if prefix != "after" or not (number.isascii() and number.isdigit()):
+  +        return None
+  +    return int(number)
+  +
+  +
+   def parse_lines(body: Any) -> list[dict[str, Any]] | None:
+       lines = body.get("lines") if isinstance(body, dict) else None
+       if not isinstance(lines, list) or not lines:
+  @@ -150,7 +173,19 @@ def create_app(
+           return JSONResponse({"ok": True})
+
+       async def list_orders(request: Request) -> JSONResponse:
+  -        return JSONResponse({"orders": store.all()})
+  +        raw_limit = request.query_params.get("limit", str(DEFAULT_PAGE))
+  +        if not (raw_limit.isascii() and raw_limit.isdigit()) or not 1 <= int(raw_limit) <= MAX_PAGE:
+  +            return error(400, f"limit must be an integer from 1 to {MAX_PAGE}")
+  +        after_id = 0
+  +        cursor = request.query_params.get("cursor")
+  +        if cursor is not None:
+  +            decoded = decode_cursor(cursor)
+  +            if decoded is None:
+  +                return error(400, "invalid cursor")
+  +            after_id = decoded
+  +        orders, more = store.page(after_id, int(raw_limit))
+  +        next_cursor = encode_cursor(orders[-1]["id"]) if more else None
+  +        return JSONResponse({"orders": orders, "next_cursor": next_cursor})
+
+       async def create_order(request: Request) -> JSONResponse:
+           try:
+notes: |
+  orders-api plus the contract document and the contract test that looked for an order in
+  the (formerly complete) list. Keyset pagination on the order id keeps pages stable.

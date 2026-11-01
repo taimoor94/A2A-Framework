@@ -1,0 +1,143 @@
+openapi: 3.1.0
+info:
+  title: inventory-service
+  version: 1.0.0
+  description: Product catalogue and stock. Owned by the inventory team; called by orders-api.
+paths:
+  /healthz:
+    get:
+      responses:
+        "200":
+          description: ready
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Health"}
+  /products:
+    get:
+      responses:
+        "200":
+          description: every product
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [products]
+                additionalProperties: false
+                properties:
+                  products:
+                    type: array
+                    items: {$ref: "#/components/schemas/Product"}
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/Product"}
+      responses:
+        "201":
+          description: created
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Product"}
+        "400": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+  /products/{sku}:
+    parameters:
+      - {$ref: "#/components/parameters/Sku"}
+    get:
+      responses:
+        "200":
+          description: the product
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Product"}
+        "404": {$ref: "#/components/responses/Error"}
+    delete:
+      responses:
+        "204": {description: removed}
+        "404": {$ref: "#/components/responses/Error"}
+  /products/{sku}/reserve:
+    parameters:
+      - {$ref: "#/components/parameters/Sku"}
+    post:
+      description: Take units out of stock, all or nothing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/StockChange"}
+      responses:
+        "200":
+          description: reserved
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/StockLevel"}
+        "400": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+  /products/{sku}/release:
+    parameters:
+      - {$ref: "#/components/parameters/Sku"}
+    post:
+      description: Put previously reserved units back into stock.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/StockChange"}
+      responses:
+        "200":
+          description: released
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/StockLevel"}
+        "400": {$ref: "#/components/responses/Error"}
+        "404": {$ref: "#/components/responses/Error"}
+components:
+  parameters:
+    Sku:
+      name: sku
+      in: path
+      required: true
+      schema: {type: string, pattern: "^[A-Z0-9][A-Z0-9-]{0,39}$"}
+  responses:
+    Error:
+      description: an error
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+  schemas:
+    Health:
+      type: object
+      required: [ok]
+      properties:
+        ok: {type: boolean}
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: {type: string}
+        sku: {type: string}
+        available: {type: integer}
+    Product:
+      type: object
+      required: [sku, name, stock, price_cents]
+      additionalProperties: false
+      properties:
+        sku: {type: string}
+        name: {type: string}
+        stock: {type: integer, minimum: 0}
+        price_cents: {type: integer, minimum: 0}
+    StockChange:
+      type: object
+      required: [qty]
+      additionalProperties: false
+      properties:
+        qty: {type: integer, minimum: 1}
+    StockLevel:
+      type: object
+      required: [sku, stock]
+      additionalProperties: false
+      properties:
+        sku: {type: string}
+        stock: {type: integer, minimum: 0}

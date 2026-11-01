@@ -1,0 +1,490 @@
+id: backorders-end-to-end
+request: |
+  Sales wants to keep taking orders for products that are temporarily out of stock instead
+  of turning customers away. Add backorders end to end. A client opts in per order with
+  "allow_backorder": true on POST /orders. Inventory then reserves whatever stock there is
+  and records the shortfall on the product as a "backordered" count (POST
+  /products/{sku}/reserve takes the same allow_backorder flag and answers with how many
+  units were reserved and how many backordered). The order is accepted with status
+  "backordered" when any line is short, and each order line shows its "backordered" units
+  (0 when fully in stock). Without the flag nothing changes: short stock is still a 409.
+  The flag must be a boolean. Existing order databases must keep working. Update both
+  OpenAPI documents in the contract repository so the new fields are documented.
+systems: [orders-api, inventory-service, contract]
+acceptance:
+  - id: inventory-backorders
+    system: inventory-service
+    files:
+      test/backorders.test.mjs: |
+        import assert from "node:assert/strict";
+        import { test } from "node:test";
+
+        import { call, useServer } from "./helpers.mjs";
+
+        const ctx = useServer([
+          { sku: "LOW-1", name: "Low", stock: 2, price_cents: 100 },
+          { sku: "NONE-2", name: "None", stock: 0, price_cents: 100 },
+          { sku: "OK-3", name: "Ok", stock: 10, price_cents: 100 },
+        ]);
+
+        test("a backorder reserves what is there and backorders the rest", async () => {
+          const r = await call(ctx, "POST", "/products/LOW-1/reserve", { qty: 5, allow_backorder: true });
+          assert.equal(r.status, 200);
+          assert.deepEqual(r.body, { sku: "LOW-1", stock: 0, reserved: 2, backordered: 3 });
+          const p = await call(ctx, "GET", "/products/LOW-1");
+          assert.equal(p.body.stock, 0);
+          assert.equal(p.body.backordered, 3);
+        });
+
+        test("backorders accumulate on an empty product", async () => {
+          await call(ctx, "POST", "/products/NONE-2/reserve", { qty: 1, allow_backorder: true });
+          const r = await call(ctx, "POST", "/products/NONE-2/reserve", { qty: 4, allow_backorder: true });
+          assert.deepEqual(r.body, { sku: "NONE-2", stock: 0, reserved: 0, backordered: 4 });
+          assert.equal((await call(ctx, "GET", "/products/NONE-2")).body.backordered, 5);
+        });
+
+        test("without allow_backorder a short reservation is still refused", async () => {
+          const r = await call(ctx, "POST", "/products/OK-3/reserve", { qty: 11 });
+          assert.equal(r.status, 409);
+          assert.equal((await call(ctx, "GET", "/products/OK-3")).body.backordered, 0);
+        });
+
+        test("a reservation that fits backorders nothing", async () => {
+          const r = await call(ctx, "POST", "/products/OK-3/reserve", { qty: 3, allow_backorder: true });
+          assert.deepEqual(r.body, { sku: "OK-3", stock: 7, reserved: 3, backordered: 0 });
+        });
+
+        test("allow_backorder must be a boolean", async () => {
+          const r = await call(ctx, "POST", "/products/OK-3/reserve", { qty: 1, allow_backorder: "yes" });
+          assert.equal(r.status, 400);
+        });
+  - id: orders-backorders
+    system: orders-api
+    files:
+      tests/test_backorders.py: |
+        """Orders with allow_backorder accept lines that are short of stock."""
+
+        import json
+
+        import httpx
+        import pytest
+        from app import create_app
+        from conftest import FakeInventory
+        from starlette.testclient import TestClient
+
+
+        class BackorderingInventory(FakeInventory):
+            """The fake inventory plus the documented allow_backorder behaviour of /reserve."""
+
+            def handle(self, request):
+                parts = request.url.path.strip("/").split("/")
+                body = json.loads(request.content or b"{}")
+                if parts[-1] == "reserve" and body.get("allow_backorder") is True:
+                    self.requests.append(request)
+                    product = self.products[parts[1]]
+                    reserved = min(product["stock"], body["qty"])
+                    product["stock"] -= reserved
+                    short = body["qty"] - reserved
+                    return httpx.Response(
+                        200,
+                        json={
+                            "sku": parts[1],
+                            "stock": product["stock"],
+                            "reserved": reserved,
+                            "backordered": short,
+                        },
+                    )
+                return super().handle(request)
+
+
+        @pytest.fixture
+        def backordering(tmp_path):
+            fake = BackorderingInventory()
+            fake.add("LOW-1", stock=2)
+            fake.add("OK-2", stock=10)
+            app = create_app(
+                str(tmp_path / "b.db"), "http://inv", transport=httpx.MockTransport(fake.handle)
+            )
+            with TestClient(app) as c:
+                yield c, fake
+
+
+        def test_a_short_line_is_backordered(backordering):
+            client, fake = backordering
+            res = client.post(
+                "/orders",
+                json={
+                    "lines": [{"sku": "LOW-1", "qty": 5}, {"sku": "OK-2", "qty": 1}],
+                    "allow_backorder": True,
+                },
+            )
+            assert res.status_code == 201, res.text
+            order = res.json()
+            assert order["status"] == "backordered"
+            assert order["lines"] == [
+                {"sku": "LOW-1", "qty": 5, "backordered": 3},
+                {"sku": "OK-2", "qty": 1, "backordered": 0},
+            ]
+            assert client.get(f"/orders/{order['id']}").json() == order
+            sent = [b for _, b in fake.calls("reserve")]
+            assert all(b.get("allow_backorder") is True for b in sent)
+
+
+        def test_an_order_that_fits_is_placed(backordering):
+            client, _ = backordering
+            res = client.post(
+                "/orders", json={"lines": [{"sku": "OK-2", "qty": 2}], "allow_backorder": True}
+            )
+            assert res.json()["status"] == "placed"
+            assert res.json()["lines"][0]["backordered"] == 0
+
+
+        def test_without_the_flag_short_stock_is_still_409(backordering):
+            client, fake = backordering
+            res = client.post("/orders", json={"lines": [{"sku": "LOW-1", "qty": 5}]})
+            assert res.status_code == 409
+            assert all("allow_backorder" not in b for _, b in fake.calls("reserve"))
+
+
+        def test_the_flag_must_be_a_boolean(backordering):
+            client, _ = backordering
+            body = {"lines": [{"sku": "OK-2", "qty": 1}], "allow_backorder": "yes"}
+            assert client.post("/orders", json=body).status_code == 400
+  - id: estate-backorders
+    system: null
+    check: estate
+    files:
+      contract/tests/test_backorders_e2e.py: |
+        """End to end: an order with allow_backorder is accepted and the shortfall is visible in both
+        services, every response conforming to the contract."""
+
+        from estate import conforms, new_product
+
+
+        def test_backorder_end_to_end(orders, inventory, orders_api, inventory_api):
+            sku = new_product(inventory, stock=2)
+            res = orders.post("/orders", json={"lines": [{"sku": sku, "qty": 5}], "allow_backorder": True})
+            assert res.status_code == 201, res.text
+            order = conforms(orders_api, "POST", "/orders", res)
+            assert order["status"] == "backordered"
+            assert order["lines"] == [{"sku": sku, "qty": 5, "backordered": 3}]
+            product = conforms(inventory_api, "GET", "/products/{sku}", inventory.get(f"/products/{sku}"))
+            assert (product["stock"], product["backordered"]) == (0, 3)
+            listed = conforms(orders_api, "GET", "/orders", orders.get("/orders"))
+            assert order in listed["orders"]
+
+
+        def test_inventory_reservation_conforms(inventory, inventory_api):
+            sku = new_product(inventory, stock=1)
+            res = inventory.post(f"/products/{sku}/reserve", json={"qty": 4, "allow_backorder": True})
+            body = conforms(inventory_api, "POST", "/products/{sku}/reserve", res)
+            assert body == {"sku": sku, "stock": 0, "reserved": 1, "backordered": 3}
+
+
+        def test_short_stock_without_backorder_is_still_refused(orders, inventory):
+            sku = new_product(inventory, stock=1)
+            assert orders.post("/orders", json={"lines": [{"sku": sku, "qty": 2}]}).status_code == 409
+reference_patch: |+
+  diff --git a/contract/openapi/inventory.yaml b/contract/openapi/inventory.yaml
+  index ed1324c..1b3ec23 100644
+  --- a/contract/openapi/inventory.yaml
+  +++ b/contract/openapi/inventory.yaml
+  @@ -60,7 +60,9 @@ paths:
+       parameters:
+         - {$ref: "#/components/parameters/Sku"}
+       post:
+  -      description: Take units out of stock, all or nothing.
+  +      description: >-
+  +        Take units out of stock, all or nothing; with allow_backorder the available units are
+  +        taken and the shortfall is added to the product's backordered count instead of a 409.
+         requestBody:
+           required: true
+           content:
+  @@ -71,7 +73,7 @@ paths:
+             description: reserved
+             content:
+               application/json:
+  -              schema: {$ref: "#/components/schemas/StockLevel"}
+  +              schema: {$ref: "#/components/schemas/Reservation"}
+           "400": {$ref: "#/components/responses/Error"}
+           "404": {$ref: "#/components/responses/Error"}
+           "409": {$ref: "#/components/responses/Error"}
+  @@ -128,12 +130,27 @@ components:
+           name: {type: string}
+           stock: {type: integer, minimum: 0}
+           price_cents: {type: integer, minimum: 0}
+  +        backordered:
+  +          type: integer
+  +          minimum: 0
+  +          readOnly: true
+  +          description: units ordered with allow_backorder and not yet in stock
+       StockChange:
+         type: object
+         required: [qty]
+         additionalProperties: false
+         properties:
+           qty: {type: integer, minimum: 1}
+  +        allow_backorder: {type: boolean, default: false, description: reserve only}
+  +    Reservation:
+  +      type: object
+  +      required: [sku, stock, reserved, backordered]
+  +      additionalProperties: false
+  +      properties:
+  +        sku: {type: string}
+  +        stock: {type: integer, minimum: 0}
+  +        reserved: {type: integer, minimum: 0}
+  +        backordered: {type: integer, minimum: 0}
+       StockLevel:
+         type: object
+         required: [sku, stock]
+  diff --git a/contract/openapi/orders.yaml b/contract/openapi/orders.yaml
+  index cdd5f2c..48b667e 100644
+  --- a/contract/openapi/orders.yaml
+  +++ b/contract/openapi/orders.yaml
+  @@ -100,6 +100,10 @@ components:
+             type: array
+             minItems: 1
+             items: {$ref: "#/components/schemas/OrderLine"}
+  +        allow_backorder:
+  +          type: boolean
+  +          default: false
+  +          description: order lines short of stock are backordered instead of refused with 409
+       OrderLine:
+         type: object
+         required: [sku, qty]
+  @@ -107,13 +111,14 @@ components:
+         properties:
+           sku: {type: string}
+           qty: {type: integer, minimum: 1}
+  +        backordered: {type: integer, minimum: 0, readOnly: true}
+       Order:
+         type: object
+         required: [id, status, created_at, lines]
+         additionalProperties: false
+         properties:
+           id: {type: integer}
+  -        status: {type: string, enum: [placed, cancelled]}
+  +        status: {type: string, enum: [placed, backordered, cancelled]}
+           created_at: {type: string}
+           lines:
+             type: array
+  diff --git a/contract/tests/test_contract.py b/contract/tests/test_contract.py
+  index ebf69e0..3f5f886 100644
+  --- a/contract/tests/test_contract.py
+  +++ b/contract/tests/test_contract.py
+  @@ -53,7 +53,7 @@ def test_placing_an_order_reserves_inventory(orders, inventory, orders_api):
+       assert res.status_code == 201, res.text
+       order = conforms(orders_api, "POST", "/orders", res)
+       assert order["status"] == "placed"
+  -    assert order["lines"] == [{"sku": sku, "qty": 4}]
+  +    assert order["lines"] == [{"sku": sku, "qty": 4, "backordered": 0}]
+       assert stock(inventory, sku) == 6
+       got = conforms(orders_api, "GET", "/orders/{order_id}", orders.get(f"/orders/{order['id']}"))
+       assert got == order
+  @@ -91,6 +91,11 @@ def test_cancel_flow(orders, inventory, orders_api):
+   def test_reserve_and_release_conform(inventory, inventory_api):
+       sku = new_product(inventory, stock=3)
+       r = inventory.post(f"/products/{sku}/reserve", json={"qty": 2})
+  -    assert conforms(inventory_api, "POST", "/products/{sku}/reserve", r) == {"sku": sku, "stock": 1}
+  +    assert conforms(inventory_api, "POST", "/products/{sku}/reserve", r) == {
+  +        "sku": sku,
+  +        "stock": 1,
+  +        "reserved": 2,
+  +        "backordered": 0,
+  +    }
+       r = inventory.post(f"/products/{sku}/release", json={"qty": 2})
+       assert conforms(inventory_api, "POST", "/products/{sku}/release", r) == {"sku": sku, "stock": 3}
+  diff --git a/inventory-service/server.mjs b/inventory-service/server.mjs
+  index cab2abe..952cdcd 100644
+  --- a/inventory-service/server.mjs
+  +++ b/inventory-service/server.mjs
+  @@ -6,7 +6,8 @@
+   //   POST   /products                   add a product {sku, name, stock, price_cents}
+   //   GET    /products/:sku              one product
+   //   DELETE /products/:sku              remove a product
+  -//   POST   /products/:sku/reserve      take {qty} units out of stock (409 when short)
+  +//   POST   /products/:sku/reserve      take {qty} units out of stock (409 when short, unless
+  +//                                      {allow_backorder: true}: the shortfall is backordered)
+   //   POST   /products/:sku/release      put {qty} units back
+   //
+   // Environment (when run as a program):
+  @@ -22,9 +23,9 @@ const MAX_BODY_BYTES = 64 * 1024;
+   const SKU = /^[A-Z0-9][A-Z0-9-]{0,39}$/;
+
+   export const SEED = [
+  -  { sku: "WIDGET-1", name: "Widget", stock: 20, price_cents: 1250 },
+  -  { sku: "GADGET-2", name: "Gadget", stock: 5, price_cents: 4999 },
+  -  { sku: "GIZMO-3", name: "Gizmo", stock: 0, price_cents: 799 },
+  +  { sku: "WIDGET-1", name: "Widget", stock: 20, price_cents: 1250, backordered: 0 },
+  +  { sku: "GADGET-2", name: "Gadget", stock: 5, price_cents: 4999, backordered: 0 },
+  +  { sku: "GIZMO-3", name: "Gizmo", stock: 0, price_cents: 799, backordered: 0 },
+   ];
+
+   class HttpError extends Error {
+  @@ -69,7 +70,7 @@ async function readJson(req) {
+   }
+
+   export function createInventory(seed = SEED) {
+  -  const products = new Map(seed.map((p) => [p.sku, { ...p }]));
+  +  const products = new Map(seed.map((p) => [p.sku, { backordered: 0, ...p }]));
+
+     function find(sku) {
+       const product = products.get(sku);
+  @@ -94,7 +95,7 @@ export function createInventory(seed = SEED) {
+           throw new HttpError(400, "price_cents must be a non-negative integer");
+         }
+         if (products.has(sku)) throw new HttpError(409, "product exists", { sku });
+  -      const product = { sku, name, stock, price_cents };
+  +      const product = { sku, name, stock, price_cents, backordered: 0 };
+         products.set(sku, product);
+         return [201, product];
+       },
+  @@ -107,11 +108,17 @@ export function createInventory(seed = SEED) {
+       "POST /products/:sku/reserve": (sku, body) => {
+         const product = find(sku);
+         const qty = qtyOf(body);
+  -      if (product.stock < qty) {
+  +      const backorder = body.allow_backorder ?? false;
+  +      if (typeof backorder !== "boolean") {
+  +        throw new HttpError(400, "allow_backorder must be a boolean");
+  +      }
+  +      if (product.stock < qty && !backorder) {
+           throw new HttpError(409, "insufficient stock", { sku, available: product.stock });
+         }
+  -      product.stock -= qty;
+  -      return [200, { sku, stock: product.stock }];
+  +      const reserved = Math.min(qty, product.stock);
+  +      product.stock -= reserved;
+  +      product.backordered += qty - reserved;
+  +      return [200, { sku, stock: product.stock, reserved, backordered: qty - reserved }];
+       },
+       "POST /products/:sku/release": (sku, body) => {
+         const product = find(sku);
+  diff --git a/inventory-service/test/inventory.test.mjs b/inventory-service/test/inventory.test.mjs
+  index c64da39..64ebc28 100644
+  --- a/inventory-service/test/inventory.test.mjs
+  +++ b/inventory-service/test/inventory.test.mjs
+  @@ -43,7 +43,7 @@ test("creates a product and refuses a duplicate or invalid one", async () => {
+   test("reserves and releases stock", async () => {
+     const r = await call(ctx, "POST", "/products/A-1/reserve", { qty: 4 });
+     assert.equal(r.status, 200);
+  -  assert.deepEqual(r.body, { sku: "A-1", stock: 6 });
+  +  assert.deepEqual(r.body, { sku: "A-1", stock: 6, reserved: 4, backordered: 0 });
+     const back = await call(ctx, "POST", "/products/A-1/release", { qty: 4 });
+     assert.deepEqual(back.body, { sku: "A-1", stock: 10 });
+   });
+  diff --git a/orders-api/app.py b/orders-api/app.py
+  index 1fb5d99..c43a8f1 100644
+  --- a/orders-api/app.py
+  +++ b/orders-api/app.py
+  @@ -4,7 +4,8 @@ repository.
+
+       GET  /healthz              readiness probe
+       GET  /orders               every order, oldest first
+  -    POST /orders               place an order {"lines": [{"sku": ..., "qty": ...}]}
+  +    POST /orders               place an order {"lines": [{"sku": ..., "qty": ...}]}; with
+  +                               "allow_backorder": true, missing stock is backordered
+       GET  /orders/{id}          one order
+       POST /orders/{id}/cancel   cancel an order
+
+  @@ -39,6 +40,7 @@ CREATE TABLE IF NOT EXISTS order_lines (
+       line_no INTEGER NOT NULL,
+       sku TEXT NOT NULL,
+       qty INTEGER NOT NULL,
+  +    backordered INTEGER NOT NULL DEFAULT 0,
+       PRIMARY KEY (order_id, line_no)
+   );
+   """
+  @@ -67,8 +69,11 @@ class InventoryClient:
+               raise InventoryError(res.status_code, data)
+           return data
+
+  -    async def reserve(self, sku: str, qty: int) -> dict[str, Any]:
+  -        return await self._post(f"/products/{quote(sku, safe='')}/reserve", {"qty": qty})
+  +    async def reserve(self, sku: str, qty: int, *, backorder: bool = False) -> dict[str, Any]:
+  +        body: dict[str, Any] = {"qty": qty}
+  +        if backorder:
+  +            body["allow_backorder"] = True
+  +        return await self._post(f"/products/{quote(sku, safe='')}/reserve", body)
+
+       async def aclose(self) -> None:
+           await self._http.aclose()
+  @@ -79,6 +84,11 @@ class Store:
+           self.path = path
+           with self.connect() as db:
+               db.executescript(SCHEMA)
+  +            columns = {row["name"] for row in db.execute("PRAGMA table_info(order_lines)")}
+  +            if "backordered" not in columns:  # databases created before backorders
+  +                db.execute(
+  +                    "ALTER TABLE order_lines ADD COLUMN backordered INTEGER NOT NULL DEFAULT 0"
+  +                )
+
+       @contextmanager
+       def connect(self) -> Iterator[sqlite3.Connection]:
+  @@ -88,18 +98,24 @@ class Store:
+                   yield db
+
+       def create(self, lines: list[dict[str, Any]]) -> int:
+  +        status = "backordered" if any(line.get("backordered") for line in lines) else "placed"
+           with self.connect() as db:
+  -            order_id = db.execute("INSERT INTO orders (status) VALUES ('placed')").lastrowid
+  +            order_id = db.execute("INSERT INTO orders (status) VALUES (?)", (status,)).lastrowid
+               db.executemany(
+  -                "INSERT INTO order_lines (order_id, line_no, sku, qty) VALUES (?, ?, ?, ?)",
+  -                [(order_id, n, line["sku"], line["qty"]) for n, line in enumerate(lines)],
+  +                "INSERT INTO order_lines (order_id, line_no, sku, qty, backordered)"
+  +                " VALUES (?, ?, ?, ?, ?)",
+  +                [
+  +                    (order_id, n, line["sku"], line["qty"], line.get("backordered", 0))
+  +                    for n, line in enumerate(lines)
+  +                ],
+               )
+           assert order_id is not None
+           return order_id
+
+       def _order(self, db: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+           lines = db.execute(
+  -            "SELECT sku, qty FROM order_lines WHERE order_id = ? ORDER BY line_no", (row["id"],)
+  +            "SELECT sku, qty, backordered FROM order_lines WHERE order_id = ? ORDER BY line_no",
+  +            (row["id"],),
+           ).fetchall()
+           return {
+               "id": row["id"],
+  @@ -160,15 +176,19 @@ def create_app(
+           lines = parse_lines(body)
+           if lines is None:
+               return error(400, "lines must be a non-empty list of {sku, qty > 0}")
+  +        backorder = body.get("allow_backorder", False)
+  +        if not isinstance(backorder, bool):
+  +            return error(400, "allow_backorder must be a boolean")
+           for line in lines:
+               try:
+  -                await inventory.reserve(line["sku"], line["qty"])
+  +                reservation = await inventory.reserve(line["sku"], line["qty"], backorder=backorder)
+               except InventoryError as e:
+                   if e.status == 404:
+                       return error(422, "unknown product", sku=line["sku"])
+                   if e.status == 409:
+                       return error(409, "insufficient stock", sku=line["sku"])
+                   return error(502, "inventory unavailable")
+  +            line["backordered"] = int(reservation.get("backordered", 0))
+           order_id = store.create(lines)
+           return JSONResponse(store.get(order_id), status_code=201)
+
+  diff --git a/orders-api/tests/test_orders.py b/orders-api/tests/test_orders.py
+  index 87926f1..0c8ecdb 100644
+  --- a/orders-api/tests/test_orders.py
+  +++ b/orders-api/tests/test_orders.py
+  @@ -11,7 +11,7 @@ def test_place_order_reserves_stock(client, inventory):
+       assert res.status_code == 201
+       order = res.json()
+       assert order["status"] == "placed"
+  -    assert order["lines"] == [{"sku": "WIDGET-1", "qty": 3}]
+  +    assert order["lines"] == [{"sku": "WIDGET-1", "qty": 3, "backordered": 0}]
+       assert inventory.stock("WIDGET-1") == 17
+
+
+notes: |
+  Touches all three repositories. The reference solution always reports "backordered" on
+  order lines and the new reservation fields on /reserve, so it also updates the existing
+  tests that compared those bodies exactly.

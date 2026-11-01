@@ -1,0 +1,362 @@
+id: contract-version-header
+request: |
+  We are about to start contract 2 work and need to be able to tell which contract a
+  caller and a service speak before anything breaks in production. Introduce an
+  X-Contract-Version header with the major version of the contract, currently "1". Both
+  orders-api and inventory-service must put X-Contract-Version: 1 on every response,
+  including errors and unknown routes. Requests may send the header; a request asking for
+  any other version must be refused with 400 and the error "unsupported contract version"
+  before it does anything, while requests without the header keep working. orders-api must
+  send X-Contract-Version: 1 on every call it makes to inventory-service. Document the
+  header in both OpenAPI documents (a components/headers/ContractVersion entry whose schema
+  enumerates the supported version).
+systems: [orders-api, inventory-service, contract]
+acceptance:
+  - id: inventory-contract-version
+    system: inventory-service
+    files:
+      test/contract_version.test.mjs: |
+        import assert from "node:assert/strict";
+        import { test } from "node:test";
+
+        import { call, useServer } from "./helpers.mjs";
+
+        const ctx = useServer([{ sku: "V-1", name: "V", stock: 1, price_cents: 1 }]);
+
+        test("every response carries X-Contract-Version: 1", async () => {
+          const responses = [
+            await call(ctx, "GET", "/healthz"),
+            await call(ctx, "GET", "/products"),
+            await call(ctx, "GET", "/products/V-1"),
+            await call(ctx, "GET", "/products/NOPE"), // 404
+            await call(ctx, "POST", "/products/V-1/reserve", { qty: 5 }), // 409
+            await call(ctx, "GET", "/no/such/route"),
+          ];
+          for (const res of responses) assert.equal(res.headers.get("x-contract-version"), "1");
+        });
+
+        test("a request for the current version is served", async () => {
+          const res = await call(ctx, "GET", "/products/V-1", undefined, { "X-Contract-Version": "1" });
+          assert.equal(res.status, 200);
+        });
+
+        test("a request for another version is refused with 400", async () => {
+          for (const version of ["2", "0", "1.1", "latest"]) {
+            const res = await call(ctx, "POST", "/products/V-1/reserve", { qty: 1 }, {
+              "X-Contract-Version": version,
+            });
+            assert.equal(res.status, 400, version);
+            assert.equal(res.body.error, "unsupported contract version");
+            assert.equal(res.headers.get("x-contract-version"), "1");
+          }
+          assert.equal((await call(ctx, "GET", "/products/V-1")).body.stock, 1);
+        });
+  - id: orders-contract-version
+    system: orders-api
+    files:
+      tests/test_contract_version.py: |
+        """orders-api speaks contract version 1 out loud: X-Contract-Version on every response and
+        on every call to inventory, and other versions are refused."""
+
+        import pytest
+
+
+        def test_every_response_carries_the_version(client):
+            responses = [
+                client.get("/healthz"),
+                client.get("/orders"),
+                client.post("/orders", json={"lines": [{"sku": "WIDGET-1", "qty": 1}]}),
+                client.get("/orders/999"),
+                client.post("/orders", json={}),
+                client.get("/no/such/route"),
+            ]
+            for res in responses:
+                assert res.headers.get("x-contract-version") == "1", res.request.url
+
+
+        def test_calls_to_inventory_send_the_version(client, inventory):
+            assert (
+                client.post("/orders", json={"lines": [{"sku": "WIDGET-1", "qty": 2}]}).status_code == 201
+            )
+            assert inventory.requests, "orders-api did not call inventory"
+            for req in inventory.requests:
+                assert req.headers.get("x-contract-version") == "1"
+
+
+        def test_the_current_version_is_served(client):
+            res = client.get("/orders", headers={"X-Contract-Version": "1"})
+            assert res.status_code == 200
+
+
+        @pytest.mark.parametrize("version", ["2", "0", "v1", "1.1"])
+        def test_another_version_is_refused(client, inventory, version):
+            res = client.post(
+                "/orders",
+                json={"lines": [{"sku": "WIDGET-1", "qty": 1}]},
+                headers={"X-Contract-Version": version},
+            )
+            assert res.status_code == 400
+            assert res.json()["error"] == "unsupported contract version"
+            assert res.headers.get("x-contract-version") == "1"
+            assert inventory.stock("WIDGET-1") == 20
+  - id: estate-contract-version
+    system: null
+    check: estate
+    files:
+      contract/tests/test_contract_version_e2e.py: |
+        """End to end: both services announce contract version 1 and refuse any other."""
+
+        import pytest
+        from estate import conforms, new_product, stock
+
+
+        def test_both_services_announce_the_version(orders, inventory):
+            sku = new_product(inventory, stock=3)
+            responses = [
+                orders.get("/healthz"),
+                orders.post("/orders", json={"lines": [{"sku": sku, "qty": 1}]}),
+                orders.get("/orders/999999"),
+                inventory.get("/healthz"),
+                inventory.get(f"/products/{sku}"),
+                inventory.post(f"/products/{sku}/reserve", json={"qty": 99}),
+            ]
+            for res in responses:
+                assert res.headers.get("x-contract-version") == "1", res.request.url
+
+
+        @pytest.mark.parametrize("service", ["orders", "inventory"])
+        def test_another_version_is_refused(service, orders, inventory):
+            client = orders if service == "orders" else inventory
+            res = client.get("/healthz", headers={"X-Contract-Version": "2"})
+            assert res.status_code == 400
+            assert res.json()["error"] == "unsupported contract version"
+
+
+        def test_an_order_flows_with_the_header(orders, inventory, orders_api):
+            sku = new_product(inventory, stock=3)
+            res = orders.post(
+                "/orders",
+                json={"lines": [{"sku": sku, "qty": 2}]},
+                headers={"X-Contract-Version": "1"},
+            )
+            assert res.status_code == 201, res.text
+            conforms(orders_api, "POST", "/orders", res)
+            assert stock(inventory, sku) == 1
+
+
+        def test_the_header_is_documented(orders_api, inventory_api):
+            for api in (orders_api, inventory_api):
+                assert api["components"]["headers"]["ContractVersion"]["schema"]["enum"] == ["1"]
+reference_patch: |
+  diff --git a/contract/openapi/inventory.yaml b/contract/openapi/inventory.yaml
+  index ed1324c..e92b34e 100644
+  --- a/contract/openapi/inventory.yaml
+  +++ b/contract/openapi/inventory.yaml
+  @@ -2,7 +2,10 @@ openapi: 3.1.0
+   info:
+     title: inventory-service
+     version: 1.0.0
+  -  description: Product catalogue and stock. Owned by the inventory team; called by orders-api.
+  +  description: >-
+  +    Product catalogue and stock. Owned by the inventory team; called by orders-api.
+  +    Every request may send, and every response carries, the header X-Contract-Version: 1
+  +    (components/headers/ContractVersion); a request with any other value is refused with 400.
+   paths:
+     /healthz:
+       get:
+  @@ -94,6 +97,10 @@ paths:
+           "400": {$ref: "#/components/responses/Error"}
+           "404": {$ref: "#/components/responses/Error"}
+   components:
+  +  headers:
+  +    ContractVersion:
+  +      description: the major version of this contract the sender implements
+  +      schema: {type: string, enum: ["1"]}
+     parameters:
+       Sku:
+         name: sku
+  @@ -117,6 +124,7 @@ components:
+         required: [error]
+         properties:
+           error: {type: string}
+  +        supported: {type: string, description: the contract version the service implements}
+           sku: {type: string}
+           available: {type: integer}
+       Product:
+  diff --git a/contract/openapi/orders.yaml b/contract/openapi/orders.yaml
+  index cdd5f2c..40aa75f 100644
+  --- a/contract/openapi/orders.yaml
+  +++ b/contract/openapi/orders.yaml
+  @@ -2,7 +2,10 @@ openapi: 3.1.0
+   info:
+     title: orders-api
+     version: 1.0.0
+  -  description: Customer orders. Owned by the orders team; reserves stock in inventory-service.
+  +  description: >-
+  +    Customer orders. Owned by the orders team; reserves stock in inventory-service.
+  +    Every request may send, and every response carries, the header X-Contract-Version: 1
+  +    (components/headers/ContractVersion); a request with any other value is refused with 400.
+   paths:
+     /healthz:
+       get:
+  @@ -68,6 +71,10 @@ paths:
+           "404": {$ref: "#/components/responses/Error"}
+           "409": {$ref: "#/components/responses/Error"}
+   components:
+  +  headers:
+  +    ContractVersion:
+  +      description: the major version of this contract the sender implements
+  +      schema: {type: string, enum: ["1"]}
+     parameters:
+       OrderId:
+         name: order_id
+  @@ -91,6 +98,7 @@ components:
+         required: [error]
+         properties:
+           error: {type: string}
+  +        supported: {type: string, description: the contract version the service implements}
+           sku: {type: string}
+       NewOrder:
+         type: object
+  diff --git a/inventory-service/server.mjs b/inventory-service/server.mjs
+  index cab2abe..47118fa 100644
+  --- a/inventory-service/server.mjs
+  +++ b/inventory-service/server.mjs
+  @@ -13,12 +13,16 @@
+   //   PORT  port to listen on (default 8001; 0 picks a free one)
+   //   HOST  address to listen on (default 127.0.0.1)
+   //
+  +// Every response carries X-Contract-Version (the major version of the contract this service
+  +// implements); a request that sends a different X-Contract-Version is refused with 400.
+  +//
+   // On start it prints one line to stdout, {"listening": <port>}. State is in memory: a restart
+   // goes back to the seed catalogue.
+   import { createServer } from "node:http";
+   import { pathToFileURL } from "node:url";
+
+   const MAX_BODY_BYTES = 64 * 1024;
+  +export const CONTRACT_VERSION = "1";
+   const SKU = /^[A-Z0-9][A-Z0-9-]{0,39}$/;
+
+   export const SEED = [
+  @@ -40,13 +44,14 @@ const isQty = (v) => Number.isInteger(v) && v > 0;
+
+   function send(res, status, body) {
+     if (body === undefined) {
+  -    res.writeHead(status).end();
+  +    res.writeHead(status, { "x-contract-version": CONTRACT_VERSION }).end();
+       return;
+     }
+     const data = JSON.stringify(body);
+     res.writeHead(status, {
+       "content-type": "application/json",
+       "content-length": Buffer.byteLength(data),
+  +    "x-contract-version": CONTRACT_VERSION,
+     });
+     res.end(data);
+   }
+  @@ -121,6 +126,10 @@ export function createInventory(seed = SEED) {
+     };
+
+     async function handle(req, res) {
+  +    const asked = req.headers["x-contract-version"];
+  +    if (asked !== undefined && asked !== CONTRACT_VERSION) {
+  +      throw new HttpError(400, "unsupported contract version", { supported: CONTRACT_VERSION });
+  +    }
+       const url = new URL(req.url, "http://inventory");
+       const parts = url.pathname.split("/").filter(Boolean);
+       let key = `${req.method} ${url.pathname}`;
+  diff --git a/orders-api/app.py b/orders-api/app.py
+  index 1fb5d99..680c2d7 100644
+  --- a/orders-api/app.py
+  +++ b/orders-api/app.py
+  @@ -8,6 +8,10 @@ repository.
+       GET  /orders/{id}          one order
+       POST /orders/{id}/cancel   cancel an order
+
+  +Every response carries ``X-Contract-Version`` (the major version of the contract); a request
+  +that sends a different ``X-Contract-Version`` is refused with 400, and calls to inventory send
+  +the header too.
+  +
+   Run it with ``python app.py``. Environment: ``PORT`` (default 8000), ``HOST`` (default
+   127.0.0.1), ``ORDERS_DB`` (default ``orders.db``), ``INVENTORY_URL`` (default
+   ``http://127.0.0.1:8001``).
+  @@ -27,6 +31,9 @@ from starlette.applications import Starlette
+   from starlette.requests import Request
+   from starlette.responses import JSONResponse
+   from starlette.routing import Route
+  +from starlette.types import ASGIApp, Message, Receive, Scope, Send
+  +
+  +CONTRACT_VERSION = "1"
+
+   SCHEMA = """
+   CREATE TABLE IF NOT EXISTS orders (
+  @@ -55,7 +62,12 @@ class InventoryError(Exception):
+
+   class InventoryClient:
+       def __init__(self, base_url: str, transport: httpx.AsyncBaseTransport | None = None) -> None:
+  -        self._http = httpx.AsyncClient(base_url=base_url, transport=transport, timeout=5.0)
+  +        self._http = httpx.AsyncClient(
+  +            base_url=base_url,
+  +            transport=transport,
+  +            timeout=5.0,
+  +            headers={"X-Contract-Version": CONTRACT_VERSION},
+  +        )
+
+       async def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+           try:
+  @@ -127,6 +139,32 @@ def error(status: int, message: str, **extra: Any) -> JSONResponse:
+       return JSONResponse({"error": message, **extra}, status_code=status)
+
+
+  +class ContractVersion:
+  +    """ASGI middleware: stamp X-Contract-Version on every response, refuse other versions."""
+  +
+  +    def __init__(self, app: ASGIApp) -> None:
+  +        self.app = app
+  +
+  +    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+  +        if scope["type"] != "http":
+  +            await self.app(scope, receive, send)
+  +            return
+  +        asked = [v for k, v in scope["headers"] if k == b"x-contract-version"]
+  +
+  +        async def stamped(message: Message) -> None:
+  +            if message["type"] == "http.response.start":
+  +                headers = [h for h in message.get("headers", []) if h[0] != b"x-contract-version"]
+  +                headers.append((b"x-contract-version", CONTRACT_VERSION.encode()))
+  +                message = {**message, "headers": headers}
+  +            await send(message)
+  +
+  +        if any(v.decode("latin-1").strip() != CONTRACT_VERSION for v in asked):
+  +            refusal = error(400, "unsupported contract version", supported=CONTRACT_VERSION)
+  +            await refusal(scope, receive, stamped)
+  +            return
+  +        await self.app(scope, receive, stamped)
+  +
+  +
+   def parse_lines(body: Any) -> list[dict[str, Any]] | None:
+       lines = body.get("lines") if isinstance(body, dict) else None
+       if not isinstance(lines, list) or not lines:
+  @@ -196,7 +234,7 @@ def create_app(
+           yield
+           await inventory.aclose()
+
+  -    return Starlette(
+  +    app = Starlette(
+           routes=[
+               Route("/healthz", healthz),
+               Route("/orders", list_orders, methods=["GET"]),
+  @@ -206,6 +244,8 @@ def create_app(
+           ],
+           lifespan=lifespan,
+       )
+  +    app.add_middleware(ContractVersion)
+  +    return app
+
+
+   if __name__ == "__main__":
+notes: |
+  A cross-cutting change: a pure ASGI middleware in orders-api, the shared send() and the
+  request handler in inventory-service, the httpx client's default headers, and both
+  OpenAPI documents.

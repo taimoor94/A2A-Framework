@@ -1,0 +1,12 @@
+{
+  "name": "inventory-service",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Product catalogue and stock for the demo estate (Node standard library only)",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test 'test/*.test.mjs'"
+  }
+}

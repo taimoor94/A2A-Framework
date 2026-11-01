@@ -1,0 +1,13 @@
+[project]
+name = "orders-api"
+version = "1.0.0"
+description = "Customer orders for the demo estate"
+requires-python = ">=3.11"
+dependencies = ["starlette", "uvicorn", "httpx"]
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--disable-plugin-autoload"

@@ -1,0 +1,501 @@
+id: inventory-low-stock-webhook-to-orders
+request: |
+  Purchasing finds out a product is running low only when customers start getting "insufficient
+  stock" errors. Have inventory-service tell orders-api when stock runs low. Inventory gets two
+  settings, LOW_STOCK_WEBHOOK_URL and LOW_STOCK_THRESHOLD (default 3): when a reservation takes a
+  product's stock from above the threshold to at or below it, inventory POSTs {"sku", "stock",
+  "threshold"} to the webhook URL, once per crossing, best effort, without slowing down or failing
+  the reservation. orders-api receives it at POST /webhooks/low-stock (202 when recorded, 400 for
+  a malformed payload), stores the alert, and lists alerts oldest first at GET
+  /alerts/low-stock as {"alerts": [{"sku", "stock", "threshold", "received_at"}]}. Document the
+  webhook in inventory.yaml (OpenAPI webhooks) and both endpoints in orders.yaml.
+systems: [orders-api, inventory-service, contract]
+acceptance:
+  - id: inventory-low-stock-webhook
+    system: inventory-service
+    files:
+      test/low_stock_webhook.test.mjs: |
+        // The low-stock webhook, configured as documented: LOW_STOCK_WEBHOOK_URL and
+        // LOW_STOCK_THRESHOLD on the server process.
+        import assert from "node:assert/strict";
+        import { spawn } from "node:child_process";
+        import { once } from "node:events";
+        import { createServer } from "node:http";
+        import { after, before, test } from "node:test";
+        import { fileURLToPath } from "node:url";
+
+        const SERVER = fileURLToPath(new URL("../server.mjs", import.meta.url));
+        const received = [];
+        let receiver;
+        let child;
+        let base;
+
+        before(async () => {
+          receiver = createServer((req, res) => {
+            let body = "";
+            req.on("data", (c) => (body += c));
+            req.on("end", () => {
+              received.push({ path: req.url, body: JSON.parse(body) });
+              res.writeHead(202).end();
+            });
+          });
+          receiver.listen(0, "127.0.0.1");
+          await once(receiver, "listening");
+          const hook = `http://127.0.0.1:${receiver.address().port}/webhooks/low-stock`;
+          child = spawn(process.execPath, [SERVER], {
+            env: { ...process.env, PORT: "0", LOW_STOCK_WEBHOOK_URL: hook, LOW_STOCK_THRESHOLD: "2" },
+            stdio: ["ignore", "pipe", "inherit"],
+          });
+          const [line] = await once(child.stdout, "data", { signal: AbortSignal.timeout(5000) });
+          base = `http://127.0.0.1:${JSON.parse(line.toString()).listening}`;
+          await add("LOW-1", 5);
+          await add("FLAT-2", 1);
+        });
+
+        after(async () => {
+          child.kill();
+          await new Promise((resolve) => receiver.close(resolve));
+        });
+
+        async function add(sku, stock) {
+          const res = await fetch(`${base}/products`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ sku, name: sku, stock, price_cents: 1 }),
+          });
+          assert.equal(res.status, 201);
+        }
+
+        async function reserve(sku, qty) {
+          const res = await fetch(`${base}/products/${sku}/reserve`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ qty }),
+          });
+          return res.status;
+        }
+
+        async function eventually(check, ms = 2000) {
+          const deadline = Date.now() + ms;
+          while (!check()) {
+            if (Date.now() > deadline) return false;
+            await new Promise((r) => setTimeout(r, 20));
+          }
+          return true;
+        }
+
+        const alertsFor = (sku) => received.filter((r) => r.body.sku === sku);
+
+        test("crossing the threshold sends one webhook", async () => {
+          assert.equal(await reserve("LOW-1", 2), 200); // 5 -> 3: above the threshold
+          assert.equal(await reserve("LOW-1", 2), 200); // 3 -> 1: crosses it
+          assert.ok(await eventually(() => alertsFor("LOW-1").length === 1), "no webhook received");
+          assert.deepEqual(alertsFor("LOW-1")[0], {
+            path: "/webhooks/low-stock",
+            body: { sku: "LOW-1", stock: 1, threshold: 2 },
+          });
+        });
+
+        test("staying below the threshold does not send it again", async () => {
+          assert.equal(await reserve("LOW-1", 1), 200); // 1 -> 0
+          await new Promise((r) => setTimeout(r, 200));
+          assert.equal(alertsFor("LOW-1").length, 1);
+        });
+
+        test("a product that starts below the threshold is not reported by reserving", async () => {
+          assert.equal(await reserve("FLAT-2", 1), 200); // 1 -> 0, never was above 2
+          await new Promise((r) => setTimeout(r, 200));
+          assert.equal(alertsFor("FLAT-2").length, 0);
+        });
+  - id: orders-low-stock-alerts
+    system: orders-api
+    files:
+      tests/test_low_stock_alerts.py: |
+        """orders-api receives inventory's low-stock webhook and lists the alerts."""
+
+        import pytest
+
+
+        def test_alerts_start_empty(client):
+            assert client.get("/alerts/low-stock").json() == {"alerts": []}
+
+
+        def test_a_webhook_is_recorded(client):
+            res = client.post("/webhooks/low-stock", json={"sku": "GADGET-2", "stock": 1, "threshold": 3})
+            assert res.status_code == 202
+            client.post("/webhooks/low-stock", json={"sku": "WIDGET-1", "stock": 0, "threshold": 3})
+            alerts = client.get("/alerts/low-stock").json()["alerts"]
+            assert [(a["sku"], a["stock"], a["threshold"]) for a in alerts] == [
+                ("GADGET-2", 1, 3),
+                ("WIDGET-1", 0, 3),
+            ]
+            assert all(a["received_at"] for a in alerts)
+
+
+        @pytest.mark.parametrize(
+            "body",
+            [
+                {},
+                {"sku": "A", "stock": -1, "threshold": 3},
+                {"sku": "A", "stock": 1},
+                {"sku": "", "stock": 1, "threshold": 1},
+                {"sku": "A", "stock": True, "threshold": 1},
+            ],
+        )
+        def test_a_bad_payload_is_400(client, body):
+            assert client.post("/webhooks/low-stock", json=body).status_code == 400
+            assert client.get("/alerts/low-stock").json()["alerts"] == []
+  - id: estate-low-stock-webhook
+    system: null
+    check: estate
+    files:
+      contract/tests/test_low_stock_webhook_e2e.py: |
+        """End to end: an order that takes stock to the threshold makes inventory-service call
+        orders-api's webhook, and orders-api lists the alert."""
+
+        import time
+
+        import httpx
+        import pytest
+        from estate import conforms, free_port, new_product, start_inventory, start_orders
+
+
+        @pytest.fixture(scope="module")
+        def wired(tmp_path_factory):
+            tmp = tmp_path_factory.mktemp("webhook")
+            inventory_port = free_port()
+            orders = start_orders(tmp, f"http://127.0.0.1:{inventory_port}")
+            try:
+                inventory = start_inventory(
+                    tmp,
+                    port=inventory_port,
+                    env={
+                        "LOW_STOCK_WEBHOOK_URL": orders.url + "/webhooks/low-stock",
+                        "LOW_STOCK_THRESHOLD": "2",
+                    },
+                )
+            except BaseException:
+                orders.stop()
+                raise
+            try:
+                with (
+                    httpx.Client(base_url=orders.url, timeout=10) as o,
+                    httpx.Client(base_url=inventory.url, timeout=10) as i,
+                ):
+                    yield o, i
+            finally:
+                inventory.stop()
+                orders.stop()
+
+
+        def alerts(orders, api):
+            res = orders.get("/alerts/low-stock")
+            assert res.status_code == 200, "orders-api has no /alerts/low-stock"
+            return conforms(api, "GET", "/alerts/low-stock", res)["alerts"]
+
+
+        def test_an_order_reaching_the_threshold_raises_an_alert(wired, orders_api):
+            orders, inventory = wired
+            sku = new_product(inventory, stock=5)
+            assert orders.post("/orders", json={"lines": [{"sku": sku, "qty": 2}]}).status_code == 201
+            assert [a for a in alerts(orders, orders_api) if a["sku"] == sku] == []
+            assert orders.post("/orders", json={"lines": [{"sku": sku, "qty": 2}]}).status_code == 201
+            deadline = time.monotonic() + 5
+            while not (found := [a for a in alerts(orders, orders_api) if a["sku"] == sku]):
+                assert time.monotonic() < deadline, "no low-stock alert reached orders-api"
+                time.sleep(0.05)
+            assert [(a["stock"], a["threshold"]) for a in found] == [(1, 2)]
+
+
+        def test_the_webhook_receiver_conforms(wired, orders_api):
+            orders, _ = wired
+            res = orders.post("/webhooks/low-stock", json={"sku": "X-1", "stock": 0, "threshold": 2})
+            conforms(orders_api, "POST", "/webhooks/low-stock", res)
+            bad = orders.post("/webhooks/low-stock", json={"sku": "X-1"})
+            assert bad.status_code == 400
+            conforms(orders_api, "POST", "/webhooks/low-stock", bad)
+
+
+        def test_the_webhook_is_documented(inventory_api):
+            hook = inventory_api["webhooks"]["lowStock"]["post"]
+            schema = hook["requestBody"]["content"]["application/json"]["schema"]
+            assert set(schema["required"]) == {"sku", "stock", "threshold"}
+reference_patch: |
+  diff --git a/contract/openapi/inventory.yaml b/contract/openapi/inventory.yaml
+  index ed1324c..47b9fdc 100644
+  --- a/contract/openapi/inventory.yaml
+  +++ b/contract/openapi/inventory.yaml
+  @@ -93,6 +93,27 @@ paths:
+                 schema: {$ref: "#/components/schemas/StockLevel"}
+           "400": {$ref: "#/components/responses/Error"}
+           "404": {$ref: "#/components/responses/Error"}
+  +webhooks:
+  +  lowStock:
+  +    post:
+  +      description: >-
+  +        Sent to LOW_STOCK_WEBHOOK_URL (orders-api's /webhooks/low-stock) when a reservation
+  +        takes a product's stock from above LOW_STOCK_THRESHOLD (default 3) to at or below
+  +        it. Sent once per crossing; delivery is best effort and never delays the reservation.
+  +      requestBody:
+  +        required: true
+  +        content:
+  +          application/json:
+  +            schema:
+  +              type: object
+  +              required: [sku, stock, threshold]
+  +              additionalProperties: false
+  +              properties:
+  +                sku: {type: string}
+  +                stock: {type: integer, minimum: 0}
+  +                threshold: {type: integer, minimum: 0}
+  +      responses:
+  +        "202": {description: accepted}
+   components:
+     parameters:
+       Sku:
+  diff --git a/contract/openapi/orders.yaml b/contract/openapi/orders.yaml
+  index cdd5f2c..8b06e7e 100644
+  --- a/contract/openapi/orders.yaml
+  +++ b/contract/openapi/orders.yaml
+  @@ -67,6 +67,38 @@ paths:
+                 schema: {$ref: "#/components/schemas/Order"}
+           "404": {$ref: "#/components/responses/Error"}
+           "409": {$ref: "#/components/responses/Error"}
+  +  /webhooks/low-stock:
+  +    post:
+  +      description: >-
+  +        Receiver for the inventory-service lowStock webhook (see inventory.yaml); stores an
+  +        alert for the purchasing team.
+  +      requestBody:
+  +        required: true
+  +        content:
+  +          application/json:
+  +            schema: {$ref: "#/components/schemas/LowStock"}
+  +      responses:
+  +        "202":
+  +          description: alert recorded
+  +          content:
+  +            application/json:
+  +              schema: {$ref: "#/components/schemas/Health"}
+  +        "400": {$ref: "#/components/responses/Error"}
+  +  /alerts/low-stock:
+  +    get:
+  +      responses:
+  +        "200":
+  +          description: every low-stock alert received, oldest first
+  +          content:
+  +            application/json:
+  +              schema:
+  +                type: object
+  +                required: [alerts]
+  +                additionalProperties: false
+  +                properties:
+  +                  alerts:
+  +                    type: array
+  +                    items: {$ref: "#/components/schemas/LowStockAlert"}
+   components:
+     parameters:
+       OrderId:
+  @@ -107,6 +139,22 @@ components:
+         properties:
+           sku: {type: string}
+           qty: {type: integer, minimum: 1}
+  +    LowStock:
+  +      type: object
+  +      required: [sku, stock, threshold]
+  +      properties:
+  +        sku: {type: string}
+  +        stock: {type: integer, minimum: 0}
+  +        threshold: {type: integer, minimum: 0}
+  +    LowStockAlert:
+  +      type: object
+  +      required: [sku, stock, threshold, received_at]
+  +      additionalProperties: false
+  +      properties:
+  +        sku: {type: string}
+  +        stock: {type: integer, minimum: 0}
+  +        threshold: {type: integer, minimum: 0}
+  +        received_at: {type: string}
+       Order:
+         type: object
+         required: [id, status, created_at, lines]
+  diff --git a/inventory-service/server.mjs b/inventory-service/server.mjs
+  index cab2abe..41489bd 100644
+  --- a/inventory-service/server.mjs
+  +++ b/inventory-service/server.mjs
+  @@ -12,6 +12,10 @@
+   // Environment (when run as a program):
+   //   PORT  port to listen on (default 8001; 0 picks a free one)
+   //   HOST  address to listen on (default 127.0.0.1)
+  +//   LOW_STOCK_WEBHOOK_URL  when set, a reservation that takes a product's stock from above
+  +//                          the threshold to at or below it POSTs {sku, stock, threshold} here
+  +//                          (once per crossing, without delaying the reservation)
+  +//   LOW_STOCK_THRESHOLD    the threshold (default 3)
+   //
+   // On start it prints one line to stdout, {"listening": <port>}. State is in memory: a restart
+   // goes back to the seed catalogue.
+  @@ -19,6 +23,8 @@ import { createServer } from "node:http";
+   import { pathToFileURL } from "node:url";
+
+   const MAX_BODY_BYTES = 64 * 1024;
+  +const WEBHOOK_TIMEOUT_MS = 2000;
+  +const DEFAULT_LOW_STOCK = 3;
+   const SKU = /^[A-Z0-9][A-Z0-9-]{0,39}$/;
+
+   export const SEED = [
+  @@ -68,7 +74,22 @@ async function readJson(req) {
+     }
+   }
+
+  -export function createInventory(seed = SEED) {
+  +async function notify(url, payload) {
+  +  try {
+  +    const res = await fetch(url, {
+  +      method: "POST",
+  +      headers: { "content-type": "application/json" },
+  +      body: JSON.stringify(payload),
+  +      signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
+  +    });
+  +    if (!res.ok) console.error(`inventory: low-stock webhook answered ${res.status}`);
+  +  } catch (err) {
+  +    console.error(`inventory: low-stock webhook failed: ${err.message}`);
+  +  }
+  +}
+  +
+  +export function createInventory(seed = SEED, webhook = {}) {
+  +  const { webhookUrl = "", lowStock = DEFAULT_LOW_STOCK } = webhook;
+     const products = new Map(seed.map((p) => [p.sku, { ...p }]));
+
+     function find(sku) {
+  @@ -110,7 +131,11 @@ export function createInventory(seed = SEED) {
+         if (product.stock < qty) {
+           throw new HttpError(409, "insufficient stock", { sku, available: product.stock });
+         }
+  +      const before = product.stock;
+         product.stock -= qty;
+  +      if (webhookUrl && before > lowStock && product.stock <= lowStock) {
+  +        notify(webhookUrl, { sku, stock: product.stock, threshold: lowStock });
+  +      }
+         return [200, { sku, stock: product.stock }];
+       },
+       "POST /products/:sku/release": (sku, body) => {
+  @@ -139,8 +164,8 @@ export function createInventory(seed = SEED) {
+     return { products, handle };
+   }
+
+  -export function start({ port = 0, host = "127.0.0.1", seed = SEED } = {}) {
+  -  const inventory = createInventory(seed);
+  +export function start({ port = 0, host = "127.0.0.1", seed = SEED, webhook = {} } = {}) {
+  +  const inventory = createInventory(seed, webhook);
+     const server = createServer((req, res) => {
+       inventory.handle(req, res).catch((err) => {
+         if (err instanceof HttpError) {
+  @@ -158,9 +183,15 @@ export function start({ port = 0, host = "127.0.0.1", seed = SEED } = {}) {
+   }
+
+   if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  +  const lowStock = Number(process.env.LOW_STOCK_THRESHOLD ?? DEFAULT_LOW_STOCK);
+  +  if (!Number.isInteger(lowStock) || lowStock < 0) {
+  +    console.error("inventory: LOW_STOCK_THRESHOLD must be a non-negative integer");
+  +    process.exit(2);
+  +  }
+     const server = await start({
+       port: Number(process.env.PORT ?? 8001),
+       host: process.env.HOST || "127.0.0.1",
+  +    webhook: { webhookUrl: process.env.LOW_STOCK_WEBHOOK_URL || "", lowStock },
+     });
+     console.log(JSON.stringify({ listening: server.address().port }));
+     const stop = () => server.close(() => process.exit(0));
+  diff --git a/orders-api/app.py b/orders-api/app.py
+  index 1fb5d99..31f0151 100644
+  --- a/orders-api/app.py
+  +++ b/orders-api/app.py
+  @@ -7,6 +7,8 @@ repository.
+       POST /orders               place an order {"lines": [{"sku": ..., "qty": ...}]}
+       GET  /orders/{id}          one order
+       POST /orders/{id}/cancel   cancel an order
+  +    POST /webhooks/low-stock   inventory-service reports a product at or below its threshold
+  +    GET  /alerts/low-stock     the low-stock alerts received, oldest first
+
+   Run it with ``python app.py``. Environment: ``PORT`` (default 8000), ``HOST`` (default
+   127.0.0.1), ``ORDERS_DB`` (default ``orders.db``), ``INVENTORY_URL`` (default
+  @@ -41,6 +43,13 @@ CREATE TABLE IF NOT EXISTS order_lines (
+       qty INTEGER NOT NULL,
+       PRIMARY KEY (order_id, line_no)
+   );
+  +CREATE TABLE IF NOT EXISTS low_stock_alerts (
+  +    id INTEGER PRIMARY KEY AUTOINCREMENT,
+  +    sku TEXT NOT NULL,
+  +    stock INTEGER NOT NULL,
+  +    threshold INTEGER NOT NULL,
+  +    received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+  +);
+   """
+
+
+  @@ -122,6 +131,20 @@ class Store:
+           with self.connect() as db:
+               db.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_id))
+
+  +    def add_alert(self, sku: str, stock: int, threshold: int) -> None:
+  +        with self.connect() as db:
+  +            db.execute(
+  +                "INSERT INTO low_stock_alerts (sku, stock, threshold) VALUES (?, ?, ?)",
+  +                (sku, stock, threshold),
+  +            )
+  +
+  +    def alerts(self) -> list[dict[str, Any]]:
+  +        with self.connect() as db:
+  +            rows = db.execute(
+  +                "SELECT sku, stock, threshold, received_at FROM low_stock_alerts ORDER BY id"
+  +            ).fetchall()
+  +            return [dict(row) for row in rows]
+  +
+
+   def error(status: int, message: str, **extra: Any) -> JSONResponse:
+       return JSONResponse({"error": message, **extra}, status_code=status)
+  @@ -191,6 +214,30 @@ def create_app(
+           store.set_status(order["id"], "cancelled")
+           return JSONResponse(store.get(order["id"]))
+
+  +    async def low_stock_webhook(request: Request) -> JSONResponse:
+  +        try:
+  +            body = await request.json()
+  +        except ValueError:
+  +            return error(400, "body must be JSON")
+  +
+  +        def count(name: str) -> bool:
+  +            v = body.get(name)
+  +            return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+  +
+  +        if not (
+  +            isinstance(body, dict)
+  +            and isinstance(body.get("sku"), str)
+  +            and body["sku"]
+  +            and count("stock")
+  +            and count("threshold")
+  +        ):
+  +            return error(400, "expected {sku, stock >= 0, threshold >= 0}")
+  +        store.add_alert(body["sku"], body["stock"], body["threshold"])
+  +        return JSONResponse({"ok": True}, status_code=202)
+  +
+  +    async def low_stock_alerts(request: Request) -> JSONResponse:
+  +        return JSONResponse({"alerts": store.alerts()})
+  +
+       @asynccontextmanager
+       async def lifespan(app: Starlette) -> Any:
+           yield
+  @@ -203,6 +250,8 @@ def create_app(
+               Route("/orders", create_order, methods=["POST"]),
+               Route("/orders/{order_id}", get_order, methods=["GET"]),
+               Route("/orders/{order_id}/cancel", cancel_order, methods=["POST"]),
+  +            Route("/webhooks/low-stock", low_stock_webhook, methods=["POST"]),
+  +            Route("/alerts/low-stock", low_stock_alerts, methods=["GET"]),
+           ],
+           lifespan=lifespan,
+       )
+notes: |
+  A service-to-service call in the other direction (inventory to orders). The whole-system
+  test wires a dedicated pair: orders-api first, pointed at a pre-picked inventory port, then
+  inventory-service on that port with the webhook URL of that orders-api. Authenticating the
+  webhook is out of scope here.

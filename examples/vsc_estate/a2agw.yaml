@@ -1,0 +1,37 @@
+# The demo estate as a Verified System Change target. Create the repositories first:
+#
+#   python examples/vsc_estate/init_estate.py examples/vsc_estate/estate
+#
+# Repository paths are relative to this file. Commands run without a shell, with `python` and
+# `node` resolved on PATH (run the gateway under `uv run` so `python` has starlette, httpx,
+# pyyaml and pytest).
+base_url: ${A2AGW_BASE_URL:-http://localhost:8000}
+db_url: ${A2AGW_DB_URL:-sqlite+aiosqlite:///a2agw.db}
+
+vsc:
+  systems:
+    - id: orders-api
+      repo: ./estate/orders-api
+      gate: [python, -m, py_compile, app.py]
+      tests: [python, -m, pytest, -q, tests]
+      index: [app.py, tests]
+    - id: inventory-service
+      repo: ./estate/inventory-service
+      gate: [node, --check, server.mjs]
+      # node --test takes files or globs, not a directory; node expands the glob itself
+      tests: [node, --test, "test/*.test.mjs"]
+      index: [server.mjs, test]
+    - id: contract
+      repo: ./estate/contract
+      tests: [python, -m, pytest, -q, tests]
+      index: [openapi, tests]
+  checks:
+    # The whole-system check runs in the FIRST listed system's workspace, so the contract
+    # repository comes first: its suite starts both services from the VSC_WS_ORDERS_API and
+    # VSC_WS_INVENTORY_SERVICE workspaces on free ports.
+    - id: estate
+      systems: [contract, orders-api, inventory-service]
+      run: [python, -m, pytest, -q, tests]
+      timeout_s: 300
+  planner: scripted
+  workers: []  # fill in your workers (Claude Code, Codex CLI, ...) before running a job

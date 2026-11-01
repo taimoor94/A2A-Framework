@@ -1,0 +1,329 @@
+id: order-total-with-tax-from-inventory-price
+request: |
+  Finance needs order totals. Today an order only lists SKUs and quantities, and the
+  checkout computes money on the client from whatever price it last saw. When an order is
+  placed, orders-api should take each product's current price_cents from inventory-service
+  (GET /products/{sku}) and keep it with the order line as unit_price_cents, so later price
+  changes do not alter existing orders. Every order then reports subtotal_cents (sum of qty
+  x unit price), tax_cents and total_cents. Tax is a flat rate configured on orders-api with
+  TAX_RATE_BPS in basis points, default 2000 (20%), applied to the subtotal and rounded half
+  up to a whole cent. Existing order databases must keep working. Document the new fields in
+  the orders contract.
+systems: [orders-api, inventory-service, contract]
+acceptance:
+  - id: orders-totals
+    system: orders-api
+    files:
+      tests/test_order_totals.py: |
+        """Orders carry prices from inventory and a subtotal, tax (20% by default) and total."""
+
+
+        def place(client, *lines):
+            res = client.post("/orders", json={"lines": [{"sku": s, "qty": q} for s, q in lines]})
+            assert res.status_code == 201, res.text
+            return res.json()
+
+
+        def test_totals_use_inventory_prices(client):
+            order = place(client, ("WIDGET-1", 3), ("GADGET-2", 1))
+            assert [line["unit_price_cents"] for line in order["lines"]] == [1250, 4999]
+            assert order["subtotal_cents"] == 3 * 1250 + 4999
+            assert order["tax_cents"] == 1750  # 20% of 8749 = 1749.8, rounded half up
+            assert order["total_cents"] == 8749 + 1750
+
+
+        def test_tax_rounds_half_up_to_a_cent(client, inventory):
+            inventory.add("HALF-1", stock=5, price_cents=1)  # 20% of 5 cents = 1 cent exactly
+            inventory.add("ODD-2", stock=5, price_cents=333)  # 20% of 333 = 66.6 -> 67
+            inventory.add("DOWN-3", stock=5, price_cents=7)  # 20% of 7 = 1.4 -> 1
+            assert place(client, ("HALF-1", 5))["tax_cents"] == 1
+            assert place(client, ("ODD-2", 1))["tax_cents"] == 67
+            assert place(client, ("DOWN-3", 1))["tax_cents"] == 1
+
+
+        def test_the_price_is_fixed_when_the_order_is_placed(client, inventory):
+            order = place(client, ("WIDGET-1", 2))
+            inventory.products["WIDGET-1"]["price_cents"] = 9999  # a later price change
+            again = client.get(f"/orders/{order['id']}").json()
+            assert again["lines"][0]["unit_price_cents"] == 1250
+            assert again["total_cents"] == order["total_cents"] == 3000
+            assert client.get("/orders").json()["orders"][0]["total_cents"] == 3000
+
+
+        def test_unknown_products_are_still_422(client):
+            res = client.post("/orders", json={"lines": [{"sku": "NOPE-1", "qty": 1}]})
+            assert res.status_code == 422
+  - id: estate-totals
+    system: null
+    check: estate
+    files:
+      contract/tests/test_order_totals_e2e.py: |
+        """End to end: order totals come from the inventory catalogue price, and the tax rate is the
+        orders-api TAX_RATE_BPS setting."""
+
+        import httpx
+        import pytest
+        from estate import conforms, new_product, start_orders
+
+
+        def test_totals_from_the_catalogue(orders, inventory, orders_api):
+            a = new_product(inventory, stock=10, price_cents=1999)
+            b = new_product(inventory, stock=10, price_cents=500)
+            res = orders.post("/orders", json={"lines": [{"sku": a, "qty": 2}, {"sku": b, "qty": 3}]})
+            assert res.status_code == 201, res.text
+            order = conforms(orders_api, "POST", "/orders", res)
+            assert [line["unit_price_cents"] for line in order["lines"]] == [1999, 500]
+            assert order["subtotal_cents"] == 5498
+            assert order["tax_cents"] == 1100  # 20% of 5498 = 1099.6
+            assert order["total_cents"] == 6598
+            conforms(orders_api, "GET", "/orders/{order_id}", orders.get(f"/orders/{order['id']}"))
+
+
+        @pytest.fixture
+        def orders_at_ten_percent(services):
+            svc = start_orders(services.tmp, services.inventory.url, env={"TAX_RATE_BPS": "1000"})
+            try:
+                with httpx.Client(base_url=svc.url, timeout=10.0) as c:
+                    yield c
+            finally:
+                svc.stop()
+
+
+        def test_the_tax_rate_is_configurable(orders_at_ten_percent, inventory):
+            sku = new_product(inventory, stock=3, price_cents=1234)
+            res = orders_at_ten_percent.post("/orders", json={"lines": [{"sku": sku, "qty": 1}]})
+            assert res.status_code == 201, res.text
+            body = res.json()
+            assert (body["subtotal_cents"], body["tax_cents"], body["total_cents"]) == (1234, 123, 1357)
+reference_patch: |+
+  diff --git a/contract/openapi/orders.yaml b/contract/openapi/orders.yaml
+  index cdd5f2c..da83adc 100644
+  --- a/contract/openapi/orders.yaml
+  +++ b/contract/openapi/orders.yaml
+  @@ -107,9 +107,14 @@ components:
+         properties:
+           sku: {type: string}
+           qty: {type: integer, minimum: 1}
+  +        unit_price_cents:
+  +          type: integer
+  +          minimum: 0
+  +          readOnly: true
+  +          description: the inventory price_cents of the product when the order was placed
+       Order:
+         type: object
+  -      required: [id, status, created_at, lines]
+  +      required: [id, status, created_at, lines, subtotal_cents, tax_cents, total_cents]
+         additionalProperties: false
+         properties:
+           id: {type: integer}
+  @@ -118,3 +123,9 @@ components:
+           lines:
+             type: array
+             items: {$ref: "#/components/schemas/OrderLine"}
+  +        subtotal_cents: {type: integer, minimum: 0, description: sum of quantity x unit price}
+  +        tax_cents:
+  +          type: integer
+  +          minimum: 0
+  +          description: the orders-api tax rate (TAX_RATE_BPS) of the subtotal, rounded half up
+  +        total_cents: {type: integer, minimum: 0, description: subtotal plus tax}
+  diff --git a/contract/tests/test_contract.py b/contract/tests/test_contract.py
+  index ebf69e0..5ce69c3 100644
+  --- a/contract/tests/test_contract.py
+  +++ b/contract/tests/test_contract.py
+  @@ -48,12 +48,12 @@ def test_catalogue_conforms(inventory, inventory_api):
+
+
+   def test_placing_an_order_reserves_inventory(orders, inventory, orders_api):
+  -    sku = new_product(inventory, stock=10)
+  +    sku = new_product(inventory, stock=10, price_cents=250)
+       res = place(orders, (sku, 4))
+       assert res.status_code == 201, res.text
+       order = conforms(orders_api, "POST", "/orders", res)
+       assert order["status"] == "placed"
+  -    assert order["lines"] == [{"sku": sku, "qty": 4}]
+  +    assert order["lines"] == [{"sku": sku, "qty": 4, "unit_price_cents": 250}]
+       assert stock(inventory, sku) == 6
+       got = conforms(orders_api, "GET", "/orders/{order_id}", orders.get(f"/orders/{order['id']}"))
+       assert got == order
+  diff --git a/orders-api/app.py b/orders-api/app.py
+  index 1fb5d99..d8b5bc8 100644
+  --- a/orders-api/app.py
+  +++ b/orders-api/app.py
+  @@ -8,9 +8,12 @@ repository.
+       GET  /orders/{id}          one order
+       POST /orders/{id}/cancel   cancel an order
+
+  +Prices come from inventory when the order is placed and are kept with the order; the tax is
+  +``TAX_RATE_BPS`` basis points of the subtotal, rounded half up to a cent.
+  +
+   Run it with ``python app.py``. Environment: ``PORT`` (default 8000), ``HOST`` (default
+   127.0.0.1), ``ORDERS_DB`` (default ``orders.db``), ``INVENTORY_URL`` (default
+  -``http://127.0.0.1:8001``).
+  +``http://127.0.0.1:8001``), ``TAX_RATE_BPS`` (default 2000, i.e. 20%).
+   """
+
+   from __future__ import annotations
+  @@ -32,6 +35,7 @@ SCHEMA = """
+   CREATE TABLE IF NOT EXISTS orders (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       status TEXT NOT NULL,
+  +    tax_rate_bps INTEGER NOT NULL DEFAULT 0,
+       created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+   );
+   CREATE TABLE IF NOT EXISTS order_lines (
+  @@ -39,9 +43,22 @@ CREATE TABLE IF NOT EXISTS order_lines (
+       line_no INTEGER NOT NULL,
+       sku TEXT NOT NULL,
+       qty INTEGER NOT NULL,
+  +    unit_price_cents INTEGER NOT NULL DEFAULT 0,
+       PRIMARY KEY (order_id, line_no)
+   );
+   """
+  +# Columns added after the first release: (table, column, definition). Orders placed before
+  +# prices were recorded read as zero.
+  +MIGRATIONS = [
+  +    ("orders", "tax_rate_bps", "INTEGER NOT NULL DEFAULT 0"),
+  +    ("order_lines", "unit_price_cents", "INTEGER NOT NULL DEFAULT 0"),
+  +]
+  +DEFAULT_TAX_RATE_BPS = 2000
+  +
+  +
+  +def tax_cents(subtotal_cents: int, rate_bps: int) -> int:
+  +    """``rate_bps`` of the subtotal, rounded half up to a whole cent."""
+  +    return (subtotal_cents * rate_bps + 5000) // 10000
+
+
+   class InventoryError(Exception):
+  @@ -67,6 +84,16 @@ class InventoryClient:
+               raise InventoryError(res.status_code, data)
+           return data
+
+  +    async def product(self, sku: str) -> dict[str, Any]:
+  +        try:
+  +            res = await self._http.get(f"/products/{quote(sku, safe='')}")
+  +        except httpx.HTTPError:
+  +            raise InventoryError(502, {"error": "inventory unavailable"}) from None
+  +        data = res.json() if res.content else {}
+  +        if res.status_code != 200:
+  +            raise InventoryError(res.status_code, data)
+  +        return data
+  +
+       async def reserve(self, sku: str, qty: int) -> dict[str, Any]:
+           return await self._post(f"/products/{quote(sku, safe='')}/reserve", {"qty": qty})
+
+  @@ -79,6 +106,10 @@ class Store:
+           self.path = path
+           with self.connect() as db:
+               db.executescript(SCHEMA)
+  +            for table, column, definition in MIGRATIONS:
+  +                columns = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+  +                if column not in columns:
+  +                    db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+       @contextmanager
+       def connect(self) -> Iterator[sqlite3.Connection]:
+  @@ -87,25 +118,38 @@ class Store:
+               with db:  # one transaction
+                   yield db
+
+  -    def create(self, lines: list[dict[str, Any]]) -> int:
+  +    def create(self, lines: list[dict[str, Any]], tax_rate_bps: int) -> int:
+           with self.connect() as db:
+  -            order_id = db.execute("INSERT INTO orders (status) VALUES ('placed')").lastrowid
+  +            order_id = db.execute(
+  +                "INSERT INTO orders (status, tax_rate_bps) VALUES ('placed', ?)", (tax_rate_bps,)
+  +            ).lastrowid
+               db.executemany(
+  -                "INSERT INTO order_lines (order_id, line_no, sku, qty) VALUES (?, ?, ?, ?)",
+  -                [(order_id, n, line["sku"], line["qty"]) for n, line in enumerate(lines)],
+  +                "INSERT INTO order_lines (order_id, line_no, sku, qty, unit_price_cents)"
+  +                " VALUES (?, ?, ?, ?, ?)",
+  +                [
+  +                    (order_id, n, line["sku"], line["qty"], line["unit_price_cents"])
+  +                    for n, line in enumerate(lines)
+  +                ],
+               )
+           assert order_id is not None
+           return order_id
+
+       def _order(self, db: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+           lines = db.execute(
+  -            "SELECT sku, qty FROM order_lines WHERE order_id = ? ORDER BY line_no", (row["id"],)
+  +            "SELECT sku, qty, unit_price_cents FROM order_lines WHERE order_id = ?"
+  +            " ORDER BY line_no",
+  +            (row["id"],),
+           ).fetchall()
+  +        subtotal = sum(line["qty"] * line["unit_price_cents"] for line in lines)
+  +        tax = tax_cents(subtotal, row["tax_rate_bps"])
+           return {
+               "id": row["id"],
+               "status": row["status"],
+               "created_at": row["created_at"],
+               "lines": [dict(line) for line in lines],
+  +            "subtotal_cents": subtotal,
+  +            "tax_cents": tax,
+  +            "total_cents": subtotal + tax,
+           }
+
+       def get(self, order_id: int) -> dict[str, Any] | None:
+  @@ -141,7 +185,11 @@ def parse_lines(body: Any) -> list[dict[str, Any]] | None:
+
+
+   def create_app(
+  -    db_path: str, inventory_url: str, *, transport: httpx.AsyncBaseTransport | None = None
+  +    db_path: str,
+  +    inventory_url: str,
+  +    *,
+  +    transport: httpx.AsyncBaseTransport | None = None,
+  +    tax_rate_bps: int = DEFAULT_TAX_RATE_BPS,
+   ) -> Starlette:
+       store = Store(db_path)
+       inventory = InventoryClient(inventory_url, transport)
+  @@ -160,6 +208,13 @@ def create_app(
+           lines = parse_lines(body)
+           if lines is None:
+               return error(400, "lines must be a non-empty list of {sku, qty > 0}")
+  +        for line in lines:  # the price is the catalogue price when the order is placed
+  +            try:
+  +                line["unit_price_cents"] = (await inventory.product(line["sku"]))["price_cents"]
+  +            except InventoryError as e:
+  +                if e.status == 404:
+  +                    return error(422, "unknown product", sku=line["sku"])
+  +                return error(502, "inventory unavailable")
+           for line in lines:
+               try:
+                   await inventory.reserve(line["sku"], line["qty"])
+  @@ -169,7 +224,7 @@ def create_app(
+                   if e.status == 409:
+                       return error(409, "insufficient stock", sku=line["sku"])
+                   return error(502, "inventory unavailable")
+  -        order_id = store.create(lines)
+  +        order_id = store.create(lines, tax_rate_bps)
+           return JSONResponse(store.get(order_id), status_code=201)
+
+       def find(request: Request) -> dict[str, Any] | None:
+  @@ -215,6 +270,7 @@ if __name__ == "__main__":
+           create_app(
+               os.environ.get("ORDERS_DB", "orders.db"),
+               os.environ.get("INVENTORY_URL", "http://127.0.0.1:8001"),
+  +            tax_rate_bps=int(os.environ.get("TAX_RATE_BPS", DEFAULT_TAX_RATE_BPS)),
+           ),
+           host=os.environ.get("HOST", "127.0.0.1"),
+           port=int(os.environ.get("PORT", "8000")),
+  diff --git a/orders-api/tests/test_orders.py b/orders-api/tests/test_orders.py
+  index 87926f1..84f0a21 100644
+  --- a/orders-api/tests/test_orders.py
+  +++ b/orders-api/tests/test_orders.py
+  @@ -11,7 +11,7 @@ def test_place_order_reserves_stock(client, inventory):
+       assert res.status_code == 201
+       order = res.json()
+       assert order["status"] == "placed"
+  -    assert order["lines"] == [{"sku": "WIDGET-1", "qty": 3}]
+  +    assert order["lines"] == [{"sku": "WIDGET-1", "qty": 3, "unit_price_cents": 1250}]
+       assert inventory.stock("WIDGET-1") == 17
+
+
+notes: |
+  inventory-service already exposes price_cents; the change is in orders-api and the
+  contract. The whole-system test starts a second orders-api with TAX_RATE_BPS=1000 against
+  the same inventory to check the setting end to end.

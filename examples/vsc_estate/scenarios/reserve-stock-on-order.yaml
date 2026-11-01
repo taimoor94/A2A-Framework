@@ -1,0 +1,174 @@
+id: reserve-stock-on-order
+request: |
+  Orders with several lines are leaking stock. When one line of an order cannot be reserved
+  (out of stock, or a SKU inventory does not know), orders-api rejects the order, but the
+  lines it already reserved before that one stay reserved in inventory-service forever, so
+  the stock is gone and nobody bought it. Placing an order must reserve stock for every line
+  or for none: if any line is refused, give back whatever was reserved for that order before
+  answering. A successful order keeps its reservations. Document the all-or-nothing rule in
+  the orders contract.
+systems: [orders-api, inventory-service, contract]
+acceptance:
+  - id: orders-all-or-nothing
+    system: orders-api
+    files:
+      tests/test_reserve_all_or_nothing.py: |
+        """Placing an order reserves stock for every line or for none."""
+
+
+        def place(client, *lines):
+            return client.post("/orders", json={"lines": [{"sku": s, "qty": q} for s, q in lines]})
+
+
+        def test_a_refused_line_releases_the_lines_before_it(client, inventory):
+            res = place(client, ("WIDGET-1", 2), ("GADGET-2", 1), ("GIZMO-3", 1))
+            assert res.status_code == 409
+            assert res.json()["sku"] == "GIZMO-3"
+            assert inventory.stock("WIDGET-1") == 20
+            assert inventory.stock("GADGET-2") == 5
+            assert client.get("/orders").json()["orders"] == []
+
+
+        def test_an_unknown_product_releases_the_lines_before_it(client, inventory):
+            res = place(client, ("WIDGET-1", 3), ("NOPE-9", 1))
+            assert res.status_code == 422
+            assert inventory.stock("WIDGET-1") == 20
+            released = inventory.calls("release")
+            assert released == [("WIDGET-1", {"qty": 3})]
+
+
+        def test_a_placed_order_keeps_its_reservations(client, inventory):
+            res = place(client, ("WIDGET-1", 2), ("GADGET-2", 5))
+            assert res.status_code == 201
+            assert inventory.stock("WIDGET-1") == 18
+            assert inventory.stock("GADGET-2") == 0
+            assert inventory.calls("release") == []
+  - id: estate-all-or-nothing
+    system: null
+    check: estate
+    files:
+      contract/tests/test_reserve_all_or_nothing_e2e.py: |
+        """End to end: a multi-line order that inventory refuses leaves no stock reserved."""
+
+        from estate import conforms, new_product, stock
+
+
+        def test_refused_multi_line_order_reserves_nothing(orders, inventory, orders_api):
+            plenty = new_product(inventory, stock=10)
+            scarce = new_product(inventory, stock=1)
+            lines = [{"sku": plenty, "qty": 4}, {"sku": scarce, "qty": 2}]
+            res = orders.post("/orders", json={"lines": lines})
+            assert res.status_code == 409
+            assert conforms(orders_api, "POST", "/orders", res)["sku"] == scarce
+            assert stock(inventory, plenty) == 10
+            assert stock(inventory, scarce) == 1
+
+
+        def test_unknown_sku_in_the_middle_reserves_nothing(orders, inventory):
+            first = new_product(inventory, stock=5)
+            last = new_product(inventory, stock=5)
+            lines = [{"sku": first, "qty": 1}, {"sku": "NO-SUCH-SKU", "qty": 1}, {"sku": last, "qty": 1}]
+            res = orders.post("/orders", json={"lines": lines})
+            assert res.status_code == 422
+            assert (stock(inventory, first), stock(inventory, last)) == (5, 5)
+reference_patch: |
+  diff --git a/contract/openapi/orders.yaml b/contract/openapi/orders.yaml
+  index cdd5f2c..378e1c6 100644
+  --- a/contract/openapi/orders.yaml
+  +++ b/contract/openapi/orders.yaml
+  @@ -28,7 +28,9 @@ paths:
+                       type: array
+                       items: {$ref: "#/components/schemas/Order"}
+       post:
+  -      description: Place an order; every line reserves stock in inventory-service.
+  +      description: >-
+  +        Place an order. Stock for every line is reserved in inventory-service, all or nothing:
+  +        when any line is refused (409, 422, 502) no stock stays reserved.
+         requestBody:
+           required: true
+           content:
+  diff --git a/orders-api/app.py b/orders-api/app.py
+  index 1fb5d99..0d62e27 100644
+  --- a/orders-api/app.py
+  +++ b/orders-api/app.py
+  @@ -1,6 +1,6 @@
+  -"""orders-api: customer orders, stored in SQLite. Each order line reserves stock in the
+  -inventory service over HTTP. The HTTP contract is ``openapi/orders.yaml`` in the contract
+  -repository.
+  +"""orders-api: customer orders, stored in SQLite. Placing an order reserves the stock of
+  +every line in the inventory service over HTTP, all or nothing. The HTTP contract is
+  +``openapi/orders.yaml`` in the contract repository.
+
+       GET  /healthz              readiness probe
+       GET  /orders               every order, oldest first
+  @@ -15,6 +15,7 @@ Run it with ``python app.py``. Environment: ``PORT`` (default 8000), ``HOST`` (d
+
+   from __future__ import annotations
+
+  +import logging
+   import os
+   import sqlite3
+   from collections.abc import Iterator
+  @@ -28,6 +29,8 @@ from starlette.requests import Request
+   from starlette.responses import JSONResponse
+   from starlette.routing import Route
+
+  +log = logging.getLogger("orders")
+  +
+   SCHEMA = """
+   CREATE TABLE IF NOT EXISTS orders (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+  @@ -70,6 +73,9 @@ class InventoryClient:
+       async def reserve(self, sku: str, qty: int) -> dict[str, Any]:
+           return await self._post(f"/products/{quote(sku, safe='')}/reserve", {"qty": qty})
+
+  +    async def release(self, sku: str, qty: int) -> dict[str, Any]:
+  +        return await self._post(f"/products/{quote(sku, safe='')}/release", {"qty": qty})
+  +
+       async def aclose(self) -> None:
+           await self._http.aclose()
+
+  @@ -160,17 +166,31 @@ def create_app(
+           lines = parse_lines(body)
+           if lines is None:
+               return error(400, "lines must be a non-empty list of {sku, qty > 0}")
+  -        for line in lines:
+  +        reserved: list[dict[str, Any]] = []
+  +        try:
+  +            for line in lines:
+  +                try:
+  +                    await inventory.reserve(line["sku"], line["qty"])
+  +                except InventoryError as e:
+  +                    if e.status == 404:
+  +                        return error(422, "unknown product", sku=line["sku"])
+  +                    if e.status == 409:
+  +                        return error(409, "insufficient stock", sku=line["sku"])
+  +                    return error(502, "inventory unavailable")
+  +                reserved.append(line)
+  +            order_id = store.create(lines)
+  +            reserved = []  # the order owns the reservations now
+  +            return JSONResponse(store.get(order_id), status_code=201)
+  +        finally:
+  +            await release_all(reserved)
+  +
+  +    async def release_all(lines: list[dict[str, Any]]) -> None:
+  +        """Give back reservations of an order that was not placed (all or nothing)."""
+  +        for line in reversed(lines):
+               try:
+  -                await inventory.reserve(line["sku"], line["qty"])
+  +                await inventory.release(line["sku"], line["qty"])
+               except InventoryError as e:
+  -                if e.status == 404:
+  -                    return error(422, "unknown product", sku=line["sku"])
+  -                if e.status == 409:
+  -                    return error(409, "insufficient stock", sku=line["sku"])
+  -                return error(502, "inventory unavailable")
+  -        order_id = store.create(lines)
+  -        return JSONResponse(store.get(order_id), status_code=201)
+  +                log.error("could not release %s x%d: %s", line["sku"], line["qty"], e)
+
+       def find(request: Request) -> dict[str, Any] | None:
+           try:
+notes: |
+  Only orders-api changes (inventory already has a release endpoint); inventory-service is
+  listed because the whole-system check covers all three repositories.

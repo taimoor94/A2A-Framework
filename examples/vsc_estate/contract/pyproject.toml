@@ -1,0 +1,13 @@
+[project]
+name = "estate-contract"
+version = "1.0.0"
+description = "The HTTP contracts between orders-api and inventory-service, and the cross-service tests"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest", "httpx", "pyyaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--disable-plugin-autoload"

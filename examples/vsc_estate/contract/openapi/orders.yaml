@@ -1,0 +1,120 @@
+openapi: 3.1.0
+info:
+  title: orders-api
+  version: 1.0.0
+  description: Customer orders. Owned by the orders team; reserves stock in inventory-service.
+paths:
+  /healthz:
+    get:
+      responses:
+        "200":
+          description: ready
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Health"}
+  /orders:
+    get:
+      responses:
+        "200":
+          description: every order, oldest first
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [orders]
+                additionalProperties: false
+                properties:
+                  orders:
+                    type: array
+                    items: {$ref: "#/components/schemas/Order"}
+    post:
+      description: Place an order; every line reserves stock in inventory-service.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/NewOrder"}
+      responses:
+        "201":
+          description: placed
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Order"}
+        "400": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+        "422": {$ref: "#/components/responses/Error"}
+        "502": {$ref: "#/components/responses/Error"}
+  /orders/{order_id}:
+    parameters:
+      - {$ref: "#/components/parameters/OrderId"}
+    get:
+      responses:
+        "200":
+          description: the order
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Order"}
+        "404": {$ref: "#/components/responses/Error"}
+  /orders/{order_id}/cancel:
+    parameters:
+      - {$ref: "#/components/parameters/OrderId"}
+    post:
+      responses:
+        "200":
+          description: cancelled
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Order"}
+        "404": {$ref: "#/components/responses/Error"}
+        "409": {$ref: "#/components/responses/Error"}
+components:
+  parameters:
+    OrderId:
+      name: order_id
+      in: path
+      required: true
+      schema: {type: integer}
+  responses:
+    Error:
+      description: an error
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+  schemas:
+    Health:
+      type: object
+      required: [ok]
+      properties:
+        ok: {type: boolean}
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: {type: string}
+        sku: {type: string}
+    NewOrder:
+      type: object
+      required: [lines]
+      properties:
+        lines:
+          type: array
+          minItems: 1
+          items: {$ref: "#/components/schemas/OrderLine"}
+    OrderLine:
+      type: object
+      required: [sku, qty]
+      additionalProperties: false
+      properties:
+        sku: {type: string}
+        qty: {type: integer, minimum: 1}
+    Order:
+      type: object
+      required: [id, status, created_at, lines]
+      additionalProperties: false
+      properties:
+        id: {type: integer}
+        status: {type: string, enum: [placed, cancelled]}
+        created_at: {type: string}
+        lines:
+          type: array
+          items: {$ref: "#/components/schemas/OrderLine"}

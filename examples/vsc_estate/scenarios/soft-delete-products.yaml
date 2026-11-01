@@ -1,0 +1,304 @@
+id: soft-delete-products
+request: |
+  Deleting a product in inventory-service erases it, and then order history breaks:
+  support cannot look up what a discontinued SKU was, and orders-api reports it as an
+  "unknown product" as if it never existed. Make DELETE /products/{sku} a soft delete. A
+  deleted product stays readable at GET /products/{sku} with "deleted": true (products that
+  are still sold show "deleted": false), disappears from GET /products unless the caller
+  asks for ?include_deleted=true, cannot be reserved any more (410, error "product
+  discontinued"), but still accepts released stock from cancelled orders. Deleting twice is
+  fine; a deleted SKU cannot be re-created. orders-api must refuse an order for a deleted
+  product with 422 and the error "product discontinued". Update both OpenAPI documents.
+systems: [orders-api, inventory-service, contract]
+acceptance:
+  - id: inventory-soft-delete
+    system: inventory-service
+    files:
+      test/soft_delete.test.mjs: |
+        import assert from "node:assert/strict";
+        import { test } from "node:test";
+
+        import { call, useServer } from "./helpers.mjs";
+
+        const ctx = useServer([
+          { sku: "OLD-1", name: "Old", stock: 4, price_cents: 100 },
+          { sku: "NEW-2", name: "New", stock: 4, price_cents: 100 },
+        ]);
+
+        test("a deleted product stays readable and is marked deleted", async () => {
+          assert.equal((await call(ctx, "DELETE", "/products/OLD-1")).status, 204);
+          const res = await call(ctx, "GET", "/products/OLD-1");
+          assert.equal(res.status, 200);
+          assert.equal(res.body.deleted, true);
+          assert.equal(res.body.stock, 4);
+          assert.equal((await call(ctx, "GET", "/products/NEW-2")).body.deleted, false);
+        });
+
+        test("listing hides deleted products unless include_deleted=true", async () => {
+          const listed = await call(ctx, "GET", "/products");
+          assert.deepEqual(listed.body.products.map((p) => p.sku), ["NEW-2"]);
+          const all = await call(ctx, "GET", "/products?include_deleted=true");
+          assert.deepEqual(all.body.products.map((p) => p.sku).sort(), ["NEW-2", "OLD-1"]);
+        });
+
+        test("a deleted product cannot be reserved but stock can be released to it", async () => {
+          const r = await call(ctx, "POST", "/products/OLD-1/reserve", { qty: 1 });
+          assert.equal(r.status, 410);
+          assert.equal(r.body.error, "product discontinued");
+          const back = await call(ctx, "POST", "/products/OLD-1/release", { qty: 2 });
+          assert.equal(back.status, 200);
+          assert.equal(back.body.stock, 6);
+        });
+
+        test("deleting twice is harmless and a deleted sku cannot be re-created", async () => {
+          assert.equal((await call(ctx, "DELETE", "/products/OLD-1")).status, 204);
+          const again = await call(ctx, "POST", "/products", {
+            sku: "OLD-1",
+            name: "Old again",
+            stock: 1,
+            price_cents: 1,
+          });
+          assert.equal(again.status, 409);
+          assert.equal((await call(ctx, "DELETE", "/products/NEVER-9")).status, 404);
+        });
+  - id: orders-discontinued
+    system: orders-api
+    files:
+      tests/test_discontinued_products.py: |
+        """A product that inventory has deleted (410 on reserve) cannot be ordered: 422."""
+
+        import httpx
+        from app import create_app
+        from conftest import FakeInventory
+        from starlette.testclient import TestClient
+
+
+        class DiscontinuingInventory(FakeInventory):
+            discontinued = frozenset({"OLD-1"})
+
+            def handle(self, request):
+                parts = request.url.path.strip("/").split("/")
+                if len(parts) == 3 and parts[1] in self.discontinued and parts[2] == "reserve":
+                    self.requests.append(request)
+                    return httpx.Response(410, json={"error": "product discontinued", "sku": parts[1]})
+                return super().handle(request)
+
+
+        def test_a_discontinued_product_is_422(tmp_path):
+            fake = DiscontinuingInventory()
+            fake.add("OLD-1", stock=5)
+            fake.add("NEW-2", stock=5)
+            app = create_app(
+                str(tmp_path / "d.db"), "http://inv", transport=httpx.MockTransport(fake.handle)
+            )
+            with TestClient(app) as client:
+                res = client.post("/orders", json={"lines": [{"sku": "OLD-1", "qty": 1}]})
+                assert res.status_code == 422
+                assert res.json() == {"error": "product discontinued", "sku": "OLD-1"}
+                assert client.get("/orders").json()["orders"] == []
+                ok = client.post("/orders", json={"lines": [{"sku": "NEW-2", "qty": 1}]})
+                assert ok.status_code == 201
+  - id: estate-soft-delete
+    system: null
+    check: estate
+    files:
+      contract/tests/test_soft_delete_e2e.py: |
+        """End to end: a product deleted in inventory is no longer sold, but its history is kept."""
+
+        from estate import conforms, new_product, stock
+
+
+        def test_a_deleted_product_cannot_be_ordered(orders, inventory, orders_api, inventory_api):
+            sku = new_product(inventory, stock=5)
+            first = orders.post("/orders", json={"lines": [{"sku": sku, "qty": 2}]})
+            assert first.status_code == 201
+            assert inventory.delete(f"/products/{sku}").status_code == 204
+            res = orders.post("/orders", json={"lines": [{"sku": sku, "qty": 1}]})
+            assert res.status_code == 422
+            assert conforms(orders_api, "POST", "/orders", res)["error"] == "product discontinued"
+            product = conforms(inventory_api, "GET", "/products/{sku}", inventory.get(f"/products/{sku}"))
+            assert product["deleted"] is True
+            assert stock(inventory, sku) == 3
+            old = orders.get(f"/orders/{first.json()['id']}")
+            assert old.status_code == 200 and old.json()["lines"][0]["sku"] == sku
+
+
+        def test_listing_and_reserve_conform(inventory, inventory_api):
+            sku = new_product(inventory, stock=1)
+            inventory.delete(f"/products/{sku}")
+            listed = conforms(inventory_api, "GET", "/products", inventory.get("/products"))
+            assert sku not in [p["sku"] for p in listed["products"]]
+            everything = inventory.get("/products", params={"include_deleted": "true"})
+            assert sku in [
+                p["sku"] for p in conforms(inventory_api, "GET", "/products", everything)["products"]
+            ]
+            gone = inventory.post(f"/products/{sku}/reserve", json={"qty": 1})
+            assert gone.status_code == 410
+            conforms(inventory_api, "POST", "/products/{sku}/reserve", gone)
+reference_patch: |
+  diff --git a/contract/openapi/inventory.yaml b/contract/openapi/inventory.yaml
+  index ed1324c..b6fe344 100644
+  --- a/contract/openapi/inventory.yaml
+  +++ b/contract/openapi/inventory.yaml
+  @@ -14,9 +14,14 @@ paths:
+                 schema: {$ref: "#/components/schemas/Health"}
+     /products:
+       get:
+  +      parameters:
+  +        - name: include_deleted
+  +          in: query
+  +          required: false
+  +          schema: {type: string, enum: ["true", "false"], default: "false"}
+         responses:
+           "200":
+  -          description: every product
+  +          description: every product still sold, or every product with include_deleted=true
+             content:
+               application/json:
+                 schema:
+  @@ -47,14 +52,17 @@ paths:
+       get:
+         responses:
+           "200":
+  -          description: the product
+  +          description: the product; a deleted product is still returned, with deleted true
+             content:
+               application/json:
+                 schema: {$ref: "#/components/schemas/Product"}
+           "404": {$ref: "#/components/responses/Error"}
+       delete:
+  +      description: >-
+  +        Soft delete: the product is no longer listed or sold (reserve answers 410) but stays
+  +        readable, and stock can still be released to it. Deleting it again is a no-op.
+         responses:
+  -        "204": {description: removed}
+  +        "204": {description: deleted}
+           "404": {$ref: "#/components/responses/Error"}
+     /products/{sku}/reserve:
+       parameters:
+  @@ -75,6 +83,7 @@ paths:
+           "400": {$ref: "#/components/responses/Error"}
+           "404": {$ref: "#/components/responses/Error"}
+           "409": {$ref: "#/components/responses/Error"}
+  +        "410": {$ref: "#/components/responses/Error"}
+     /products/{sku}/release:
+       parameters:
+         - {$ref: "#/components/parameters/Sku"}
+  @@ -128,6 +137,7 @@ components:
+           name: {type: string}
+           stock: {type: integer, minimum: 0}
+           price_cents: {type: integer, minimum: 0}
+  +        deleted: {type: boolean, readOnly: true, description: discontinued by DELETE}
+       StockChange:
+         type: object
+         required: [qty]
+  diff --git a/contract/openapi/orders.yaml b/contract/openapi/orders.yaml
+  index cdd5f2c..2779e5f 100644
+  --- a/contract/openapi/orders.yaml
+  +++ b/contract/openapi/orders.yaml
+  @@ -28,7 +28,9 @@ paths:
+                       type: array
+                       items: {$ref: "#/components/schemas/Order"}
+       post:
+  -      description: Place an order; every line reserves stock in inventory-service.
+  +      description: >-
+  +        Place an order; every line reserves stock in inventory-service. A product unknown to
+  +        inventory ("unknown product") or deleted there ("product discontinued") is a 422.
+         requestBody:
+           required: true
+           content:
+  diff --git a/inventory-service/server.mjs b/inventory-service/server.mjs
+  index cab2abe..c3debb6 100644
+  --- a/inventory-service/server.mjs
+  +++ b/inventory-service/server.mjs
+  @@ -2,12 +2,13 @@
+   // The HTTP contract is ../contract/openapi/inventory.yaml (in the contract repository).
+   //
+   //   GET    /healthz                    readiness probe
+  -//   GET    /products                   every product
+  +//   GET    /products                   every product still sold (?include_deleted=true: all)
+   //   POST   /products                   add a product {sku, name, stock, price_cents}
+  -//   GET    /products/:sku              one product
+  -//   DELETE /products/:sku              remove a product
+  -//   POST   /products/:sku/reserve      take {qty} units out of stock (409 when short)
+  -//   POST   /products/:sku/release      put {qty} units back
+  +//   GET    /products/:sku              one product, deleted ones included ("deleted": true)
+  +//   DELETE /products/:sku              discontinue a product (soft delete: it is kept)
+  +//   POST   /products/:sku/reserve      take {qty} units out of stock (409 when short, 410
+  +//                                      when the product is deleted)
+  +//   POST   /products/:sku/release      put {qty} units back (deleted products too)
+   //
+   // Environment (when run as a program):
+   //   PORT  port to listen on (default 8001; 0 picks a free one)
+  @@ -69,7 +70,7 @@ async function readJson(req) {
+   }
+
+   export function createInventory(seed = SEED) {
+  -  const products = new Map(seed.map((p) => [p.sku, { ...p }]));
+  +  const products = new Map(seed.map((p) => [p.sku, { deleted: false, ...p }]));
+
+     function find(sku) {
+       const product = products.get(sku);
+  @@ -84,7 +85,10 @@ export function createInventory(seed = SEED) {
+
+     const routes = {
+       "GET /healthz": () => [200, { ok: true }],
+  -    "GET /products": () => [200, { products: [...products.values()] }],
+  +    "GET /products": (_, __, url) => {
+  +      const all = url.searchParams.get("include_deleted") === "true";
+  +      return [200, { products: [...products.values()].filter((p) => all || !p.deleted) }];
+  +    },
+       "POST /products": (_, body) => {
+         const { sku, name, stock, price_cents } = body;
+         if (typeof sku !== "string" || !SKU.test(sku)) throw new HttpError(400, "invalid sku");
+  @@ -94,19 +98,20 @@ export function createInventory(seed = SEED) {
+           throw new HttpError(400, "price_cents must be a non-negative integer");
+         }
+         if (products.has(sku)) throw new HttpError(409, "product exists", { sku });
+  -      const product = { sku, name, stock, price_cents };
+  +      const product = { sku, name, stock, price_cents, deleted: false };
+         products.set(sku, product);
+         return [201, product];
+       },
+       "GET /products/:sku": (sku) => [200, find(sku)],
+       "DELETE /products/:sku": (sku) => {
+  -      find(sku);
+  -      products.delete(sku);
+  +      // soft delete: orders and reports still refer to the product, so it stays readable
+  +      find(sku).deleted = true;
+         return [204, undefined];
+       },
+       "POST /products/:sku/reserve": (sku, body) => {
+         const product = find(sku);
+         const qty = qtyOf(body);
+  +      if (product.deleted) throw new HttpError(410, "product discontinued", { sku });
+         if (product.stock < qty) {
+           throw new HttpError(409, "insufficient stock", { sku, available: product.stock });
+         }
+  diff --git a/inventory-service/test/inventory.test.mjs b/inventory-service/test/inventory.test.mjs
+  index c64da39..30025ab 100644
+  --- a/inventory-service/test/inventory.test.mjs
+  +++ b/inventory-service/test/inventory.test.mjs
+  @@ -67,7 +67,8 @@ test("rejects a bad qty or body", async () => {
+   test("deletes a product", async () => {
+     await call(ctx, "POST", "/products", { sku: "D-4", name: "Date", stock: 1, price_cents: 1 });
+     assert.equal((await call(ctx, "DELETE", "/products/D-4")).status, 204);
+  -  assert.equal((await call(ctx, "GET", "/products/D-4")).status, 404);
+  +  assert.equal((await call(ctx, "GET", "/products/D-4")).body.deleted, true);
+  +  assert.equal((await call(ctx, "DELETE", "/products/NOPE")).status, 404);
+   });
+
+   test("unknown routes are 404", async () => {
+  diff --git a/orders-api/app.py b/orders-api/app.py
+  index 1fb5d99..a0a7c09 100644
+  --- a/orders-api/app.py
+  +++ b/orders-api/app.py
+  @@ -166,6 +166,8 @@ def create_app(
+               except InventoryError as e:
+                   if e.status == 404:
+                       return error(422, "unknown product", sku=line["sku"])
+  +                if e.status == 410:
+  +                    return error(422, "product discontinued", sku=line["sku"])
+                   if e.status == 409:
+                       return error(409, "insufficient stock", sku=line["sku"])
+                   return error(502, "inventory unavailable")

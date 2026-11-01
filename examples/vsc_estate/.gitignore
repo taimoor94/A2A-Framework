@@ -1,0 +1,5 @@
+# created by init_estate.py; the a2agw.yaml systems point here
+estate/
+# the gateway state and workspaces when run from this directory
+.a2agw/
+a2agw.db*

@@ -1,0 +1,237 @@
+id: idempotency-key
+request: |
+  The checkout front end retries POST /orders when the network times out, and every retry
+  places a second order and reserves the stock again; support has refunded a dozen duplicate
+  orders this week. Support an Idempotency-Key request header on POST /orders: a retry with
+  the same key and the same order must return the order created the first time (still 201,
+  with an Idempotent-Replayed: true header) without reserving anything again, even after a
+  restart of orders-api. Reusing a key for a different order is a client bug, answer 422. A
+  key from a refused order (for example out of stock) can be used again. Keys are 1 to 255
+  printable characters. Without the header nothing changes. Document the header in the
+  orders contract.
+systems: [orders-api, contract]
+acceptance:
+  - id: orders-idempotency-key
+    system: orders-api
+    files:
+      tests/test_idempotency_key.py: |
+        """POST /orders with an Idempotency-Key header is safe to retry."""
+
+        import httpx
+        from app import create_app
+        from starlette.testclient import TestClient
+
+        ORDER = {"lines": [{"sku": "WIDGET-1", "qty": 2}]}
+
+
+        def post(client, body, key=None):
+            headers = {} if key is None else {"Idempotency-Key": key}
+            return client.post("/orders", json=body, headers=headers)
+
+
+        def test_a_retry_returns_the_same_order_and_reserves_once(client, inventory):
+            first = post(client, ORDER, "checkout-7f3a")
+            assert first.status_code == 201
+            retry = post(client, ORDER, "checkout-7f3a")
+            assert retry.status_code == 201
+            assert retry.json() == first.json()
+            assert retry.headers.get("Idempotent-Replayed") == "true"
+            assert "Idempotent-Replayed" not in first.headers
+            assert inventory.stock("WIDGET-1") == 18
+            assert len(inventory.calls("reserve")) == 1
+            assert len(client.get("/orders").json()["orders"]) == 1
+
+
+        def test_the_same_key_for_a_different_order_is_refused(client, inventory):
+            assert post(client, ORDER, "k-1").status_code == 201
+            other = post(client, {"lines": [{"sku": "WIDGET-1", "qty": 3}]}, "k-1")
+            assert other.status_code == 422
+            assert "Idempotency-Key" in other.json()["error"]
+            assert inventory.stock("WIDGET-1") == 18
+
+
+        def test_different_keys_and_no_key_place_separate_orders(client, inventory):
+            assert post(client, ORDER, "a").json()["id"] != post(client, ORDER, "b").json()["id"]
+            assert post(client, ORDER).json()["id"] != post(client, ORDER).json()["id"]
+            assert inventory.stock("WIDGET-1") == 12
+
+
+        def test_a_refused_order_does_not_use_up_the_key(client, inventory):
+            big = {"lines": [{"sku": "GADGET-2", "qty": 6}]}
+            assert post(client, big, "retry-me").status_code == 409
+            inventory.products["GADGET-2"]["stock"] = 10  # restocked
+            res = post(client, big, "retry-me")
+            assert res.status_code == 201
+            assert "Idempotent-Replayed" not in res.headers
+
+
+        def test_keys_survive_a_restart(tmp_path, inventory):
+            db = str(tmp_path / "restart.db")
+
+            def app():
+                return create_app(
+                    db, "http://inventory.test", transport=httpx.MockTransport(inventory.handle)
+                )
+
+            with TestClient(app()) as c:
+                first = post(c, ORDER, "persisted").json()
+            with TestClient(app()) as c:
+                assert post(c, ORDER, "persisted").json()["id"] == first["id"]
+            assert inventory.stock("WIDGET-1") == 18
+
+
+        def test_a_bad_key_is_400(client):
+            assert post(client, ORDER, "x" * 256).status_code == 400
+            assert post(client, ORDER, "").status_code == 400
+reference_patch: |
+  diff --git a/contract/openapi/orders.yaml b/contract/openapi/orders.yaml
+  index cdd5f2c..c87e90a 100644
+  --- a/contract/openapi/orders.yaml
+  +++ b/contract/openapi/orders.yaml
+  @@ -28,7 +28,16 @@ paths:
+                       type: array
+                       items: {$ref: "#/components/schemas/Order"}
+       post:
+  -      description: Place an order; every line reserves stock in inventory-service.
+  +      description: >-
+  +        Place an order; every line reserves stock in inventory-service. With an
+  +        Idempotency-Key, a retry of the same order returns the order placed the first time
+  +        (201, header Idempotent-Replayed: true) and reserves nothing again; the same key with
+  +        a different order is refused with 422. Refused orders do not use up the key.
+  +      parameters:
+  +        - name: Idempotency-Key
+  +          in: header
+  +          required: false
+  +          schema: {type: string, minLength: 1, maxLength: 255}
+         requestBody:
+           required: true
+           content:
+  diff --git a/orders-api/app.py b/orders-api/app.py
+  index 1fb5d99..a7e4c6c 100644
+  --- a/orders-api/app.py
+  +++ b/orders-api/app.py
+  @@ -4,7 +4,8 @@ repository.
+
+       GET  /healthz              readiness probe
+       GET  /orders               every order, oldest first
+  -    POST /orders               place an order {"lines": [{"sku": ..., "qty": ...}]}
+  +    POST /orders               place an order {"lines": [{"sku": ..., "qty": ...}]}; an
+  +                               Idempotency-Key header makes retries safe
+       GET  /orders/{id}          one order
+       POST /orders/{id}/cancel   cancel an order
+
+  @@ -15,6 +16,9 @@ Run it with ``python app.py``. Environment: ``PORT`` (default 8000), ``HOST`` (d
+
+   from __future__ import annotations
+
+  +import asyncio
+  +import hashlib
+  +import json
+   import os
+   import sqlite3
+   from collections.abc import Iterator
+  @@ -41,7 +45,13 @@ CREATE TABLE IF NOT EXISTS order_lines (
+       qty INTEGER NOT NULL,
+       PRIMARY KEY (order_id, line_no)
+   );
+  +CREATE TABLE IF NOT EXISTS idempotency_keys (
+  +    key TEXT PRIMARY KEY,
+  +    request_sha256 TEXT NOT NULL,
+  +    order_id INTEGER NOT NULL REFERENCES orders (id)
+  +);
+   """
+  +MAX_KEY_LEN = 255
+
+
+   class InventoryError(Exception):
+  @@ -87,16 +97,30 @@ class Store:
+               with db:  # one transaction
+                   yield db
+
+  -    def create(self, lines: list[dict[str, Any]]) -> int:
+  +    def create(self, lines: list[dict[str, Any]], key: tuple[str, str] | None = None) -> int:
+  +        """A new order; ``key`` is an (idempotency key, request digest) stored with it."""
+           with self.connect() as db:
+               order_id = db.execute("INSERT INTO orders (status) VALUES ('placed')").lastrowid
+               db.executemany(
+                   "INSERT INTO order_lines (order_id, line_no, sku, qty) VALUES (?, ?, ?, ?)",
+                   [(order_id, n, line["sku"], line["qty"]) for n, line in enumerate(lines)],
+               )
+  +            if key is not None:
+  +                db.execute(
+  +                    "INSERT INTO idempotency_keys (key, request_sha256, order_id) VALUES (?, ?, ?)",
+  +                    (*key, order_id),
+  +                )
+           assert order_id is not None
+           return order_id
+
+  +    def by_key(self, key: str) -> tuple[str, int] | None:
+  +        """(request digest, order id) stored for an idempotency key."""
+  +        with self.connect() as db:
+  +            row = db.execute(
+  +                "SELECT request_sha256, order_id FROM idempotency_keys WHERE key = ?", (key,)
+  +            ).fetchone()
+  +            return None if row is None else (row["request_sha256"], row["order_id"])
+  +
+       def _order(self, db: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+           lines = db.execute(
+               "SELECT sku, qty FROM order_lines WHERE order_id = ? ORDER BY line_no", (row["id"],)
+  @@ -145,6 +169,22 @@ def create_app(
+   ) -> Starlette:
+       store = Store(db_path)
+       inventory = InventoryClient(inventory_url, transport)
+  +    key_locks: dict[str, tuple[asyncio.Lock, int]] = {}  # key -> (lock, requests holding it)
+  +
+  +    @asynccontextmanager
+  +    async def key_lock(key: str) -> Any:
+  +        """Serialise requests that share an idempotency key; forget the lock when idle."""
+  +        lock, users = key_locks.get(key, (asyncio.Lock(), 0))
+  +        key_locks[key] = (lock, users + 1)
+  +        try:
+  +            async with lock:
+  +                yield
+  +        finally:
+  +            lock, users = key_locks[key]
+  +            if users == 1:
+  +                del key_locks[key]
+  +            else:
+  +                key_locks[key] = (lock, users - 1)
+
+       async def healthz(request: Request) -> JSONResponse:
+           return JSONResponse({"ok": True})
+  @@ -160,6 +200,23 @@ def create_app(
+           lines = parse_lines(body)
+           if lines is None:
+               return error(400, "lines must be a non-empty list of {sku, qty > 0}")
+  +        key = request.headers.get("idempotency-key")
+  +        if key is None:
+  +            return await place(lines, None)
+  +        if not key or len(key) > MAX_KEY_LEN or not key.isprintable():
+  +            return error(400, f"Idempotency-Key must be 1 to {MAX_KEY_LEN} printable characters")
+  +        digest = hashlib.sha256(json.dumps(lines, sort_keys=True).encode()).hexdigest()
+  +        async with key_lock(key):  # a concurrent retry waits for the first attempt
+  +            seen = store.by_key(key)
+  +            if seen is not None:
+  +                if seen[0] != digest:
+  +                    return error(422, "Idempotency-Key was used for a different order")
+  +                replay = JSONResponse(store.get(seen[1]), status_code=201)
+  +                replay.headers["Idempotent-Replayed"] = "true"
+  +                return replay
+  +            return await place(lines, (key, digest))
+  +
+  +    async def place(lines: list[dict[str, Any]], key: tuple[str, str] | None) -> JSONResponse:
+           for line in lines:
+               try:
+                   await inventory.reserve(line["sku"], line["qty"])
+  @@ -169,7 +226,7 @@ def create_app(
+                   if e.status == 409:
+                       return error(409, "insufficient stock", sku=line["sku"])
+                   return error(502, "inventory unavailable")
+  -        order_id = store.create(lines)
+  +        order_id = store.create(lines, key)
+           return JSONResponse(store.get(order_id), status_code=201)
+
+       def find(request: Request) -> dict[str, Any] | None:
+notes: |
+  orders-api only, plus the contract document. Concurrent retries with one key are
+  serialised by a per-key lock in the reference solution.
