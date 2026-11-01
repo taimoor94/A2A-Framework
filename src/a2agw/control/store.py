@@ -161,6 +161,20 @@ PARTNER_VERSIONS = Table(
     Column("approved_at", Float, nullable=True),
     PrimaryKeyConstraint("partner_id", "version"),
 )
+# What each gateway last reported about a partner (``partner.state`` events): its local
+# status (active | quarantined | disabled) and, when it holds a pending card, that card's
+# hash. Only the hash: the control plane never takes a card from a gateway.
+PARTNER_STATES = Table(
+    "cp_partner_states",
+    _metadata,
+    _id("gateway_id", nullable=False),
+    _id("partner_id", nullable=False, index=True),
+    Column("status", String(16), nullable=False),
+    _id("pending_hash", nullable=True),
+    Column("event", String(32), nullable=False),
+    Column("ts", Float, nullable=False),
+    PrimaryKeyConstraint("gateway_id", "partner_id"),
+)
 POLICIES = Table(
     "cp_policies",
     _metadata,

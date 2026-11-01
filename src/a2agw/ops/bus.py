@@ -24,7 +24,8 @@ from typing import Any, Literal, Self
 # Payloads (``GatewayEvent.data``), all ids and states, never message text or secrets:
 # - task.state: {task_id, context_id, state} (AdapterExecutor)
 # - partner.call: {partner_id, task_id, state, duration_ms} (PartnerClient)
-# - partner.state: {partner_id, status, event} (AgentHost, on every registry change)
+# - partner.state: {partner_id, status, event, pending_hash?} (AgentHost, on every registry
+#   change; pending_hash only while a pending card is held)
 # - security.denied: {reason, rule?, principal_kind} (AgentHost.report_denied, at every
 #   refusal: authz at the mount, admin and executor, egress, sidecar; with or without the
 #   audit log, never coalesced); never a principal id.

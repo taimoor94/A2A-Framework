@@ -31,9 +31,10 @@ from a2agw.config import (
     registry_options,
     server_run_kwargs,
 )
+from a2agw.consult.cardfetch import MAX_CARD_BYTES
 from a2agw.consult.guarded_net import fixed_tier, guarded_async_client
 from a2agw.consult.netguard import UnsafeURL, check_url
-from a2agw.consult.registry import MAX_CARD_BYTES, CardFetchError, PartnerRegistry
+from a2agw.consult.registry import CardFetchError, PartnerRegistry
 from a2agw.gateway.auth import MCP_EXTRA_HINT
 from a2agw.ops import actions
 from a2agw.ops.actions import RegistryHost

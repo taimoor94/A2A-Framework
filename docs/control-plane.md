@@ -170,3 +170,43 @@ for its first state or is locked down because no policy is assigned.
 - One gateway per database: `a2agw_cp_state` holds one gateway's state.
 - Applied and rejected outcomes are reported one per report, so after a burst of states the
   control plane learns the last one a few report intervals later.
+
+## Partner catalogue
+
+The catalogue is the central registry: each partner is registered once and assigned to the
+gateways that use it. A partner's status is `pending` (nothing approved yet), `approved`,
+`quarantined` or `rejected`; only an approved partner is sent to its gateways, as its
+approved card version. Every write is audited in `cp_audit`.
+
+| Route | Permission | What it does |
+|---|---|---|
+| `POST /api/v1/partners` `{id, card_url \| card, tier, credential_ref?, tls_ref?, tags?}` | `partners.register` | fetch the card (SSRF-guarded for the tier), validate and verify it; version 1, `pending` |
+| `GET /api/v1/partners?tier=&status=&gateway_id=&q=` | `read` | the list; `q` is the skill search |
+| `GET /api/v1/partners/{id}` | `read` | approved card, pending card, their `diff`, the versions, what each gateway reported |
+| `POST /api/v1/partners/{id}/approve` `{version, expected_hash}` | `partners.trust` | approve that version (409 if the hash differs) |
+| `POST /api/v1/partners/{id}/reject`, `.../quarantine` | `partners.trust` | the partner leaves every gateway |
+| `POST /api/v1/partners/{id}/refresh` | `partners.register` | fetch the card again |
+| `PUT /api/v1/partners/{id}/settings` `{tier?, credential_ref?, tls_ref?, tags?}` | `partners.trust` | change the operator's fields (`null` clears a ref) |
+| `PUT /api/v1/gateways/{gid}/partners` `{partner_ids}` | `assign` | replace the gateway's partners |
+
+- **Cards.** The control plane fetches and checks cards with the gateway's own code: no
+  redirects, a 1 MiB cap, the tier's address rules (a `public` partner on a private address
+  is refused), interface URLs checked for the tier, and a signature check for the tiers in
+  `trust.require_signed` (the keys of `trust`, files relative to control.yaml). A card that
+  fails is a 422 `{"error": "card", "detail": "<class>"}`: `UnsafeCardURL`,
+  `CardUnavailable`, `InvalidCard`, `CardSignatureInvalid` or `UnsafeInterfaceURL`. A card
+  given inline is checked the same way and cannot be refreshed.
+- **Refresh.** A significant change (anything but `version`, `documentationUrl`, `iconUrl`,
+  `provider` and the signatures, or a new signing key) is stored as a pending version: the
+  partner stays approved with `pending: true` and its gateways keep the approved card until
+  the new version is approved. A cosmetic change of an approved partner is applied at once
+  as a new approved version.
+- **Settings.** A tier change is a trust change (audited with `reason: trust`): the approved
+  and pending cards are checked again for the new tier first.
+- **Gateway reports.** Each gateway's `partner.state` events are kept per gateway: the list
+  shows `quarantined_on`, the detail each gateway's status and the hash of the pending card
+  it holds. Only that hash is taken from a gateway, never a card. Approving the version with
+  that hash also queues `partner.approve {id, expected_hash}` for those gateways.
+- **References only.** `credential_ref` and `tls_ref` are names each gateway resolves from
+  its own configuration. The control plane holds no partner secret, and it fetches cards
+  without a client certificate: register an mTLS-only partner with its card inline.

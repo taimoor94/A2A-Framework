@@ -98,6 +98,8 @@ Action = Literal[
     "cp.partner.approve",
     "cp.partner.reject",
     "cp.partner.quarantine",
+    "cp.partner.refresh",
+    "cp.partner.update",
     "cp.assign",
     "cp.policy.save",
     "cp.policy.dryrun",

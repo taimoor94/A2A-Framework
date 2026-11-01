@@ -1164,6 +1164,31 @@ async def test_partner_state_and_security_denied_are_published(env):
     assert "key:b" not in text and "secret-b" not in text and "hello" not in text
 
 
+async def test_partner_state_carries_the_pending_hash_only(env):
+    """A quarantined record with a pending card reports that card's hash (what an approval
+    must name), never the card."""
+    from google.protobuf.json_format import MessageToDict
+
+    from a2agw.consult.registry import card_hash
+
+    e = await env(spec("alpha"))
+    _, sub = e.host.bus.subscribe_with_replay(0)
+    card = MessageToDict(e.host.cards["alpha"])
+    rec = await e.host.partners.add_from_card("p1", card, "internal")
+    pending = {**card, "description": "changed"}
+    rec.pending_card, rec.status = pending, "quarantined"
+    e.host.partners._changed(rec, "quarantined")
+    async with sub:
+        got = [await asyncio.wait_for(sub.__anext__(), 5) for _ in range(2)]
+    assert got[1].data == {
+        "partner_id": "p1",
+        "status": "quarantined",
+        "event": "quarantined",
+        "pending_hash": card_hash(pending),
+    }
+    assert "changed" not in repr(got[1].data)
+
+
 async def test_security_denied_principal_kind_from_the_principal_at_every_site(env):
     """The executor and egress deny sites name the principal's kind, as the mount does: a
     principal whose id has no key:/jwt: prefix is not reported as "system"."""

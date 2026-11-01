@@ -152,7 +152,7 @@ def serve(
 
     settings = load_control_settings(config)
     _db_run(settings.db_url, _check_db(settings.db_url))
-    uvicorn.run(create_app(settings), host=host, port=port)
+    uvicorn.run(create_app(settings, config_dir=config.parent), host=host, port=port)
 
 
 @control_app.command("create-api-key")

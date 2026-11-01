@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import copy
-import hashlib
-import json
 import logging
 import os
 import re
@@ -16,14 +14,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import urlsplit
 
 import httpx
 import yaml
 from a2a.client.card_resolver import parse_agent_card
 from a2a.types import AgentCard
-from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH
-from google.protobuf.json_format import MessageToDict
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -33,21 +28,25 @@ from pydantic import (
     model_validator,
 )
 
-from a2agw.consult.guarded_net import fixed_tier
+from a2agw.consult import cardfetch
+from a2agw.consult.cardfetch import (
+    CardFetchError,
+    CardSignatureInvalid,
+    TlsConfigMissing,
+    card_hash,
+)
+from a2agw.consult.cardfetch import normalize_card as _normalize
 from a2agw.consult.netguard import (
-    FetchError,
     Tier,
     UnsafeURL,
     check_url,
     check_url_syntax,
-    safe_get,
 )
-from a2agw.consult.tls import TlsClientConfig, build_async_client
+from a2agw.consult.tls import TlsClientConfig
 from a2agw.security.cardsign import CardSignatureError, CardVerifier
 
 logger = logging.getLogger(__name__)
-MAX_CARD_BYTES = 1024 * 1024
-FETCH_TIMEOUT_S = 10.0
+FETCH_TIMEOUT_S = cardfetch.FETCH_TIMEOUT_S  # read at each fetch (tests shorten it)
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 # Everything except these top-level fields is significant (name/description reach LLM tool text).
 COSMETIC_FIELDS = frozenset({"version", "documentationUrl", "iconUrl", "provider"})
@@ -144,15 +143,6 @@ def _write_durably(path: Path, text: str) -> None:
         os.close(dir_fd)
 
 
-class CardFetchError(Exception):
-    """The Agent Card could not be fetched or validated."""
-
-
-def card_hash(card: dict[str, Any]) -> str:
-    blob = json.dumps(card, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(blob.encode()).hexdigest()
-
-
 class PartnerRecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -214,21 +204,6 @@ def _major_minor(version: Any) -> tuple[int, int] | None:
         return int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
     except ValueError:
         return None
-
-
-def _normalize(card: dict[str, Any]) -> tuple[dict[str, Any], AgentCard]:
-    try:
-        proto = parse_agent_card(copy.deepcopy(card))
-    except Exception as e:  # noqa: BLE001 - any parse failure is a bad card
-        raise CardFetchError(f"invalid agent card: {type(e).__name__}") from None
-    return MessageToDict(proto), proto
-
-
-def _card_urls(base: str) -> str:
-    parts = urlsplit(base)
-    if parts.path.endswith(".json"):
-        return base
-    return base.rstrip("/") + AGENT_CARD_WELL_KNOWN_PATH
 
 
 def _significant_differs(old: dict[str, Any], new: dict[str, Any]) -> bool:
@@ -361,57 +336,26 @@ class PartnerRegistry:
 
     # -- fetching -------------------------------------------------------
     async def _fetch(self, card_url: str, tier: Tier, tls_ref: str | None = None) -> dict[str, Any]:
-        url = _card_urls(card_url)
-        own: httpx.AsyncClient | None = None
-        http = self._http
+        tls: TlsClientConfig | None = None
         if tls_ref is not None:  # mTLS partner: never fall back to a plain client
-            cfg = self.tls.get(tls_ref)
-            if cfg is None:
-                raise CardFetchError("tls config missing")
-            own = http = build_async_client(
-                cfg, httpx.Timeout(FETCH_TIMEOUT_S), tier_for_host=fixed_tier(tier)
-            )
-        try:
-            body = await safe_get(
-                url, tier, max_bytes=MAX_CARD_BYTES, deadline_s=FETCH_TIMEOUT_S, http=http
-            )
-        except UnsafeURL as e:
-            raise CardFetchError(f"unsafe card URL: {e}") from None
-        except FetchError as e:
-            raise CardFetchError(f"card fetch failed: {e}") from None
-        finally:
-            if own is not None:
-                await own.aclose()
-        try:
-            data = json.loads(body)
-        except ValueError:
-            raise CardFetchError("agent card is not valid JSON") from None
-        if not isinstance(data, dict):
-            raise CardFetchError("agent card must be a JSON object")
-        return data
+            tls = self.tls.get(tls_ref)
+            if tls is None:
+                raise TlsConfigMissing("tls config missing")
+        return await cardfetch.fetch_card(
+            card_url, tier, http=self._http, tls=tls, deadline_s=FETCH_TIMEOUT_S
+        )
 
     async def _verify_signature(self, proto: AgentCard, tier: Tier) -> str | None:
         """The verified key id when `tier` requires signed cards, else None (not checked).
 
-        Raises CardSignatureError when a required signature does not verify. Any other
-        error inside the verifier is reported the same way: verification fails closed."""
-        if tier not in self.require_signed:
-            return None
-        if self.verifier is None:  # unreachable via __init__; never treat as verified
-            raise CardSignatureError("no card verifier configured")
-        try:
-            return (await self.verifier.verify(proto)).id
-        except CardSignatureError:
-            raise
-        except Exception as e:  # noqa: BLE001
-            raise CardSignatureError(f"verification error: {type(e).__name__}") from None
+        Raises CardSignatureError when a required signature does not verify (fails closed;
+        see ``cardfetch.verify_signature``)."""
+        return await cardfetch.verify_signature(
+            proto, tier, verifier=self.verifier, require_signed=self.require_signed
+        )
 
     async def _check_endpoints(self, proto: AgentCard, tier: Tier) -> None:
-        for iface in proto.supported_interfaces:
-            try:
-                await check_url(iface.url, tier)
-            except UnsafeURL as e:
-                raise CardFetchError(f"unsafe interface URL: {e}") from None
+        await cardfetch.check_endpoints(proto, tier)
 
     # -- mutations ------------------------------------------------------
     async def add_from_url(
@@ -452,7 +396,7 @@ class PartnerRegistry:
         try:
             key_id = await self._verify_signature(proto, tier)
         except CardSignatureError:
-            raise CardFetchError("card signature invalid") from None
+            raise CardSignatureInvalid("card signature invalid") from None
         await self._check_endpoints(proto, tier)
         if id in self._records:  # re-check after awaits
             raise ValueError(f"duplicate partner id: {id!r}")

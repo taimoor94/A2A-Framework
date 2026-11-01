@@ -77,7 +77,7 @@ from a2agw.consult.credentials import CredentialProvider
 from a2agw.consult.guarded_net import is_guarded_client
 from a2agw.consult.handles import OutboundHandleStore
 from a2agw.consult.netguard import Tier, UnsafeURL
-from a2agw.consult.registry import CardFetchError, PartnerRecord, PartnerRegistry
+from a2agw.consult.registry import CardFetchError, PartnerRecord, PartnerRegistry, card_hash
 from a2agw.consult.tls import TlsClientConfig
 from a2agw.consult.tools import PartnerTool, partner_tools
 from a2agw.context.signing import CallContextSigner, CallContextVerifier
@@ -1627,14 +1627,13 @@ class AgentHost:
             logger.warning("partner change before startup not audited (buffer full)")
 
     def _publish_partner_state(self, rec: PartnerRecord, event: str) -> None:
-        """Registry listener: a ``partner.state`` bus event per partner lifecycle change."""
-        self.bus.publish(
-            GatewayEvent(
-                kind="partner.state",
-                agent_id="host",
-                data={"partner_id": rec.id, "status": rec.status, "event": event},
-            )
-        )
+        """Registry listener: a ``partner.state`` bus event per partner lifecycle change.
+        A record holding a pending (quarantined) card also carries ``pending_hash``, the
+        hash an approval of that card must name (the card itself is never sent)."""
+        data: dict[str, Any] = {"partner_id": rec.id, "status": rec.status, "event": event}
+        if rec.pending_card is not None:
+            data["pending_hash"] = card_hash(rec.pending_card)
+        self.bus.publish(GatewayEvent(kind="partner.state", agent_id="host", data=data))
 
     async def report_denied(self, ev: AuditEvent, *, coalesce: str | None = None) -> None:
         """A security refusal (an ``authz.deny`` at an agent mount or the admin API, a policy

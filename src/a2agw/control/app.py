@@ -22,6 +22,7 @@ import logging
 import secrets
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -37,9 +38,10 @@ from starlette.datastructures import MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from a2agw.config import trust_card_verifier
 from a2agw.consult.guarded_net import fixed_tier, guarded_async_client
 from a2agw.control import admin as _admin  # noqa: F401 - registers the gateway routes
-from a2agw.control import authn, channel
+from a2agw.control import authn, catalogue, channel
 from a2agw.control.rbac import ROUTES, Permission, public, route
 from a2agw.control.settings import ControlSettings
 from a2agw.control.store import AUDIT_TABLE, ControlStore
@@ -207,12 +209,22 @@ def create_app(
     clock: Callable[[], float] = time.time,
     maintenance_interval_s: float = MAINTENANCE_INTERVAL_S,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    config_dir: Path | str = ".",
 ) -> FastAPI:
     """The control-plane app. ``http`` is the client for outbound calls (the OIDC provider,
     partner cards); when omitted the app owns two guarded clients (``http`` for the
     ``public`` tier and ``idp_http``, tier ``partner``, for the OIDC provider) and closes
-    them at shutdown. ``clock`` (epoch seconds), ``maintenance_interval_s`` and ``sleep``
-    (the wait between two polls of a gateway stream) are test seams."""
+    them at shutdown, and each partner card is fetched with a guarded client for the
+    partner's tier. ``config_dir``: where the ``trust`` key files are (the directory of
+    control.yaml); the card verifier is built here, so a bad key fails at once.
+    ``clock`` (epoch seconds), ``maintenance_interval_s`` and ``sleep`` (the wait between
+    two polls of a gateway stream) are test seams."""
+    trust = settings.trust
+    cards = catalogue.CardChecker(
+        http=http,
+        verifier=trust_card_verifier(trust, config_dir),
+        require_signed=frozenset(trust.require_signed if trust else ()),
+    )
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -252,6 +264,7 @@ def create_app(
             app.state.seen = channel.SeenWriter()  # last_seen_at, written at most every 5 s
             background = app.state.background = channel.Background()
             app.state.maintenance = maintenance
+            app.state.cards = cards  # the partner catalogue's card fetch and checks
             task = asyncio.create_task(maintenance.run_forever(), name="a2agw:cp-maint")
             yield
         finally:

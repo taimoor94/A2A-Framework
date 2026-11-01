@@ -791,7 +791,13 @@ def tls_configs(cfg: GatewayConfig, config_dir: Path | str) -> dict[str, TlsClie
 
 def card_verifier(cfg: GatewayConfig, config_dir: Path | str) -> CardVerifier | None:
     """The partner card verifier from ``trust`` (None without card keys or JWKS URLs)."""
-    t = cfg.trust
+    return trust_card_verifier(cfg.trust, config_dir)
+
+
+def trust_card_verifier(t: TrustConfig | None, config_dir: Path | str) -> CardVerifier | None:
+    """The partner card verifier of a ``trust`` section (the gateway's, or the control
+    plane's of the same shape); key files are relative to ``config_dir``. None without
+    card keys or JWKS URLs."""
     if t is None or not (t.card_keys or t.jwks_urls):
         return None
     config_dir = Path(config_dir).resolve()

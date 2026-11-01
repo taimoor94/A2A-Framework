@@ -233,6 +233,7 @@ def test_core_does_not_import_fastapi():
         control / "authn.py",
         control / "channel.py",
         control / "admin.py",
+        control / "catalogue.py",
         control / "__init__.py",
     }
     importing = []

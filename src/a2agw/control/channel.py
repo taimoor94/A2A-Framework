@@ -24,7 +24,9 @@ version and gateway info. The body is capped at ``report_max_bytes`` (413) and e
 ``report_max_items``; anything cut, malformed or not allowed is counted in ``dropped``.
 Events keep only their kind's allowlisted ``data`` keys and scalar values, strings cut to
 ``STRING_MAX``. Audit rows are stored verbatim, keyed on ``(gateway_id, seq)``, so a report
-sent again changes nothing.
+sent again changes nothing. ``partner.state`` events also update ``cp_partner_states``, the
+gateway's last reported status of each partner and the hash of a pending card it holds
+(the partner catalogue shows where a partner is quarantined; no card is taken from it).
 
 Desired state (``compute_desired``): the approved partners and the policy assigned to the
 gateway. Its hash is the SHA-256 of its canonical JSON, and its version grows only when the
@@ -69,6 +71,8 @@ from a2agw.control.store import (
     GATEWAY_TOKENS,
     GATEWAYS,
     HEALTH,
+    ID,
+    PARTNER_STATES,
     PARTNER_VERSIONS,
     PARTNERS,
     POLICY_VERSIONS,
@@ -101,7 +105,7 @@ _COMPUTE_TRIES = 5
 EVENT_KEYS: dict[str, frozenset[str]] = {
     "task.state": frozenset({"task_id", "context_id", "state", "trace_id"}),
     "partner.call": frozenset({"partner_id", "task_id", "state", "duration_ms"}),
-    "partner.state": frozenset({"partner_id", "status", "event"}),
+    "partner.state": frozenset({"partner_id", "status", "event", "pending_hash"}),
     "security.denied": frozenset({"reason", "rule", "principal_kind"}),
 }
 FINISHED = frozenset({"done", "failed", "expired"})
@@ -987,6 +991,50 @@ def _event_row(item: Any, gateway_id: str, now: float) -> dict[str, Any] | None:
     }
 
 
+def _partner_state(row: dict[str, Any]) -> dict[str, Any] | None:
+    """The ``cp_partner_states`` values of a stored ``partner.state`` event row, or None
+    when it lacks a partner id or status. A ``removed`` event has status None (the row is
+    deleted)."""
+    if row["kind"] != "partner.state":
+        return None
+    data = _loads(row["data_json"], {})
+    partner_id, status, event = data.get("partner_id"), data.get("status"), data.get("event")
+    if not isinstance(partner_id, str) or not partner_id or not isinstance(status, str):
+        return None
+    pending = data.get("pending_hash")
+    return {
+        "gateway_id": row["gateway_id"],
+        "partner_id": _clean(partner_id, ID),
+        "status": None if event == "removed" else _clean(status, 16),
+        "pending_hash": _clean(pending, ID) if isinstance(pending, str) else None,
+        "event": _clean(event, 32) if isinstance(event, str) else "",
+        "ts": row["ts"],
+    }
+
+
+async def _record_partner_states(
+    store: ControlStore, conn: AsyncConnection, rows: list[dict[str, Any]]
+) -> None:
+    """Keep each gateway's last reported state of each partner (where the partner list
+    shows it quarantined, and the pending hash an approval is matched against)."""
+    for state in sorted(filter(None, map(_partner_state, rows)), key=lambda r: r["ts"]):
+        key = (PARTNER_STATES.c.gateway_id == state["gateway_id"]) & (
+            PARTNER_STATES.c.partner_id == state["partner_id"]
+        )
+        if state["status"] is None:
+            await conn.execute(PARTNER_STATES.delete().where(key))
+            continue
+        stmt = _insert(store)(PARTNER_STATES).values(**state)
+        changes = {k: state[k] for k in ("status", "pending_hash", "event", "ts")}
+        await conn.execute(
+            stmt.on_conflict_do_update(
+                index_elements=["gateway_id", "partner_id"],
+                set_=changes,
+                where=PARTNER_STATES.c.ts <= state["ts"],
+            )
+        )
+
+
 @dataclass
 class _Ingest:
     store: ControlStore
@@ -1012,6 +1060,7 @@ class _Ingest:
         if rows:
             async with self.store.engine.begin() as conn:
                 await conn.execute(EVENTS.insert(), rows)
+                await _record_partner_states(self.store, conn, rows)
         return len(rows)
 
     async def audit(self, items: list[Any]) -> int:
