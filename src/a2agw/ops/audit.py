@@ -107,6 +107,7 @@ Action = Literal[
     "cp.apikey.create",
     "cp.apikey.revoke",
     "cp.denied",
+    "cp.audit.export",
 ]
 ACTIONS: frozenset[str] = frozenset(get_args(Action))
 DETAIL_KEYS = frozenset(
@@ -133,6 +134,7 @@ DETAIL_KEYS = frozenset(
         "role",  # control plane: the role given to an API key or user
         "user",  # control plane: the user id a row is about (cp.user.update)
         "policy",  # control plane: the policy id a row is about (cp.policy.*, cp.assign)
+        "format",  # control plane: the format of an audit export (csv, jsonl)
     }
 )
 # PartnerRegistry change events -> audit actions (``registry_audit_action``).
@@ -380,6 +382,11 @@ class AuditLog:
                 await conn.run_sync(self._metadata.create_all, checkfirst=True)
 
         await retry_ddl(create)
+
+    @property
+    def table(self) -> Table:
+        """The chain's table, for read-only queries (rows are written by ``append`` only)."""
+        return self._table
 
     # -- writing ---------------------------------------------------------------------------
 

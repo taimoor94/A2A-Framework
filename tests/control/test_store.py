@@ -107,6 +107,32 @@ async def test_indexes_and_wide_event_seq(store, engine):
     assert type(seq).__name__ == ("INTEGER" if engine.dialect.name == "sqlite" else "BIGINT")
 
 
+async def test_initialize_upgrades_an_older_events_table(store, engine):
+    """A cp_events table made before the read APIs gains their columns and indexes."""
+    from a2agw.control.store import EVENT_INDEXES
+
+    def columns(c):
+        return {col["name"] for col in inspect(c).get_columns("cp_events")}
+
+    def indexes(c):
+        return {i["name"]: tuple(i["column_names"]) for i in inspect(c).get_indexes("cp_events")}
+
+    async with engine.begin() as conn:
+        for name in EVENT_INDEXES:
+            await conn.execute(text(f"DROP INDEX {name}"))
+        await conn.execute(text("ALTER TABLE cp_events DROP COLUMN state"))
+        await conn.execute(text("ALTER TABLE cp_events DROP COLUMN duration_ms"))
+    async with engine.connect() as conn:
+        assert {"state", "duration_ms"}.isdisjoint(await conn.run_sync(columns))
+    await ControlStore(engine).initialize()
+    await ControlStore(engine).initialize()  # idempotent on the upgraded table
+    async with engine.connect() as conn:
+        assert {"state", "duration_ms"} <= await conn.run_sync(columns)
+        found = await conn.run_sync(indexes)
+    assert found["ix_cp_events_kind_ts"] == ("kind", "ts")
+    assert found["ix_cp_events_kind_gateway_task"] == ("kind", "gateway_id", "task_id", "seq")
+
+
 async def test_initialize_idempotent_concurrent(db_url):
     engines = [await create_engine(db_url) for _ in range(4)]
     try:

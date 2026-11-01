@@ -23,10 +23,12 @@ the client's disconnect (``Background``).
 version and gateway info. The body is capped at ``report_max_bytes`` (413) and each list at
 ``report_max_items``; anything cut, malformed or not allowed is counted in ``dropped``.
 Events keep only their kind's allowlisted ``data`` keys and scalar values, strings cut to
-``STRING_MAX``. Audit rows are stored verbatim, keyed on ``(gateway_id, seq)``, so a report
-sent again changes nothing. ``partner.state`` events also update ``cp_partner_states``, the
-gateway's last reported status of each partner and the hash of a pending card it holds
-(the partner catalogue shows where a partner is quarantined; no card is taken from it).
+``STRING_MAX``; the ``state`` of ``task.state`` and ``partner.call`` events and a call's
+``duration_ms`` are also stored as columns (the Console's aggregations). Audit rows are
+stored verbatim, keyed on ``(gateway_id, seq)``, so a report sent again changes nothing.
+``partner.state`` events also update ``cp_partner_states``, the gateway's last reported
+status of each partner and the hash of a pending card it holds (the partner catalogue shows
+where a partner is quarantined; no card is taken from it).
 
 Desired state (``compute_desired``): the approved partners and the policy assigned to the
 gateway. Its hash is the SHA-256 of its canonical JSON, and its version grows only when the
@@ -109,6 +111,8 @@ EVENT_KEYS: dict[str, frozenset[str]] = {
     "security.denied": frozenset({"reason", "rule", "principal_kind"}),
 }
 FINISHED = frozenset({"done", "failed", "expired"})
+_STATEFUL = frozenset({"task.state", "partner.call"})  # their ``state`` is a column too
+STATE_MAX = 64
 
 Sleep = Callable[[float], Awaitable[None]]
 
@@ -988,6 +992,8 @@ def _event_row(item: Any, gateway_id: str, now: float) -> dict[str, Any] | None:
         "task_id": column("task_id"),
         "trace_id": column("trace_id", TRACE_ID_MAX),
         "data_json": _json(data),
+        "state": column("state", STATE_MAX) if kind in _STATEFUL else None,
+        "duration_ms": _number(data.get("duration_ms")) if kind == "partner.call" else None,
     }
 
 

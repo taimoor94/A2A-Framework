@@ -5,8 +5,10 @@ stored: gateway tokens, API keys, session ids and CSRF tokens are kept as their 
 digest (``token_digest``), and the token itself is returned once, by the call that creates it.
 
 Schema: ``initialize`` runs ``create_all(checkfirst=True)`` through ``retry_ddl``, so several
-replicas (or a replica and the CLI) can start against one empty database. Columns added in
-later releases will need an ``_ADDED_COLUMNS`` step like ``OutboundHandleStore``'s.
+replicas (or a replica and the CLI) can start against one empty database. Columns added
+after a table was first released are in ``_ADDED_COLUMNS`` (added to an existing table at
+``initialize``), and the indexes of ``EVENT_INDEXES`` are created with ``IF NOT EXISTS``, so
+tables made before them gain them too.
 """
 
 from __future__ import annotations
@@ -35,13 +37,15 @@ from sqlalchemy import (
     Text,
     delete,
     func,
+    inspect,
     select,
+    text,
     update,
 )
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects import sqlite as sqlite_dialect
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from a2agw._ddl import retry_ddl
 from a2agw.control.settings import ROLES
@@ -248,6 +252,10 @@ EVENTS = Table(
     Column("task_id", String(NAME), nullable=True, index=True),
     _id("trace_id", nullable=True, index=True),
     Column("data_json", Text, nullable=False, default="{}"),
+    # copied out of ``data`` at ingest for the Console's aggregations: the task or call state
+    # (task.state, partner.call) and a partner call's duration
+    Column("state", String(64), nullable=True),
+    Column("duration_ms", Float, nullable=True),
     sqlite_autoincrement=True,
 )
 # Copies of each gateway's own audit rows (its seq, the row as JSON).
@@ -277,6 +285,29 @@ META = Table(
 )
 EPOCH_KEY = "epoch"
 TABLES = tuple(_metadata.sorted_tables)
+
+# Columns added to existing tables after their first release: table -> {column: DDL type}.
+_ADDED_COLUMNS: dict[str, dict[str, str]] = {
+    "cp_events": {"state": "VARCHAR(64)", "duration_ms": "FLOAT"},
+}
+# Indexes of the Console's read APIs (Task 10): time ranges of one event kind (overview,
+# topology) and the latest event of each task (the task list, a task's own events).
+EVENT_INDEXES: dict[str, str] = {
+    "ix_cp_events_kind_ts": "kind, ts",
+    "ix_cp_events_kind_gateway_task": "kind, gateway_id, task_id, seq",
+}
+
+
+def _column_names(sync: Any, table: str) -> set[str]:
+    return {c["name"] for c in inspect(sync).get_columns(table)}
+
+
+async def _add_column(conn: AsyncConnection, table: str, name: str, ddl: str) -> None:
+    """``ALTER TABLE ... ADD COLUMN`` (``IF NOT EXISTS`` on PostgreSQL). A concurrent
+    startup adding it first is a duplicate-column error, which ``retry_ddl`` retries: the
+    step then sees the column and skips it."""
+    guard = "IF NOT EXISTS " if conn.dialect.name == "postgresql" else ""
+    await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {guard}{name} {ddl}"))
 
 
 def token_digest(token: str) -> str:
@@ -375,7 +406,21 @@ class ControlStore:
                 await conn.run_sync(_metadata.create_all, checkfirst=True)
 
         await retry_ddl(create)
+        await retry_ddl(self._upgrade)
         self._epoch = await self._ensure_epoch()
+
+    async def _upgrade(self) -> None:
+        """Add the ``_ADDED_COLUMNS`` a table lacks and create ``EVENT_INDEXES``."""
+        async with self.engine.begin() as conn:
+            for table, added in _ADDED_COLUMNS.items():
+                have = await conn.run_sync(_column_names, table)
+                for name, ddl in added.items():
+                    if name not in have:
+                        await _add_column(conn, table, name, ddl)
+            for name, columns in EVENT_INDEXES.items():
+                await conn.execute(
+                    text(f"CREATE INDEX IF NOT EXISTS {name} ON cp_events ({columns})")
+                )
 
     async def _ensure_epoch(self) -> str:
         """The stored epoch, created first if there is none (a concurrent initialize may
