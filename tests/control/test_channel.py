@@ -450,12 +450,12 @@ async def test_token_cannot_read_other_gateway(db_url, make_cp):
 # -- reports -------------------------------------------------------------------------------
 
 
-async def test_report_idempotent_audit_rows(db_url, make_cp, run_app):
+async def test_report_idempotent_audit_rows(db_url, make_cp, run_app, clock):
     app = make_cp(settings_for(db_url))
     async with run_app(app) as c:
         _gw, token = await app.state.store.create_gateway("gw-a", actor="t")
         audit = [
-            {"seq": s, "action": "inbound.admit", "ts": 100.0 + s, "detail": {"n": s}}
+            {"seq": s, "action": "inbound.admit", "ts": clock.t - 100 + s, "detail": {"n": s}}
             for s in (1, 2, 3)
         ]
         bad = [
@@ -474,7 +474,7 @@ async def test_report_idempotent_audit_rows(db_url, make_cp, run_app):
         assert sorted(r.seq for r in stored) == [1, 2, 3]
         for row in stored:
             assert json.loads(row.row_json) == audit[row.seq - 1]  # verbatim
-            assert row.ts == 100.0 + row.seq
+            assert row.ts == clock.t - 100 + row.seq
         # an empty report acks what is stored
         r = await report(c, token)
         assert r.json() == {"acked_audit_seq": 3, "accepted_events": 0, "dropped": 0}
@@ -907,3 +907,136 @@ async def test_last_seen_written_at_most_every_5s(db_url, make_cp, clock):
         assert polls >= 20 and 1 <= writes[0] <= 3
         [g] = await rows(app, GATEWAYS, GATEWAYS.c.id == gw)
         assert g.last_seen_at > t0 + 5.2
+
+
+# -- review fixes ------------------------------------------------------------------------------
+
+
+async def test_huge_integers_do_not_break_a_report(db_url, make_cp, run_app, clock):
+    """A 400-digit integer (valid JSON) is not a finite float: it is dropped from event
+    data, and a timestamp made of one counts as missing; the report still succeeds."""
+    app = make_cp(settings_for(db_url))
+    async with run_app(app) as c:
+        _gw, token = await app.state.store.create_gateway("gw-a", actor="t")
+        huge = 10**400
+        events = [
+            {"kind": "task.state", "agent_id": "a", "data": {"state": huge, "task_id": "t1"}},
+            {"kind": "task.state", "agent_id": "a", "data": {"state": "working"}, "ts": huge},
+            {"kind": "partner.call", "agent_id": "a", "data": {"duration_ms": -huge}},
+        ]
+        audit = [{"seq": 1, "action": "inbound.admit", "ts": huge}]
+        r = await report(c, token, events=events, audit=audit, health={"n": huge})
+        assert r.status_code == 200, r.text
+        assert r.json() == {"acked_audit_seq": 1, "accepted_events": 3, "dropped": 0}
+        stored = await rows(app, EVENTS)
+        assert [json.loads(e.data_json) for e in stored] == [
+            {"task_id": "t1"},
+            {"state": "working"},
+            {},
+        ]
+        assert {e.ts for e in stored} == {clock.t}
+        [row] = await rows(app, GATEWAY_AUDIT)
+        assert row.ts == clock.t and json.loads(row.row_json)["ts"] == huge
+        assert channel._finite_number(2**53 - 1) and not channel._finite_number(2**53)
+
+
+async def test_audit_rows_sorted_before_the_cap(db_url, make_cp, run_app):
+    """Rows cut by the item cap are the highest seqs, never acked, whatever the order sent."""
+    app = make_cp(settings_for(db_url, report_max_items=3))
+    async with run_app(app) as c:
+        _gw, token = await app.state.store.create_gateway("gw-a", actor="t")
+        audit = [{"seq": s, "action": "inbound.admit"} for s in (5, 1, 4, 2, 3)]
+        r = await report(c, token, audit=[{"action": "no seq"}, *audit])
+        assert r.json() == {"acked_audit_seq": 3, "accepted_events": 0, "dropped": 3}
+        assert sorted(r.seq for r in await rows(app, GATEWAY_AUDIT)) == [1, 2, 3]
+        rest = [a for a in audit if a["seq"] > 3]  # a gateway resends what is not acked
+        r = await report(c, token, audit=rest)
+        assert r.json()["acked_audit_seq"] == 5
+        assert sorted(r.seq for r in await rows(app, GATEWAY_AUDIT)) == [1, 2, 3, 4, 5]
+
+
+async def test_audit_row_ts_clamped_but_row_kept_verbatim(db_url, make_cp, run_app, clock):
+    app = make_cp(settings_for(db_url))
+    async with run_app(app) as c:
+        _gw, token = await app.state.store.create_gateway("gw-a", actor="t")
+        now = clock.t
+        audit = [
+            {"seq": 1, "action": "inbound.admit", "ts": now + 10 * 86400},
+            {"seq": 2, "action": "inbound.admit", "ts": 5.0},
+            {"seq": 3, "action": "inbound.admit", "ts": now - 60},
+        ]
+        await report(c, token, audit=audit)
+        stored = {r.seq: r for r in await rows(app, GATEWAY_AUDIT)}
+        assert stored[1].ts == now + 300 and stored[2].ts == now - 86400
+        assert stored[3].ts == now - 60
+        for seq, item in zip((1, 2, 3), audit, strict=True):
+            assert json.loads(stored[seq].row_json) == item
+
+
+async def test_revoke_between_liveness_and_delivery_delivers_nothing(db_url, make_cp, run_app):
+    from a2agw.control.store import token_digest
+
+    app = make_cp(settings_for(db_url))
+    async with run_app(app):
+        store = app.state.store
+        gw, old = await store.create_gateway("gw-a", actor="t")
+        cid = await channel.enqueue_command(store, gw, "task.cancel", {}, "oidc:op")
+        # the stream checked its (old) token, then the token is rotated away
+        new = await store.rotate_gateway_token(gw, actor="t")
+        now = store.now()
+        assert await channel.take_commands(store, gw, now, digest=token_digest(old)) == []
+        [row] = await rows(app, COMMANDS, COMMANDS.c.id == cid)
+        assert row.status == "pending"
+        # the new token takes it
+        [taken] = await channel.take_commands(store, gw, now, digest=token_digest(new))
+        assert taken.id == cid
+        # a revoked gateway: nothing either, whatever the token
+        cid2 = await channel.enqueue_command(store, gw, "task.cancel", {}, "oidc:op")
+        await store.revoke_gateway(gw, actor="t")
+        assert await channel.take_commands(store, gw, now, digest=token_digest(new)) == []
+        [row] = await rows(app, COMMANDS, COMMANDS.c.id == cid2)
+        assert row.status == "pending"
+
+
+async def test_rejected_apply_hash_is_cleaned_in_the_audit(sqlite_settings, make_cp, run_app):
+    app = make_cp(settings_for(sqlite_settings.db_url))
+    async with run_app(app) as c:
+        _gw, token = await app.state.store.create_gateway("gw-a", actor="t")
+        applied = {"epoch": "e", "version": 1, "hash": "ab\x00cd", "status": "rejected"}
+        assert (await report(c, token, applied=applied)).status_code == 200
+        [row] = await audit_rows(app, "cp.apply")
+        assert row["detail"]["hash"] == "ab�cd"
+
+
+async def test_background_drain_is_bounded(caplog):
+    background = channel.Background(drain_timeout_s=0.2)
+    stuck = asyncio.Event()
+
+    async def hangs() -> None:
+        await stuck.wait()  # never set
+
+    async def caller() -> None:
+        await background.run(hangs())
+
+    waiter = asyncio.create_task(caller())
+    await asyncio.sleep(0.01)
+    waiter.cancel()  # the client went away; the shielded poll goes on
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    with caplog.at_level("WARNING", logger="a2agw.control.channel"):
+        await asyncio.wait_for(background.drain(), 5)
+    assert loop.time() - started < 2
+    assert background.pending == 0
+    assert any("hangs" in r.getMessage() for r in caplog.records), caplog.text
+
+
+async def test_shutdown_finishes_with_a_stuck_poll(sqlite_settings, make_cp):
+    app = make_cp(settings_for(sqlite_settings.db_url))
+    never = asyncio.Event()
+    async with app.router.lifespan_context(app):
+        app.state.background.drain_timeout_s = 0.2
+        poll = asyncio.create_task(app.state.background.run(never.wait()))
+        await asyncio.sleep(0.01)
+        poll.cancel()
+        exit_started = asyncio.get_running_loop().time()
+    assert asyncio.get_running_loop().time() - exit_started < 3

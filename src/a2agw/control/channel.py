@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import math
 import re
 import secrets
@@ -76,6 +77,8 @@ from a2agw.control.store import (
 )
 from a2agw.ops.audit import AuditEvent, canonical_json
 
+log = logging.getLogger(__name__)
+
 POLL_S = 0.5  # how often a stream looks at the database
 SEEN_EVERY_S = 5.0  # last_seen_at is written at most this often per gateway (per process)
 STRING_MAX = 256  # strings in events (and other short fields) are cut to this
@@ -85,10 +88,13 @@ AUDIT_ROW_MAX_BYTES = 8192  # a gateway audit row larger than this (as JSON) is 
 RESULT_MAX_BYTES = 8192  # a larger command result is stored as {"truncated": true}
 TS_PAST_S = 86400.0  # event timestamps are clamped to [now - 1 day, now + 5 minutes]
 TS_FUTURE_S = 300.0
+INT_MAX_EXACT = 2**53  # larger ints are not kept as numbers
 SEQ_MAX = 2**31 - 1  # cp_gateway_audit.seq is a 32-bit integer
 COMMAND_TTL_S = 60.0
 COMMANDS_PER_POLL = 100
 WAIT_POLL_S = 0.25
+DRAIN_TIMEOUT_S = 10.0  # shutdown waits this long for stream polls, then cancels them
+CANCEL_WAIT_S = 1.0
 _COMPUTE_TRIES = 5
 
 # Event kinds and the ``data`` keys kept for each (see a2agw.ops.bus).
@@ -120,7 +126,13 @@ def _number(value: Any) -> float | None:
 
 
 def _finite_number(value: Any) -> bool:
-    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+    """A JSON number usable as a float: a finite float, or an int within +-2**53 (exactly
+    representable; a 400-digit int would raise OverflowError in ``math.isfinite``)."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return abs(value) < INT_MAX_EXACT
+    return isinstance(value, float) and math.isfinite(value)
 
 
 async def _emit(store: ControlStore, event: AuditEvent, coalesce: str | None = None) -> None:
@@ -596,9 +608,28 @@ async def wait_command(
         waited += step
 
 
-async def take_commands(store: ControlStore, gateway_id: str, now: float) -> list[CommandRow]:
+async def take_commands(
+    store: ControlStore, gateway_id: str, now: float, *, digest: str | None = None
+) -> list[CommandRow]:
     """The gateway's pending, unexpired commands, oldest first, marked ``delivered``. A
-    command another stream (or replica) took first is not returned."""
+    command another stream (or replica) took first is not returned.
+
+    The marking UPDATE itself requires the gateway to be active and, with ``digest`` (the
+    stream's token), that token to be live: a revoke or rotation landing between a poll's
+    liveness check and this delivers nothing."""
+    live = (
+        select(GATEWAYS.c.id)
+        .where(GATEWAYS.c.id == gateway_id)
+        .where(GATEWAYS.c.status == "active")
+    )
+    if digest is not None:
+        live = live.where(
+            select(GATEWAY_TOKENS.c.digest)
+            .where(GATEWAY_TOKENS.c.digest == digest)
+            .where(GATEWAY_TOKENS.c.gateway_id == gateway_id)
+            .where(GATEWAY_TOKENS.c.revoked_at.is_(None))
+            .exists()
+        )
     async with store.engine.begin() as conn:
         pending = (
             await conn.execute(
@@ -616,6 +647,7 @@ async def take_commands(store: ControlStore, gateway_id: str, now: float) -> lis
                 update(COMMANDS)
                 .where(COMMANDS.c.id == row.id)
                 .where(COMMANDS.c.status == "pending")
+                .where(live.exists())
                 .values(status="delivered", delivered_at=now)
             )
             if marked.rowcount == 1:
@@ -686,8 +718,13 @@ class Background:
     that await, and the poll finishes on its own and returns its connections. The
     lifespan awaits ``drain`` before it disposes the engine (``app.state.background``)."""
 
-    def __init__(self) -> None:
+    def __init__(self, drain_timeout_s: float = DRAIN_TIMEOUT_S) -> None:
+        self.drain_timeout_s = drain_timeout_s
         self._tasks: set[asyncio.Task[Any]] = set()
+
+    @property
+    def pending(self) -> int:
+        return len(self._tasks)
 
     async def run(self, work: Awaitable[Any]) -> Any:
         task = asyncio.ensure_future(work)
@@ -701,8 +738,32 @@ class Background:
             task.exception()  # retrieved: a poll nobody awaits any more may fail quietly
 
     async def drain(self) -> None:
-        while self._tasks:
-            await asyncio.gather(*list(self._tasks), return_exceptions=True)
+        """Wait for the running polls, ``drain_timeout_s`` at most; the ones still running
+        then (a stuck database call) are cancelled and logged by name, so shutdown always
+        finishes."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.drain_timeout_s
+        while self._tasks and (left := deadline - loop.time()) > 0:
+            await asyncio.wait(list(self._tasks), timeout=left)
+        stragglers = list(self._tasks)
+        if not stragglers:
+            return
+        names = sorted({_task_name(t) for t in stragglers})
+        log.warning(
+            "control-plane shutdown: cancelling %d stream poll(s) still running after %.1fs: %s",
+            len(stragglers),
+            self.drain_timeout_s,
+            ", ".join(names),
+        )
+        for t in stragglers:
+            t.cancel()
+        await asyncio.wait(stragglers, timeout=CANCEL_WAIT_S)
+        self._tasks.difference_update(stragglers)
+
+
+def _task_name(task: asyncio.Task[Any]) -> str:
+    coro = task.get_coro()
+    return str(getattr(coro, "__qualname__", type(coro).__name__))
 
 
 @dataclass
@@ -735,7 +796,8 @@ class _Poll:
             if desired is not None:
                 out.append(_frame("state", desired.frame()))
                 self.sent = (desired.epoch, desired.version)
-        out += [_frame("command", c.frame()) for c in await take_commands(store, gateway_id, now)]
+        taken = await take_commands(store, gateway_id, now, digest=self.digest)
+        out += [_frame("command", c.frame()) for c in taken]
         return out
 
 
@@ -876,6 +938,20 @@ def _scalar(value: Any) -> tuple[bool, Any]:
     return False, None
 
 
+def _clamp_ts(value: Any, now: float) -> float:
+    """A reported timestamp within [now - 1 day, now + 5 minutes]; ``now`` when it is not
+    a usable number."""
+    sent = _number(value)
+    return now if sent is None else min(max(sent, now - TS_PAST_S), now + TS_FUTURE_S)
+
+
+def _seq_order(item: Any) -> tuple[int, int]:
+    seq = item.get("seq") if isinstance(item, dict) else None
+    if type(seq) is int and 0 <= seq <= SEQ_MAX:
+        return (0, seq)
+    return (1, 0)
+
+
 def _event_row(item: Any, gateway_id: str, now: float) -> dict[str, Any] | None:
     """The ``cp_events`` row of one reported event, or None to drop it."""
     if not isinstance(item, dict):
@@ -891,8 +967,7 @@ def _event_row(item: Any, gateway_id: str, now: float) -> dict[str, Any] | None:
         keep, value = _scalar(raw[key])
         if keep:
             data[key] = value
-    sent = _number(item.get("ts"))
-    ts = now if sent is None else min(max(sent, now - TS_PAST_S), now + TS_FUTURE_S)
+    ts = _clamp_ts(item.get("ts"), now)
 
     def column(key: str, limit: int = STRING_MAX) -> str | None:
         value = data.get(key)
@@ -941,7 +1016,9 @@ class _Ingest:
         """Store the gateway's audit rows; returns the seq the gateway may forget up to."""
         rows = []
         acked = 0
-        for item in self.cap(items):
+        # by seq (rows without a usable seq last), so the cap cuts the highest seqs: a row
+        # cut here is never acked, and is sent again
+        for item in self.cap(sorted(items, key=_seq_order)):
             seq = item.get("seq") if isinstance(item, dict) else None
             if type(seq) is not int or not 0 <= seq <= SEQ_MAX:
                 self.dropped += 1
@@ -951,13 +1028,12 @@ class _Ingest:
             if len(row_json) > AUDIT_ROW_MAX_BYTES:
                 self.dropped += 1
                 continue
-            ts = _number(item.get("ts"))
             rows.append(
                 {
                     "gateway_id": self.gateway_id,
                     "seq": seq,
-                    "row_json": row_json,
-                    "ts": self.now if ts is None else ts,
+                    "row_json": row_json,  # verbatim, its own ts included
+                    "ts": _clamp_ts(item.get("ts"), self.now),  # ordering and retention
                 }
             )
         async with self.store.engine.begin() as conn:
@@ -1014,7 +1090,7 @@ class _Ingest:
         detail: dict[str, Any] = {
             "gateway": gateway_id,
             "version": applied.version,
-            "hash": applied.hash,
+            "hash": _clean(applied.hash),
         }
         epoch = _clean(applied.epoch, TRACE_ID_MAX)
         if applied.status == "applied":
