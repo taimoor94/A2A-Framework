@@ -246,3 +246,28 @@ def test_claude_planner_requires_extra(monkeypatch):
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", None)
     with pytest.raises(ImportError, match=r"a2a-gateway\[vsc\]"):
         claude_planner_adapter(VscConfig(systems=SYSTEMS))
+
+
+def test_scripted_planner_reports_no_usage():
+    assert ScriptedPlanner().usage() == (0, 0, 0.0)
+
+
+async def test_agent_planner_usage_from_the_turn_task(tmp_path):
+    from a2agw.core.events import Done, Usage
+
+    plan = two_step_plan()
+
+    async def reply(ctx):
+        yield Usage(tokens_in=7, tokens_out=3, cost=0.5)
+        yield Done(text=plan.model_dump_json())
+
+    host, planner = await _host(tmp_path / "h", reply)
+    try:
+        assert planner.usage() == (0, 0, 0.0)
+        await planner.plan(make_spec())
+        assert planner.usage() == (7, 3, 0.5)
+        await planner.plan(make_spec())
+        assert planner.usage() == (14, 6, 1.0)  # cumulative over the turns
+    finally:
+        await planner.aclose()
+        await host.shutdown()

@@ -9,10 +9,17 @@ Modes: ``apply`` writes the files and answers ``done``; ``fail`` answers ``faile
 ``apply`` plus a usage event; ``noop`` answers ``done`` without writing; ``hang`` sends one
 ``status`` event and never answers; ``crash`` exits with code 3 mid-turn; ``hang_marked`` is
 ``hang`` when the invoke text contains ``HANG`` and ``apply`` otherwise.
+
+Acting adversaries (each is ``apply`` plus an action): ``write-outside`` also writes
+``$VSC_OUTSIDE`` (default ``OUTSIDE.txt``, relative to the worktree); ``push`` also runs ``git
+push origin HEAD`` in the worktree (its result ignored); ``exfil`` also copies
+``$VSC_EXFIL_FROM`` (default ``~/.ssh/id_rsa``) into the worktree as ``stolen.txt``.
 """
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 
@@ -54,6 +61,14 @@ def answer(rid, req):
     apply_files(req["text"])
     if MODE == "inject":
         emit(rid, {"type": "text", "text": INJECT})
+    if MODE == "write-outside":
+        with open(os.environ.get("VSC_OUTSIDE", "OUTSIDE.txt"), "w") as f:
+            f.write("written outside the system path\n")
+    if MODE == "push":
+        subprocess.run(["git", "push", "origin", "HEAD"], capture_output=True, check=False)
+    if MODE == "exfil":
+        src = os.path.expanduser(os.environ.get("VSC_EXFIL_FROM", "~/.ssh/id_rsa"))
+        shutil.copyfile(src, "stolen.txt")
     if MODE == "usage":
         emit(rid, {"type": "usage", "tokens_in": 10, "tokens_out": 20, "cost": 0.01})
     emit(rid, {"type": "done", "text": "done"})

@@ -15,6 +15,10 @@ discards or cleans their half-done worktrees and continues each job from its fir
 not passed; a job whose whole-system checks already passed (``whole_passed``) goes straight back
 to its privileged steps.
 
+The planner never sees acceptance-test contents: ``plan`` and ``replan`` get ``_planner_view``
+of the spec (file names only). Its usage (``Planner.usage``, cumulative) is charged to the job
+after every planner call, like a worker's.
+
 Budgets (the tighter of ``cfg.budgets`` and the spec's) are enforced here: tokens and cost after
 every worker and planner turn; attempts per step (counted from the step's stored rows, so the
 bound holds across whole-system rounds and restarts); the deadline bounds active time
@@ -85,6 +89,24 @@ class JobFailed(Exception):
 
 def _decision(kind: str, text: str, step_id: str | None = None) -> Decision:
     return Decision(ts=time.time(), step_id=step_id, text=text[:DECISION_MAX_CHARS], kind=kind)  # type: ignore[arg-type]
+
+
+def _planner_view(spec: ExecutableSpec) -> ExecutableSpec:
+    """The spec as the planner sees it after intake: acceptance tests keep their id, system,
+    check, run and file *names*; the file contents (the hidden tests) are emptied. The full spec
+    is only for verification."""
+    return spec.model_copy(
+        update={
+            "acceptance": [
+                t.model_copy(update={"files": dict.fromkeys(t.files, "")}) for t in spec.acceptance
+            ]
+        }
+    )
+
+
+def _planner_usage(planner: Planner) -> tuple[int, int, float]:
+    usage = getattr(planner, "usage", None)
+    return usage() if usage is not None else (0, 0, 0.0)
 
 
 def _sha256(text: str) -> str:
@@ -176,6 +198,8 @@ class JobRunner:
         self._locks: dict[str, asyncio.Lock] = {}
         self._cancelled: set[str] = set()
         self._active_since: dict[str, float] = {}  # job id -> loop time it became active
+        # job id -> the planner's cumulative usage when last charged
+        self._planner_seen: dict[str, tuple[int, int, float]] = {}
 
     # -- public API ----------------------------------------------------------------------
 
@@ -255,6 +279,7 @@ class JobRunner:
         if job["state"] in TERMINAL_STATES:
             return job
         planner = self._planner_factory(job_id)
+        self._planner_seen[job_id] = _planner_usage(planner)
         try:
             await self._drive(job, planner)
         except asyncio.CancelledError:
@@ -273,6 +298,7 @@ class JobRunner:
             log.exception("vsc job %s failed", job_id)
             await self._fail(job_id, "error")
         finally:
+            self._planner_seen.pop(job_id, None)
             with suppress(Exception):
                 await self._tick(job_id, keep=False)
             aclose = getattr(planner, "aclose", None)
@@ -310,22 +336,29 @@ class JobRunner:
                     validate_against(spec, cfg)
                 except (PlannerError, ValueError) as e:
                     log.warning("vsc job %s: intake failed: %s", job_id, e)
+                    await self._charge_planner(job_id, planner, None)
                     raise JobFailed("planner") from e
-                budget.charge(0, 0, 0.0)  # planner usage is not reported to the runner
+                await self._charge_planner(job_id, planner, budget)
                 await self._store.set_spec(job_id, spec)
             limits = tighter(cfg.budgets, spec.budgets)
-            budget = self._budget(job, limits, start)
+            budget = dataclasses.replace(  # keep what this run has charged so far
+                self._budget(job, limits, start),
+                used_tokens=budget.used_tokens,
+                used_cost=budget.used_cost,
+            )
+            budget.charge(0, 0, 0.0)  # the spec's limits may be tighter
             if job["plan_json"]:
                 plan = Plan.model_validate_json(job["plan_json"])
             else:
                 state = await self._move(job_id, state, "planning")
                 try:
-                    plan = await planner.plan(spec)
+                    plan = await planner.plan(_planner_view(spec))
                     validate_plan(plan, spec)
                 except (PlannerError, ValueError) as e:
                     log.warning("vsc job %s: planning failed: %s", job_id, e)
+                    await self._charge_planner(job_id, planner, None)
                     raise JobFailed("planner") from e
-                budget.charge(0, 0, 0.0)
+                await self._charge_planner(job_id, planner, budget)
                 plan.decisions.append(_decision("plan", f"{len(plan.steps)} steps"))
                 await self._save_plan(job_id, plan)
             for seq, step in enumerate(plan.steps):  # idempotent
@@ -473,15 +506,28 @@ class JobRunner:
             for r in await self._store.steps(ctx.job_id)
         ]
         try:
-            d = await ctx.planner.replan(ctx.spec, ctx.plan, failure, steps)
+            d = await ctx.planner.replan(_planner_view(ctx.spec), ctx.plan, failure, steps)
         except (PlannerError, ValueError) as e:
             log.warning("vsc job %s: replan failed: %s", ctx.job_id, e)
+            await self._charge_planner(ctx.job_id, ctx.planner, None)
             raise JobFailed("planner") from e
-        ctx.budget.charge(0, 0, 0.0)
+        await self._charge_planner(ctx.job_id, ctx.planner, ctx.budget)
         d = guard_replan(ctx.plan, d)
         if d.step_id is None and step_id is not None:
             d = d.model_copy(update={"step_id": step_id})
         return d
+
+    async def _charge_planner(self, job_id: str, planner: Planner, budget: Budget | None) -> None:
+        """Record the planner's usage since the last charge on the job and (unless ``budget`` is
+        None: the call failed anyway) charge it to the budget."""
+        now = _planner_usage(planner)
+        i0, o0, c0 = self._planner_seen.get(job_id, (0, 0, 0.0))
+        self._planner_seen[job_id] = now
+        di, do, dc = now[0] - i0, now[1] - o0, now[2] - c0
+        if di or do or dc:
+            await self._store.add_usage(job_id, di, do, dc)
+        if budget is not None:
+            budget.charge(di, do, dc)
 
     async def _record(self, ctx: _Run, d: Decision) -> None:
         """Append to the decision log; an accepted replan's plan replaces the stored plan."""

@@ -96,6 +96,7 @@ def mono(tmp_path):
     3. a and b with new failing tests            -> task
     4. a and b, no new tests                     (no acceptance)
     5. a and b, new test passing on the parent   (dropped by reproduction_before)
+    5b. a and b, new test failing at the commit too (dropped: not solvable)
     6. merge --no-ff of a side branch changing a and b with new failing tests -> task (the
        side branch's own commit is not on the first-parent line)
     """
@@ -134,6 +135,13 @@ def mono(tmp_path):
         "a test that already passes",
         {"a/tests/test_more_f.py": test_fn("f", 1), "b/notes.txt": "b2\n"},
     )
+    shas["broken"] = commit(  # fails on the parent AND at the commit: unsolvable, dropped
+        repo,
+        "a test that never passes",
+        {"a/tests/test_bad.py": test_fn("f", 99), "b/notes.txt": "b3\n"},
+    )
+    git(repo, "rm", "-q", "a/tests/test_bad.py")
+    git(repo, "commit", "-q", "-m", "drop the bad test")  # one system: not a task
     git(repo, "checkout", "-q", "-b", "side")
     commit(
         repo,
@@ -148,6 +156,7 @@ def mono(tmp_path):
     git(repo, "checkout", "-q", "main")
     git(repo, "merge", "-q", "--no-ff", "-m", "Merge side: k everywhere", "side")
     shas["merge"] = git(repo, "rev-parse", "HEAD")
+    git(repo, "tag", "v-solution", shas["merge"])
     systems = [
         SystemConfig(id="svc-a", repo="./mono", path="a", tests=PYTEST),
         SystemConfig(id="svc-b", repo="./mono", path="b", tests=PYTEST),
@@ -159,7 +168,21 @@ def test_restrict_command():
     assert restrict_command(PYTEST, ["tests/test_g.py"]) == [*PYTEST[:-1], "tests/test_g.py"]
     node = ["node", "--test", "test/*.test.mjs"]
     assert restrict_command(node, ["test/x.test.mjs"]) == ["node", "--test", "test/x.test.mjs"]
-    assert restrict_command(["make", "check"], ["tests/t.py"]) == ["make", "check", "tests/t.py"]
+    # a tool whose file form is unknown keeps its command (it still runs the new files)
+    assert restrict_command(["make", "check"], ["tests/t.py"]) == ["make", "check"]
+    assert restrict_command(["go", "test", "./..."], ["tests/x_test.go"]) == ["go", "test", "./..."]
+    assert restrict_command(["npm", "test"], ["tests/x.test.js"]) == ["npm", "test"]
+    # never the value of a preceding option
+    k = [PY, "-m", "pytest", "-k", "tests"]
+    assert restrict_command(k, ["tests/test_g.py"]) == [*k, "tests/test_g.py"]
+    # unittest discover -s tests: not "-s tests/test_g.py", but the file form
+    discover = [PY, "-B", "-m", "unittest", "discover", "-s", "tests"]
+    assert restrict_command(discover, ["tests/test_g.py"]) == [
+        PY, "-B", "-m", "unittest", "tests/test_g.py",
+    ]  # fmt: skip
+    assert restrict_command([PY, "-m", "unittest", "-v"], ["tests/t.py"]) == [
+        PY, "-m", "unittest", "-v", "tests/t.py",
+    ]  # fmt: skip
 
 
 def test_mine_history_finds_cross_system_commits(mono):
@@ -396,7 +419,10 @@ async def test_bench_oracle_and_vsc_on_tiny_estate(tiny, tmp_path):
     )  # fmt: skip
     assert single.solved and single.budget_tokens == 60, single
     text = report(load_results(out), out)
-    assert "on 1 task run in both modes, vsc solved 1/1 (100.0%) and single solved 1/1" in text
+    assert (
+        "on 1 task where single's token budget equalled vsc's recorded tokens, vsc solved 1/1"
+        in text
+    )
 
 
 async def test_bench_vsc_wrong_behaviour(tiny, tmp_path):
@@ -421,32 +447,46 @@ def test_classify():
 
 
 def test_bench_report_matched_budget_line(tmp_path):
-    def r(task, mode, solved, tokens, fc="none"):
+    def r(task, mode, solved, tokens, fc="none", budget=None):
         return BenchResult(task_id=task, mode=mode, solved=solved, tokens=tokens, cost=0.5,
-                           wall_s=2.0, failure_class=fc)  # fmt: skip
+                           wall_s=2.0, failure_class=fc, budget_tokens=budget)  # fmt: skip
 
     results = [
         r("t1", "vsc", True, 1000),
         r("t2", "vsc", True, 3000),
         r("t3", "vsc", False, 500, "budget"),
-        r("t1", "single", True, 900),
-        r("t2", "single", False, 3000, "missed_system"),
-        r("t9", "single", False, 100, "worker_error"),  # vsc never ran it: not matched
+        r("t4", "vsc", True, 700),
+        r("t1", "single", True, 900, budget=1000),
+        r("t2", "single", False, 3000, "missed_system", budget=3000),
+        r("t4", "single", True, 650, budget=2_000_000),  # single ran before vsc: not matched
+        r("t9", "single", False, 100, "worker_error", budget=5),  # vsc never ran it
         r("t1", "oracle", True, 0),
     ]
     text = report(results, tmp_path)
     assert (tmp_path / "report.md").read_text() == text
     line = (
-        "Matched budget: on 2 tasks run in both modes, vsc solved 2/2 (100.0%) and single solved "
-        "1/2 (50.0%), single's token budget being vsc's recorded tokens (mean tokens: vsc 2000, "
-        "single 1950)."
+        "Matched budget: on 2 tasks where single's token budget equalled vsc's recorded tokens, "
+        "vsc solved 2/2 (100.0%) and single solved 1/2 (50.0%) (mean tokens: vsc 2000, single "
+        "1950). Left out, run in both modes with a different budget: 1 (t4)."
     )
     assert line in text.splitlines()
     assert "## Mode `vsc`" in text and "## Mode `single`" in text and "## Mode `oracle`" in text
-    assert "| 3 | 2 | 66.7% | 1500 | 0.5000 | 2.0 |" in text
+    assert "| 4 | 3 | 75.0% | 1300 | 0.5000 | 2.0 |" in text
+    for override in (
+        "told the affected-repository set",
+        "privileged steps are removed",
+        "acceptance tests and budget replace",
+        "single is unconfined",
+    ):
+        assert override in text, override
     assert "| missed_system | 1 |" in text
     assert matched_budget_line([results[0]]) == (
         "Matched budget: no task was run in both vsc and single mode."
+    )
+    only_unmatched = matched_budget_line([results[3], results[6]])
+    assert only_unmatched == (
+        "Matched budget: no task ran in single mode with vsc's recorded tokens as its budget. "
+        "Left out, run in both modes with a different budget: 1 (t4)."
     )
 
 
@@ -532,3 +572,29 @@ def test_cli_bench_mine_run_report(mono, tmp_path):
          "--config", str(config)],
     )  # fmt: skip
     assert res.exit_code == 1 and "needs at least one worker" in res.output
+
+
+def test_prepared_history_repo_has_no_solution(mono, tmp_path):
+    """The task's repository holds the base and its ancestry only: not the solution commit, no
+    tags, no reflog, no other branch."""
+    from a2agw.vsc.bench.run import _prepare
+
+    repo, systems, shas = mono
+    (task,) = mine_history(repo, systems, limit=1)  # the merge commit's task
+    cfg = VscConfig(systems=systems)
+    tmp = tmp_path / "prep"
+    tmp.mkdir()
+    tcfg, base = _prepare(task, cfg, tmp_path, tmp)
+    prepared = Path(tcfg.systems[0].repo)
+    assert base == task.base
+    assert git(prepared, "rev-parse", "HEAD") == task.base["mono"]
+    for sha in (shas["merge"], git(repo, "rev-parse", "side")):
+        res = subprocess.run(
+            ["git", "cat-file", "-e", sha], cwd=prepared, capture_output=True, check=False
+        )
+        assert res.returncode != 0, sha
+    assert git(prepared, "tag") == ""
+    assert git(prepared, "remote") == ""
+    assert git(prepared, "for-each-ref", "--format=%(refname)") == "refs/heads/main"
+    assert shas["merge"] not in git(prepared, "log", "--all", "--format=%H")
+    assert git(prepared, "reflog", "--all") == ""

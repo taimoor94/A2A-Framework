@@ -1,8 +1,9 @@
 """Run a benchmark corpus in one mode and record a ``BenchResult`` per task.
 
 Every task gets fresh repositories in a temporary directory: an ``estate`` task runs its
-estate's ``init_estate.py``; a ``history`` task clones its origin (the clone's remote is
-removed, so nothing can be pushed back) and puts the default branch on the base commit. The
+estate's ``init_estate.py``; a ``history`` task's repository is ``git init`` plus a fetch of
+the base commit alone (no tags, no remote, reflog expired, unreachable objects pruned), so the
+solution commit is not reachable from any workspace. The
 configured systems whose repository id is in ``task.base`` are pointed at those copies; the other
 systems, and the checks that need them, are left out. Auto-approval is never configured: the
 bench measures the change, not its delivery.
@@ -133,6 +134,10 @@ class BenchPlanner:
     ) -> Decision:
         return await self._inner.replan(spec, plan, failure, steps)
 
+    def usage(self) -> tuple[int, int, float]:
+        usage = getattr(self._inner, "usage", None)
+        return usage() if usage is not None else (0, 0, 0.0)
+
     async def aclose(self) -> None:
         aclose = getattr(self._inner, "aclose", None)
         if aclose is not None:
@@ -183,39 +188,49 @@ def _git(cwd: Path, *args: str) -> str:
 def _prepare(
     task: BenchTask, cfg: VscConfig, config_dir: Path, tmp: Path
 ) -> tuple[VscConfig, dict[str, str]]:
-    """Fresh repositories for the task; the config pointed at them; the resolved base."""
+    """Fresh repositories for the task; the config pointed at them; the resolved base.
+
+    A history task's repository is built from the base commit alone (``git init`` + ``git
+    fetch <origin> <base>``, no tags, no remote, reflog expired, unreachable objects pruned),
+    so nothing in it leads to the solution commit."""
     origin = Path(task.origin)
+    ids = WorkspaceManager(tmp / "ids", cfg.systems, config_dir)
+    branches: dict[str, str] = {}
+    for s in cfg.systems:
+        rid = ids.repo_id(s.id)
+        if rid in task.base:
+            branches.setdefault(rid, s.default_branch)
     repos: dict[str, Path] = {}
     if task.source == "estate":
         target = tmp / "estate"
         _run([sys.executable, str(origin / "init_estate.py"), str(target)], tmp)
-        repos = {rid: target / rid for rid in task.base}
+        repos = {rid: target / rid for rid in task.base if rid in branches}
+        for rid, repo in repos.items():
+            _git(repo, "checkout", "-q", "-B", branches[rid], task.base[rid])
     else:
-        for rid in task.base:
+        for rid, branch in branches.items():
             dst = tmp / "repos" / rid
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            _git(tmp, "clone", "-q", str(origin), str(dst))
-            _git(dst, "remote", "remove", "origin")
+            dst.mkdir(parents=True)
+            _git(dst, "init", "-q", "-b", branch)
+            _git(
+                dst, "fetch", "-q", "--no-tags", "--no-write-fetch-head", "--update-head-ok",
+                str(origin), f"{task.base[rid]}:refs/heads/{branch}",
+            )  # fmt: skip
+            _git(dst, "checkout", "-q", "-f", branch)
+            _git(dst, "reflog", "expire", "--expire=now", "--all")
+            _git(dst, "gc", "-q", "--prune=now")
             repos[rid] = dst
-    ids = WorkspaceManager(tmp / "ids", cfg.systems, config_dir)
-    systems: list[SystemConfig] = []
-    branches: dict[str, str] = {}
-    for s in cfg.systems:
-        rid = ids.repo_id(s.id)
-        if rid in repos:
-            systems.append(s.model_copy(update={"repo": str(repos[rid])}))
-            branches.setdefault(rid, s.default_branch)
+    systems = [
+        s.model_copy(update={"repo": str(repos[ids.repo_id(s.id)])})
+        for s in cfg.systems
+        if ids.repo_id(s.id) in repos
+    ]
     missing = sorted(set(task.systems) - {s.id for s in systems})
     if missing:
         raise ValueError(
             f"task {task.id}: systems not in the configuration's repositories: {missing}"
         )
-    base: dict[str, str] = {}
-    for rid, repo in repos.items():
-        if rid not in branches:
-            continue
-        _git(repo, "checkout", "-q", "-B", branches[rid], task.base[rid])
-        base[rid] = _git(repo, "rev-parse", "HEAD")
+    base = {rid: _git(repo, "rev-parse", "HEAD") for rid, repo in repos.items()}
     kept = {s.id for s in systems}
     checks = [c for c in cfg.checks if set(c.systems) <= kept]
     tcfg = cfg.model_copy(update={"systems": systems, "checks": checks, "auto_approve": []})

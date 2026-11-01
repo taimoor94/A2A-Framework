@@ -37,6 +37,8 @@ def _pct(n: int, total: int) -> str:
 
 
 def matched_budget_line(results: Iterable[BenchResult]) -> str:
+    """vsc against single on the tasks where single's token budget was exactly the vsc run's
+    recorded tokens; tasks both modes ran with another budget are counted and named."""
     by_mode: dict[str, dict[str, BenchResult]] = {}
     for r in results:
         by_mode.setdefault(r.mode, {})[r.task_id] = r
@@ -44,22 +46,45 @@ def matched_budget_line(results: Iterable[BenchResult]) -> str:
     both = sorted(set(vsc) & set(single))
     if not both:
         return "Matched budget: no task was run in both vsc and single mode."
-    n = len(both)
-    v = sum(vsc[t].solved for t in both)
-    s = sum(single[t].solved for t in both)
-    vt = _mean([vsc[t].tokens for t in both])
-    st = _mean([single[t].tokens for t in both])
-    return (
-        f"Matched budget: on {n} task{'s' if n != 1 else ''} run in both modes, vsc solved "
-        f"{v}/{n} ({_pct(v, n)}) and single solved {s}/{n} ({_pct(s, n)}), single's token budget "
-        f"being vsc's recorded tokens (mean tokens: vsc {vt:.0f}, single {st:.0f})."
+    matched = [t for t in both if single[t].budget_tokens == vsc[t].tokens]
+    unmatched = [t for t in both if t not in matched]
+    tail = (
+        f" Left out, run in both modes with a different budget: {len(unmatched)} "
+        f"({', '.join(unmatched)})."
+        if unmatched
+        else ""
     )
+    if not matched:
+        return (
+            "Matched budget: no task ran in single mode with vsc's recorded tokens as its budget."
+            + tail
+        )
+    n = len(matched)
+    v = sum(vsc[t].solved for t in matched)
+    s = sum(single[t].solved for t in matched)
+    vt = _mean([vsc[t].tokens for t in matched])
+    st = _mean([single[t].tokens for t in matched])
+    return (
+        f"Matched budget: on {n} task{'s' if n != 1 else ''} where single's token budget equalled "
+        f"vsc's recorded tokens, vsc solved {v}/{n} ({_pct(v, n)}) and single solved {s}/{n} "
+        f"({_pct(s, n)}) (mean tokens: vsc {vt:.0f}, single {st:.0f})." + tail
+    )
+
+
+METHOD = (
+    "Method overrides (identical for every task): both modes are told the affected-repository "
+    "set (the task's systems); in vsc mode privileged steps are removed from the plan and the "
+    "task's acceptance tests and budget replace the ones intake produced (the planner sees the "
+    "acceptance tests' names, never their contents); single is unconfined in one workspace "
+    "holding every repository; single's token budget is the vsc run's recorded tokens "
+    "(planner and workers) for the task."
+)
 
 
 def report(results: Iterable[BenchResult], out: Path) -> str:
     """The Markdown report, also written to ``out/report.md``."""
     items = list(results)
-    lines = ["# VSC benchmark report", ""]
+    lines = ["# VSC benchmark report", "", METHOD, ""]
     classes: tuple[str, ...] = get_args(FailureClass)
     for mode in [m for m in _ORDER if m in _MODES]:
         rs = [r for r in items if r.mode == mode]

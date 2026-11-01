@@ -1,25 +1,43 @@
-"""The injection suite: untrusted content cannot steer a job.
+"""The injection suite: what untrusted text and an acting worker can and cannot do to a job.
 
-Each case (``tests/vsc/injection/*.yaml``) is a two-repository fixture plus a request where the
-request, a repository file or the worker's own output carries instructions: push to origin,
-skip approval, add a deploy step, read ``~/.ssh``, mark the check as passed. The job runs with
-the scripted planner, so the test is deterministic: the attack surface here is the runner, the
-verifier and the gate (what the system *does* with untrusted text), not the planner's judgement,
-which ``AgentPlanner``'s own prompts and ``guard_replan`` cover.
+Each case (``tests/vsc/injection/*.yaml``) is a two-repository fixture plus a request. In the
+*text* cases the request, a repository file or the worker's own output carries instructions
+(push to origin, skip approval, add a deploy step, read ``~/.ssh``, mark the check as passed);
+in the *action* cases the fake worker acts on such an instruction itself (writes outside its
+system path, runs ``git push``, copies a file from outside the repository into it).
 
-Per case: the receipt's ``plan_hash`` is the hash of the plan the planner produced (no step
-added); no step outside that plan ran; no privileged step executed, and any that passed has an
-approval row (none of the cases configures auto-approval); no ``git push`` ran (a ``git`` shim
-first on ``PATH`` for every subprocess records each call and refuses ``push``) and the origin
-remotes are unchanged; the injected text is in no audit row's detail; a canary private key in
-``$HOME/.ssh`` appears nowhere in the receipt, the audit log or the workspaces; the job ends as
-the case expects (a wrong change stays failed whatever the text says); ``verify_receipt`` is
-clean.
+What the suite proves, with the scripted planner (deterministic on purpose):
 
-Case keys: ``id``, ``surface`` (request | file | worker), ``injected`` (the instruction text),
-``repo_files`` (``{system: {path: content}}``, ``{injected}`` replaced), ``change`` (the files the
-worker writes, default a correct ``greet.py``), ``privileged`` (privileged step kinds the plan
-adds after the edits), ``expect`` (accepted | failed | awaiting_approval).
+- the runner, the verifier and the gate never act on text: the receipt's ``plan_hash`` is the
+  hash of the plan the planner produced, no step outside it ran, no privileged step executed
+  without an approval (none of the cases configures auto-approval, so none executed), a wrong
+  change stays failed whatever the text claims, and ``verify_receipt`` is clean;
+- audit hygiene: worker and repository text never reaches an audit row's detail, and a canary
+  private key in ``$HOME/.ssh`` never reaches the audit log or the receipt;
+- confinement by path: a worker that writes outside its system's ``path`` fails the step's
+  ``path_confinement`` check, so the job fails and nothing is merged.
+
+What it does not test: the planner's judgement (a model planner reading the same text is
+covered by ``AgentPlanner``'s prompts and ``guard_replan``, not here) and OS-level sandboxing.
+Two known gaps of Phase 5a are recorded as cases rather than hidden:
+
+- ``action-push``: nothing in the product stops a worker process from running ``git push``. In
+  this suite a ``git`` shim first on ``PATH`` (for every subprocess: workspaces, workers,
+  checks) records every call and refuses ``push``, so the push is recorded and refused and the
+  origin is unchanged; the guard is the test's, not the product's. OS confinement arrives with
+  the sandboxes of Phase 5c.
+- ``action-exfil``: a worker can copy a file it can read (here the canary key) into its
+  workspace and the step still passes verification; nothing in 5a prevents it. The canary
+  still never reaches the audit log or the receipt.
+
+Case keys: ``id``, ``surface`` (request | file | worker | action), ``injected`` (the instruction
+text; in the request for request and action cases), ``worker`` (the fake worker's mode for an
+action case), ``repo_files`` (``{system: {path: content}}``, ``{injected}`` replaced),
+``system_path`` (both systems' ``path``, the fixture's files go under it), ``change`` (the files
+the worker writes, default a correct ``greet.py`` under the system path), ``privileged``
+(privileged step kinds the plan adds after the edits), ``expect`` (accepted | failed |
+awaiting_approval), ``expect_check`` (the check kind that must have failed), ``expect_push`` /
+``expect_exfil`` (the known gaps above).
 """
 
 from __future__ import annotations
@@ -28,6 +46,7 @@ import asyncio
 import dataclasses
 import json
 import os
+import posixpath
 import shutil
 import subprocess
 import sys
@@ -51,7 +70,10 @@ from .conftest import make_repo, worker
 
 CASE_DIR = Path(__file__).with_name("injection")
 CASES = sorted(CASE_DIR.glob("*.yaml"))
-CASE_KEYS = {"id", "surface", "injected", "repo_files", "change", "privileged", "expect"}
+CASE_KEYS = {
+    "id", "surface", "injected", "worker", "repo_files", "system_path", "change", "privileged",
+    "expect", "expect_check", "expect_push", "expect_exfil",
+}  # fmt: skip
 PY = sys.executable
 TESTS = [PY, "-B", "-m", "unittest", "discover", "-s", "tests"]
 GREET = "def hello():\n    return 'hi'\n"
@@ -60,14 +82,20 @@ TEST_X = (
     "class T(unittest.TestCase):\n    def test_hello(self):\n"
     "        self.assertEqual(hello(), 'hi')\n"
 )
-WHOLE = [
-    PY,
-    "-c",
-    (
-        "import os, sys; sys.exit(0 if all(os.path.exists(os.path.join(os.environ[k], 'greet.py'))"
-        " for k in ('VSC_WS_ALPHA', 'VSC_WS_BETA')) else 1)"
-    ),
-]
+
+
+def whole_check(sub: str) -> list[str]:
+    """The whole-system check: ``<sub>/greet.py`` exists in both workspaces."""
+    return [
+        PY,
+        "-c",
+        (
+            "import os, sys; sys.exit(0 if all(os.path.exists(os.path.join(os.environ[k], "
+            f"{sub!r}, 'greet.py')) for k in ('VSC_WS_ALPHA', 'VSC_WS_BETA')) else 1)"
+        ),
+    ]
+
+
 CANARY = "CANARY-PRIVATE-KEY-7f3a9c2e"
 SHIM = """#!/bin/sh
 printf '%s\\n' "$*" >> "{log}"
@@ -82,7 +110,8 @@ def load_case(path: Path) -> dict:
     case = yaml.safe_load(path.read_text())
     assert set(case) <= CASE_KEYS and {"id", "surface", "injected", "expect"} <= set(case), path
     assert case["id"] == path.stem
-    assert case["surface"] in ("request", "file", "worker")
+    assert case["surface"] in ("request", "file", "worker", "action")
+    assert ("worker" in case) == (case["surface"] == "action"), path
     assert case["expect"] in ("accepted", "failed", "awaiting_approval")
     return case
 
@@ -90,7 +119,8 @@ def load_case(path: Path) -> dict:
 def test_the_suite_covers_every_surface_and_instruction():
     cases = [load_case(p) for p in CASES]
     assert len(cases) >= 8
-    assert {c["surface"] for c in cases} == {"request", "file", "worker"}
+    assert {c["surface"] for c in cases} == {"request", "file", "worker", "action"}
+    assert {c.get("worker") for c in cases} >= {"write-outside", "push", "exfil"}
     text = " ".join(c["injected"].lower() for c in cases)
     for phrase in ("push", "skip approval", "deploy step", "~/.ssh", "mark the check as passed"):
         assert phrase in text, phrase
@@ -128,9 +158,9 @@ def git(repo: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-def fixture_repo(tmp: Path, name: str, extra: dict[str, str]) -> tuple[Path, Path]:
-    """A repository with a bare ``origin`` remote holding its ``main``."""
-    files = {".gitignore": "__pycache__/\n", "tests/test_x.py": TEST_X, **extra}
+def fixture_repo(tmp: Path, name: str, extra: dict[str, str], sub: str) -> tuple[Path, Path]:
+    """A repository (its tests under ``sub``) with a bare ``origin`` remote holding ``main``."""
+    files = {".gitignore": "__pycache__/\n", f"{sub}/tests/test_x.py": TEST_X, **extra}
     repo = make_repo(tmp, name, files)
     remote = tmp / f"{name}-origin.git"
     git(tmp, "init", "-q", "--bare", str(remote))
@@ -166,8 +196,9 @@ async def test_injection_cases(path, tmp_path, monkeypatch):
         sid: {rel: c.replace("{injected}", injected) for rel, c in files.items()}
         for sid, files in (case.get("repo_files") or {}).items()
     }
-    alpha, alpha_origin = fixture_repo(tmp_path, "alpha", repo_files.get("alpha", {}))
-    beta, beta_origin = fixture_repo(tmp_path, "beta", repo_files.get("beta", {}))
+    sub = case.get("system_path", ".")
+    alpha, alpha_origin = fixture_repo(tmp_path, "alpha", repo_files.get("alpha", {}), sub)
+    beta, beta_origin = fixture_repo(tmp_path, "beta", repo_files.get("beta", {}), sub)
     origin_heads = {r: git(r, "rev-parse", "main") for r in (alpha_origin, beta_origin)}
     base_heads = {r: git(r, "rev-parse", "main") for r in (alpha, beta)}
 
@@ -184,19 +215,21 @@ async def test_injection_cases(path, tmp_path, monkeypatch):
 
     cfg = VscConfig(
         systems=[
-            SystemConfig(id="alpha", repo=str(alpha), tests=TESTS),
-            SystemConfig(id="beta", repo=str(beta), tests=TESTS),
+            SystemConfig(id="alpha", repo=str(alpha), path=sub, tests=TESTS),
+            SystemConfig(id="beta", repo=str(beta), path=sub, tests=TESTS),
         ],
-        checks=[CheckConfig(id="whole", systems=["alpha", "beta"], run=WHOLE, timeout_s=60)],
+        checks=[
+            CheckConfig(id="whole", systems=["alpha", "beta"], run=whole_check(sub), timeout_s=60)
+        ],
         planner="scripted",
     )
-    mode = "inject" if case["surface"] == "worker" else "apply"
+    mode = {"worker": "inject", "action": case.get("worker")}.get(case["surface"], "apply")
     fake = worker(mode)
     if case["surface"] == "worker":
         fake = dataclasses.replace(fake, env={"VSC_INJECT_TEXT": injected})
-    change = case.get("change") or {"greet.py": GREET}
+    change = case.get("change") or {posixpath.join(sub, "greet.py"): GREET}
     request = "Add a hello() greeting that returns 'hi' to both services."
-    if case["surface"] == "request":
+    if case["surface"] in ("request", "action"):
         request += "\n" + injected
     request += "\nsystems: alpha, beta\n---FILES---\n" + json.dumps({"files": change})
 
@@ -255,18 +288,36 @@ async def test_injection_cases(path, tmp_path, monkeypatch):
         assert approved == set()
         assert {r: git(r, "rev-parse", "main") for r in (alpha, beta)} == base_heads
 
-        # no push: the shim saw git (so it was in the way) but never a push
+        # pushes: the shim saw git (so it was in the way); only the acting worker tried to push,
+        # and the shim refused it (a known 5a gap: the guard is the test's)
         calls = log.read_text().splitlines()
         assert calls, "the git shim was never used"
-        assert not [c for c in calls if "push" in c.split()], calls
+        pushes = [c for c in calls if "push" in c.split()]
+        if case.get("expect_push"):
+            assert pushes and all(c.split()[:3] == ["push", "origin", "HEAD"] for c in pushes)
+        else:
+            assert not pushes, calls
         assert {r: git(r, "rev-parse", "main") for r in (alpha_origin, beta_origin)} == origin_heads
+        for remote in (alpha_origin, beta_origin):  # the job branches were never pushed
+            assert git(remote, "for-each-ref", "--format=%(refname)") == "refs/heads/main"
 
         # the injected text never reaches the audit log; the canary key reaches nothing
         for r in rows:
             assert injected not in json.dumps(r["detail"]), r
         assert CANARY not in json.dumps(rows)
         assert CANARY not in json.dumps(receipt)
-        assert CANARY not in all_text(tmp_path / "ws")
+        if case.get("expect_exfil"):  # a known 5a gap: the copied key sits in the workspace
+            assert CANARY in all_text(tmp_path / "ws")
+            assert any(  # ... and passed verification
+                a["step_id"] == "edit-alpha" and a["state"] == "passed" for a in attempts
+            )
+        else:
+            assert CANARY not in all_text(tmp_path / "ws")
+        if case.get("expect_check"):
+            failed_kinds = {
+                c["kind"] for st in receipt["steps"] for c in st["checks"] if not c["passed"]
+            }
+            assert case["expect_check"] in failed_kinds, failed_kinds
 
         if case["expect"] == "failed":  # "mark the check as passed" changes nothing
             whole = [r for r in rows if r["action"] == "vsc.check" and "step" not in r["detail"]]

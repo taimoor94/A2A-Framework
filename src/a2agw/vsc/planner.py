@@ -14,11 +14,13 @@ from typing import Any, Protocol
 import httpx
 from a2a.client import ClientConfig, ClientFactory
 from a2a.types import Message, Part, Role, SendMessageRequest, TaskState
+from google.protobuf.json_format import MessageToDict
 from pydantic import ValidationError
 
 from a2agw.core.spi import InboundAdapter
 from a2agw.security.auth import AgentAccess
 from a2agw.serve.agent import AgentSpec, SkillSpec
+from a2agw.serve.executor import USAGE_KEY
 from a2agw.serve.host import AgentHost
 from a2agw.vsc.config import BudgetConfig, CheckConfig, SystemConfig, VscConfig
 from a2agw.vsc.plan import (
@@ -95,6 +97,10 @@ class Planner(Protocol):
         self, spec: ExecutableSpec, plan: Plan, failure: CheckResult, steps: list[dict]
     ) -> Decision: ...
 
+    def usage(self) -> tuple[int, int, float]:
+        """Cumulative (tokens_in, tokens_out, cost) of this planner's turns so far."""
+        ...
+
 
 def _decision(
     kind: str, text: str, step_id: str | None = None, plan: Plan | None = None
@@ -121,6 +127,9 @@ class ScriptedPlanner:
     def __init__(self, spec_for: Callable[[str], ExecutableSpec] | None = None) -> None:
         self._spec_for = spec_for
         self._failures = 0
+
+    def usage(self) -> tuple[int, int, float]:
+        return (0, 0, 0.0)
 
     async def intake(
         self, request: str, systems: list[SystemConfig], checks: list[CheckConfig]
@@ -176,6 +185,22 @@ class AgentPlanner:
         self._api_key = api_key
         self._http: httpx.AsyncClient | None = None
         self._client: Any = None
+        self._usage: tuple[int, int, float] = (0, 0, 0.0)
+
+    def usage(self) -> tuple[int, int, float]:
+        """Summed from each turn's task record (the ``a2agw.usage`` metadata the host's
+        executor stores on the task)."""
+        return self._usage
+
+    def _add_usage(self, task: Any) -> None:
+        recorded = MessageToDict(task.metadata).get(USAGE_KEY)
+        if isinstance(recorded, dict):
+            i, o, c = self._usage
+            self._usage = (
+                i + int(recorded.get("tokens_in", 0)),
+                o + int(recorded.get("tokens_out", 0)),
+                c + float(recorded.get("cost", 0.0)),
+            )
 
     async def aclose(self) -> None:
         if self._http is not None:
@@ -208,6 +233,7 @@ class AgentPlanner:
                 chunks.append(_text_of(ev.message))
             elif ev.HasField("task"):
                 task = ev.task
+                self._add_usage(task)
                 if task.status.state != TaskState.TASK_STATE_COMPLETED:
                     raise PlannerError(f"planner task ended in state {task.status.state}")
                 chunks.extend(_text_of(a) for a in task.artifacts)

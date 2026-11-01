@@ -654,3 +654,87 @@ async def test_whole_system_acceptance_file_outside_workspace_fails_check(env):
     reasons = [x["detail"]["reason"] for x in await env.whole_checks(job_id)]
     assert reasons and all("outside the workspace" in x for x in reasons), reasons
     assert not (env.tmp / "escape.txt").exists()
+
+
+class SeeingPlanner(AcceptancePlanner):
+    """Records the specs handed to plan and replan."""
+
+    def __init__(self, steps, acceptance) -> None:
+        super().__init__(steps, acceptance)
+        self.seen: list = []
+
+    async def plan(self, spec):
+        self.seen.append(spec)
+        return await super().plan(spec)
+
+    async def replan(self, spec, plan, failure, steps):
+        self.seen.append(spec)
+        return await super().replan(spec, plan, failure, steps)
+
+
+async def test_planner_sees_acceptance_names_not_contents(env):
+    repo = make_repo(env.tmp, "repo-a", REPO_FILES)
+    cfg = VscConfig(systems=[sys_cfg("alpha", repo)], budgets=BudgetConfig(attempts=2))
+    hidden = "import unittest\n\n\nclass H(unittest.TestCase):\n    def test_no(self):\n        self.fail('HIDDEN-BODY')\n"
+    acceptance = [AcceptanceTest(id="hidden", system="alpha", files={"tests/test_h.py": hidden})]
+    planner = SeeingPlanner([edit("alpha")], acceptance)
+    r = env.runner(cfg, planner, [worker("apply")])
+    job_id = await r.submit("greet", owner="key:a")
+    job = await r.run(job_id)
+    # verification ran the real (failing) body ...
+    assert job["state"] == "failed", job
+    steps = await env.store.attempts(job_id)
+    checks = json.loads(steps[-1]["result_json"])["checks"]
+    assert any(c["kind"] == "reproduction_after" and not c["passed"] for c in checks)
+    # ... while the planner only ever saw the file's name
+    assert len(planner.seen) >= 2  # plan and at least one replan
+    for spec in planner.seen:
+        (t,) = spec.acceptance
+        assert (t.id, t.system, t.check, t.run) == ("hidden", "alpha", None, None)
+        assert t.files == {"tests/test_h.py": ""}
+    assert json.loads(job["spec_json"])["acceptance"][0]["files"]["tests/test_h.py"] == hidden
+
+
+class UsagePlanner(FixedPlanner):
+    """Every planner call costs 10 tokens in, 5 out and 0.01."""
+
+    def __init__(self, steps, budgets=None) -> None:
+        super().__init__(steps, budgets)
+        self._u = (0, 0, 0.0)
+
+    def _spend(self) -> None:
+        i, o, c = self._u
+        self._u = (i + 10, o + 5, c + 0.01)
+
+    def usage(self):
+        return self._u
+
+    async def intake(self, request, systems, checks):
+        self._spend()
+        return await super().intake(request, systems, checks)
+
+    async def plan(self, spec):
+        self._spend()
+        return await super().plan(spec)
+
+
+async def test_planner_usage_is_charged_to_the_job(env):
+    cfg = two_repo_cfg(env.tmp)
+    r = env.runner(cfg, UsagePlanner([edit("alpha"), edit("beta")]), [worker("apply")])
+    job_id = await r.submit("greet systems: alpha, beta", owner="key:a")
+    job = await r.run(job_id)
+    assert job["state"] == "accepted", job
+    assert (job["tokens_in"], job["tokens_out"]) == (20, 10)  # intake + plan; workers report 0
+    assert job["cost"] == pytest.approx(0.02)
+
+
+async def test_planner_usage_counts_against_the_budget(env):
+    cfg = two_repo_cfg(env.tmp, budgets=BudgetConfig(tokens=25))
+    r = env.runner(cfg, UsagePlanner([edit("alpha"), edit("beta")]), [worker("apply")])
+    job_id = await r.submit("greet systems: alpha, beta", owner="key:a")
+    job = await r.run(job_id)
+    assert (job["state"], job["reason"]) == ("failed", "budget"), (
+        job
+    )  # 15 after intake, 30 after plan
+    limits = [x["detail"].get("limit") for x in await env.rows("vsc.job", job_id)]
+    assert "tokens" in limits
