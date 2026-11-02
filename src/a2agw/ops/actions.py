@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -55,7 +56,15 @@ from a2a.types import (
 from google.protobuf.json_format import MessageToDict
 
 from a2agw.consult.carddiff import card_diff
-from a2agw.consult.registry import PartnerRecord, PartnerRegistry, ReloadConflict, card_hash
+from a2agw.consult.registry import (
+    APPROVE_DISABLED,
+    CARD_CHANGED,
+    PENDING_CHANGED,
+    PartnerRecord,
+    PartnerRegistry,
+    ReloadConflict,
+    card_hash,
+)
 from a2agw.ops.audit import AuditEvent, AuditLog
 from a2agw.security.policy import PolicyError, parse_policy, policy_hash
 from a2agw.security.principal import Principal, PrincipalUser
@@ -82,6 +91,25 @@ MAX_ANSWER_BYTES = 32 * 1024  # an operator's answer, UTF-8
 ANSWERED_BY_KEY = "a2agw.answered_by"  # message metadata: who answered for the owner
 TASK_FINAL = "task is final"
 NOT_WAITING = "task is not waiting for input"
+ANSWER_EMPTY = "text must be a non-empty string"
+ANSWER_TOO_LONG = f"text is longer than {MAX_ANSWER_BYTES} bytes"
+ANSWER_NUL = "text contains NUL"
+ANSWER_SURROGATE = "text contains a lone surrogate"
+# ValueError texts of the operations that name no input value: a control-plane command's
+# failure reports one of these as its detail, any other ValueError only by its class
+# (``cp_client._failure``; a pydantic ValidationError quotes its input).
+REFUSAL_REASONS = frozenset(
+    {
+        ANSWER_EMPTY,
+        ANSWER_TOO_LONG,
+        ANSWER_NUL,
+        ANSWER_SURROGATE,
+        APPROVE_DISABLED,
+        PENDING_CHANGED,
+        CARD_CHANGED,
+    }
+)
+_SURROGATE = re.compile("[\ud800-\udfff]")
 
 
 class TaskNotFound(LookupError):
@@ -702,13 +730,16 @@ async def cancel_task(
 
 def check_answer(text: Any) -> str:
     """An answer's text: a non-empty string of at most ``MAX_ANSWER_BYTES`` (UTF-8), with no
-    NUL. ValueError otherwise (the message never quotes it)."""
+    NUL and no lone surrogate (not encodable as UTF-8). ValueError otherwise (the message
+    never quotes it)."""
     if not isinstance(text, str) or not text:
-        raise ValueError("text must be a non-empty string")
+        raise ValueError(ANSWER_EMPTY)
     if len(text.encode("utf-8", "surrogatepass")) > MAX_ANSWER_BYTES:
-        raise ValueError(f"text is longer than {MAX_ANSWER_BYTES} bytes")
+        raise ValueError(ANSWER_TOO_LONG)
     if "\x00" in text:
-        raise ValueError("text contains NUL")
+        raise ValueError(ANSWER_NUL)
+    if _SURROGATE.search(text):
+        raise ValueError(ANSWER_SURROGATE)
     return text
 
 

@@ -108,6 +108,7 @@ Action = Literal[
     "cp.apikey.revoke",
     "cp.denied",
     "cp.audit.export",
+    "cp.audit_seq_reset",
 ]
 ACTIONS: frozenset[str] = frozenset(get_args(Action))
 DETAIL_KEYS = frozenset(
@@ -135,6 +136,7 @@ DETAIL_KEYS = frozenset(
         "user",  # control plane: the user id a row is about (cp.user.update)
         "policy",  # control plane: the policy id a row is about (cp.policy.*, cp.assign)
         "format",  # control plane: the format of an audit export (csv, jsonl)
+        "generation",  # control plane: a gateway's audit generation (cp.audit_seq_reset)
     }
 )
 # PartnerRegistry change events -> audit actions (``registry_audit_action``).

@@ -454,10 +454,15 @@ class ControlPlaneConfig(BaseModel):
     @field_validator("url")
     @classmethod
     def _https(cls, v: str) -> str:
+        # no userinfo (check_url_syntax), query or fragment: the URL is logged at connect,
+        # and the channel's paths are appended to it
         try:
             check_url_syntax(v)
         except UnsafeURL as e:
             raise ValueError(str(e)) from None
+        parts = urlsplit(v)
+        if parts.query or parts.fragment or "?" in v or "#" in v:
+            raise ValueError("control_plane.url must not have a query or a fragment")
         return _https_only(v).rstrip("/")
 
     @field_validator("manage")

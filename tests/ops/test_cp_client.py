@@ -126,6 +126,8 @@ class FakeCP:
         self.live: asyncio.Queue[bytes] = asyncio.Queue()
         self.acked = 0
         self.ack: Callable[[dict[str, Any]], int] = self._ack_all
+        # a status to refuse a report with (by its body), or None to take it
+        self.refuse: Callable[[dict[str, Any]], int | None] = lambda body: None
         self.app = Starlette(
             routes=[
                 Route("/cp/v1/stream", self.stream, methods=["GET"]),
@@ -174,9 +176,10 @@ class FakeCP:
         body = await request.json()
         if self.report_hang is not None:
             await self.report_hang.wait()
-        if self.report_status != 200:  # refused: not taken (the gateway sends it again)
+        status = self.refuse(body) or self.report_status
+        if status != 200:  # refused: not taken (the gateway sends it again)
             self.refused += 1
-            return JSONResponse({"error": "nope"}, status_code=self.report_status)
+            return JSONResponse({"error": "nope"}, status_code=status)
         self.reports.append(body)
         return JSONResponse(
             {
@@ -495,6 +498,138 @@ async def test_expired_command_not_run(gateway, cp):
     await until(lambda: cp.results())
     assert cp.results() == [{"id": "cmd-old", "status": "failed", "result": {"error": "expired"}}]
     assert await audit_rows(host, "task.reap") == []
+
+
+async def test_command_expired_while_waiting_for_its_slot_is_not_run(gateway, cp, clock):
+    """Expiry is checked again once a command has a slot: one that waited past its
+    expires_at behind running commands is reported expired, not run late."""
+    host, conn = await gateway()
+    await until(lambda: conn.status()["connected"])
+    conn._command_gate = gate = asyncio.Semaphore(1)
+    await gate.acquire()  # every slot busy
+    cp.push("command", command("cmd-late", "tasks.reap", {"agent_id": "ghost"}, ttl=30))
+    await until(lambda: any(t.get_name() == "a2agw:cp-cmd-late" for t in conn._work))
+    clock.t += 60  # it waits past its expiry
+    gate.release()
+    await until(lambda: cp.results())
+    assert cp.results() == [{"id": "cmd-late", "status": "failed", "result": {"error": "expired"}}]
+    assert await audit_rows(host, "task.reap") == []
+
+
+def test_failure_reports_class_names_and_known_reasons_only():
+    """A refusal's detail is a known reason from a2agw.ops.actions or the error class: a
+    pydantic ValidationError (whose text quotes the input) never reaches the report."""
+    from pydantic import BaseModel, ValidationError
+
+    from a2agw.ops import actions
+    from a2agw.ops.cp_client import _failure
+
+    class M(BaseModel):
+        n: int
+
+    try:
+        M.model_validate({"n": "SECRET-INPUT"})
+    except ValidationError as e:
+        validation = e
+    assert _failure(validation) == {"error": "refused", "detail": "ValidationError"}
+    assert _failure(ValueError("token SECRET-INPUT is bad")) == {
+        "error": "refused",
+        "detail": "ValueError",
+    }
+    for reason in sorted(actions.REFUSAL_REASONS):
+        assert _failure(ValueError(reason)) == {"error": "refused", "detail": reason}
+    try:
+        actions.check_answer("a\x00b")
+    except ValueError as e:
+        assert _failure(e) == {"error": "refused", "detail": "text contains NUL"}
+
+
+def test_control_plane_url_carries_no_userinfo_query_or_fragment():
+    """The URL is logged (at connect) and paths are appended to it."""
+    for bad in (
+        "https://user:pw@cp.example.com",
+        "https://user@cp.example.com",
+        "https://cp.example.com/?token=SECRET",
+        "https://cp.example.com/#frag",
+    ):
+        with pytest.raises(ValueError) as e:
+            ControlPlaneConfig(url=bad, token_env=TOKEN_ENV)
+        assert "SECRET" not in str(e.value).split("input_value")[0]
+    assert ControlPlaneConfig(url="https://cp.example.com/base/", token_env=TOKEN_ENV).url == (
+        "https://cp.example.com/base"
+    )
+
+
+async def test_ack_never_beyond_the_rows_sent(gateway, cp):
+    """An acknowledgement above the highest seq the report carried moves the cursor only
+    to that seq: rows not sent yet are never skipped."""
+    sent: list[int] = []
+
+    def ack(body: dict[str, Any]) -> int:
+        sent.extend(r["seq"] for r in body.get("audit", []))
+        return 10**6
+
+    cp.ack = ack
+    host, conn = await gateway()
+    await until(lambda: sent and conn._acked == max(sent))
+    assert conn._acked < 10**6
+    assert host.engine is not None
+    store = CpStateStore(host.engine)
+    for _ in range(200):  # saved right after the response is read
+        if (saved := await store.get("audit_acked_seq")) is not None:
+            break
+        await asyncio.sleep(0.005)
+    assert saved is not None and saved <= max(sent) < 10**6
+
+
+def _health_parts(body: dict[str, Any]) -> set[str]:
+    return {"health", "metrics", "info"} & body.keys()
+
+
+async def test_oversize_health_is_dropped_after_413_at_batch_one(gateway, cp, caplog):
+    """A report refused with 413 down to one item: health and metrics leave it (then
+    info), so events still go; logged once."""
+    from a2agw.ops.bus import GatewayEvent
+
+    caplog.set_level(logging.WARNING, logger="a2agw.ops.cp_client")
+    cp.refuse = lambda body: 413 if {"health", "metrics"} & body.keys() else None
+    host, _conn = await gateway()
+    host.bus.publish(GatewayEvent(kind="task.state", agent_id="alpha", data={"task_id": "t1"}))
+    await until(lambda: any(r.get("events") for r in cp.reports))
+    assert any("info" in r for r in cp.reports)  # info alone still fits
+    assert all(not {"health", "metrics"} & r.keys() for r in cp.reports)
+    dropped = [r for r in caplog.records if "health and metrics" in r.getMessage()]
+    assert len(dropped) == 1
+
+
+async def test_a_refused_section_does_not_block_the_rest(gateway, cp, caplog):
+    """A 4xx other than 401/413 for a report with the health section: the next reports
+    leave it out (health and metrics, then info), so events, audit rows and results still
+    go; each step is logged once."""
+    from a2agw.ops.bus import GatewayEvent
+
+    caplog.set_level(logging.WARNING, logger="a2agw.ops.cp_client")
+    cp.refuse = lambda body: 422 if _health_parts(body) else None
+    host, _conn = await gateway()
+    host.bus.publish(GatewayEvent(kind="task.state", agent_id="alpha", data={"task_id": "t1"}))
+    await until(lambda: any(r.get("events") for r in cp.reports))
+    await until(lambda: any(r.get("audit") for r in cp.reports))
+    assert all(not _health_parts(r) for r in cp.reports)
+    messages = [r.getMessage() for r in caplog.records]
+    assert len([m for m in messages if "health and metrics" in m]) == 1
+    assert len([m for m in messages if "gateway info" in m]) == 1
+
+
+async def test_a_refused_report_is_logged_once_and_backs_off(gateway, cp, sleeps, caplog):
+    """A report the control plane keeps refusing (4xx) is logged once, and the retries back
+    off instead of resending at the report interval."""
+    caplog.set_level(logging.WARNING, logger="a2agw.ops.cp_client")
+    cp.report_status = 400
+    _host, _conn = await gateway(report_interval_s=1.0)
+    await until(lambda: cp.refused >= 8)
+    refused = [r for r in caplog.records if "retrying with back-off" in r.getMessage()]
+    assert len(refused) == 1
+    assert max(sleeps) >= 8.0  # backed off
 
 
 # -- connection ----------------------------------------------------------------------------
@@ -911,3 +1046,11 @@ async def test_a_report_carries_at_most_8_task_get_results(gateway, cp):
     assert set(second[0]) == {"id", "status", "result"}  # the kind is not reported
     conn._sent_results(second)
     assert conn._take_results() == []
+
+
+def test_check_answer_refuses_a_lone_surrogate():
+    from a2agw.ops import actions
+
+    with pytest.raises(ValueError, match="lone surrogate"):
+        actions.check_answer("yes \ud800")
+    assert actions.check_answer("yes \U0001f600") == "yes \U0001f600"

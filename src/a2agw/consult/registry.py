@@ -71,6 +71,12 @@ REMOTE_TRIES = 5  # apply_remote: plans retried when the registry changed while 
 LOCK_RETRY_S = 0.02
 
 
+# Refusals of ``approve`` (static texts: reported as is to the control plane)
+APPROVE_DISABLED = "partner is disabled; re-enable explicitly before approving"
+PENDING_CHANGED = "pending card changed since it was reviewed"
+CARD_CHANGED = "card changed since it was reviewed"
+
+
 class PartnersFileBusy(TimeoutError):
     """Another process held the partners file lock for longer than the registry waits."""
 
@@ -469,10 +475,10 @@ class PartnerRegistry:
     def approve(self, id: str, expected_hash: str | None = None) -> PartnerRecord:
         rec = self.get(id)
         if rec.status == "disabled":
-            raise ValueError("partner is disabled; re-enable explicitly before approving")
+            raise ValueError(APPROVE_DISABLED)
         if rec.pending_card is not None:
             if expected_hash is not None and expected_hash != card_hash(rec.pending_card):
-                raise ValueError("pending card changed since it was reviewed")
+                raise ValueError(PENDING_CHANGED)
             staged = rec.model_copy(
                 update={"card": rec.pending_card, "signed_key_id": rec.pending_key_id}
             )
@@ -489,7 +495,7 @@ class PartnerRegistry:
             rec.signed_key_id = rec.pending_key_id
             rec.pending_card = rec.pending_key_id = None
         elif expected_hash is not None and expected_hash != rec.card_hash:
-            raise ValueError("card changed since it was reviewed")
+            raise ValueError(CARD_CHANGED)
         rec.status = "active"
         self._changed(rec, "approved")
         return rec

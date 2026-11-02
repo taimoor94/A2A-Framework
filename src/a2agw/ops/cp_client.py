@@ -20,7 +20,8 @@ three things:
   ``cp:<the command's actor>`` and its result is reported (``done`` or ``failed`` with
   ``{"error": ...}``). A command whose ``expires_at`` has passed (control-plane time, from
   the ``hello`` frame's ``server_time``) is not run: it is reported ``failed`` with
-  ``{"error": "expired"}``. Commands are delivered at most once; a result the control plane
+  ``{"error": "expired"}``; so is one whose expiry passed while it waited for one of the
+  ``COMMAND_CONCURRENCY`` slots (checked again once it has one). Commands are delivered at most once; a result the control plane
   ignores (it expired there meanwhile) counts in its ``dropped``.
 - **Reports.** Every ``report_interval_s`` it posts ``/cp/v1/report``: up to
   ``REPORT_EVENTS_MAX`` bus events (from a subscription of ``EVENT_QUEUE_MAX`` events; a
@@ -32,7 +33,9 @@ three things:
   effective limits, see ``limits_info``). A command result larger than
   ``result_cap(kind)`` (8 KiB, 64 KiB for ``task.get``) is reported as ``{"truncated": true}``. ``audit_acked_seq`` moves
   only from the response's ``acked_audit_seq``: rows not acknowledged are sent again (the
-  control plane stores them idempotently). A report that fails is sent again, whole.
+  control plane stores them idempotently), and never past the rows the report carried. A
+  report that fails is sent again, whole; one refused with a 4xx (a 413 already at one
+  item) leaves out health and metrics, then the info, from the next reports (``_refused``).
 
 Fail static: with managed sections, the host's startup calls ``restore`` before it serves.
 The last applied state is loaded from ``a2agw_cp_state`` and put in force again (local
@@ -118,6 +121,7 @@ STOP_TIMEOUT_S = 5.0
 FINAL_REPORT_S = 2.0  # stop: the last report's share of STOP_TIMEOUT_S
 CANCEL_WAIT_S = 1.0
 COMMAND_CONCURRENCY = 8
+SHED_RETRY_S = 300.0  # a refused health section is sent in full again after this
 APPLIED_PENDING_MAX = 16  # applied / rejected outcomes kept for reporting
 ACTOR = "control_plane"  # the actor of state changes this connector makes
 LOCKDOWN_RULE_ID = "cp:unconfigured"
@@ -379,8 +383,10 @@ def _failure(exc: BaseException) -> dict[str, Any]:
         return {"error": "refused", "detail": exc.reason}
     if isinstance(exc, CardFetchError | UnsafeURL):
         return {"error": "card", "detail": type(exc).__name__}
-    if isinstance(exc, ValueError):
-        return {"error": "refused", "detail": str(exc)[:256]}
+    if isinstance(exc, ValueError):  # a known reason as is, else only its class
+        reason = str(exc)
+        known = reason in actions.REFUSAL_REASONS and type(exc) is ValueError
+        return {"error": "refused", "detail": reason if known else type(exc).__name__}
     return {"error": "internal", "detail": type(exc).__name__}
 
 
@@ -431,6 +437,9 @@ class ControlPlaneConnector:
         # applied / rejected outcomes not yet reported, oldest first (one per report)
         self._pending_applied: list[dict[str, Any]] = []
         self._last_health: float | None = None
+        self._shed = 0  # 1: reports leave out health and metrics, 2: the gateway info too
+        self._shed_at = 0.0
+        self._warned: set[str] = set()  # report refusals logged once
         self._loops: list[asyncio.Task[None]] = []
         self._work: set[asyncio.Task[Any]] = set()
         self._command_gate = asyncio.Semaphore(COMMAND_CONCURRENCY)
@@ -928,6 +937,10 @@ class ControlPlaneConnector:
             who = data.get("actor")
             actor = f"cp:{who}" if isinstance(who, str) and who else f"cp:{cid}"
             async with self._command_gate:
+                now = self._server_now()  # it may have waited for its slot past expiry
+                if now is None or expires_at <= now:
+                    self._record_result(cid, kind, "failed", {"error": "expired"})
+                    return
                 try:
                     status, result = "done", await COMMANDS[kind](self.host, args, actor)
                 except Exception as exc:  # noqa: BLE001 - every failure is reported
@@ -1026,15 +1039,20 @@ class ControlPlaneConnector:
         health_due = (
             self._last_health is None or now - self._last_health >= self.cfg.health_interval_s
         )
-        if health_due:
+        if health_due and self._shed and now - self._shed_at >= SHED_RETRY_S:
+            self._shed = 0  # try the whole health section again now and then
+        if health_due and self._shed < 1:
             body["health"] = {
                 "status": "waiting" if self.waiting_for_state else "ok",
                 "audit_errors": host.audit.audit_errors if host.audit is not None else 0,
                 **self.status(),
             }
             body["metrics"] = await host.metrics.snapshot_with_index(host.index)
+        if health_due and self._shed < 2:
             body["info"] = self._info()
         if not body:
+            if health_due:
+                self._last_health = now
             return True
         token = self._token()
         if token is None:
@@ -1048,9 +1066,12 @@ class ControlPlaneConnector:
         )
         if r.status_code == 401:
             self._unauthorized()
-        if r.status_code == 413:
+        if r.status_code == 413 and self._batch > 1:
             self._batch = max(1, self._batch // 2)  # smaller reports until one fits
             self._error("http_413")
+            return False
+        if 400 <= r.status_code < 500:  # 413 at one item, or a refusal: sent again, it fails
+            self._refused(r.status_code, body, now)
             return False
         if r.status_code != 200:
             self._error(f"http_{r.status_code}")
@@ -1066,8 +1087,50 @@ class ControlPlaneConnector:
             acked = r.json().get("acked_audit_seq")
         except (ValueError, AttributeError):
             acked = None
+        # never past the rows this report carried: a row not sent yet is never skipped
+        top = max(
+            (row["seq"] for row in body.get("audit", ()) if type(row.get("seq")) is int),
+            default=self._acked,
+        )
+        if type(acked) is int and acked > self._acked:
+            acked = min(acked, top)
         if type(acked) is int and acked > self._acked:
             self._acked = acked
             if self._store is not None:
                 await self._store.set(ACKED_KEY, acked)
         return True
+
+    def _refused(self, status: int, body: dict[str, Any], now: float) -> None:
+        """A report the control plane refused with a 4xx (a 413 already down to one item):
+        sending it again would fail again. With the health section in it, the next reports
+        leave out health and metrics, then the gateway info too (tried in full again after
+        ``SHED_RETRY_S``), so events, audit rows and results still go. Without it, the
+        report waits for the loop's back-off. Each case is logged once."""
+        self._error(f"http_{status}")
+        if {"health", "metrics"} & body.keys():
+            self._shed, self._shed_at = 1, now
+            self._warn_once(
+                "shed-health",
+                "control plane refused a report (http_%d): health and metrics are left out "
+                "of reports for now",
+                status,
+            )
+        elif "info" in body:
+            self._shed, self._shed_at = 2, now
+            self._warn_once(
+                "shed-info",
+                "control plane refused a report (http_%d): the gateway info is left out of "
+                "reports for now",
+                status,
+            )
+        else:
+            self._warn_once(
+                f"refused-{status}",
+                "control plane refused a report (http_%d); retrying with back-off",
+                status,
+            )
+
+    def _warn_once(self, key: str, message: str, *args: Any) -> None:
+        if key not in self._warned:
+            self._warned.add(key)
+            log.warning(message, *args)
