@@ -829,3 +829,39 @@ async def test_concurrent_assignments_leave_one_policy(pg_url, make_app, run_app
         assert [tuple(r) for r in rows] == [(p2, 1)]
         state = await channel.compute_desired(store, gid)
         assert parse_policy(state.policy) == parse_policy(LONE_DENY)
+
+
+async def test_an_assignment_and_its_gateway_flag_commit_together(
+    db_url, make_app, run_app, monkeypatch
+):
+    """Flagging the gateways is part of the write's transaction (assign, new version)."""
+    from sqlalchemy import func, select
+
+    from a2agw.control.store import ASSIGNMENTS, POLICY_VERSIONS
+
+    async def fails(*_args: Any, **_kw: Any) -> None:
+        raise RuntimeError("the database went away")
+
+    app = make_app(settings_for(db_url))
+    async with run_app(app) as c:
+        admin = await admin_key(app)
+        gid, _ = await app.state.store.create_gateway("edge-1", actor="t")
+        p0 = (await create(c, admin, "p0", ALLOW_ALL)).json()["id"]
+        p1 = (await create(c, admin, "p1", ALLOW_ALICE)).json()["id"]
+        assert (await assign(c, admin, gid, p0, None)).status_code == 200
+        monkeypatch.setattr(channel, "mark_dirty", fails)
+        assert (await assign(c, admin, gid, p1, None)).status_code == 500
+        r = await c.post(f"/api/v1/policies/{p0}/versions", json={"doc": LONE_DENY}, headers=admin)
+        assert r.status_code == 500
+        async with app.state.engine.connect() as conn:
+            policy = (
+                await conn.execute(
+                    select(ASSIGNMENTS.c.ref_id)
+                    .where(ASSIGNMENTS.c.gateway_id == gid)
+                    .where(ASSIGNMENTS.c.kind == "policy")
+                )
+            ).scalar_one()
+            versions = (
+                await conn.execute(select(func.count()).where(POLICY_VERSIONS.c.policy_id == p0))
+            ).scalar_one()
+        assert policy == p0 and versions == 1

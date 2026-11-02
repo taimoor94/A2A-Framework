@@ -2,8 +2,12 @@
 
 ``create_app(settings)`` returns the app. Its lifespan opens the database engine, initializes
 the store and the control plane's own audit chain (``cp_audit``), and runs the maintenance
-loop; on shutdown it stops the loop, drains the audit log, closes the HTTP client it owns and
-disposes the engine.
+loop; on shutdown it stops the loop (a pass already running finishes: passes run through
+``channel.Background``), ends open gateway streams, waits for their polls, drains the audit
+log, closes the HTTP client it owns and disposes the engine. An exit signal ends the open
+streams at once (``end_streams``), since the server waits for open responses before it runs
+that shutdown. Request bodies are capped at ``BODY_MAX_BYTES`` (``BodyLimit``; not
+``/cp/v1``), and JSON is answered ASCII-only (``a2agw.control.responses``).
 
 Errors have one shape, ``{"error": "<code>", "detail": "<message>"}``. Validation errors are
 422 with ``fields``: dotted paths of the offending inputs, never their values. Unexpected
@@ -33,7 +37,6 @@ require_fastapi()  # a one-line install hint instead of a bare ModuleNotFoundErr
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
 from starlette.datastructures import MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -50,14 +53,22 @@ from a2agw.control import (  # noqa: F401 - routes
     views,
 )
 from a2agw.control.rbac import ROUTES, Permission, public, route
+from a2agw.control.responses import JSONResponse
 from a2agw.control.settings import ControlSettings
 from a2agw.control.store import AUDIT_TABLE, ControlStore
 from a2agw.ops.audit import AuditLog
+from a2agw.serve.host import _on_exit_signal
 from a2agw.serve.store import create_engine
 
 log = logging.getLogger(__name__)
 
 MAINTENANCE_INTERVAL_S = 60.0
+# ``a2agw control serve``: how long uvicorn waits for open requests at shutdown before it
+# cancels them and runs the lifespan cleanup (open gateway streams end at once on an exit
+# signal, see ``end_streams``).
+GRACEFUL_SHUTDOWN_S = 10.0
+BODY_MAX_BYTES = 1024 * 1024  # every request body but /cp/v1's (``BodyLimit``)
+GATEWAY_PREFIX = "/cp/v1/"  # the report keeps its own cap (``limits.report_max_bytes``)
 OPENAPI_URL = "/api/openapi.json"
 
 _CODES = {
@@ -98,11 +109,14 @@ class Maintenance:
         *,
         clock: Callable[[], float],
         interval_s: float,
+        background: channel.Background | None = None,
     ) -> None:
         self.store = store
         self.settings = settings
         self.clock = clock
         self.interval_s = interval_s
+        self.background = background
+        self.stopping = False
         self.hooks: list[MaintenanceHook] = [self._recompute_desired]
 
     async def _recompute_desired(self, _now: float) -> int:
@@ -121,10 +135,19 @@ class Maintenance:
         return {"expired": expired, **purged}
 
     async def run_forever(self) -> None:
-        while True:
+        """Until ``stopping``: wait, then one pass. A pass runs through ``background`` (when
+        given): cancelling the loop at shutdown lands in the wait or at the pass's await, so
+        a pass is never cut mid-database-call; the lifespan drains it before the engine
+        goes."""
+        while not self.stopping:
             await asyncio.sleep(self.interval_s)
+            if self.stopping:
+                return
             try:
-                await self.run_once()
+                if self.background is not None:
+                    await self.background.run(self.run_once())
+                else:
+                    await self.run_once()
             except Exception as exc:  # noqa: BLE001 - one failed pass must not stop the loop
                 log.warning("control-plane maintenance failed: %s", type(exc).__name__)
 
@@ -197,6 +220,60 @@ class InternalErrors:
             await response(scope, receive, send)
 
 
+class _TooLarge(Exception):
+    pass
+
+
+class BodyLimit:
+    """Pure ASGI middleware: a request body larger than ``max_bytes`` is answered 413
+    ``too_large`` before a route parses it, by its ``Content-Length`` or, without one
+    (chunked), counted as it is read. ``/cp/v1`` is left alone: the report checks its own
+    cap while it reads, and the stream has no body."""
+
+    def __init__(self, app: ASGIApp, max_bytes: int = BODY_MAX_BYTES) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("path", "").startswith(GATEWAY_PREFIX):
+            await self.app(scope, receive, send)
+            return
+        too_large = error(413, f"request body exceeds {self.max_bytes} bytes", "too_large")
+        declared = dict(scope.get("headers") or []).get(b"content-length")
+        if declared is not None and declared.isdigit() and int(declared) > self.max_bytes:
+            await too_large(scope, receive, send)
+            return
+        seen = 0
+        started = refused = False
+
+        async def counted() -> Message:
+            nonlocal seen, refused
+            if refused:
+                raise _TooLarge
+            message = await receive()
+            if message["type"] == "http.request":
+                seen += len(message.get("body", b""))
+                if seen > self.max_bytes:
+                    refused = True
+                    if not started:  # answer here: the route may swallow the exception
+                        await too_large(scope, receive, send)
+                    raise _TooLarge
+            return message
+
+        async def tracked(message: Message) -> None:
+            nonlocal started
+            if refused:
+                return
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.app(scope, counted, tracked)
+        except _TooLarge:
+            pass
+
+
 @public("GET", "/healthz")
 async def healthz() -> dict[str, str]:
     """Liveness (public)."""
@@ -207,6 +284,15 @@ async def healthz() -> dict[str, str]:
 async def openapi(request: Request) -> JSONResponse:
     """The OpenAPI document (needs the read permission)."""
     return JSONResponse(request.app.openapi())
+
+
+def end_streams(app: FastAPI) -> None:
+    """End the open gateway streams (each at its next poll, within ``channel.POLL_S``) and
+    refuse new ones. A server waits for open responses before it runs the lifespan
+    shutdown, and a gateway stream never ends by itself: the exit signals (SIGINT,
+    SIGTERM) do this at once; an embedder stopping its server some other way (e.g.
+    uvicorn's ``should_exit``) calls it first."""
+    app.state.stopping.set()
 
 
 def create_app(
@@ -227,6 +313,7 @@ def create_app(
     ``clock`` (epoch seconds), ``maintenance_interval_s`` and ``sleep`` (the wait between
     two polls of a gateway stream) are test seams."""
     trust = settings.trust
+    stopping = channel.Stopping()
     cards = catalogue.CardChecker(
         http=http,
         verifier=trust_card_verifier(trust, config_dir),
@@ -235,10 +322,12 @@ def create_app(
 
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        stopping.clear()
         engine = await create_engine(settings.db_url)
         owned: list[httpx.AsyncClient] = []
         task: asyncio.Task[None] | None = None
         background: channel.Background | None = None
+        maintenance: Maintenance | None = None
         audit: AuditLog | None = None
         try:
             audit = AuditLog(engine, table_name=AUDIT_TABLE)
@@ -251,8 +340,13 @@ def create_app(
                 owned.append(client)
                 idp_client = guarded_async_client(fixed_tier(authn.IDP_TIER))
                 owned.append(idp_client)
+            background = app.state.background = channel.Background()
             maintenance = Maintenance(
-                store, settings, clock=clock, interval_s=maintenance_interval_s
+                store,
+                settings,
+                clock=clock,
+                interval_s=maintenance_interval_s,
+                background=background,
             )
             app.state.settings = settings
             app.state.engine = engine
@@ -269,14 +363,17 @@ def create_app(
             app.state.sleep = sleep
             app.state.gateway_auth = channel.gateway_auth  # /cp/v1: gateway tokens only
             app.state.seen = channel.SeenWriter()  # last_seen_at, written at most every 5 s
-            background = app.state.background = channel.Background()
             app.state.maintenance = maintenance
             app.state.cards = cards  # the partner catalogue's card fetch and checks
             app.state.task_details = views.DetailGate()  # task.get sharing and waiters
             app.state.operations = operations.OperateGate()  # operator actions' waiters
             task = asyncio.create_task(maintenance.run_forever(), name="a2agw:cp-maint")
-            yield
+            with _on_exit_signal(stopping.set):  # end the streams as soon as it is seen
+                yield
         finally:
+            stopping.set()
+            if maintenance is not None:
+                maintenance.stopping = True
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -298,8 +395,11 @@ def create_app(
         redoc_url=None,
         swagger_ui_oauth2_redirect_url=None,
         lifespan=lifespan,
+        default_response_class=JSONResponse,  # ASCII JSON: any stored string can be answered
     )
+    app.state.stopping = stopping  # end_streams(app): open gateway streams end
     _install_error_handlers(app)
+    app.add_middleware(BodyLimit)
     app.add_middleware(InternalErrors)
     ROUTES.mount(app)
     return app

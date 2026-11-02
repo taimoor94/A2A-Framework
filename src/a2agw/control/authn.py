@@ -42,7 +42,7 @@ from a2agw.control import require_fastapi
 require_fastapi()
 
 from fastapi import HTTPException, Query, Request
-from fastapi.responses import JSONResponse, RedirectResponse, Response
+from fastapi.responses import RedirectResponse, Response
 
 from a2agw.consult import netguard
 from a2agw.consult.netguard import FetchError, Tier, UnsafeURL, require_https
@@ -56,6 +56,7 @@ from a2agw.control.rbac import (
     public,
     unauthorized,
 )
+from a2agw.control.responses import JSONResponse
 from a2agw.control.settings import ControlSettings, OidcSettings, Role
 from a2agw.control.store import LoginState, csrf_token_for, token_digest
 from a2agw.ops.audit import AuditEvent

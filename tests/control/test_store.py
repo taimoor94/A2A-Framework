@@ -133,6 +133,58 @@ async def test_initialize_upgrades_an_older_events_table(store, engine):
     assert found["ix_cp_events_kind_gateway_task"] == ("kind", "gateway_id", "task_id", "seq")
 
 
+_OLD_GATEWAY_AUDIT = (
+    "CREATE TABLE cp_gateway_audit (gateway_id VARCHAR(64) NOT NULL, seq INTEGER NOT NULL, "
+    "row_json TEXT NOT NULL, ts FLOAT NOT NULL, PRIMARY KEY (gateway_id, seq))"
+)
+
+
+async def test_initialize_rekeys_an_older_gateway_audit_table(db_url):
+    """A cp_gateway_audit made before audit generations gains the ``generation`` column in
+    its primary key; its rows are kept (generation 0). Concurrent startups do it once."""
+    from a2agw.control.store import GATEWAY_AUDIT
+
+    engines = [await create_engine(db_url) for _ in range(3)]
+    engine = engines[0]
+    try:
+        await ControlStore(engine).initialize()
+        async with engine.begin() as conn:
+            await conn.execute(text("DROP TABLE cp_gateway_audit"))
+        async with engine.begin() as conn:
+            await conn.execute(text(_OLD_GATEWAY_AUDIT))
+            await conn.execute(
+                text("INSERT INTO cp_gateway_audit VALUES ('gw-1', 1, :row, 5.0)"),
+                {"row": '{"seq":1}'},
+            )
+        await asyncio.gather(*(ControlStore(e).initialize() for e in engines))
+        await ControlStore(engine).initialize()  # idempotent on the re-keyed table
+
+        def shape(c):
+            i = inspect(c)
+            return (
+                i.get_pk_constraint("cp_gateway_audit")["constrained_columns"],
+                {tuple(x["column_names"]) for x in i.get_indexes("cp_gateway_audit")},
+            )
+
+        async with engine.begin() as conn:
+            pk, indexes = await conn.run_sync(shape)
+            await conn.execute(
+                GATEWAY_AUDIT.insert().values(
+                    gateway_id="gw-1", generation=1, seq=1, row_json="{}", ts=6.0
+                )
+            )
+            kept = (await conn.execute(select(GATEWAY_AUDIT).order_by("generation"))).all()
+        assert sorted(pk) == ["gateway_id", "generation", "seq"]
+        assert ("ts",) in indexes
+        assert [(r.gateway_id, r.generation, r.seq, r.row_json, r.ts) for r in kept] == [
+            ("gw-1", 0, 1, '{"seq":1}', 5.0),
+            ("gw-1", 1, 1, "{}", 6.0),
+        ]
+    finally:
+        for e in engines:
+            await e.dispose()
+
+
 async def test_initialize_idempotent_concurrent(db_url):
     engines = [await create_engine(db_url) for _ in range(4)]
     try:
@@ -205,7 +257,9 @@ async def test_expire_and_purge(store, engine):
         for cid, status, created, expires in [
             ("c-live", "pending", 990.0, 2000.0),
             ("c-due", "pending", 900.0, 999.0),
+            # delivered: the gateway may still finish it, until the grace after its expiry
             ("c-sent", "delivered", 900.0, 999.0),
+            ("c-gone", "delivered", 600.0, 1000.0 - 301.0),
             ("c-done", "done", 900.0, 999.0),
             ("c-old", "done", 1000.0 - 8 * day, 0.0),
             ("c-late", "done", 1000.0 - 8 * day, 0.0),  # finished a day ago: kept
@@ -236,7 +290,8 @@ async def test_expire_and_purge(store, engine):
     assert status == {
         "c-live": "pending",
         "c-due": "expired",
-        "c-sent": "expired",
+        "c-sent": "delivered",
+        "c-gone": "expired",
         "c-done": "done",
         "c-late": "done",
     }

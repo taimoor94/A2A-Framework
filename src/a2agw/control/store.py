@@ -46,6 +46,7 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects import sqlite as sqlite_dialect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+from sqlalchemy.schema import CreateIndex, CreateTable
 
 from a2agw._ddl import retry_ddl
 from a2agw.control.settings import ROLES
@@ -58,6 +59,9 @@ DAY_S = 86400.0
 BATCH = 1000  # rows per maintenance statement
 LOGIN_STATE_TTL_S = 600.0  # a sign-in must finish within 10 minutes
 TOUCH_EVERY_S = 60.0  # last_used_at of sessions and API keys moves at most this often
+# A delivered command is swept to ``expired`` only this long after its ``expires_at``: the
+# gateway may have started it just before, and its result must still be recorded.
+DELIVERED_GRACE_S = 300.0
 
 _metadata = MetaData()
 
@@ -258,15 +262,18 @@ EVENTS = Table(
     Column("duration_ms", Float, nullable=True),
     sqlite_autoincrement=True,
 )
-# Copies of each gateway's own audit rows (its seq, the row as JSON).
+# Copies of each gateway's own audit rows (its seq, the row as JSON). ``generation`` counts
+# the gateway's sequence resets (its database recreated: its seq starts at 1 again); the rows
+# of each generation are kept apart (``channel._Ingest.audit``).
 GATEWAY_AUDIT = Table(
     "cp_gateway_audit",
     _metadata,
     _id("gateway_id", nullable=False),
+    Column("generation", Integer, nullable=False, default=0, server_default="0"),
     Column("seq", Integer, nullable=False),
     Column("row_json", Text, nullable=False),
     Column("ts", Float, nullable=False, index=True),
-    PrimaryKeyConstraint("gateway_id", "seq"),
+    PrimaryKeyConstraint("gateway_id", "generation", "seq"),
 )
 HEALTH = Table(
     "cp_health",
@@ -289,6 +296,8 @@ TABLES = tuple(_metadata.sorted_tables)
 # Columns added to existing tables after their first release: table -> {column: DDL type}.
 _ADDED_COLUMNS: dict[str, dict[str, str]] = {
     "cp_events": {"state": "VARCHAR(64)", "duration_ms": "FLOAT"},
+    # in the primary key too (``_rekey_gateway_audit``)
+    "cp_gateway_audit": {"generation": "INTEGER NOT NULL DEFAULT 0"},
 }
 # Indexes of the Console's read APIs (Task 10): time ranges of one event kind (overview,
 # topology) and the latest event of each task (the task list, a task's own events).
@@ -308,6 +317,44 @@ async def _add_column(conn: AsyncConnection, table: str, name: str, ddl: str) ->
     step then sees the column and skips it."""
     guard = "IF NOT EXISTS " if conn.dialect.name == "postgresql" else ""
     await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {guard}{name} {ddl}"))
+
+
+def _primary_key(sync: Any, table: str) -> dict[str, Any]:
+    return dict(inspect(sync).get_pk_constraint(table))
+
+
+async def _rekey_gateway_audit(conn: AsyncConnection) -> None:
+    """Put ``generation`` in the primary key of a ``cp_gateway_audit`` made before it (its
+    rows keep generation 0). PostgreSQL swaps the constraint in the transaction; sqlite,
+    which cannot alter a primary key, copies the table (``CREATE``, then ``INSERT ...
+    SELECT``, ``DROP`` and ``RENAME`` in one transaction; a copy left by an interrupted run
+    is dropped first). A concurrent startup doing it first is retried by ``retry_ddl`` and
+    then finds the new key."""
+    pk = await conn.run_sync(_primary_key, GATEWAY_AUDIT.name)
+    if "generation" in (pk.get("constrained_columns") or ()):
+        return
+    if conn.dialect.name == "postgresql":
+        name = pk.get("name") or f"{GATEWAY_AUDIT.name}_pkey"
+        await conn.execute(text(f'ALTER TABLE {GATEWAY_AUDIT.name} DROP CONSTRAINT "{name}"'))
+        await conn.execute(
+            text(f"ALTER TABLE {GATEWAY_AUDIT.name} ADD PRIMARY KEY (gateway_id, generation, seq)")
+        )
+    else:
+        await _copy_gateway_audit(conn)
+    for index in GATEWAY_AUDIT.indexes:
+        await conn.execute(CreateIndex(index, if_not_exists=True))
+
+
+async def _copy_gateway_audit(conn: AsyncConnection) -> None:
+    copy_name = f"{GATEWAY_AUDIT.name}_rekey"
+    columns = ", ".join(c.name for c in GATEWAY_AUDIT.columns)
+    await conn.execute(text(f"DROP TABLE IF EXISTS {copy_name}"))
+    await conn.execute(CreateTable(GATEWAY_AUDIT.to_metadata(MetaData(), name=copy_name)))
+    await conn.execute(
+        text(f"INSERT INTO {copy_name} ({columns}) SELECT {columns} FROM {GATEWAY_AUDIT.name}")
+    )
+    await conn.execute(text(f"DROP TABLE {GATEWAY_AUDIT.name}"))
+    await conn.execute(text(f"ALTER TABLE {copy_name} RENAME TO {GATEWAY_AUDIT.name}"))
 
 
 def token_digest(token: str) -> str:
@@ -410,13 +457,15 @@ class ControlStore:
         self._epoch = await self._ensure_epoch()
 
     async def _upgrade(self) -> None:
-        """Add the ``_ADDED_COLUMNS`` a table lacks and create ``EVENT_INDEXES``."""
+        """Add the ``_ADDED_COLUMNS`` a table lacks (and re-key ``cp_gateway_audit``), and
+        create ``EVENT_INDEXES``."""
         async with self.engine.begin() as conn:
             for table, added in _ADDED_COLUMNS.items():
                 have = await conn.run_sync(_column_names, table)
                 for name, ddl in added.items():
                     if name not in have:
                         await _add_column(conn, table, name, ddl)
+            await _rekey_gateway_audit(conn)
             for name, columns in EVENT_INDEXES.items():
                 await conn.execute(
                     text(f"CREATE INDEX IF NOT EXISTS {name} ON cp_events ({columns})")
@@ -858,27 +907,23 @@ class ControlStore:
     # -- maintenance ---------------------------------------------------------------------
 
     async def expire_commands(self, *, now: float, batch: int = BATCH) -> int:
-        """Pending or delivered commands past ``expires_at`` become ``expired`` (never
-        delivered later), ``batch`` rows per transaction. Returns how many."""
-        due = COMMANDS.c.status.in_(("pending", "delivered"))
+        """Pending commands past ``expires_at`` (never delivered later), and delivered ones
+        ``DELIVERED_GRACE_S`` past it (the gateway may still be running one it took just
+        before its expiry), become ``expired``, ``batch`` rows per transaction. Returns how
+        many."""
+        c = COMMANDS.c
+        due = ((c.status == "pending") & (c.expires_at <= now)) | (
+            (c.status == "delivered") & (c.expires_at <= now - DELIVERED_GRACE_S)
+        )
         total = 0
         while True:
             async with self.engine.begin() as conn:
-                ids = list(
-                    (
-                        await conn.execute(
-                            select(COMMANDS.c.id)
-                            .where(due)
-                            .where(COMMANDS.c.expires_at <= now)
-                            .limit(batch)
-                        )
-                    ).scalars()
-                )
+                ids = list((await conn.execute(select(c.id).where(due).limit(batch))).scalars())
                 if not ids:
                     return total
                 result = await conn.execute(
                     update(COMMANDS)
-                    .where(COMMANDS.c.id.in_(ids))
+                    .where(c.id.in_(ids))
                     .where(due)
                     .values(status="expired", finished_at=now)
                 )

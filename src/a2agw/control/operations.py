@@ -10,6 +10,10 @@
   (``tasks.operate``): ``tasks.reap``.
 - ``POST /api/v1/partners/{id}/gateways/{gateway_id}/refresh`` (``tasks.operate``):
   ``partner.refresh`` on one gateway.
+
+Ids in these paths (and the reap body's ``agent_id``) are at most 256 characters with no
+control characters (422 otherwise). A gateway with ``channel.OPEN_COMMANDS_MAX`` open
+commands answers 429 ``too_many_requests``.
 - ``GET /api/v1/commands/{id}`` (``read``): ``{id, gateway_id, kind, status, result, actor,
   created_at, finished_at}``. ``actor`` is its kind (``console`` for a signed-in user,
   ``key`` for an API key), like the other read views show no principal ids; a ``task.get``
@@ -28,6 +32,7 @@ waiting.
 
 from __future__ import annotations
 
+import re
 from typing import Annotated, Any
 
 from a2agw.control import require_fastapi
@@ -36,14 +41,14 @@ require_fastapi()
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, StrictBool
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 from sqlalchemy import select
 
 from a2agw.control import channel
 from a2agw.control.rbac import Actor, Permission, require, route
+from a2agw.control.responses import JSONResponse
 from a2agw.control.store import PARTNERS, ControlStore
-from a2agw.control.views import public_detail
+from a2agw.control.views import PATH_ID_MAX, PATH_ID_PATTERN, PathId, public_detail
 
 OPERATE = Permission.TASKS_OPERATE
 READ = Permission.READ
@@ -54,6 +59,7 @@ OPERATE_WAIT_S = 10.0  # how long an action waits for the gateway's answer
 OPERATE_WAITERS_MAX = 16  # requests waiting for command results at once (per process)
 ANSWER_MAX_BYTES = 32 * 1024  # an operator's answer, UTF-8 (like the gateway's limit)
 OPEN = ("pending", "delivered")
+_SURROGATE = re.compile("[\ud800-\udfff]")
 
 _FORBID = ConfigDict(extra="forbid")
 
@@ -73,7 +79,7 @@ class AnswerBody(BaseModel):
 
 class ReapBody(BaseModel):
     model_config = _FORBID
-    agent_id: str
+    agent_id: str = Field(max_length=PATH_ID_MAX, pattern=PATH_ID_PATTERN)
     confirm: StrictBool = False
     force: StrictBool = False
 
@@ -96,6 +102,8 @@ async def _operate(request: Request, actor: Actor, gateway_id: str, kind: str, a
         raise _not_found("gateway") from None
     except ValueError:
         raise HTTPException(409, {"error": "conflict", "detail": "gateway is revoked"}) from None
+    except channel.TooManyCommands:
+        raise channel.queue_full() from None
     if gate.waiting >= OPERATE_WAITERS_MAX:
         command = await channel.get_command(store, command_id)
     else:
@@ -125,7 +133,7 @@ def _status(command: channel.CommandRow, now: float) -> str:
 
 @route("POST", "/api/v1/tasks/{gateway_id}/{agent_id}/{task_id}/cancel", OPERATE)
 async def cancel_task(
-    gateway_id: str, agent_id: str, task_id: str, request: Request, actor: Operator
+    gateway_id: PathId, agent_id: PathId, task_id: PathId, request: Request, actor: Operator
 ) -> Any:
     args = {"agent_id": agent_id, "task_id": task_id}
     return await _operate(request, actor, gateway_id, "task.cancel", args)
@@ -133,9 +141,9 @@ async def cancel_task(
 
 @route("POST", "/api/v1/tasks/{gateway_id}/{agent_id}/{task_id}/answer", OPERATE)
 async def answer_task(
-    gateway_id: str,
-    agent_id: str,
-    task_id: str,
+    gateway_id: PathId,
+    agent_id: PathId,
+    task_id: PathId,
     body: AnswerBody,
     request: Request,
     actor: Operator,
@@ -149,19 +157,21 @@ async def answer_task(
         raise _invalid(("body", "text"), "text must not be empty")
     if "\x00" in body.text:
         raise _invalid(("body", "text"), "text contains NUL")
+    if _SURROGATE.search(body.text):  # not UTF-8: the gateway refuses it too
+        raise _invalid(("body", "text"), "text contains a lone surrogate")
     args = {"agent_id": agent_id, "task_id": task_id, "text": body.text}
     return await _operate(request, actor, gateway_id, "task.answer", args)
 
 
 @route("POST", "/api/v1/gateways/{gateway_id}/reap", OPERATE)
-async def reap_tasks(gateway_id: str, body: ReapBody, request: Request, actor: Operator) -> Any:
+async def reap_tasks(gateway_id: PathId, body: ReapBody, request: Request, actor: Operator) -> Any:
     args = {"agent_id": body.agent_id, "confirm": body.confirm, "force": body.force}
     return await _operate(request, actor, gateway_id, "tasks.reap", args)
 
 
 @route("POST", "/api/v1/partners/{partner_id}/gateways/{gateway_id}/refresh", OPERATE)
 async def refresh_partner(
-    partner_id: str, gateway_id: str, request: Request, actor: Operator
+    partner_id: PathId, gateway_id: PathId, request: Request, actor: Operator
 ) -> Any:
     store: ControlStore = request.app.state.store
     async with store.engine.connect() as conn:

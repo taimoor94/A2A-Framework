@@ -49,7 +49,6 @@ require_fastapi()
 
 from fastapi import Depends, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.exc import IntegrityError
@@ -67,6 +66,7 @@ from a2agw.consult.cardfetch import (
 from a2agw.consult.netguard import Tier
 from a2agw.control import channel
 from a2agw.control.rbac import Actor, Permission, require, route
+from a2agw.control.responses import JSONResponse
 from a2agw.control.store import (
     ASSIGNMENTS,
     GATEWAYS,
@@ -487,11 +487,6 @@ async def _audit(
         )
 
 
-async def _assigned_ids(store: ControlStore, partner_id: str) -> list[str]:
-    async with store.engine.connect() as conn:
-        return await _assigned(conn, partner_id)
-
-
 @route("POST", "/api/v1/partners", Permission.PARTNERS_REGISTER, status_code=201)
 async def register_partner(
     body: RegisterPartner, request: Request, actor: Registrar
@@ -610,7 +605,7 @@ async def approve_partner(
             )
         ).scalars()
         quarantined_with_it = [str(g) for g in holding]
-    await channel.mark_dirty(store, assigned)
+        await channel.mark_dirty(store, assigned, conn=conn)
     commands = []
     for gid in quarantined_with_it:
         args = {"id": partner_id, "expected_hash": body.expected_hash}
@@ -618,7 +613,9 @@ async def approve_partner(
             command_id = await channel.enqueue_command(
                 store, gid, "partner.approve", args, actor.id
             )
-        except (KeyError, ValueError):  # deleted or revoked meanwhile
+        # deleted or revoked meanwhile, or its queue is full (the gateway keeps the card
+        # quarantined; approving again queues it then)
+        except (KeyError, ValueError, channel.TooManyCommands):
             continue
         commands.append({"gateway_id": gid, "command_id": command_id})
     await _audit(
@@ -649,7 +646,7 @@ async def _set_status(
             .values(status=status, updated_at=store.now())
         )
         assigned = await _assigned(conn, partner_id)
-    await channel.mark_dirty(store, assigned)
+        await channel.mark_dirty(store, assigned, conn=conn)
     await _audit(
         store,
         actor.id,
@@ -730,10 +727,11 @@ async def refresh_partner(partner_id: str, request: Request, actor: Registrar) -
                 )
                 if moved.rowcount != 1:
                     raise _conflict("partner changed while it was refreshed")
+                if cosmetic:
+                    assigned = await _assigned(conn, partner_id)
+                    await channel.mark_dirty(store, assigned, conn=conn)
         except IntegrityError:  # a concurrent refresh added this version
             raise _conflict("partner changed while it was refreshed") from None
-        if cosmetic:
-            await channel.mark_dirty(store, await _assigned_ids(store, partner_id))
     await _audit(
         store,
         actor.id,
@@ -798,7 +796,7 @@ async def partner_settings(
                 .values(signed_key_id=key_id)
             )
         assigned = await _assigned(conn, partner_id)
-    await channel.mark_dirty(store, assigned)
+        await channel.mark_dirty(store, assigned, conn=conn)
     audit_detail: dict[str, Any] = {"fields": ",".join(changed), "tier": tier}
     if "tier" in changed:
         audit_detail["reason"] = "trust"  # a tier change is a trust change
@@ -813,9 +811,21 @@ async def assign_partners(
     store: ControlStore = request.app.state.store
     wanted = list(dict.fromkeys(body.partner_ids))
     async with store.engine.begin() as conn:
-        known_gateway = await conn.execute(select(GATEWAYS.c.id).where(GATEWAYS.c.id == gateway_id))
-        if known_gateway.first() is None:
+        # The gateway row is written first (a no-op update, as policies.replace_assignment
+        # does): it locks the row on PostgreSQL (the write lock on sqlite) until this ends,
+        # so two assignments to one gateway are serialized instead of colliding on the
+        # rows the other inserted (a unique violation).
+        locked = await conn.execute(
+            update(GATEWAYS)
+            .where(GATEWAYS.c.id == gateway_id)
+            .values(desired_gen=GATEWAYS.c.desired_gen)
+            .returning(GATEWAYS.c.status)
+        )
+        status = locked.scalar_one_or_none()
+        if status is None:
             raise _not_found("gateway")
+        if status != "active":
+            raise _conflict("gateway is revoked")
         known = set(
             (await conn.execute(select(PARTNERS.c.id).where(PARTNERS.c.id.in_(wanted)))).scalars()
         )
@@ -840,7 +850,7 @@ async def assign_partners(
                     for pid in wanted
                 ],
             )
-    await channel.mark_dirty(store, [gateway_id])
+        await channel.mark_dirty(store, [gateway_id], conn=conn)
     await _audit(
         store,
         actor.id,

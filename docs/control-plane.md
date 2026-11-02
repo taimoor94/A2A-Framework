@@ -29,7 +29,14 @@ a2agw control init                       # writes a commented control.yaml
 a2agw control serve -c control.yaml --host 0.0.0.0 --port 8100
 ```
 
-`serve` checks the database before the server starts. Put TLS in front of it (a reverse
+`serve` checks the database before the server starts. At shutdown (SIGINT, SIGTERM) open
+gateway streams end at once, so the server reaches its cleanup (audit drain, engine
+dispose) promptly; any other open request gets 10 s (`GRACEFUL_SHUTDOWN_S`), then it is
+cancelled. Embedding the app in your own server: run uvicorn with
+`timeout_graceful_shutdown`, and call `a2agw.control.app.end_streams(app)` before stopping it
+some way other than an exit signal (e.g. `should_exit`), or the open streams keep the server
+waiting. Every request body but `/cp/v1`'s is capped at 1 MiB (`413 too_large`, with or
+without a `Content-Length`); the report has its own cap (`limits.report_max_bytes`). Put TLS in front of it (a reverse
 proxy or a load balancer) and set `base_url` to the https URL people and gateways use:
 gateways refuse a plain-http control plane unless `A2AGW_DEV=1`. The Docker example has an
 optional `control-plane` service behind a compose profile
@@ -47,7 +54,7 @@ a hint to use `*_env`.
 | `oidc` | none | `{issuer, client_id, client_secret_env, scopes, roles_claim, role_map}`: sign-in for people |
 | `session` | `{absolute_s: 28800, idle_s: 3600, cookie_secure: true}` | Console sessions |
 | `retention` | `{events_days: 7, commands_days: 7}` | see [Retention](#retention) |
-| `limits` | `{report_max_bytes: 1048576, report_max_items: 1000, stream_keepalive_s: 15}` | what gateways may send, and the stream keepalive |
+| `limits` | `{report_max_bytes: 1048576, report_max_items: 1000, stream_keepalive_s: 15}` | what gateways may send, and the stream keepalive (3 to 60 s) |
 | `trust` | none | the gateway's `trust` shape: keys for partner card signatures (`require_signed` tiers) |
 
 **Sign-in.** People sign in through the OIDC provider (authorization code flow with PKCE,
@@ -280,8 +287,15 @@ detail.
 
 Commands are delivered at most once. One whose `expires_at` has passed when it arrives
 (measured in control-plane time, from the stream's `hello`) is not run: it is reported
-`failed` with `{"error": "expired"}`. A result that arrives after the command expired on the
-control plane is ignored there (counted in the report's `dropped`).
+`failed` with `{"error": "expired"}`, and so is one whose expiry passed while it waited for
+one of the gateway's 8 command slots (checked again once it has one). A delivered command
+stays `delivered` on the control plane until the gateway's result, or until 5 minutes after
+its `expires_at` (`DELIVERED_GRACE_S`), when the maintenance pass marks it `expired`; a
+result that arrives after that is ignored (counted in the report's `dropped`).
+
+A gateway has at most 256 open commands (`OPEN_COMMANDS_MAX`: pending, or delivered and
+not yet past that grace); queueing one more (an operator action, a task detail) answers
+`429 too_many_requests` with `Retry-After`.
 
 ### Reports
 
@@ -292,7 +306,14 @@ Every `report_interval_s` the gateway posts what it has to say, in one report:
   `status.dropped`);
 - the audit rows after `audit_acked_seq`, ascending, up to 500. `audit_acked_seq` (kept in
   `a2agw_cp_state`) moves only to the response's `acked_audit_seq`, so rows not acknowledged
-  are sent again; the control plane stores them once;
+  are sent again; the control plane stores them once. The acknowledgement is the highest seq
+  that report carried and the control plane handled (stored, already stored, or too large
+  to keep), never more, and the gateway never moves past the rows it sent. A row whose seq
+  is already stored with another hash means the gateway's sequence started over (its
+  database was recreated): from that row on its rows are stored under a new `generation`
+  (shown in the audit views and exports), so nothing is dropped as a duplicate, and the
+  control plane audits `cp.audit_seq_reset` (coalesced per gateway; `detail.generation`).
+  Two gateways sharing one token keep resetting each other's generation: give each its own;
 - command results (at most 8 `task.get` results per report, the rest in the next ones), and
   the outcome of each state applied or rejected;
 - every `health_interval_s`: health, the metrics snapshot (`/a2agw/admin/metrics`) and the
@@ -312,7 +333,11 @@ edge is (gateway, calling agent, partner).
 span), as `task.state` events do.
 
 A report that fails is sent again, whole; after a `413` the gateway sends smaller reports
-until one fits. At shutdown the gateway waits for running commands, then posts one last
+until one fits. A report refused anyway (a `413` down to one item, or another `4xx` but
+`401`) would fail again if sent again: when it carried health, the next reports leave out
+health and metrics, then the gateway info too (tried in full again after 5 minutes), so
+events, audit rows and results still go; without them the gateway backs off. Each case is
+logged once. At shutdown the gateway waits for running commands, then posts one last
 report (2 s at most, within the connector's 5 s shutdown bound), so the latest events and
 results are not lost.
 
@@ -471,15 +496,17 @@ The request waits up to 10 s for the gateway (no database connection is held mea
 
 - 200 `{command_id, status: "done", result}`;
 - 409 `{command_id, status: "failed" | "expired", result}` when the gateway reports a
-  failure (`not_found`, `conflict`, ...) or the command expired before delivery;
+  failure (`not_found`, `conflict`, `expired`, ...) or the command expired before delivery;
 - 202 `{command_id, status: "pending" | "delivered"}` otherwise. Follow it with
   `GET /api/v1/commands/{id}` (`read`), which shows who queued it as a kind only (`console`
   or `key`).
 
 At most 16 requests wait at once per process; the others answer 202 at once. A command is
 delivered at most once and never after it expired. A delivered command stays `delivered`
-until the gateway reports it, or until the maintenance pass marks it `expired` after its
-TTL; a result that arrives after that is ignored.
+until the gateway reports it, or until the maintenance pass marks it `expired` 5 minutes
+after its TTL (the gateway may have started it just before); a result that arrives after
+that is ignored. Ids in action and task-detail paths are at most 256 characters with no
+control characters (422 otherwise); a gateway's full command queue answers 429.
 
 ## Console read API
 
@@ -543,8 +570,8 @@ filters, or on another list, is a `400 bad_request`, so it never widens what a c
 
 ## Retention
 
-The maintenance pass (every 60 s, in every replica) expires commands past their TTL, then
-deletes in batches:
+The maintenance pass (every 60 s, in every replica) expires pending commands past their TTL
+and delivered ones 5 minutes past it, then deletes in batches:
 
 - gateway events (`cp_events`) older than `retention.events_days` (7). Every read view
   (tasks, overview, topology, timelines) is computed from these events, so it covers at

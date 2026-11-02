@@ -51,6 +51,7 @@ import hashlib
 import io
 import json
 import math
+import re
 from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal
@@ -60,8 +61,9 @@ from a2agw.control import require_fastapi
 require_fastapi()
 
 from fastapi import Depends, HTTPException, Query, Request
+from fastapi import Path as PathParam
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 from sqlalchemy import Integer, Table, and_, case, cast, exists, func, literal, or_, select
 from sqlalchemy import tuple_ as row
@@ -70,6 +72,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection
 from a2agw.consult.registry import PartnerRecord
 from a2agw.control import channel
 from a2agw.control.rbac import Actor, Permission, require, route
+from a2agw.control.responses import JSONResponse
 from a2agw.control.store import (
     ASSIGNMENTS,
     EVENTS,
@@ -125,6 +128,7 @@ EXPORT_BATCH = 1000
 CSV_COLUMNS = (
     "source",
     "gateway_id",
+    "generation",
     "seq",
     "ts",
     "actor",
@@ -545,6 +549,8 @@ def _hosted(gw: GatewayRow, health: dict[str, Any] | None) -> list[dict[str, Any
     for agent_id, entry in sorted(reported.items()):
         skills = entry.get("skills")
         card_url = _str(entry.get("card_url"))
+        if card_url is not None and not channel.http_url(card_url):
+            card_url = None  # stored before reports were checked: never served
         if card_url is None and base:
             card_url = f"{base.rstrip('/')}/agents/{agent_id}{CARD_PATH}"
         out.append(
@@ -837,6 +843,13 @@ async def timeline(
     return [_timeline_entry(r) for r in rows]
 
 
+# An id in a path that is sent on to a gateway (agent, task, partner, gateway ids): at most
+# ``PATH_ID_MAX`` characters, no control characters (422 otherwise).
+PATH_ID_MAX = 256
+PATH_ID_PATTERN = r"^[^\x00-\x1f\x7f]+$"
+PathId = Annotated[str, PathParam(max_length=PATH_ID_MAX, pattern=PATH_ID_PATTERN)]
+
+
 class DetailGate:
     """Bounds what task details cost (``app.state.task_details``): concurrent requests for
     one task share one ``task.get`` (found or queued under ``lock``, so two requests of
@@ -875,11 +888,13 @@ async def _detail_command(
             raise HTTPException(
                 409, {"error": "conflict", "detail": "gateway is revoked"}
             ) from None
+        except channel.TooManyCommands:
+            raise channel.queue_full() from None
 
 
 @route("GET", "/api/v1/tasks/{gateway_id}/{agent_id}/{task_id}", READ)
 async def task_detail(
-    gateway_id: str, agent_id: str, task_id: str, request: Request, actor: Reader
+    gateway_id: PathId, agent_id: PathId, task_id: PathId, request: Request, actor: Reader
 ) -> Any:
     state = request.app.state
     store: ControlStore = state.store
@@ -1126,7 +1141,8 @@ def audit_filters(
 
 
 AuditQuery = Annotated[AuditFilters, Depends(audit_filters)]
-Position = tuple[float, int, str, int]  # (ts, source rank, gateway id, seq): sorted descending
+# (ts, source rank, gateway id, generation, seq): sorted descending
+Position = tuple[float, int, str, int, int]
 
 
 def _contains(conn: AsyncConnection, column: Any, needle: str) -> Any:
@@ -1159,7 +1175,7 @@ def _control_query(conn: AsyncConnection, t: Table, f: AuditFilters, after: Posi
     if f.until is not None:
         query = query.where(t.c.ts <= f.until)
     if after is not None:
-        ts, rank, _gid, seq = after
+        ts, rank, _gid, _generation, seq = after
         if rank > _RANK["control"]:
             query = query.where(t.c.ts <= ts)
         else:
@@ -1185,18 +1201,20 @@ def _gateway_query(conn: AsyncConnection, f: AuditFilters, after: Position | Non
     if f.until is not None:
         query = query.where(g.ts <= f.until)
     if after is not None:
-        ts, rank, gid, seq = after
+        ts, rank, gid, generation, seq = after
         if rank < _RANK["gateway"]:
             query = query.where(g.ts < ts)
         else:
-            query = query.where(row(g.ts, g.gateway_id, g.seq) < row(ts, gid, seq))
-    return query.order_by(g.ts.desc(), g.gateway_id.desc(), g.seq.desc())
+            position = row(g.ts, g.gateway_id, g.generation, g.seq)
+            query = query.where(position < row(ts, gid, generation, seq))
+    return query.order_by(g.ts.desc(), g.gateway_id.desc(), g.generation.desc(), g.seq.desc())
 
 
 def _control_item(r: Any) -> dict[str, Any]:
     return {
         "source": "control",
         "gateway_id": None,
+        "generation": None,
         "seq": r.seq,
         "ts": r.ts,
         "actor": r.actor,
@@ -1218,6 +1236,7 @@ def _gateway_item(r: Any) -> dict[str, Any]:
     return {
         "source": "gateway",
         "gateway_id": r.gateway_id,
+        "generation": r.generation,  # the gateway's sequence resets (see channel)
         "seq": r.seq,
         "ts": r.ts,
         **{
@@ -1261,7 +1280,7 @@ async def audit_page(
         if f.source in (None, "control"):
             query = _control_query(conn, log.table, f, after).limit(limit + 1)
             for r in (await conn.execute(query)).all():
-                read.append(((r.ts, _RANK["control"], "", r.seq), _control_item(r)))
+                read.append(((r.ts, _RANK["control"], "", 0, r.seq), _control_item(r)))
         if f.source in (None, "gateway"):
             query = _gateway_query(conn, f, after).limit(limit + 1)
             for r in (await conn.execute(query)).all():
@@ -1269,18 +1288,18 @@ async def audit_page(
                 # fields still differ is read (its position counts) but not shown
                 item = _gateway_item(r)
                 keep = item if _matches(item, f) else None
-                read.append(((r.ts, _RANK["gateway"], r.gateway_id, r.seq), keep))
+                read.append(((r.ts, _RANK["gateway"], r.gateway_id, r.generation, r.seq), keep))
     read.sort(key=lambda pi: pi[0], reverse=True)
     chosen = read[:limit]
     items = [item for _pos, item in chosen if item is not None]
     return items, chosen[-1][0] if chosen else None, len(read) > limit
 
 
-AUDIT_SHAPE: Shape = (float, int, str, int)
+AUDIT_SHAPE: Shape = (float, int, str, int, int)
 
 
 def _position(value: list[Any] | None) -> Position | None:
-    return (value[0], value[1], value[2], value[3]) if value is not None else None
+    return (value[0], value[1], value[2], value[3], value[4]) if value is not None else None
 
 
 @route("GET", "/api/v1/audit", AUDIT_READ)
@@ -1303,6 +1322,15 @@ def csv_cell(value: Any) -> str:
     else:
         text = str(value)
     return "'" + text if text.startswith(FORMULA_PREFIXES) else text
+
+
+_SURROGATES = re.compile("[\ud800-\udfff]")
+
+
+def utf8(text: str) -> bytes:
+    """``text`` as UTF-8, a lone surrogate (which a gateway can send, and which UTF-8 cannot
+    encode) replaced by U+FFFD."""
+    return _SURROGATES.sub("\ufffd", text).encode("utf-8")
 
 
 def _csv_lines(rows: Iterable[Sequence[Any]]) -> str:
@@ -1330,7 +1358,7 @@ async def _export(
         )
         if items:
             sent += len(items)
-            yield render(items).encode()
+            yield utf8(render(items))
         if not more or after is None:
             return
 
@@ -1363,7 +1391,7 @@ async def export_audit(
 
     async def body() -> AsyncIterator[bytes]:
         if fmt == "csv":
-            yield _csv_lines([CSV_COLUMNS]).encode()
+            yield utf8(_csv_lines([CSV_COLUMNS]))
         async for chunk in _export(request, f, as_csv if fmt == "csv" else as_jsonl):
             yield chunk
 

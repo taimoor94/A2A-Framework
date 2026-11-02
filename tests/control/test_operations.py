@@ -404,6 +404,36 @@ async def test_delivered_past_expiry_is_never_shown_expired_before_it_finishes(
         assert shown["status"] == "done" and shown["result"] == {"state": "X"}
 
 
+async def test_maintenance_spares_a_delivered_command_within_the_grace(
+    db_url, cp_http, run_app, clock
+):
+    """The sweep expires a delivered command only ``DELIVERED_GRACE_S`` after its expiry:
+    a gateway that ran it and reports done meanwhile is recorded done."""
+    from a2agw.control.store import DELIVERED_GRACE_S
+
+    app = make(db_url, clock, cp_http, silent)
+    async with run_app(app) as c:
+        _kid, op = await key(app, "operator")
+        gw, _tok = await gateway(app)
+        store = app.state.store
+        cid = (await c.post(CANCEL.format(gw=gw), headers=op)).json()["command_id"]
+        [cmd] = await channel.take_commands(store, gw, clock())
+        clock.advance(channel.COMMAND_TTL_S + 30)  # past expires_at, inside the grace
+        await app.state.maintenance.run_once()
+        assert await channel.finish_command(store, gw, cmd.id, "done", {"state": "X"}, now=clock())
+        shown = (await c.get(f"/api/v1/commands/{cid}", headers=op)).json()
+        assert shown["status"] == "done" and shown["result"] == {"state": "X"}
+        # never answered: expired once the grace is over
+        cid2 = (await c.post(CANCEL.format(gw=gw), headers=op)).json()["command_id"]
+        await channel.take_commands(store, gw, clock())
+        clock.advance(channel.COMMAND_TTL_S + DELIVERED_GRACE_S - 1)
+        await app.state.maintenance.run_once()
+        assert (await channel.get_command(store, cid2)).status == "delivered"
+        clock.advance(2)
+        await app.state.maintenance.run_once()
+        assert (await channel.get_command(store, cid2)).status == "expired"
+
+
 async def test_action_wait_ending_on_delivered_answers_202_delivered(
     db_url, cp_http, run_app, clock
 ):
@@ -443,3 +473,45 @@ async def test_session_post_needs_csrf(db_url, cp_http, run_app, clock):
         ok = await c.post(CANCEL.format(gw=gw), headers=session)
         assert ok.status_code == 202
         assert len(await command_rows(app)) == 1
+
+
+async def test_ids_in_action_and_detail_paths_are_bounded(db_url, cp_http, run_app, clock):
+    app = make(db_url, clock, cp_http, silent)
+    async with run_app(app) as c:
+        _kid, op = await key(app, "operator")
+        gw, _tok = await gateway(app)
+        long_id = "a" * 257
+        for path in (
+            f"/api/v1/tasks/{gw}/{long_id}/t1/cancel",
+            f"/api/v1/tasks/{gw}/billing/{long_id}/cancel",
+            f"/api/v1/tasks/{gw}/billing/t%01x/cancel",
+            f"/api/v1/partners/{long_id}/gateways/{gw}/refresh",
+        ):
+            r = await c.post(path, headers=op)
+            assert r.status_code == 422, (path, r.status_code)
+        r = await c.post(f"/api/v1/tasks/{gw}/billing/t%7F/answer", json={"text": "x"}, headers=op)
+        assert r.status_code == 422
+        r = await c.post(f"/api/v1/gateways/{gw}/reap", json={"agent_id": long_id}, headers=op)
+        assert r.status_code == 422
+        for path in (f"/api/v1/tasks/{gw}/{long_id}/t1", f"/api/v1/tasks/{gw}/billing/t%0A"):
+            assert (await c.get(path, headers=op)).status_code == 422, path
+        async with app.state.engine.connect() as conn:
+            assert (await conn.execute(select(COMMANDS))).all() == []
+        assert (
+            await c.post(f"/api/v1/tasks/{gw}/{'a' * 256}/t1/cancel", headers=op)
+        ).status_code == 202
+
+
+async def test_a_full_command_queue_answers_429(db_url, cp_http, run_app, clock, monkeypatch):
+    monkeypatch.setattr(channel, "OPEN_COMMANDS_MAX", 2)
+    app = make(db_url, clock, cp_http, silent)
+    async with run_app(app) as c:
+        _kid, op = await key(app, "operator")
+        gw, _tok = await gateway(app)
+        for task in ("t1", "t2"):
+            r = await c.post(f"/api/v1/tasks/{gw}/billing/{task}/cancel", headers=op)
+            assert r.status_code == 202
+        r = await c.post(f"/api/v1/tasks/{gw}/billing/t3/cancel", headers=op)
+        assert r.status_code == 429 and r.json()["error"] == "too_many_requests"
+        r = await c.get(f"/api/v1/tasks/{gw}/billing/t4", headers=op)  # task.get too
+        assert r.status_code == 429

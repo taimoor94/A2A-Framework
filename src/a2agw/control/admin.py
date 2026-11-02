@@ -32,13 +32,13 @@ from a2agw.control import require_fastapi
 require_fastapi()
 
 from fastapi import Depends, HTTPException, Request
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select, tuple_
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 
 from a2agw.control.rbac import Actor, Permission, permissions_for, require, route
+from a2agw.control.responses import JSONResponse
 from a2agw.control.settings import ControlSettings, Role
 from a2agw.control.store import API_KEYS, DESIRED, GATEWAYS, NAME, USERS, ControlStore
 from a2agw.control.views import Keyset, PageQuery

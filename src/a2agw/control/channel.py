@@ -25,7 +25,9 @@ version and gateway info. The body is capped at ``report_max_bytes`` (413) and e
 Events keep only their kind's allowlisted ``data`` keys and scalar values, strings cut to
 ``STRING_MAX``; the ``state`` of ``task.state`` and ``partner.call`` events and a call's
 ``duration_ms`` are also stored as columns (the Console's aggregations). Audit rows are
-stored verbatim, keyed on ``(gateway_id, seq)``, so a report sent again changes nothing.
+stored verbatim, keyed on ``(gateway_id, generation, seq)``, so a report sent again changes
+nothing; a different row under a stored seq starts a new generation (``_store_audit``), and
+the acknowledgement covers only the rows of the report.
 ``partner.state`` events also update ``cp_partner_states``, the gateway's last reported
 status of each partner and the hash of a pending card it holds (the partner catalogue shows
 where a partner is quarantined; no card is taken from it).
@@ -48,6 +50,7 @@ import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from a2agw.control import require_fastapi
 
@@ -67,6 +70,7 @@ from a2agw.control.rbac import gateway_route, require_gateway
 from a2agw.control.store import (
     ASSIGNMENTS,
     COMMANDS,
+    DELIVERED_GRACE_S,
     DESIRED,
     EVENTS,
     GATEWAY_AUDIT,
@@ -100,6 +104,7 @@ INT_MAX_EXACT = 2**53  # larger ints are not kept as numbers
 SEQ_MAX = 2**31 - 1  # cp_gateway_audit.seq is a 32-bit integer
 COMMAND_TTL_S = 60.0
 COMMANDS_PER_POLL = 100
+OPEN_COMMANDS_MAX = 256  # pending or delivered (and not yet expired) commands per gateway
 WAIT_POLL_S = 0.25
 DRAIN_TIMEOUT_S = 10.0  # shutdown waits this long for stream polls, then cancels them
 CANCEL_WAIT_S = 1.0
@@ -431,19 +436,29 @@ async def load_desired(store: ControlStore, gateway_id: str) -> DesiredState | N
     )
 
 
-async def mark_dirty(store: ControlStore, gateway_ids: Iterable[str]) -> None:
+async def mark_dirty(
+    store: ControlStore, gateway_ids: Iterable[str], *, conn: AsyncConnection | None = None
+) -> None:
     """Flag gateways whose desired state may have changed (an assignment, an approved
     partner version, a new policy version): it is recomputed by the maintenance pass and
-    by the gateway's open stream at its next poll. Unknown ids are ignored."""
+    by the gateway's open stream at its next poll. Unknown ids are ignored.
+
+    Writes pass their transaction as ``conn``: the flag then commits with the change (or
+    neither does), so a reject or a quarantine is never committed without its gateways
+    hearing of it. The rows are updated in id order (one lock order for every writer)."""
     ids = sorted(set(gateway_ids))
     if not ids:
         return
-    async with store.engine.begin() as conn:
-        await conn.execute(
-            update(GATEWAYS)
-            .where(GATEWAYS.c.id.in_(ids))
-            .values(desired_gen=GATEWAYS.c.desired_gen + 1)
-        )
+    stmt = (
+        update(GATEWAYS)
+        .where(GATEWAYS.c.id.in_(ids))
+        .values(desired_gen=GATEWAYS.c.desired_gen + 1)
+    )
+    if conn is not None:
+        await conn.execute(stmt)
+        return
+    async with store.engine.begin() as own:
+        await own.execute(stmt)
 
 
 def _dirty() -> Any:
@@ -491,6 +506,34 @@ async def _clean_version(store: ControlStore, gateway_id: str) -> int | None:
 
 
 # -- commands ------------------------------------------------------------------------------
+
+
+class TooManyCommands(Exception):
+    """The gateway already has ``OPEN_COMMANDS_MAX`` open commands (429)."""
+
+
+def queue_full() -> HTTPException:
+    """The 429 of a request whose command finds the gateway's queue full."""
+    return HTTPException(
+        429,
+        {"error": "too_many_requests", "detail": "too many open commands for this gateway"},
+        headers={"Retry-After": str(int(COMMAND_TTL_S))},
+    )
+
+
+def _open_commands(gateway_id: str, now: float) -> Any:
+    """The gateway's open commands: pending and unexpired, or delivered and within the
+    sweep's grace (the gateway may still answer them)."""
+    c = COMMANDS.c
+    return (
+        select(func.count())
+        .select_from(COMMANDS)
+        .where(c.gateway_id == gateway_id)
+        .where(
+            ((c.status == "pending") & (c.expires_at > now))
+            | ((c.status == "delivered") & (c.expires_at > now - DELIVERED_GRACE_S))
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -547,7 +590,8 @@ async def enqueue_command(
     """Queue a command for a gateway; it is delivered on the gateway's stream (at most
     once) until ``ttl_s`` from now. Returns its id. ``KeyError`` for an unknown gateway,
     ``ValueError`` for a revoked one or a bad kind or ttl, ``TypeError`` for args that
-    are not a dict."""
+    are not a dict, ``TooManyCommands`` when the gateway has ``OPEN_COMMANDS_MAX`` open
+    ones (counted under the gateway row's lock, so concurrent enqueues cannot pass it)."""
     if not kind or len(kind) > 64:
         raise ValueError("command kind must be 1 to 64 characters")
     if not isinstance(args, dict):
@@ -559,12 +603,19 @@ async def enqueue_command(
     now = store.now()
     async with store.engine.begin() as conn:
         status = (
-            await conn.execute(select(GATEWAYS.c.status).where(GATEWAYS.c.id == gateway_id))
+            await conn.execute(
+                update(GATEWAYS)
+                .where(GATEWAYS.c.id == gateway_id)
+                .values(desired_gen=GATEWAYS.c.desired_gen)  # locks the row
+                .returning(GATEWAYS.c.status)
+            )
         ).scalar_one_or_none()
         if status is None:
             raise KeyError(f"unknown gateway {gateway_id}")
         if status != "active":
             raise ValueError("gateway is revoked")
+        if (await conn.execute(_open_commands(gateway_id, now))).scalar_one() >= OPEN_COMMANDS_MAX:
+            raise TooManyCommands(gateway_id)
         await conn.execute(
             COMMANDS.insert().values(
                 id=command_id,
@@ -756,6 +807,23 @@ def _frame(event: str, data: Any) -> str:
     return f"event: {event}\ndata: {_json(data)}\n\n"
 
 
+class Stopping:
+    """Set at shutdown (``app.state.stopping``, ``app.end_streams``): open streams end at
+    their next poll and new ones end after ``hello``."""
+
+    def __init__(self) -> None:
+        self._set = False
+
+    def set(self) -> None:
+        self._set = True
+
+    def clear(self) -> None:
+        self._set = False
+
+    def is_set(self) -> bool:
+        return self._set
+
+
 class Background:
     """Database work of streams, run as tasks the client's disconnect cannot cancel.
 
@@ -870,7 +938,8 @@ async def _frames(
     yield _frame("hello", {"gateway_id": gateway_id, "server_time": now})
     poll = _Poll(store, state.seen, gateway_id, digest, applied)
     last_beat = now
-    while True:
+    stopping: Stopping = state.stopping
+    while not stopping.is_set():
         now = clock()
         frames = await background.run(poll.once(now))
         if frames is None:
@@ -1085,8 +1154,16 @@ async def _record_partner_states(
     store: ControlStore, conn: AsyncConnection, rows: list[dict[str, Any]]
 ) -> None:
     """Keep each gateway's last reported state of each partner (where the partner list
-    shows it quarantined, and the pending hash an approval is matched against)."""
-    for state in sorted(filter(None, map(_partner_state, rows)), key=lambda r: r["ts"]):
+    shows it quarantined, and the pending hash an approval is matched against). Partner
+    ids the catalogue does not have are ignored."""
+    states = sorted(filter(None, map(_partner_state, rows)), key=lambda r: r["ts"])
+    if not states:
+        return
+    ids = sorted({s["partner_id"] for s in states})
+    known = set((await conn.execute(select(PARTNERS.c.id).where(PARTNERS.c.id.in_(ids)))).scalars())
+    for state in states:
+        if state["partner_id"] not in known:  # not in the catalogue: nothing to show it on
+            continue
         key = (PARTNER_STATES.c.gateway_id == state["gateway_id"]) & (
             PARTNER_STATES.c.partner_id == state["partner_id"]
         )
@@ -1113,6 +1190,9 @@ def _agent(agent: str | ReportedAgent) -> dict[str, Any]:
     def text(value: str | None, limit: int = STRING_MAX) -> str | None:
         return _clean(value, limit) if value is not None else None
 
+    card_url = agent.card_url
+    if card_url is not None and not http_url(card_url):
+        card_url = None  # only http(s) links are served to the Console
     skills = None
     if agent.skills is not None:
         skills = [_clean(s) for s in agent.skills if isinstance(s, str)][:SKILLS_MAX]
@@ -1121,8 +1201,76 @@ def _agent(agent: str | ReportedAgent) -> dict[str, Any]:
         "name": text(agent.name),
         "version": text(agent.version),
         "skills": skills,
-        "card_url": text(agent.card_url, URL_MAX),
+        "card_url": text(card_url, URL_MAX),
     }
+
+
+def http_url(value: str) -> bool:
+    """An absolute http(s) URL (case-insensitive scheme) with a host."""
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return False
+    return parts.scheme.lower() in ("http", "https") and bool(parts.netloc)
+
+
+def _same_row(stored_json: str, row_json: str) -> bool:
+    """Whether a stored copy is the row sent again: the same chain hash (the gateway's row
+    hash covers its content and its predecessor), or the same JSON for a row without one."""
+    stored, sent = _loads(stored_json, {}), _loads(row_json, {})
+    a = stored.get("hash") if isinstance(stored, dict) else None
+    b = sent.get("hash") if isinstance(sent, dict) else None
+    if isinstance(a, str) and isinstance(b, str):
+        return a == b
+    return stored_json == row_json
+
+
+async def _store_audit(
+    store: ControlStore, conn: AsyncConnection, gateway_id: str, rows: list[dict[str, Any]]
+) -> int | None:
+    """Store a report's audit rows (ascending seq, one per seq) under the gateway's current
+    generation; returns the new generation when the rows reset the sequence, else None.
+
+    A row whose seq is stored with the same hash was sent again: skipped. A row whose seq
+    is stored with another hash means the gateway's sequence started over (its database
+    was recreated, or two gateways share one token): from that row on, the report's rows
+    go to a new generation, so no row is lost as a duplicate. The gateway row is written
+    first (a no-op update), which serializes the reports of one gateway."""
+    await conn.execute(
+        update(GATEWAYS)
+        .where(GATEWAYS.c.id == gateway_id)
+        .values(desired_gen=GATEWAYS.c.desired_gen)
+    )
+    g = GATEWAY_AUDIT.c
+    generation = int(
+        (
+            await conn.execute(select(func.max(g.generation)).where(g.gateway_id == gateway_id))
+        ).scalar_one_or_none()
+        or 0
+    )
+    stored = dict(
+        (
+            await conn.execute(
+                select(g.seq, g.row_json)
+                .where(g.gateway_id == gateway_id)
+                .where(g.generation == generation)
+                .where(g.seq.in_([r["seq"] for r in rows]))
+            )
+        ).all()
+    )
+    reset: int | None = None
+    fresh: list[dict[str, Any]] = []
+    for row in rows:
+        if reset is None:
+            copy = stored.get(row["seq"])
+            if copy is not None and _same_row(copy, row["row_json"]):
+                continue
+            if copy is not None:
+                reset = generation = generation + 1
+        fresh.append({**row, "generation": generation})
+    if fresh:
+        await conn.execute(_insert(store)(GATEWAY_AUDIT).on_conflict_do_nothing(), fresh)
+    return reset
 
 
 @dataclass
@@ -1154,8 +1302,10 @@ class _Ingest:
         return len(rows)
 
     async def audit(self, items: list[Any]) -> int:
-        """Store the gateway's audit rows; returns the seq the gateway may forget up to."""
-        rows = []
+        """Store the gateway's audit rows; returns the seq the gateway may forget up to:
+        the highest seq of this report that was handled (stored, already stored, or too
+        large to keep), never more than the report carried."""
+        rows: dict[int, dict[str, Any]] = {}
         acked = 0
         # by seq (rows without a usable seq last), so the cap cuts the highest seqs: a row
         # cut here is never acked, and is sent again
@@ -1166,29 +1316,28 @@ class _Ingest:
                 continue
             acked = max(acked, seq)  # handled: stored, already stored, or too large
             row_json = _json(item)
-            if len(row_json) > AUDIT_ROW_MAX_BYTES:
+            if len(row_json) > AUDIT_ROW_MAX_BYTES or seq in rows:
                 self.dropped += 1
                 continue
-            rows.append(
-                {
-                    "gateway_id": self.gateway_id,
-                    "seq": seq,
-                    "row_json": row_json,  # verbatim, its own ts included
-                    "ts": _clamp_ts(item.get("ts"), self.now),  # ordering and retention
-                }
-            )
-        async with self.store.engine.begin() as conn:
-            if rows:
-                stmt = _insert(self.store)(GATEWAY_AUDIT).on_conflict_do_nothing()
-                await conn.execute(stmt, rows)
-            stored = (
-                await conn.execute(
-                    select(func.max(GATEWAY_AUDIT.c.seq)).where(
-                        GATEWAY_AUDIT.c.gateway_id == self.gateway_id
-                    )
+            rows[seq] = {
+                "gateway_id": self.gateway_id,
+                "seq": seq,
+                "row_json": row_json,  # verbatim, its own ts included
+                "ts": _clamp_ts(item.get("ts"), self.now),  # ordering and retention
+            }
+        if rows:
+            async with self.store.engine.begin() as conn:
+                reset = await _store_audit(self.store, conn, self.gateway_id, list(rows.values()))
+            if reset is not None:
+                event = AuditEvent(
+                    actor=self.gateway_id,
+                    action="cp.audit_seq_reset",
+                    outcome="reset",
+                    detail={"gateway": self.gateway_id, "generation": reset},
+                    ts=self.now,
                 )
-            ).scalar_one_or_none()
-        return max(acked, int(stored or 0))
+                await _emit(self.store, event, coalesce=self.gateway_id)
+        return acked
 
     async def health(self, health: dict[str, Any] | None, metrics: dict[str, Any] | None) -> None:
         if health is None and metrics is None:

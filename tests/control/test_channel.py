@@ -33,7 +33,7 @@ from a2agw.control.store import (
     POLICY_VERSIONS,
 )
 
-KEEPALIVE_S = 2.0
+KEEPALIVE_S = 3.0
 BASE = "https://cp.example"
 
 
@@ -464,6 +464,7 @@ async def test_gateway_cannot_post_events_as_other_gateway(db_url, make_cp):
         async with stream(c, token_b) as frames:  # delivered to gw-b
             await frames.until(lambda f: f.get("event") == "command")
         desired_b = await channel.compute_desired(store, gw_b)
+        await seed_partner(app, None, "p")  # partner states are kept for catalogue partners
         [b_before] = await rows(app, GATEWAYS, GATEWAYS.c.id == gw_b)
         r = await report(
             c,
@@ -543,9 +544,69 @@ async def test_report_idempotent_audit_rows(db_url, make_cp, run_app, clock):
         for row in stored:
             assert json.loads(row.row_json) == audit[row.seq - 1]  # verbatim
             assert row.ts == clock.t - 100 + row.seq
-        # an empty report acks what is stored
+        # an empty report acks nothing: only the rows of a report are acknowledged
         r = await report(c, token)
-        assert r.json() == {"acked_audit_seq": 3, "accepted_events": 0, "dropped": 0}
+        assert r.json() == {"acked_audit_seq": 0, "accepted_events": 0, "dropped": 0}
+
+
+def _audit(seq: int, label: str, *, ts: float = 1.0) -> dict[str, Any]:
+    return {
+        "seq": seq,
+        "action": "inbound.admit",
+        "actor": label,
+        "hash": f"{label}-{seq}",
+        "ts": ts,
+    }
+
+
+async def test_audit_ack_covers_only_the_rows_of_the_report(db_url, make_cp, run_app, clock):
+    """The ack is the highest seq this report carried, never the highest stored."""
+    app = make_cp(settings_for(db_url))
+    async with run_app(app) as c:
+        _gw, token = await app.state.store.create_gateway("gw-a", actor="t")
+        r = await report(c, token, audit=[_audit(s, "a", ts=clock.t) for s in (1, 2, 3)])
+        assert r.json()["acked_audit_seq"] == 3
+        r = await report(c, token, audit=[_audit(2, "a", ts=clock.t)])  # a resend of row 2
+        assert r.json() == {"acked_audit_seq": 2, "accepted_events": 0, "dropped": 0}
+
+
+async def test_audit_seq_reset_keeps_the_new_rows(db_url, make_cp, run_app, clock):
+    """A gateway whose database was recreated starts its seq at 1 again: its new rows are
+    stored under a new generation (not dropped as duplicates), audited once."""
+    app = make_cp(settings_for(db_url))
+    async with run_app(app) as c:
+        gw, token = await app.state.store.create_gateway("gw-a", actor="t")
+        old = [_audit(s, "old", ts=clock.t) for s in (1, 2, 3)]
+        assert (await report(c, token, audit=old)).json()["acked_audit_seq"] == 3
+        new = [_audit(s, "new", ts=clock.t + 1) for s in (1, 2)]
+        r = await report(c, token, audit=new)
+        assert r.json() == {"acked_audit_seq": 2, "accepted_events": 0, "dropped": 0}
+        r = await report(c, token, audit=new)  # sent again: stored once
+        assert r.json() == {"acked_audit_seq": 2, "accepted_events": 0, "dropped": 0}
+        r = await report(c, token, audit=[_audit(3, "new", ts=clock.t + 2)])
+        assert r.json()["acked_audit_seq"] == 3
+        stored = {
+            (row.generation, row.seq): json.loads(row.row_json)["actor"]
+            for row in await rows(app, GATEWAY_AUDIT)
+        }
+        assert stored == {
+            (0, 1): "old",
+            (0, 2): "old",
+            (0, 3): "old",
+            (1, 1): "new",
+            (1, 2): "new",
+            (1, 3): "new",
+        }
+        [reset] = await audit_rows(app, "cp.audit_seq_reset")
+        assert reset["actor"] == gw and reset["outcome"] == "reset"
+        # coalesced per gateway: ``count`` is the resets folded into the row since the last
+        assert reset["detail"] == {"gateway": gw, "generation": 1, "count": 0}
+        # the Console's audit view lists both generations
+        _kid, key = await app.state.store.create_api_key("k", "admin", actor="t")
+        page = await c.get("/api/v1/audit?source=gateway&limit=200", headers=bearer(key))
+        assert page.status_code == 200, page.text
+        listed = sorted((i["generation"], i["seq"]) for i in page.json()["items"])
+        assert listed == sorted(stored)
 
 
 async def test_report_body_cap_413(sqlite_settings, make_cp, run_app):
@@ -1003,8 +1064,7 @@ async def test_last_seen_written_at_most_every_5s(db_url, make_cp, clock):
         writes[0] = 0
         start = clock.t
         async with stream(c, token) as frames:
-            while clock.t - start < 4.5:  # 9 polls or so, all within 5 s of the report
-                await frames.until_keepalive()
+            await frames.until_keepalive()  # 6 polls or so, all within 5 s of the report
             assert writes[0] == 0
             while clock.t - start < 10.6:
                 await frames.until_keepalive()
@@ -1204,3 +1264,66 @@ async def test_partner_call_trace_id_is_kept(sqlite_settings, make_cp, run_app):
         assert r.json()["dropped"] == 0
         [ev] = await rows(app, EVENTS)
     assert ev.trace_id == "a" * 32 and json.loads(ev.data_json)["trace_id"] == "a" * 32
+
+
+# -- bounds on what a gateway reports and what is queued for it -----------------------------
+
+
+async def test_reported_card_urls_must_be_http(db_url, make_cp, run_app):
+    app = make_cp(settings_for(db_url))
+    async with run_app(app) as c:
+        gw, token = await app.state.store.create_gateway("gw-a", actor="t")
+        agents = [
+            {"id": "ok", "card_url": "https://gw.example/agents/ok/card"},
+            {"id": "js", "card_url": "javascript:alert(1)"},
+            {"id": "data", "card_url": "data:text/html,<b>x</b>"},
+            {"id": "plain", "card_url": "HTTP://gw.example/agents/plain"},
+        ]
+        info = {"version": "1", "agents": agents, "base_url": "https://gw.example"}
+        assert (await report(c, token, info=info)).status_code == 200
+        [row] = await rows(app, GATEWAYS, GATEWAYS.c.id == gw)
+        stored = {a["id"]: a["card_url"] for a in json.loads(row.info_json)["agents"]}
+        assert stored == {
+            "ok": "https://gw.example/agents/ok/card",
+            "js": None,
+            "data": None,
+            "plain": "HTTP://gw.example/agents/plain",
+        }
+
+
+async def test_partner_states_only_for_catalogue_partners(db_url, make_cp, run_app):
+    from a2agw.control.store import PARTNER_STATES
+
+    app = make_cp(settings_for(db_url))
+    async with run_app(app) as c:
+        gw, token = await app.state.store.create_gateway("gw-a", actor="t")
+        await seed_partner(app, gw, "known")
+        events = [
+            {
+                "kind": "partner.state",
+                "agent_id": "a",
+                "ts": 1.0,
+                "data": {"partner_id": pid, "status": "quarantined", "event": "quarantined"},
+            }
+            for pid in ("known", "invented-1", "invented-2")
+        ]
+        assert (await report(c, token, events=events)).status_code == 200
+        assert [r.partner_id for r in await rows(app, PARTNER_STATES)] == ["known"]
+
+
+async def test_open_commands_per_gateway_are_bounded(db_url, make_cp, run_app, monkeypatch):
+    monkeypatch.setattr(channel, "OPEN_COMMANDS_MAX", 3)
+    app = make_cp(settings_for(db_url))
+    async with run_app(app) as _c:
+        store = app.state.store
+        gw, _token = await store.create_gateway("gw-a", actor="t")
+        other, _ = await store.create_gateway("gw-b", actor="t")
+        for i in range(3):
+            await channel.enqueue_command(store, gw, "task.get", {"task_id": f"t{i}"}, "u")
+        with pytest.raises(channel.TooManyCommands):
+            await channel.enqueue_command(store, gw, "task.get", {"task_id": "t9"}, "u")
+        await channel.enqueue_command(store, other, "task.get", {"task_id": "t9"}, "u")
+        # a finished one frees its place
+        [first, *_] = await channel.take_commands(store, gw, store.now())
+        await channel.finish_command(store, gw, first.id, "done", {}, now=store.now())
+        await channel.enqueue_command(store, gw, "task.get", {"task_id": "t9"}, "u")

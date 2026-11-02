@@ -226,7 +226,7 @@ async def control_plane(tmp_path) -> AsyncIterator[Any]:
     settings = ControlSettings(
         base_url=CP,
         db_url=f"sqlite+aiosqlite:///{tmp_path / 'cp.db'}",
-        limits={"stream_keepalive_s": 2.0},
+        limits={"stream_keepalive_s": 3.0},
     )
     async with httpx.AsyncClient() as cp_http:
         app = create_app(

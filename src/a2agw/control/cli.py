@@ -144,15 +144,23 @@ def serve(
     host: Annotated[str, typer.Option("--host")] = "127.0.0.1",
     port: Annotated[int, typer.Option("--port")] = 8100,
 ) -> None:
-    """Run the control plane. The database is checked before the server starts."""
+    """Run the control plane. The database is checked before the server starts. At
+    shutdown open gateway streams end at once and other requests get 10 s."""
     import uvicorn
 
     from a2agw.cli import _check_db, _db_run
-    from a2agw.control.app import create_app
+    from a2agw.control.app import GRACEFUL_SHUTDOWN_S, create_app
 
     settings = load_control_settings(config)
     _db_run(settings.db_url, _check_db(settings.db_url))
-    uvicorn.run(create_app(settings, config_dir=config.parent), host=host, port=port)
+    uvicorn.run(
+        create_app(settings, config_dir=config.parent),
+        host=host,
+        port=port,
+        # open requests get this long at shutdown, then the lifespan cleanup runs; uvicorn
+        # annotates it int but passes it to asyncio.wait_for (a float works)
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S,  # type: ignore[arg-type]
+    )
 
 
 @control_app.command("create-api-key")

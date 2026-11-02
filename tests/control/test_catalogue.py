@@ -915,3 +915,111 @@ async def test_desired_is_the_approved_version_at_current_version(
         assert rec["card_hash"] == v1["card_hash"]
         await c.post("/api/v1/partners/acme/quarantine", headers=admin)
         assert (await desired(app, gid)).partners == []
+
+
+# -- desired-state flags commit with the write ----------------------------------------------
+
+
+async def _flag_fails(*_args: Any, **_kw: Any) -> None:
+    raise RuntimeError("the database went away")
+
+
+@respx.mock(assert_all_called=False)
+async def test_a_trust_change_and_its_gateway_flag_commit_together(
+    db_url, catalogue_app, run_app, monkeypatch
+):
+    """Flagging the gateways is part of the write's transaction: when it fails, the reject
+    or the assignment is not committed either (never a revocation no gateway hears of)."""
+    from a2agw.control.store import ASSIGNMENTS, PARTNERS
+
+    app = catalogue_app(settings_for(db_url))
+    async with run_app(app) as c:
+        admin = await admin_key(app)
+        gid, _ = await gateway(app, "edge-1")
+        await register(c, admin, "acme", card=card("Acme"))
+        await register(c, admin, "beta", card=card("Beta"))
+        await assign(c, admin, gid, "acme")
+        await approve(c, admin, "acme")
+        monkeypatch.setattr(channel, "mark_dirty", _flag_fails)
+        for action in ("reject", "quarantine"):
+            r = await c.post(f"/api/v1/partners/acme/{action}", headers=admin)
+            assert r.status_code == 500
+        assert (await assign(c, admin, gid, "beta")).status_code == 500
+        async with app.state.engine.connect() as conn:
+            status = (
+                await conn.execute(select(PARTNERS.c.status).where(PARTNERS.c.id == "acme"))
+            ).scalar_one()
+            assigned = (
+                (
+                    await conn.execute(
+                        select(ASSIGNMENTS.c.ref_id).where(ASSIGNMENTS.c.gateway_id == gid)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert status == "approved" and list(assigned) == ["acme"]
+
+
+@respx.mock(assert_all_called=False)
+async def test_assign_partners_to_a_revoked_gateway_is_refused(db_url, catalogue_app, run_app):
+    app = catalogue_app(settings_for(db_url))
+    async with run_app(app) as c:
+        admin = await admin_key(app)
+        gid, _ = await gateway(app, "edge-1")
+        await register(c, admin, "acme", card=card("Acme"))
+        await app.state.store.revoke_gateway(gid, actor="t")
+        r = await assign(c, admin, gid, "acme")
+        assert r.status_code == 409 and r.json()["error"] == "conflict"
+
+
+@pytest.mark.postgres
+@respx.mock(assert_all_called=False)
+async def test_concurrent_partner_assignments_wait_for_each_other(pg_url, catalogue_app, run_app):
+    """Two overlapping assignments to one gateway at once: the second waits for the first
+    (the gateway row's lock) and replaces its set, instead of a unique violation (500)."""
+    import asyncio
+
+    from sqlalchemy import update
+    from test_policies import _wait_for_lock_waiter
+
+    from a2agw.control.store import ASSIGNMENTS, GATEWAYS
+
+    app = catalogue_app(settings_for(pg_url))
+    async with run_app(app) as c:
+        admin = await admin_key(app)
+        gid, _ = await gateway(app, "edge-1")
+        await register(c, admin, "acme", card=card("Acme"))
+        await register(c, admin, "beta", card=card("Beta"))
+        conn = await app.state.engine.connect()
+        try:
+            tx = await conn.begin()
+            await conn.execute(  # what the first assignment holds while it writes
+                update(GATEWAYS)
+                .where(GATEWAYS.c.id == gid)
+                .values(desired_gen=GATEWAYS.c.desired_gen)
+            )
+            await conn.execute(
+                ASSIGNMENTS.insert().values(gateway_id=gid, kind="partner", ref_id="acme")
+            )
+            second = asyncio.create_task(assign(c, admin, gid, "acme", "beta"))
+            await _wait_for_lock_waiter(app.state.engine)
+            assert not second.done()
+            await tx.commit()
+        finally:
+            await conn.close()
+        r = await second
+        assert r.status_code == 200, r.text
+        async with app.state.engine.connect() as check:
+            rows = (
+                (
+                    await check.execute(
+                        select(ASSIGNMENTS.c.ref_id)
+                        .where(ASSIGNMENTS.c.gateway_id == gid)
+                        .order_by(ASSIGNMENTS.c.ref_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert list(rows) == ["acme", "beta"]

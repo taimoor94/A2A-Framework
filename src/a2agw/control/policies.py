@@ -44,7 +44,6 @@ require_fastapi()
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import and_, delete, func, or_, select, tuple_, update
 from sqlalchemy.exc import IntegrityError
@@ -55,6 +54,7 @@ from a2agw.consult.netguard import Tier
 from a2agw.consult.registry import PartnerRecord
 from a2agw.control import channel
 from a2agw.control.rbac import Actor, Permission, require, route
+from a2agw.control.responses import JSONResponse
 from a2agw.control.store import (
     ASSIGNMENTS,
     DAY_S,
@@ -415,9 +415,9 @@ async def add_version(
             )
             following = [g.gateway_id for g in await _following(conn, policy_id, latest_only=True)]
             known = await _known_partners(conn, policy)
+            await channel.mark_dirty(store, following, conn=conn)
     except IntegrityError:  # a concurrent save took this version number
         raise _conflict("policy changed while the version was saved") from None
-    await channel.mark_dirty(store, following)
     await _audit(
         store,
         actor.id,
@@ -478,7 +478,7 @@ async def assign_policy(
     store: ControlStore = request.app.state.store
     async with store.engine.begin() as conn:
         await replace_assignment(conn, gateway_id, body.policy_id, body.version)
-    await channel.mark_dirty(store, [gateway_id])
+        await channel.mark_dirty(store, [gateway_id], conn=conn)
     await _audit(
         store,
         actor.id,
@@ -748,7 +748,8 @@ async def replay(
 ) -> tuple[Replay, bool]:
     """Replay the gateways' audit rows of the last ``days`` against ``policy``, newest
     first, ``DRY_RUN_MAX_ROWS`` at most; returns the outcome and whether rows were left
-    out. Rows are read ``DRY_RUN_BATCH`` at a time (keyset on ``(ts, gateway_id, seq)``)
+    out. Rows are read ``DRY_RUN_BATCH`` at a time (keyset on ``(ts, gateway_id,
+    generation, seq)``)
     and each batch is evaluated in a worker thread, so the loop is never held and at most
     one batch of rows is in memory."""
     engine = PolicyEngine(policy)  # no classifier: content checks are not replayed
@@ -760,6 +761,7 @@ async def replay(
             GATEWAY_AUDIT.c.seq,
             GATEWAY_AUDIT.c.ts,
             GATEWAY_AUDIT.c.row_json,
+            GATEWAY_AUDIT.c.generation,
         )
         .where(GATEWAY_AUDIT.c.ts >= since)
         .where(_action_filter())
@@ -769,20 +771,25 @@ async def replay(
     order = (
         GATEWAY_AUDIT.c.ts.desc(),
         GATEWAY_AUDIT.c.gateway_id.desc(),
+        GATEWAY_AUDIT.c.generation.desc(),
         GATEWAY_AUDIT.c.seq.desc(),
     )
-    key = tuple_(GATEWAY_AUDIT.c.ts, GATEWAY_AUDIT.c.gateway_id, GATEWAY_AUDIT.c.seq)
+    key = tuple_(
+        GATEWAY_AUDIT.c.ts,
+        GATEWAY_AUDIT.c.gateway_id,
+        GATEWAY_AUDIT.c.generation,
+        GATEWAY_AUDIT.c.seq,
+    )
     cache: dict[str, _Partner] = {}
-    after: tuple[float, str, int] | None = None
+    after: tuple[float, str, int, int] | None = None
     while out.read < DRY_RUN_MAX_ROWS:
         limit = min(DRY_RUN_BATCH, DRY_RUN_MAX_ROWS - out.read)
         query = base.order_by(*order).limit(limit)
         if after is not None:
             query = query.where(key < tuple_(*after))
         async with store.engine.connect() as conn:
-            rows = [
-                (str(r[0]), int(r[1]), float(r[2]), str(r[3])) for r in await conn.execute(query)
-            ]
+            read = list(await conn.execute(query))
+        rows = [(str(r[0]), int(r[1]), float(r[2]), str(r[3])) for r in read]
         if rows:
             batch = await asyncio.to_thread(_parse_batch, rows)
             ids = _partner_ids(batch)
@@ -790,7 +797,8 @@ async def replay(
                 async with store.engine.connect() as conn:
                     await _partners(conn, ids, cache)
             await asyncio.to_thread(_replay_batch, engine, batch, cache, out)
-            after = (rows[-1][2], rows[-1][0], rows[-1][1])
+            last = read[-1]
+            after = (float(last[2]), str(last[0]), int(last[4]), int(last[1]))
         if len(rows) < limit:
             return out, False
     # the cap is reached: is there anything older?

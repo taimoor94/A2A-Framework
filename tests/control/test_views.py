@@ -168,6 +168,7 @@ async def test_overview_buckets_and_alerts(db_url, make_app, run_app, clock):
         admin = await admin_key(app)
         gw1, t1 = await gateway(app, "east")
         gw2, t2 = await gateway(app, "west")
+        await add_partner(app, "p3")  # partner states are kept for catalogue partners
         await report(c, t2, events=[])  # seen now, then silent
         clock.advance(120)
         now = clock()
@@ -1095,3 +1096,57 @@ async def test_percentiles_match_the_nearest_rank_definition(db_url, make_app, r
         assert by_partner[pid]["p95_ms"] == _percentile(ds, 95), pid
     for t in top:
         assert t["p95_ms"] == _percentile(durations[t["partner_id"]], 95)
+
+
+async def test_lone_surrogates_from_a_gateway_never_break_a_view(db_url, make_app, run_app, clock):
+    """Gateway strings are stored verbatim (so chains verify): a lone surrogate in them is
+    answered escaped (ASCII JSON) and replaced in CSV, never a 500."""
+    app = make_app(settings_for(db_url))
+    async with run_app(app) as c:
+        admin = await admin_key(app)
+        _gw, token = await gateway(app, "east")
+        await add_partner(app, "p1")
+        row = gw_row(1, "inbound.admit", clock() - 5, actor="key:\ud800x")
+        body = {
+            "audit": [row],
+            "health": {"status": "ok\udc00"},
+            "metrics": {"partners": {"p1": {"breaker": "open", "note": "\ud83d"}}},
+            "info": {"version": "1", "agents": ["billing"], "base_url": "https://gw.example"},
+        }
+        raw = json.dumps(body).encode()  # ASCII, with the \\ud800 escapes
+        r = await c.post(
+            "/cp/v1/report",
+            content=raw,
+            headers={**bearer(token), "content-type": "application/json"},
+        )
+        assert r.status_code == 200, r.text
+        for path in ("/api/v1/audit?source=gateway", "/api/v1/agents", "/api/v1/overview"):
+            got = await c.get(path, headers=admin)
+            assert got.status_code == 200, (path, got.status_code)
+            got.content.decode("ascii")  # escaped
+        listed = (await c.get("/api/v1/audit?source=gateway", headers=admin)).json()
+        assert listed["items"][0]["actor"] == "key:\ud800x"
+        for fmt in ("csv", "jsonl"):
+            got = await c.get(
+                "/api/v1/audit/export", params={"format": fmt, "source": "gateway"}, headers=admin
+            )
+            assert got.status_code == 200 and "key:" in got.content.decode("utf-8")
+        csv_text = (
+            await c.get(
+                "/api/v1/audit/export", params={"format": "csv", "source": "gateway"}, headers=admin
+            )
+        ).text
+        assert "key:�x" in csv_text
+
+
+async def test_answer_with_a_lone_surrogate_is_422(db_url, make_app, run_app):
+    app = make_app(settings_for(db_url))
+    async with run_app(app) as c:
+        admin = await admin_key(app)
+        gw, _token = await gateway(app, "east")
+        r = await c.post(
+            f"/api/v1/tasks/{gw}/billing/t1/answer",
+            content=b'{"text": "yes \\ud800"}',
+            headers={**admin, "content-type": "application/json"},
+        )
+        assert r.status_code == 422 and r.json()["fields"] == ["body.text"]

@@ -66,7 +66,9 @@ class LimitsSettings(BaseModel):
     model_config = _FORBID
     report_max_bytes: int = Field(default=1048576, gt=0)
     report_max_items: int = Field(default=1000, gt=0)
-    stream_keepalive_s: float = Field(default=15, gt=0)
+    # a gateway counts as connected while seen within two keepalives; under 3 s the
+    # keepalives are mostly overhead, over 60 s a lost gateway shows connected too long
+    stream_keepalive_s: float = Field(default=15, ge=3, le=60)
 
 
 class ControlSettings(BaseModel):

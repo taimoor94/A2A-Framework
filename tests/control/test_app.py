@@ -237,6 +237,7 @@ def test_core_does_not_import_fastapi():
         control / "policies.py",
         control / "views.py",
         control / "operations.py",
+        control / "responses.py",
         control / "__init__.py",
     }
     importing = []
@@ -377,3 +378,26 @@ def test_control_serve_runs_uvicorn_with_the_app(tmp_path, monkeypatch):
     assert r.exit_code == 0, r.output
     assert isinstance(seen["app"], fastapi.FastAPI)
     assert seen["kw"]["host"] == "127.0.0.1" and seen["kw"]["port"] == 8123
+
+
+async def test_request_bodies_are_capped_except_the_report(sqlite_settings, run_app):
+    """1 MiB on every route but /cp/v1 (the report has its own cap), with or without a
+    Content-Length."""
+    from a2agw.control.app import BODY_MAX_BYTES
+
+    app = create_app(sqlite_settings)
+    async with run_app(app) as c:
+        _kid, key = await app.state.store.create_api_key("k", "admin", actor="t")
+        headers = {"authorization": f"Bearer {key}", "content-type": "application/json"}
+        big = json.dumps({"name": "x", "doc": {"pad": "x" * BODY_MAX_BYTES}}).encode()
+        r = await c.post("/api/v1/policies", content=big, headers=headers)
+        assert r.status_code == 413 and r.json()["error"] == "too_large"
+
+        async def chunks():
+            for i in range(0, len(big), 65536):
+                yield big[i : i + 65536]
+
+        r = await c.post("/api/v1/policies", content=chunks(), headers=headers)
+        assert r.status_code == 413 and r.json()["error"] == "too_large"
+        small = {"name": "p", "doc": {"version": 1, "authz": []}}
+        assert (await c.post("/api/v1/policies", json=small, headers=headers)).status_code == 201

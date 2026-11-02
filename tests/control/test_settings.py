@@ -126,3 +126,13 @@ def test_trust_section_uses_gateway_shape(tmp_path):
     )
     with pytest.raises(ConfigError, match="require_signed needs card_keys"):
         load_control_settings(p, env={})
+
+
+@pytest.mark.parametrize("value", [0.5, 2.9, 60.1, 3600])
+def test_stream_keepalive_bounded(value):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        ControlSettings(base_url="https://cp.example", limits={"stream_keepalive_s": value})
+    for ok in (3, 15, 60):
+        ControlSettings(base_url="https://cp.example", limits={"stream_keepalive_s": ok})
